@@ -886,35 +886,47 @@ sync-main-clone: ## ff-only sync the bind-mount source clone to origin/main
 # systemd variant is `deploy-systemd`). `make redeploy` remains a working
 # DEPRECATED alias of this target.
 #
-# TWO ordered compose ops, FIRST of which is the atomic self-redeploy op:
-#   1. `docker compose up -d --force-recreate claude-container`  (atomic)
-#   2. `docker compose up -d`  (no service arg — fill in the rest of the
-#      stack: ttyd, queue-minisite, eichi-search — idempotently, WITHOUT
-#      --force-recreate so the just-recreated claude-container is left
-#      running untouched).
+# Ordered compose ops, the SECOND-TO-LAST of which is the atomic
+# self-redeploy op:
+#   1. `docker compose up -d --build --force-recreate queue-minisite`
+#      (non-fatal on failure — q-site has its own Dockerfile, so a bare
+#      `up -d` below would never rebuild/recreate it on a code-only change).
+#   2. `docker compose up -d --build --force-recreate ttyd` (same reasoning:
+#      ttyd has its own Dockerfile under examples/compose/ttyd/, so it needs
+#      the same explicit rebuild+recreate step as queue-minisite, or a
+#      ttyd-only change — e.g. #721 — never goes live via this target).
+#      Non-fatal on failure.
+#   3. `docker compose up -d --force-recreate claude-container`  (atomic)
+#   4. `docker compose up -d`  (no service arg — fill in whatever's left of
+#      the stack, e.g. eichi-search — idempotently, WITHOUT --force-recreate
+#      so the just-recreated services are left running untouched).
 #
-# Command 1 is deliberately ONE host-daemon operation so the target works
-# when issued FROM INSIDE the container (self-redeploy): the in-container
-# docker CLI hands the recreate request to the HOST docker daemon, which
-# performs the stop-old + start-new host-side and COMPLETES it even after
-# the issuing container (and the shell that ran `make redeploy`) is torn
-# down. The daemon owns that op — no backgrounding, no nohup, no disown.
+# Command 3 (the claude-container recreate) is deliberately ONE host-daemon
+# operation so the target works when issued FROM INSIDE the container
+# (self-redeploy): the in-container docker CLI hands the recreate request to
+# the HOST docker daemon, which performs the stop-old + start-new host-side
+# and COMPLETES it even after the issuing container (and the shell that ran
+# `make redeploy`) is torn down. The daemon owns that op — no backgrounding,
+# no nohup, no disown.
 #
-# The claude-container recreate is ordered FIRST precisely so it never
-# DEPENDS on a following command. On self-redeploy the recreate tears down
-# the issuing container, the recipe shell dies, and the trailing `&& up -d`
-# (command 2) simply never runs — which is fine: self-redeploy always runs
-# on an already-up system where the siblings are ALREADY running, so the
-# claude-container recreate is the only thing it needs. On a HOST cold
+# Commands 1-2 (queue-minisite, ttyd) are ordered BEFORE the claude-container
+# recreate precisely so they still run to completion on self-redeploy — the
+# issuing container isn't torn down until command 3, so its shell survives
+# through 1-2. Command 3 is the pivot point: nothing AFTER it depends on the
+# issuing shell surviving except the idempotent trailing `up -d` (command 4).
+# On self-redeploy the recreate tears down the issuing container, the recipe
+# shell dies, and command 4 simply never runs — which is fine: self-redeploy
+# always runs on an already-up system where eichi-search (the only thing
+# command 4 would still need to touch) is ALREADY running. On a HOST cold
 # start (docker-autostart after a Docker Desktop restart, everything down),
-# the recipe shell runs host-side and SURVIVES the recreate, so command 2
-# executes and brings the whole stack up. This is the coverage fix for the
+# the recipe shell runs host-side and SURVIVES the recreate, so command 4
+# executes and brings up whatever's left. This is the coverage fix for the
 # 'siblings missing after Docker Desktop restart' bug (ttyd / minisite /
 # eichi-search never came up because deploy-container only touched
 # claude-container). The trailing `up -d` is idempotent: on a normal
 # already-up host it no-ops.
 #
-# Why command 1 is a single op and NOT a `rm -sf && up -d` split: when run
+# Why command 3 is a single op and NOT a `rm -sf && up -d` split: when run
 # from inside the container, a FIRST `rm -sf` / `down` destroys the very
 # container running the make recipe, so the shell dies and the `&& up -d`
 # never executes — the container goes down and never comes back.
@@ -1031,7 +1043,7 @@ else
 	@echo "[deploy-container] no DEPLOY_DASHBOARDS_CMD configured; skipping Grafana dashboard deploy (see examples/compose/deploy-container.local.mk.example)"
 endif
 
-deploy-container: container-build ## One-command deploy: dashboards + q-site + force-recreate claude-container, then up -d the stack
+deploy-container: container-build ## One-command deploy: dashboards + q-site + ttyd + force-recreate claude-container, then up -d the stack
 	@$(MAKE) --no-print-directory deploy-dashboards
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
@@ -1043,6 +1055,8 @@ deploy-container: container-build ## One-command deploy: dashboards + q-site + f
 	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then export COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)"; fi; \
 	  echo "[deploy-container] redeploying queue-minisite (q-site)..."; \
 	  docker compose $$env_flag up -d --build --force-recreate queue-minisite || echo "[deploy-container] WARN: queue-minisite redeploy failed (non-fatal); continuing"; \
+	  echo "[deploy-container] redeploying ttyd..."; \
+	  docker compose $$env_flag up -d --build --force-recreate ttyd || echo "[deploy-container] WARN: ttyd redeploy failed (non-fatal); continuing"; \
 	  docker compose $$env_flag up -d --force-recreate claude-container && \
 	  docker compose $$env_flag up -d
 
