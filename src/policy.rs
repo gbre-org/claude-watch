@@ -161,6 +161,68 @@ pub(crate) fn apply_thinking_token_progress(
     }
 }
 
+/// Bound on `carry_forward_token_misparse`: how many CONSECUTIVE zero-token
+/// polls a large, same-pane context reading may be carried forward before the
+/// zero is finally trusted. Small so a genuine `/clear` or crashed process
+/// still registers within a couple of extra cycles; large enough to bridge the
+/// 1-2-poll transient misparse (an overlay panel or a mid-redraw scrolls the
+/// bare context total out of the capture window) that the 2026-08 status-parser
+/// hardening now surfaces as a bare 0 instead of a small bogus count.
+pub(crate) const MISPARSE_CARRY_MAX: u32 = 3;
+
+/// Smooth a transient status-bar token MISPARSE so a live session is not
+/// misread as dead/cleared.
+///
+/// Context: the status parser was hardened (2026-08) to NEVER adopt the
+/// thinking-indicator (`\u{2193} N tokens`, the current turn's own output) or
+/// an agent-roster row's per-subagent count as the session context total --
+/// those numbers fooled the fresh-/clear and dead-process detectors into
+/// phantom "context clear" injects. The hardened parser instead returns `None`
+/// (-> `0`) when only those lines are on screen and the bare context total has
+/// momentarily scrolled out of the capture window. But a bare `0` itself feeds
+/// two liveness paths that the old small-bogus count did not: the
+/// `tokens == 0 && bashes == 0` dead-check accumulator and the
+/// fresh-external-session gate. A long, intact session that is merely thinking
+/// mid-turn -- or quiet-holding while subagent roster rows are on screen --
+/// would then be misread as a fresh/dead session and get a bogus resume prompt.
+///
+/// This carries the last known reading forward across a BOUNDED run of
+/// consecutive zero polls, but ONLY when the prior reading was clearly LARGE
+/// (`last_known >= carry_floor`, set by the caller to the fresh-/clear window's
+/// upper bound):
+///
+///   * A genuinely fresh/low session (`last_known < carry_floor`) is never
+///     carried, so fresh-/clear detection in the low-token window is untouched.
+///   * A large context that momentarily reads 0 is held at its last value, so a
+///     transient misparse cannot manufacture a phantom clear.
+///   * The carry is bounded (`max_carry`), so a REAL `/clear` or crashed
+///     process -- which holds 0 for many consecutive polls -- still registers
+///     once the bound is exhausted.
+///
+/// The caller additionally gates this on pane continuity (only smooth within
+/// the SAME pane), so a genuine new session (pane change) is never carried.
+///
+/// Returns `(effective_tokens, new_carry_count)`.
+pub(crate) fn carry_forward_token_misparse(
+    current: u64,
+    last_known: u64,
+    carry_count: u32,
+    carry_floor: u64,
+    max_carry: u32,
+) -> (u64, u32) {
+    if current > 0 {
+        // Real reading this poll -- trust it and reset the carry run.
+        return (current, 0);
+    }
+    if last_known >= carry_floor && carry_count < max_carry {
+        // Transient misparse of a large same-pane context -- hold the last
+        // value and advance the bounded run.
+        return (last_known, carry_count + 1);
+    }
+    // Nothing large to carry, or the carry bound is exhausted: trust the 0.
+    (0, carry_count)
+}
+
 /// Age in whole seconds of a liveness stamp relative to `now` (pure).
 /// Returns `None` when the stamp is unavailable (file missing/unreadable) or
 /// in the FUTURE relative to `now` (`duration_since` fails on clock skew /
@@ -651,6 +713,27 @@ pub(crate) fn fresh_clear_inject_suppressed(
 /// on).
 pub(crate) fn ack_liveness_fresh(liveness_age: Option<u64>, stale_secs: u64) -> bool {
     liveness_age.is_some_and(|age| age < stale_secs)
+}
+
+/// Pure predicate: should `ack_liveness_fresh` suppress a fresh-/clear or
+/// post-clear-resume inject THIS cycle?
+///
+/// `ack_liveness_fresh` exists to catch a status-bar MISPARSE — a live,
+/// intact session whose low-token reading is actually a thinking-indicator
+/// or agent-roster count leaking through, not a real clear. It must defer
+/// to a genuine context-limit/rate-limit wedge (`wedged_now`, from
+/// `tmux::detect_wedged` on the *current* banner text — independent,
+/// stronger evidence than a token-count reading). Without this carve-out, a
+/// session that hit "Context limit reached" moments after its last
+/// event-ack reads as "alive" for the whole `ack.stale_minutes` window,
+/// and the ack gate's early `return` in `check_cycle` never lets control
+/// reach `handle_wedged_pane` — silently swallowing the autoclear-on-
+/// context-limit recovery (2026-08-26 incident: "Context limit reached"
+/// then "Context low (0% remaining)", autoclear never fired).
+///
+/// Returns true iff `ack_alive && !wedged_now`.
+pub(crate) fn ack_liveness_suppresses_clear_inject(ack_alive: bool, wedged_now: bool) -> bool {
+    ack_alive && !wedged_now
 }
 
 /// Pure predicate: should the dead-process restart be suppressed because
@@ -3790,9 +3873,11 @@ pub async fn check_update_trigger(config: &Config, state: &mut State, pane: &str
     }
 
     // Check version mismatch (or force)
-    let version_info = tokio::task::spawn_blocking(crate::status::get_version_info)
-        .await
-        .unwrap_or_default();
+    // Pane-scoped: resolve the RUNNING version from the main-loop pane's own
+    // PID, NOT the global `pgrep -af claude` first-match — which in a container
+    // can return a SIGKILL-orphaned OLDER versioned claude and manufacture a
+    // false `running != installed`, driving a self-sustaining relaunch loop.
+    let version_info = crate::status::get_version_info_for_pane(pane).await;
 
     let running = match version_info.running {
         Some(v) => v,
@@ -3903,9 +3988,11 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
     }
 
     // Check version mismatch
-    let version_info = tokio::task::spawn_blocking(crate::status::get_version_info)
-        .await
-        .unwrap_or_default();
+    // Pane-scoped: resolve the RUNNING version from the main-loop pane's own
+    // PID, NOT the global `pgrep -af claude` first-match — which in a container
+    // can return a SIGKILL-orphaned OLDER versioned claude and manufacture a
+    // false `running != installed`, driving a self-sustaining relaunch loop.
+    let version_info = crate::status::get_version_info_for_pane(pane).await;
 
     let running = match version_info.running {
         Some(v) => v,
@@ -4239,6 +4326,23 @@ async fn run_auto_update_clean_relaunch(
     // Inject the resume prompt (lands in the Claude TUI, never a raw shell).
     info!("auto-update: injecting resume prompt (clean-relaunch)...");
     inject_dispatch::inject_to_agent(pane, &config.auto_update.resume_prompt).await;
+
+    // Latch this clear as already handled (mirrors the daemon-driven-clear
+    // stamp at the Path-1 branch of `maybe_reset_context_clear`): the
+    // concurrent poll loop's own external-clear detection (Path 2 —
+    // `context_reset_signal` observing the respawned pane's near-zero token
+    // reading) typically stamps `last_context_clear` DURING this relaunch,
+    // independent of this function, since check_cycle keeps polling while
+    // this clean-relaunch sequence awaits the new binary/idle prompt. That
+    // stamp is never otherwise matched by `post_clear_resume_injected_for`
+    // (only the daemon-driven-clear path sets that), so the sibling
+    // "Post-clear resume detection" block's
+    // `post_clear_resume_injected_for != last_context_clear` guard reads
+    // true forever after and double-injects a SECOND resume ~40s later on
+    // top of the one just sent above. Sync the two fields to close that gap.
+    let mut st = crate::state::load_state(&config.general.state_file);
+    st.post_clear_resume_injected_for = st.last_context_clear.clone();
+    crate::state::save_state(&config.general.state_file, &st);
 
     write_jsonl_log(
         &config.general.log_file,
@@ -5109,6 +5213,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     let pane = &cs.pane;
     let tokens = cs.tokens;
     let bashes = cs.bashes;
+    let active_ui = cs.active_ui;
     let watchmen_count = status::check_watchmen_count().await;
 
     // --- Activity detection (Phase 1: logging only) ---
@@ -5163,6 +5268,28 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         crate::state::save_state(&config.general.state_file, state);
         return;
     }
+
+    // Carry-forward guard against a transient status-bar token misparse (see
+    // `carry_forward_token_misparse`): if this poll reads 0 tokens for the SAME
+    // pane whose last known reading was a large, intact context, hold the prior
+    // value for a bounded run of polls rather than let the 0 trip the dead-check
+    // accumulator or the fresh-/clear detection below. A pane change (new
+    // session) or an exhausted carry run lets the 0 through. Applied only to the
+    // liveness/detection logic that follows -- the post-restart resume block
+    // above deliberately keeps the raw reading.
+    let same_pane = !cs.pane.is_empty() && cs.pane == state.last_known_pane;
+    let (tokens, token_carry_count) = if same_pane {
+        carry_forward_token_misparse(
+            tokens,
+            state.last_known_tokens,
+            state.token_carry_count,
+            config.fresh_clear.max_tokens,
+            MISPARSE_CARRY_MAX,
+        )
+    } else {
+        (tokens, 0)
+    };
+    state.token_carry_count = token_carry_count;
 
     // --- Find pane when claude-status can't (process crashed) ---
     let effective_pane: String = if pane.is_empty() && tokens == 0 && bashes == 0 {
@@ -5225,6 +5352,28 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     if api_retrying {
         debug!("check_cycle: api_retry active — suppressing wedged/watcher/context fires");
     }
+
+    // --- Wedged-pane pre-check (context limit / persistent rate limit) ---
+    //
+    // Computed once, early, so the ack-liveness suppression gates below (the
+    // fresh-/clear and post-clear-resume fixes from #707/#713, 2026-08-24/25)
+    // can tell a genuine context-wall wedge apart from the status-bar
+    // MISPARSE those gates were built to catch. A session that just hit
+    // "Context limit reached" / "Context low (N% remaining)" typically acked
+    // an event/keepalive moments before it wedged, so `ack_liveness_fresh`
+    // keeps reading "alive" for up to the whole stale window
+    // (`config.ack.stale_minutes`) — during which both ack-gated blocks below
+    // `return`ed BEFORE this function ever reached `handle_wedged_pane`,
+    // silently swallowing the autoclear-on-context-limit recovery (incident
+    // 2026-08-26: "Context limit reached" then "Context low (0% remaining)",
+    // autoclear never fired, operator had to `/clear` by hand). The
+    // ack-liveness gate must suppress spurious resume/restart injects on an
+    // intact session — it must never suppress the wedged-pane recovery,
+    // which rests on independent banner-text evidence (not a token-count
+    // misparse) and has its own consecutive-cycle + cooldown gating inside
+    // `handle_wedged_pane`.
+    let wedged_now =
+        !effective_pane.is_empty() && tmux::detect_wedged(&effective_pane).await.is_some();
 
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
@@ -5320,7 +5469,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     info!("dead state reached after active session — resetting fresh_session_injected");
                     state.fresh_session_injected = false;
                     state.was_alive_since_inject = false;
-                } else if inject_expired {
+                } else if inject_expired
+                    // ONE-SHOT LATCH GUARD (operator #5620): only treat a
+                    // never-active session as "died during fresh startup" (and
+                    // thus re-arm the inject) when this pane was NOT hosting a
+                    // large context. A large last-known total is positive proof
+                    // the pane holds a live, intact session whose bare total is
+                    // merely a persistent parse miss — re-arming there is what
+                    // re-fired the bogus resume prompt every ~5 min.
+                    && state.last_known_tokens < config.fresh_clear.max_tokens
+                {
                     info!("dead state reached — inject expired (>5min, never active) — resetting fresh_session_injected");
                     state.fresh_session_injected = false;
                     state.was_alive_since_inject = false;
@@ -5448,7 +5606,15 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // recent handoff short-circuits without extra tmux work, and
                 // placed at the GATE (not just inside `inject_to_agent`) so the
                 // `fresh_session_injected` latch is not set on a deferred fire.
-                !tmux::self_clear_in_progress()
+                // ACTIVE-UI SUPPRESSION (operator #5620): a long, active
+                // session whose bare context total has scrolled behind the
+                // thinking indicator / agent-roster / background-tasks overlay
+                // reads tokens==0 — a parse MISS, not a fresh session. Those
+                // active-work markers never appear on a genuinely fresh idle
+                // pane, so their presence is positive proof this is NOT a fresh
+                // external session: never fire the resume-checklist inject.
+                !active_ui
+                && !tmux::self_clear_in_progress()
                 && !tmux::self_clear_handoff_recent(
                     config.fresh_clear.self_clear_handoff_grace_secs,
                 )
@@ -5584,6 +5750,54 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         && state.last_context_clear.is_some()
         && state.post_clear_resume_injected_for != state.last_context_clear
     {
+        // Liveness gate (mirrors the 2026-08-24 fresh-/clear fix at the
+        // sibling fast path — #707/ack_liveness_fresh): THE single liveness
+        // signal is the age of the last event-ack. If the loop acked ANY
+        // event/keepalive within the stale window it is provably alive and
+        // therefore CANNOT be a genuinely stranded post-clear loop — the
+        // low-token reading that satisfied this block's guard is almost
+        // certainly the SAME status-bar misparse #707 fixed for the fresh-
+        // /clear fast path (`context_reset_signal` stamping `last_context_clear`
+        // from a sub-30K sample that is actually the thinking-indicator's
+        // current-turn count or an agent-roster row leaking through, not a
+        // real reset; see `status::parse_status_bar`). This is a hard
+        // suppression, checked before any idle-check bookkeeping or the
+        // `post_clear_resume_due` call so a fresh ack is never overridden. A
+        // genuinely stranded post-clear loop stops acking, so its stamp ages
+        // past the threshold and this gate opens again — deferring to, not
+        // disabling, wedge detection.
+        let ack_alive = ack_liveness_fresh(
+            last_ack_timestamp_age(&config.ack.resolve_state_dir()),
+            config.ack.stale_minutes * 60,
+        );
+        if ack_liveness_suppresses_clear_inject(ack_alive, wedged_now) {
+            info!(
+                tokens,
+                bashes,
+                "post-clear resume inject suppressed: fresh event-ack liveness (loop alive)"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "post_clear_inject_suppressed",
+                serde_json::json!({
+                    "tokens": tokens,
+                    "bashes": bashes,
+                    "reason": "ack_liveness_fresh",
+                    "stale_secs": config.ack.stale_minutes * 60,
+                }),
+            );
+            state.post_clear_idle_checks = 0;
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        } else if ack_alive {
+            debug!(
+                tokens,
+                bashes,
+                "post-clear resume suppression skipped: pane shows a genuine wedge banner — deferring to wedged-pane recovery"
+            );
+        }
+
         // A clear the DAEMON drove is already covered: the `self-clear` child
         // polls until the clear lands and then injects its own resume prompt.
         // Only operator-driven clears need this gate.
@@ -5739,7 +5953,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 last_ack_timestamp_age(&config.ack.resolve_state_dir()),
                 config.ack.stale_minutes * 60,
             );
-            if ack_alive {
+            if ack_liveness_suppresses_clear_inject(ack_alive, wedged_now) {
                 info!(
                     tokens,
                     bashes,
@@ -5761,6 +5975,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 state.last_check = Some(now);
                 crate::state::save_state(&config.general.state_file, state);
                 return;
+            } else if ack_alive {
+                debug!(
+                    tokens,
+                    bashes,
+                    "fresh /clear suppression skipped: pane shows a genuine wedge banner — deferring to wedged-pane recovery"
+                );
             }
 
             // Active-turn suppression (2026-04-27 false-positive fix):
@@ -10163,6 +10383,149 @@ cooldown = 300
         // No ack data at all (fresh boot / host without event-ack): we cannot
         // prove liveness, so DON'T suppress — preserve fast-path behaviour.
         assert!(!ack_liveness_fresh(None, 20 * 60));
+    }
+
+    // --- ack_liveness_suppresses_clear_inject: the wedged carve-out
+    // (2026-08-26 autoclear-swallowed-by-ack-gate fix) ---
+    //
+    // Regression coverage for the incident: a session hit "Context limit
+    // reached" / "Context low (0% remaining)" shortly after its last
+    // event-ack, so `ack_liveness_fresh` kept reading "alive" for the whole
+    // stale window and the fresh-/clear + post-clear-resume gates `return`ed
+    // before `check_cycle` ever reached `handle_wedged_pane`. Autoclear
+    // never fired; the operator had to `/clear` by hand.
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_normal_case() {
+        // Fresh ack, no wedge banner on screen: this IS the misparse case the
+        // gate was built for — suppress the spurious resume/fresh-clear inject.
+        assert!(ack_liveness_suppresses_clear_inject(true, false));
+    }
+
+    #[test]
+    fn test_ack_liveness_does_not_suppress_when_genuinely_wedged() {
+        // Fresh ack (acked moments before hitting the wall) BUT the pane is
+        // showing a genuine context-limit/rate-limit banner right now: do NOT
+        // suppress. Autoclear must be allowed to reach `handle_wedged_pane`
+        // regardless of how recently the loop last acked.
+        assert!(!ack_liveness_suppresses_clear_inject(true, true));
+    }
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_no_ack_no_wedge() {
+        // No proof of life and no wedge banner: gate stays out of the way
+        // (unrelated to the wedge carve-out — mirrors ack_liveness_fresh's
+        // own "no data => false" behaviour flowing through unchanged).
+        assert!(!ack_liveness_suppresses_clear_inject(false, false));
+    }
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_no_ack_but_wedged() {
+        // Stale/absent ack AND wedged: still don't suppress (wedge detection
+        // was already going to run regardless — this just confirms wedged
+        // never flips the result to "suppress").
+        assert!(!ack_liveness_suppresses_clear_inject(false, true));
+    }
+
+    #[test]
+    fn test_carry_forward_real_reading_resets_run() {
+        // A non-zero reading this poll is trusted verbatim and resets the
+        // carry run to 0, regardless of any prior carry.
+        assert_eq!(
+            carry_forward_token_misparse(180_000, 200_000, 2, 50_000, 3),
+            (180_000, 0)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_large_context_zero_is_carried() {
+        // A large same-pane context momentarily reads 0 -> hold the last value
+        // and advance the bounded run.
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 0, 50_000, 3),
+            (200_000, 1)
+        );
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 1, 50_000, 3),
+            (200_000, 2)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_bound_exhausted_lets_zero_through() {
+        // Once the run reaches max_carry the 0 is finally trusted, so a real
+        // /clear or crashed process still registers.
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 3, 50_000, 3),
+            (0, 3)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_below_floor_not_carried() {
+        // A genuinely small prior reading (below the fresh-/clear window's
+        // upper bound) is never carried: fresh-/clear detection in the
+        // low-token window must be untouched.
+        assert_eq!(
+            carry_forward_token_misparse(0, 4_000, 0, 50_000, 3),
+            (0, 0)
+        );
+    }
+
+    /// End-to-end MISPARSE PATTERN over consecutive polls (the real bug):
+    /// a large, intact context (408_000) momentarily reads 0 for a couple of
+    /// polls -- the 2026-08 status-parser hardening now yields a bare 0 for a
+    /// thinking/roster-only pane instead of the old tiny (~2600) count -- then
+    /// the real total returns. Every transient 0 must be carried forward (never
+    /// surfaced as the session total, so no phantom context-clear fires), and
+    /// the real reading resumes cleanly and resets the carry run.
+    #[test]
+    fn test_carry_forward_transient_misparse_sequence_is_smoothed() {
+        let floor = 50_000u64;
+        let max = MISPARSE_CARRY_MAX;
+        let mut last_known = 408_000u64;
+        let mut carry = 0u32;
+        // Two consecutive misparse polls must both be held at the last large
+        // value rather than collapsing the reported context to 0/tiny.
+        for _ in 0..2 {
+            let (eff, c) = carry_forward_token_misparse(0, last_known, carry, floor, max);
+            assert_eq!(eff, 408_000, "a transient 0 must be carried, not surfaced");
+            carry = c;
+            last_known = eff; // caller writes the effective value back (check_cycle)
+        }
+        // Real total returns -> trusted verbatim, carry run resets to 0.
+        let (eff, c) = carry_forward_token_misparse(410_000, last_known, carry, floor, max);
+        assert_eq!(eff, 410_000, "a real reading is always trusted");
+        assert_eq!(c, 0, "a real reading resets the carry run");
+    }
+
+    /// A GENUINE /clear (or crashed process) holds 0 for many consecutive
+    /// polls. The carry is BOUNDED, so after `MISPARSE_CARRY_MAX` held polls
+    /// the 0 is finally trusted and the clear registers: the guard DELAYS a
+    /// real clear by a couple of cycles, it never SUPPRESSES one.
+    #[test]
+    fn test_carry_forward_sustained_zero_eventually_registers_clear() {
+        let floor = 50_000u64;
+        let max = MISPARSE_CARRY_MAX;
+        let mut last_known = 408_000u64;
+        let mut carry = 0u32;
+        let mut effective = Vec::new();
+        for _ in 0..(max + 2) {
+            let (eff, c) = carry_forward_token_misparse(0, last_known, carry, floor, max);
+            effective.push(eff);
+            carry = c;
+            last_known = eff; // mirror check_cycle writing the effective value back
+        }
+        // The first `max` polls are held at the large value...
+        for e in effective.iter().take(max as usize) {
+            assert_eq!(*e, 408_000, "within the bound the large context is held");
+        }
+        // ...then the bound is exhausted and the 0 is trusted, so a real
+        // /clear finally registers downstream.
+        assert_eq!(
+            effective[max as usize], 0,
+            "past the carry bound a sustained 0 (real clear) must register"
+        );
     }
 
     #[test]

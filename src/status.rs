@@ -12,6 +12,12 @@ pub struct ClaudeStatus {
     pub pane: String,
     pub tokens: u64,
     pub bashes: u64,
+    /// True when the pane showed active-work UI markers (thinking indicator,
+    /// agent-roster rows, or the Background-tasks overlay) at capture time.
+    /// Positive proof the session is alive even when the bare context total
+    /// could not be parsed (`tokens == 0` is then a parse MISS, not a fresh
+    /// session). See `pane_shows_active_ui`. (operator #5620)
+    pub active_ui: bool,
     pub compact_remaining: Option<u32>,
     pub version: Option<String>,
     pub latest: Option<String>,
@@ -181,12 +187,52 @@ pub(crate) fn is_agent_roster_row(line: &str) -> bool {
         && trimmed.contains("tok")
 }
 
+/// Pure predicate: does the pane show ACTIVE-WORK UI markers — a thinking
+/// indicator (`↑/↓ N tokens`), one or more agent-roster rows, or the
+/// "Background tasks" overlay?
+///
+/// These markers are drawn ONLY while the session is actively generating or
+/// has live subagents / background tasks; they NEVER appear on a genuinely
+/// fresh, idle session sitting at an empty `❯` prompt. So when the status
+/// parser cannot read the bare context total (it has scrolled out of the
+/// capture window behind these very markers) and returns `tokens == 0`, this
+/// predicate is the positive-liveness signal that separates a live session
+/// with an off-screen total (a parse MISS) from a genuinely fresh/empty one.
+/// The dead-process / fresh-external-session inject path consults it so a
+/// long, active session is never misread as fresh and spuriously handed the
+/// resume-checklist prompt (recurring false-positive, operator #5620).
+///
+/// Scans the WHOLE pane (markers can sit well above the bottom-10 window when
+/// an overlay panel pushes the tail up), mirroring the whole-pane marker scan
+/// in `parse_status_bar_with_diag`.
+pub(crate) fn pane_shows_active_ui(pane_text: &str) -> bool {
+    let thinking_re =
+        Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
+    pane_text.lines().any(|line| {
+        is_agent_roster_row(line)
+            || thinking_re.is_match(line)
+            || line.contains("Background tasks")
+            || line.contains("active shells")
+            || line.contains("active shell")
+            || line.contains("active agents")
+            || line.contains("active agent")
+            || line.contains("Local agents")
+            || line.contains(" Shells (")
+    })
+}
+
 /// Like `parse_status_bar` but also returns whether a status-bar marker was
 /// detected in the tail. The marker flag lets `is_parse_miss` suppress
 /// warnings for legitimately-idle status bars (which carry neither tokens
 /// nor a shell count).
 pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, bool) {
     let mut result = ParsedStatusBar::default();
+    // Seen-but-not-trusted markers: a thinking-indicator or agent-roster
+    // line proves *some* Claude Code status UI was on screen (so
+    // `is_parse_miss` shouldn't complain), but per the fix below neither
+    // one's number is ever allowed into `result.tokens`.
+    let mut saw_thinking_indicator = false;
+    let mut saw_agent_roster = false;
 
     let lines: Vec<&str> = pane_text.lines().collect();
     let start = if lines.len() > 10 {
@@ -310,34 +356,37 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
                 }
             }
         }
-        // Thinking-indicator tokens (with k/M suffix) — match regardless of
-        // status_bar flag. The arrow prefix is itself a strong anchor.
+        // Thinking-indicator lines (`↑/↓ N tokens`) and agent-roster rows
+        // both carry a "N tokens" number, but NEITHER is the session
+        // context total:
+        //   * the thinking indicator's number is the CURRENT TURN's own
+        //     streamed/output token count — it starts near zero and climbs
+        //     for as long as that turn is generating;
+        //   * a roster row's number belongs to ONE SUBAGENT.
         //
-        // Skip agent-roster rows here, same discipline as the whole-pane
-        // fallback below (PR #646): a roster row's `<n> tokens` belongs to
-        // ONE SUBAGENT, not the session. Unlike the bare-total pass above
-        // (which strips arrow-prefixed counters before matching), this
-        // regex supports k/M suffixes, so an over-1000-token roster row
-        // (`102.8k tokens`) matches it just as easily as a real thinking
-        // indicator — without this guard a subagent's count can win here
-        // purely because its roster row is drawn earlier in the bottom-10
-        // window than the real indicator. If nothing else matches, the
-        // roster-aware whole-pane fallback below still recovers a roster
-        // row as a last resort.
-        if result.tokens.is_none() && !is_agent_roster_row(line) {
-            if let Some(caps) = token_thinking_re.captures(line) {
-                if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
-                    if let Ok(base) = num.as_str().parse::<f64>() {
-                        let mult: f64 = match suffix.as_str() {
-                            "k" | "K" => 1_000.0,
-                            "m" | "M" => 1_000_000.0,
-                            _ => 1.0,
-                        };
-                        let v = (base * mult).round() as u64;
-                        result.tokens = Some(v);
-                    }
-                }
-            }
+        // ROOT CAUSE (2026-08 recurring false "fresh session" fires): this
+        // function used to fall back to whichever of those two numbers it
+        // could find whenever the bare total wasn't on screen — reasoning
+        // that a wrong-but-plausible number was "better than nothing" for
+        // the rare case where an overlay panel had pushed the real total
+        // off screen (PR #646, 2026-04-27). But the bare total is ALSO
+        // absent every time the main loop is simply mid-turn — which is
+        // routine, not rare — so on every such poll the fallback handed a
+        // tiny, climbing "current turn" count to callers as if it were the
+        // session's context size. Downstream consumers that watch for a
+        // huge-to-tiny drop (context-clear / fresh-session detection) read
+        // that as the context collapsing and injected a bogus "fresh
+        // session, run the resume checklist" prompt every few minutes,
+        // even though the real context was untouched.
+        //
+        // Fix: never let either number populate `result.tokens`. Still
+        // record that we *saw* one, purely so `is_parse_miss` (below)
+        // continues to treat a thinking/roster-only pane as a recognized
+        // UI state rather than a suspicious miss.
+        if is_agent_roster_row(line) {
+            saw_agent_roster = true;
+        } else if token_thinking_re.is_match(line) {
+            saw_thinking_indicator = true;
         }
         if let Some(caps) = bash_re.captures(line) {
             if let Some(m) = caps.get(1) {
@@ -399,48 +448,26 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
         }
     }
 
-    // Whole-pane scan for thinking-indicator tokens (always safe because
-    // the ↑/↓ + tok anchor never appears in chat prose). Catches cases
-    // where a thinking line is more than 10 lines above the bottom.
-    //
-    // Run it in two passes so an agent-roster row is only ever a LAST
-    // resort: a roster row reports one subagent's tokens, which is a much
-    // worse stand-in for the session context size than the main loop's own
-    // thinking indicator. The second pass keeps the pre-existing behaviour
-    // when a roster row is the only arrow line on screen — reporting
-    // nothing would read downstream as `tokens = 0`, which is not an
-    // improvement over reporting something.
-    if result.tokens.is_none() {
-        for pass_skips_roster in [true, false] {
-            for line in &lines {
-                if pass_skips_roster && is_agent_roster_row(line) {
-                    continue;
-                }
-                if let Some(caps) = token_thinking_re.captures(line) {
-                    if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
-                        if let Ok(base) = num.as_str().parse::<f64>() {
-                            let mult: f64 = match suffix.as_str() {
-                                "k" | "K" => 1_000.0,
-                                "m" | "M" => 1_000_000.0,
-                                _ => 1.0,
-                            };
-                            let v = (base * mult).round() as u64;
-                            result.tokens = Some(v);
-                            break;
-                        }
-                    }
-                }
-            }
-            if result.tokens.is_some() {
-                break;
+    // Whole-pane scan: a thinking-indicator or roster line can sit more
+    // than 10 lines above the bottom (overlay panels push the tail up).
+    // Same rule as the bottom-10 pass above: this only ever updates the
+    // "did we see one" markers, never `result.tokens` — see the fix note
+    // on the bottom-10 pass for why.
+    if !saw_thinking_indicator || !saw_agent_roster {
+        for line in &lines {
+            if is_agent_roster_row(line) {
+                saw_agent_roster = true;
+            } else if token_thinking_re.is_match(line) {
+                saw_thinking_indicator = true;
             }
         }
     }
 
-    // Treat the overlay as a status-bar marker: even though it visually
-    // replaces the bar, it's a known UI state with a count present, and
-    // we don't want is_parse_miss to flag it.
-    let saw_status_bar = has_status_bar || overlay_visible;
+    // Treat the overlay, and a thinking-indicator/roster sighting, as a
+    // status-bar marker: even though none of them carries a trustworthy
+    // token total, they're all known UI states, and we don't want
+    // `is_parse_miss` to flag a pane that's simply mid-turn.
+    let saw_status_bar = has_status_bar || overlay_visible || saw_thinking_indicator || saw_agent_roster;
 
     (result, saw_status_bar)
 }
@@ -748,6 +775,164 @@ pub fn get_version_info() -> VersionInfo {
     info
 }
 
+/// Resolve a tmux pane's foreground PID — the process tmux forked for the pane.
+/// In the main-loop pane that is the claude TUI itself (launched as
+/// `exec claude`), so its `/proc/<pid>/exe` points straight at the running
+/// versioned binary.
+async fn resolve_pane_pid(pane: &str) -> Option<String> {
+    let (out, ok) = run_cmd_any(
+        &["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+        5,
+    )
+    .await;
+    if !ok {
+        return None;
+    }
+    let pid = out.trim();
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(pid.to_string())
+}
+
+/// True iff an exe path looks like a REAL claude TUI binary — the native
+/// versioned layout (under a `/versions/` dir), the `~/.local/bin/claude`
+/// launcher, or an npm-global `@anthropic-ai/claude-code` binary — as opposed
+/// to tmux, `claude-watch`, or a bash watcher that merely matched
+/// `pgrep -af claude` on its command line. Used to filter the fallback
+/// candidate set so a non-claude PID can never contribute a bogus version.
+pub(crate) fn is_claude_tui_exe(exe_path: &str) -> bool {
+    exe_path.contains("/versions/")
+        || exe_path.ends_with("/.local/bin/claude")
+        || exe_path.contains("@anthropic-ai/claude-code")
+}
+
+/// Compare two dotted numeric version strings (`"2.1.245"` vs `"2.1.243"`).
+/// Components parse as integers (non-numeric / missing components sort as 0),
+/// so `2.1.245 > 2.1.99` (numeric, not lexical).
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(s: &str) -> Vec<u64> {
+        s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect()
+    }
+    parts(a).cmp(&parts(b))
+}
+
+/// A resolved running-claude candidate: a PID and the version it loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningCandidate {
+    pub pid: String,
+    pub version: String,
+}
+
+/// Pure selection core for pane-scoped running-version detection.
+///
+/// Given the resolved running-claude candidates and the main-loop pane's PID,
+/// pick the running version: PREFER the candidate whose PID is the pane PID
+/// (the live main-loop TUI); otherwise fall back to the HIGHEST version among
+/// candidates. The highest-wins fallback guarantees that a dying OLDER
+/// versioned process — a native/npm atomic-install overlap, or a
+/// SIGKILL-orphaned old build still executable on disk — can NEVER mask the
+/// live newer one, which is exactly the false `running < installed` mismatch
+/// that drove the self-sustaining auto-update relaunch loop.
+pub(crate) fn select_running_version(
+    candidates: &[RunningCandidate],
+    pane_pid: Option<&str>,
+) -> Option<String> {
+    if let Some(pp) = pane_pid {
+        if let Some(c) = candidates.iter().find(|c| c.pid == pp) {
+            return Some(c.version.clone());
+        }
+    }
+    candidates
+        .iter()
+        .max_by(|a, b| compare_versions(&a.version, &b.version))
+        .map(|c| c.version.clone())
+}
+
+/// Gather resolved running-claude candidates for the fallback path: every
+/// `pgrep -af claude` PID whose `/proc/<pid>/exe` is a real claude TUI binary
+/// (see [`is_claude_tui_exe`]) and that resolves to a version. Non-claude
+/// matches (tmux/`claude-watch`/bash watchers) are filtered out so they cannot
+/// contribute a bogus version.
+async fn scan_running_candidates() -> Vec<RunningCandidate> {
+    let (stdout, _) = run_cmd_any(&["pgrep", "-af", "claude"], 5).await;
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(pid) = line.split_whitespace().next() else {
+            continue;
+        };
+        // Filter to real claude TUI processes by their exe target.
+        let exe_ok = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|t| is_claude_tui_exe(&t.to_string_lossy()))
+            .unwrap_or(false);
+        if !exe_ok {
+            continue;
+        }
+        if let Some(version) = resolve_running_version(pid) {
+            out.push(RunningCandidate {
+                pid: pid.to_string(),
+                version,
+            });
+        }
+    }
+    out
+}
+
+/// Pane-scoped variant of [`get_version_info`]: resolve the RUNNING version
+/// from the main-loop pane's own PID rather than the global `pgrep -af claude`
+/// first-match.
+///
+/// ## Why (the auto-update version-detection loop)
+///
+/// [`get_version_info`] takes the FIRST `pgrep -af claude` match that resolves
+/// to a version. In a container that pattern matches ~10+ PIDs (the tmux
+/// launcher, `tmux attach`, `claude-watch`, bash watchers) and — critically —
+/// any SIGKILL-orphaned OLD versioned claude processes that briefly coexist
+/// with the live one during a respawn-pane `-k` overlap (the versions dir keeps
+/// several builds all executable). When an older PID sorts first, `running`
+/// comes back OLDER than `installed` (the symlink, always newest), so
+/// `check_auto_update` sees a false `running != installed`, fires
+/// `cwsr --no-upgrade` (which swaps nothing on disk), and re-fires next cycle —
+/// self-sustaining. Pane DETECTION already dodges this exact first-match hazard
+/// via [`find_claude_pane_with_config`]; version detection never did.
+///
+/// Resolution:
+///   1. Resolve the pane's `#{pane_pid}` (the live claude TUI) and read the
+///      running version from THAT PID only.
+///   2. If the pane PID can't be resolved or yields no version, fall back to a
+///      FILTERED scan (real claude TUI exes only) and pick the HIGHEST version
+///      (see [`select_running_version`]) so a dying old PID can't win.
+///
+/// `installed` is sourced identically to [`get_version_info`].
+pub async fn get_version_info_for_pane(pane: &str) -> VersionInfo {
+    let mut info = VersionInfo::default();
+
+    // Installed (on-disk) version — identical source to get_version_info.
+    if let Some(bin) = find_claude_launcher() {
+        info.installed = resolve_installed_version(&bin);
+    }
+
+    let pane_pid = resolve_pane_pid(pane).await;
+
+    // Primary: the version loaded by the pane's own PID.
+    if let Some(pid) = pane_pid.as_deref() {
+        info.running = resolve_running_version(pid);
+    }
+
+    // Fallback (pane PID unresolved, or it carried no version): filtered scan,
+    // preferring the pane PID, else the highest version among real claude TUIs.
+    if info.running.is_none() {
+        let candidates = scan_running_candidates().await;
+        info.running = select_running_version(&candidates, pane_pid.as_deref());
+    }
+
+    info
+}
+
 /// Find the MAIN-LOOP Claude Code pane, preferring the explicitly-configured
 /// `[tmux] dashboard_pane` / `dashboard_session` over the unconstrained
 /// auto-detect scan.
@@ -1001,6 +1186,7 @@ async fn get_claude_status_inner(
                 pane,
                 tokens: parsed.tokens.unwrap_or(0),
                 bashes: parsed.bashes.unwrap_or(0),
+                active_ui: pane_shows_active_ui(&capture),
                 compact_remaining: parsed.compact_remaining,
                 version: version_info.running,
                 latest: version_info.installed,
@@ -1036,6 +1222,7 @@ async fn get_claude_status_fallback() -> Option<ClaudeStatus> {
         pane: data["pane"].as_str().unwrap_or("").to_string(),
         tokens: data["tokens"].as_u64().unwrap_or(0),
         bashes: data["bashes"].as_u64().unwrap_or(0),
+        active_ui: data["active_ui"].as_bool().unwrap_or(false),
         compact_remaining: data["compact_remaining"].as_u64().map(|v| v as u32),
         version: data["version"].as_str().map(|s| s.to_string()),
         latest: data["latest"].as_str().map(|s| s.to_string()),
@@ -2008,6 +2195,39 @@ mod tests {
     }
 
     #[test]
+    fn active_ui_true_for_agent_roster_row() {
+        let pane = "\u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{b7} \u{2193} 102.8k tokens\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_thinking_indicator() {
+        let pane = "\u{25cf} Zigzagging\u{2026} (37s \u{b7} \u{2193} 1.3k tokens \u{b7} thought for 13s)\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_background_tasks_overlay() {
+        let pane = "Background tasks\n  Shells (2)\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_false_for_fresh_idle_pane() {
+        // A genuinely fresh/idle session: permission-mode status bar + empty
+        // prompt, no thinking indicator, no roster, no overlay.
+        let pane = "\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt\n\u{276f} ";
+        assert!(!pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_false_for_bare_status_bar_total() {
+        // Status bar showing the bare context total but no active-work markers.
+        let pane = "224598 tokens\n\u{23f5}\u{23f5} bypass permissions on\n\u{276f} ";
+        assert!(!pane_shows_active_ui(pane));
+    }
+
+    #[test]
     fn test_watcher_runtime_file_age_secs_none_when_no_files() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -2309,36 +2529,44 @@ mod tests {
         assert_eq!(parsed.tokens, Some(224598));
     }
 
-    /// A roster row must not be promoted to "the session's token count" by
-    /// the whole-pane arrow fallback either, as long as a real thinking
-    /// indicator is on screen to supply one.
+    /// With no bare context total on the status bar, NEITHER a thinking
+    /// indicator (`↓ 26000 tokens`, current-turn output) NOR a subagent's
+    /// roster row (`↓ 119 tokens`) is trusted as the session total: both are
+    /// refused and `tokens` stays None (2026-08 hardening). The pane is still a
+    /// recognized UI state, so it is not a parse miss.
     #[test]
-    fn test_thinking_indicator_beats_agent_roster_row_in_fallback() {
+    fn test_thinking_indicator_and_roster_both_refused_in_fallback() {
         let input = "\
 \u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)\n\
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt\n\
   \u{25cf} main\n\
   \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
-        let parsed = parse_status_bar(input);
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
         assert_eq!(
-            parsed.tokens,
-            Some(26000),
-            "with no total on the status bar, the main loop's own thinking \
-             indicator is the fallback — not a subagent's roster row"
+            parsed.tokens, None,
+            "neither a thinking indicator nor a roster row may stand in for the \
+             session context total — reading either manufactured phantom \
+             context clears"
         );
+        assert!(saw_bar);
     }
 
-    /// Last-resort behaviour is preserved: when a roster row is the ONLY
-    /// arrow line on screen the fallback still reports it. Reporting
-    /// nothing collapses to `tokens = 0` downstream, which is no better.
+    /// A roster row alone yields NO session total. Its `↓ 119 tokens` is one
+    /// subagent's count; adopting it as the session context size is exactly the
+    /// misparse that manufactured phantom context clears (it collapses a
+    /// six-figure context to 119). `tokens` must be None -- the downstream
+    /// carry-forward guard (`policy::carry_forward_token_misparse`) holds the
+    /// prior real value rather than trusting this 0, so "no better than 0" no
+    /// longer applies.
     #[test]
-    fn test_agent_roster_row_is_last_resort_not_forbidden() {
+    fn test_agent_roster_row_alone_yields_no_session_total() {
         let input = "\
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt\n\
   \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(119));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
@@ -2359,24 +2587,23 @@ mod tests {
         ));
     }
 
-    /// The PRIMARY per-line pass (not just the whole-pane fallback) must
-    /// also treat a roster row as a last resort: `token_thinking_re`
-    /// supports k/M suffixes, so an over-1000-token roster row matches this
-    /// pass just as easily as a real thinking indicator, and without a
-    /// guard here a subagent's count can win purely because its roster row
-    /// is drawn earlier in the bottom-10-line window than the real one.
+    /// The PRIMARY per-line (bottom-10) pass must refuse both kinds of
+    /// arrow-token line just as the whole-pane fallback does: neither a roster
+    /// row (`↓ 102.8k tokens`) nor a real thinking indicator (`↓ 26000
+    /// tokens`) is the session total, so `tokens` stays None even though both
+    /// match `token_thinking_re`.
     #[test]
-    fn test_thinking_indicator_beats_agent_roster_row_in_primary_pass() {
+    fn test_thinking_indicator_and_roster_both_refused_in_primary_pass() {
         let input = "\
   \u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens\n\
 \u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)";
-        let parsed = parse_status_bar(input);
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
         assert_eq!(
-            parsed.tokens,
-            Some(26000),
-            "the roster row (drawn first) must not win over the real \
-             thinking indicator that follows it in the same window"
+            parsed.tokens, None,
+            "no arrow-prefixed token count in the bottom-10 window may become \
+             the session total"
         );
+        assert!(saw_bar);
     }
 
     #[test]
@@ -2626,10 +2853,13 @@ mod tests {
                          watcher-ctl run memory-remind (running)\n\
                        \u{276f} watcher-ctl run events-watcher (running)\n\
                        \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
-        let parsed = parse_status_bar(input);
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
         assert_eq!(parsed.bashes, Some(4));
-        // Thinking-indicator token recovery: "↑ 286 tokens".
-        assert_eq!(parsed.tokens, Some(286));
+        // 2026-08 hardening: the "↑ 286 tokens" thinking count is NOT the
+        // session total, so `tokens` stays None; the overlay + thinking
+        // indicator still register as a status bar (no parse miss).
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
@@ -2706,15 +2936,17 @@ mod tests {
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
         let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // 2026-08 hardening: the whole-pane fallback still RECOGNIZES a
+        // thinking indicator above the 10-line window (so it is not a parse
+        // miss), but no longer TRUSTS its count as the session total.
         assert_eq!(
-            parsed.tokens,
-            Some(1300),
-            "thinking-indicator above the 10-line window must be recovered \
-             by the whole-pane fallback scan"
+            parsed.tokens, None,
+            "a thinking indicator above the window is a recognized UI state, \
+             but its count is the current turn's, not the session total"
         );
         assert!(
             saw_bar,
-            "⏵⏵ icon at bottom must register as status bar"
+            "thinking indicator / ⏵⏵ icon must register as status bar"
         );
     }
 
@@ -2774,32 +3006,71 @@ mod tests {
         // status bar is partly obscured but a thinking line is visible, we
         // can still extract a token count from "↑ 2.3k tokens".
         let input = "\u{25cf} Honking\u{2026} (1m 9s \u{00b7} \u{2191} 2.3k tokens)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(2300));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // 2026-08 hardening: a thinking indicator's token count is the CURRENT
+        // TURN's own output, never the session context total, so it must NOT
+        // populate `tokens` (a `2.3k` reading here is exactly the tiny misparse
+        // that manufactured phantom context clears). It IS a recognized UI
+        // state, so it still suppresses `is_parse_miss`.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_down_arrow() {
         // Some thinking lines use ↓ instead of ↑.
         let input = "\u{25cf} Zigzagging\u{2026} (37s \u{00b7} \u{2193} 1.3k tokens \u{00b7} thought for 13s)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(1300));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // Down-arrow thinking indicator: still the current turn's count, not
+        // the session total -- refused (see k-suffix test).
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_no_suffix() {
         // ↑ N tokens (no suffix) — N is a literal integer.
         let input = "\u{25cf} Newspapering\u{2026} (21s \u{00b7} \u{2191} 286 tokens \u{00b7} thought for 1s)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(286));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // A bare-integer (`286`) thinking count is the classic sub-1000 tiny
+        // misparse; it must not become the session total.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_m_suffix() {
         // Defensive: M-suffix support for huge contexts (1.4M tokens).
         let input = "\u{25cf} Cooking\u{2026} (5m \u{00b7} \u{2191} 1.4M tokens)";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // Even a huge M-suffixed thinking count is the current turn's, not the
+        // session context total -- refused all the same.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
+    }
+
+    /// A genuine low-token fresh session (a real BARE context total, no arrow
+    /// prefix) MUST still be detected -- the hardening only refuses
+    /// thinking-indicator / roster numbers, never a real bare total, so
+    /// fresh-/clear detection in the low-token window is preserved.
+    #[test]
+    fn test_genuine_low_token_fresh_session_still_detected() {
+        let input = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 0 shells \u{00b7} 1,200 tokens";
         let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(1_400_000));
+        assert_eq!(parsed.tokens, Some(1200));
+    }
+
+    /// Companion to the "both refused" tests: when a real bare context total
+    /// AND a thinking indicator are both on screen, the bare total wins and the
+    /// thinking count is ignored.
+    #[test]
+    fn test_bare_total_wins_over_thinking_indicator() {
+        let input = "\
+\u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)\n\
+\u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} 224598 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(224598));
+        assert_eq!(parsed.bashes, Some(5));
     }
 
     #[test]
@@ -3073,6 +3344,95 @@ mod tests {
         assert!(!is_claude_hooks_shim(std::path::Path::new(
             "/home/u/.local/share/claude/versions/2.1.186/node_modules/.bin/claude"
         )));
+    }
+
+    // --- pane-scoped running-version selection tests ---
+
+    #[test]
+    fn test_compare_versions_numeric_not_lexical() {
+        use std::cmp::Ordering;
+        // Lexical compare would call "2.1.99" > "2.1.245"; numeric must not.
+        assert_eq!(compare_versions("2.1.245", "2.1.99"), Ordering::Greater);
+        assert_eq!(compare_versions("2.1.243", "2.1.245"), Ordering::Less);
+        assert_eq!(compare_versions("2.1.245", "2.1.245"), Ordering::Equal);
+        assert_eq!(compare_versions("2.2.0", "2.1.999"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_is_claude_tui_exe() {
+        // Native versioned layout, launcher symlink, npm-global binary.
+        assert!(is_claude_tui_exe(
+            "/home/u/.local/share/claude/versions/2.1.245/node_modules/.bin/claude"
+        ));
+        assert!(is_claude_tui_exe("/home/u/.local/bin/claude"));
+        assert!(is_claude_tui_exe(
+            "/home/u/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+        ));
+        // A deleted-inode exe target keeps the /versions/ segment.
+        assert!(is_claude_tui_exe(
+            "/home/u/.local/share/claude/versions/2.1.245/cli.js (deleted)"
+        ));
+        // NOT claude TUIs — these merely match `pgrep -af claude`.
+        assert!(!is_claude_tui_exe("/usr/local/bin/claude-watch"));
+        assert!(!is_claude_tui_exe("/usr/bin/tmux"));
+        assert!(!is_claude_tui_exe("/usr/bin/bash"));
+    }
+
+    #[test]
+    fn test_select_running_version_prefers_pane_pid() {
+        // The live main-loop TUI is pid 143 on 2.1.245; an orphaned OLD build
+        // (pid 99 on 2.1.241) is still executable and also resolved. The pane
+        // PID must win regardless of scan order.
+        let candidates = vec![
+            RunningCandidate { pid: "99".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "143".into(), version: "2.1.245".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, Some("143")),
+            Some("2.1.245".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_pane_pid_even_if_lower() {
+        // Truthfulness: if the pane's OWN pid loaded an older build (genuinely
+        // running behind installed), report THAT — a real mismatch the updater
+        // should act on — not some other process's newer version.
+        let candidates = vec![
+            RunningCandidate { pid: "143".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "200".into(), version: "2.1.245".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, Some("143")),
+            Some("2.1.241".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_fallback_highest_when_pane_pid_absent() {
+        // Pane PID unresolved / not among candidates: a dying OLD process
+        // (2.1.241) must NOT mask the live NEW one (2.1.245). Highest wins —
+        // the exact orphan-masks-live failure mode of the global first-match.
+        let candidates = vec![
+            RunningCandidate { pid: "99".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "143".into(), version: "2.1.245".into() },
+            RunningCandidate { pid: "150".into(), version: "2.1.243".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, None),
+            Some("2.1.245".to_string())
+        );
+        // Pane PID given but not in the candidate set -> same highest-wins path.
+        assert_eq!(
+            select_running_version(&candidates, Some("777")),
+            Some("2.1.245".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_empty_is_none() {
+        assert_eq!(select_running_version(&[], Some("143")), None);
+        assert_eq!(select_running_version(&[], None), None);
     }
 
     // --- resolve_installed_version tests ---

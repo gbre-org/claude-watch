@@ -489,7 +489,7 @@ fn default_interrupt_enabled() -> bool {
 /// the loop recognises it as a daemon interrupt, and asks for a watcher
 /// sanity-check so a genuinely-wedged event pipeline still gets surfaced.
 fn default_ack_stale_prompt() -> String {
-    "[CLAUDE-WATCH] No claude-event has been acked for longer than the stale window — from here the loop looks wedged. Run `event-ack ack-batch` NOW (one bare command; it acks every pending entry and stamps the liveness timestamp). Then check why events weren't reaching you (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details.".to_string()
+    "[CLAUDE-WATCH] No claude-event has been acked for longer than the stale window — from here the loop looks wedged. Run `event-ack ack-batch` NOW (one bare command; it acks every pending entry and stamps the liveness timestamp). Then check why events weren't reaching you (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM the operator with the details.".to_string()
 }
 
 /// Default post-clear resume prompt. Single-line (the tmux inject pipeline
@@ -500,7 +500,7 @@ fn default_ack_stale_prompt() -> String {
 /// for a watcher cleanup, and it tells the loop what to check if the premise
 /// is wrong, so a misfire is reported rather than acted on.
 fn default_post_clear_resume_prompt() -> String {
-    "[CLAUDE-WATCH] A context clear was observed and the pane has been idle at an empty prompt since — nothing has picked the work back up. Resume from your recorded resume action (session-task) and continue; do NOT run a watcher cleanup on account of this message. If your context was NOT cleared (the conversation above is intact), this fired incorrectly: ignore it, finish what you were doing, and DM Andrew with the details.".to_string()
+    "[CLAUDE-WATCH] A context clear was observed and the pane has been idle at an empty prompt since — nothing has picked the work back up. Resume from your recorded resume action (session-task) and continue; do NOT run a watcher cleanup on account of this message. If your context was NOT cleared (the conversation above is intact), this fired incorrectly: ignore it, finish what you were doing, and DM the operator with the details.".to_string()
 }
 
 fn default_interrupt_message() -> String {

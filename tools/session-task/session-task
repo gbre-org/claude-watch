@@ -8370,12 +8370,6 @@ def _infer_scope_from_text(text):
 
     # agent-proto: mentions
     proto_map = {
-        "ebook-convert-pdf": "agent-proto:ebook-convert-pdf",
-        "em-dash": "agent-proto:ebook-convert-pdf",
-        "chapter-breaks": "agent-proto:ebook-convert-pdf",
-        "epub-check-breaks": "agent-proto:ebook-convert-pdf",
-        "line-break": "agent-proto:ebook-convert-pdf",
-        "toc": "agent-proto:ebook-convert-pdf",
         "security-patcher": "agent-proto:security-patcher",
         "security-scanner": "agent-proto:security-scanner",
     }
@@ -8386,16 +8380,8 @@ def _infer_scope_from_text(text):
     # repo: mentions
     if "~/repos/example-monorepo" in t or "example-monorepo" in t or "monitoring/docker-compose" in t:
         scope.append("repo:example-monorepo")
-    if "~/repos/media-tools" in t or "media-tools" in t or "ebook-convert-pdf" in t:
-        scope.append("repo:media-tools")
     if ".claude/agents" in t or "agents/security-" in t:
         scope.append("repo:claude-config")
-
-    # book: mentions
-    if "fadr" in t or "first and rare" in t:
-        scope.append("book:fadr")
-    if "laws of trading" in t or "calibre id 342" in t:
-        scope.append("book:laws-of-trading")
 
     # Dedupe
     seen = set()
