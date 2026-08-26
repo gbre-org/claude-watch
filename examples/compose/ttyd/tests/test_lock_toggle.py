@@ -146,10 +146,15 @@ global.document = {
 };
 
 // --- window.term stub: capture the veto callback -------------------
+// `element` is the xterm `.xterm` container the pointer/mouse guard binds
+// its capture-phase listeners to; makeEl records them in `_listeners` so
+// the test can fire a synthetic pointer event and inspect the guard.
 var keyVeto = null;
+var termElement = makeEl();
 global.window = {
     term: {
         attachCustomKeyEventHandler: function(fn) { keyVeto = fn; },
+        element: termElement,
     },
     // Drives the `?autolock=<seconds>` per-tab override.
     location: { search: '__LOCATION_SEARCH__' },
@@ -262,6 +267,47 @@ advance(3600 * 1000);
 runTicks();
 out.afterLongIdle = snapshot();
 
+// --- pointer / mouse guard ------------------------------------------
+// The lock must ALSO swallow pointer input (clicks/taps, wheel
+// scrollback, mouse-tracking escape sequences, touch) — otherwise a
+// locked terminal still forwards them to the live session. The guard
+// binds capture-phase listeners to the terminal element; here we fire
+// each synthetically and record whether it was swallowed. Driven from a
+// deterministic UNLOCKED baseline so the outcome is independent of the
+// build config that ran the toggle cycle above.
+var POINTER_GUARD_EVENTS = [
+    'mousedown', 'mouseup', 'mousemove', 'click', 'dblclick',
+    'contextmenu', 'wheel',
+    'pointerdown', 'pointerup', 'pointermove',
+    'touchstart', 'touchmove', 'touchend'
+];
+function firePointer(name) {
+    var fn = termElement._listeners[name];
+    if (typeof fn !== 'function') { return { installed: false }; }
+    var prevented = false, stopped = false;
+    fn({
+        type: name,
+        cancelable: true,
+        preventDefault: function() { prevented = true; },
+        stopImmediatePropagation: function() { stopped = true; },
+    });
+    return { installed: true, prevented: prevented, stopped: stopped };
+}
+function firePointerAll() {
+    var r = {};
+    for (var i = 0; i < POINTER_GUARD_EVENTS.length; i++) {
+        r[POINTER_GUARD_EVENTS[i]] = firePointer(POINTER_GUARD_EVENTS[i]);
+    }
+    return r;
+}
+// Force a known UNLOCKED baseline (the toggle cycle / auto-lock may have
+// left it either way depending on config), then measure both states.
+if (global.window.__cwTerminalLocked) { click(fakeEvt); }
+out.pointerUnlocked = firePointerAll();
+click(fakeEvt);   // engage the lock
+out.pointerLocked = firePointerAll();
+out.pointerGuardEvents = POINTER_GUARD_EVENTS;
+
 process.stdout.write(JSON.stringify(out) + '\n');
 process.exit(0);
 """
@@ -342,6 +388,64 @@ class LockToggleTests(unittest.TestCase):
         self.assertIsNone(self.out["initial"]["stored"])
         self.assertEqual(self.out["afterLock"]["stored"], "1")
         self.assertEqual(self.out["afterUnlock"]["stored"], "0")
+
+
+class LockPointerGuardTests(unittest.TestCase):
+    """The lock swallows POINTER input too, not just keystrokes.
+
+    attachCustomKeyEventHandler only vetoes KEY events; mouse / wheel /
+    touch are a separate path xterm.js turns into selection, focus,
+    scrollback, and mouse-tracking escape sequences bound for the live
+    session. The guard binds capture-phase listeners on the terminal
+    element that swallow the full pointer set while locked and pass through
+    untouched while unlocked.
+    """
+
+    # Every event the guard must cover — the full mouse/wheel set plus the
+    # unified-pointer and touch equivalents (the kiosk client is touch).
+    EXPECTED_POINTER_EVENTS = {
+        "mousedown", "mouseup", "mousemove", "click", "dblclick",
+        "contextmenu", "wheel",
+        "pointerdown", "pointerup", "pointermove",
+        "touchstart", "touchmove", "touchend",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.out = _run_node_harness()
+
+    def test_guard_covers_the_full_pointer_set(self):
+        self.assertEqual(
+            set(self.out["pointerGuardEvents"]), self.EXPECTED_POINTER_EVENTS
+        )
+
+    def test_guard_is_installed_on_the_terminal_element(self):
+        # A listener must exist for every guarded event — a missing one is
+        # a silent leak of that event type to the terminal.
+        for name, r in self.out["pointerLocked"].items():
+            self.assertTrue(r["installed"], f"{name} guard not installed")
+
+    def test_locked_swallows_all_pointer_events(self):
+        # Locked → each event is stopped (never reaches xterm) and, when
+        # cancelable, its default is prevented.
+        for name, r in self.out["pointerLocked"].items():
+            self.assertTrue(r["stopped"], f"{name} not stopped while locked")
+            self.assertTrue(
+                r["prevented"], f"{name} default not prevented while locked"
+            )
+
+    def test_unlocked_is_a_pure_passthrough(self):
+        # Unlocked → stock ttyd behavior: the guard touches nothing, so no
+        # stopPropagation and no preventDefault on any pointer event.
+        for name, r in self.out["pointerUnlocked"].items():
+            self.assertTrue(r["installed"], f"{name} guard not installed")
+            self.assertFalse(
+                r["stopped"], f"{name} stopped while UNLOCKED (regression)"
+            )
+            self.assertFalse(
+                r["prevented"],
+                f"{name} prevented while UNLOCKED (regression)",
+            )
 
 
 class LockToggleAutoLockTests(unittest.TestCase):

@@ -771,6 +771,16 @@ LOCK_TOGGLE_STYLE = """<style id="lock-toggle-injected-style">
 # not the browser's separate `paste` event, so the paste path needs its
 # own check for the guard to be complete.
 #
+# For the SAME reason a pointer/mouse guard runs alongside the key veto:
+# `attachCustomKeyEventHandler` does nothing for mouse / wheel / touch
+# input, which xterm.js otherwise turns into selection, focus, scrollback,
+# and mouse-tracking escape sequences bound for the live tmux/claude
+# session. `attachPointerGuard` binds capture-phase listeners on the
+# terminal element (`term.element`) that stopImmediatePropagation +
+# preventDefault the full pointer set while locked, so nothing reaches
+# xterm; unlocked they are pure passthrough. Reading the same
+# `window.__cwTerminalLocked` flag keeps all three guards in lockstep.
+#
 # Persistence: the lock state is stored in localStorage under
 # `cw-terminal-locked` ('1' locked / '0' unlocked). It's read back on
 # page load to seed the initial state (button glyph, aria-pressed, the
@@ -997,9 +1007,64 @@ LOCK_TOGGLE_JS = """<script id="lock-toggle-injected">
         }
     }
 
+    // ---- pointer / mouse guard ----------------------------------------
+    // attachCustomKeyEventHandler only vetoes KEY events. Mouse, wheel,
+    // and touch input are a SEPARATE path: xterm.js turns them into
+    // selection, focus, scrollback, and — for a mouse-tracking app like
+    // tmux / vim / Claude Code's TUI — the xterm mouse-reporting escape
+    // sequences that get written to the PTY. Without a guard those still
+    // reach the live session while locked (the exact leak this fixes).
+    //
+    // The listeners are bound to the TERMINAL ELEMENT (`term.element`,
+    // xterm's `.xterm` container) in the CAPTURE phase, so they run before
+    // xterm's own handlers on the descendant screen/viewport nodes and can
+    // swallow the event first. Scoping to that element — rather than
+    // document — keeps browser behavior OUTSIDE the terminal (the padlock
+    // button, page scroll, browser chrome) byte-for-byte identical, the
+    // same containment principle as the terminal-scoped key veto.
+    var POINTER_GUARD_EVENTS = [
+        'mousedown', 'mouseup', 'mousemove', 'click', 'dblclick',
+        'contextmenu', 'wheel',
+        'pointerdown', 'pointerup', 'pointermove',
+        'touchstart', 'touchmove', 'touchend'
+    ];
+
+    function pointerGuard(e) {
+        // Gated ENTIRELY on the lock: unlocked → return immediately with
+        // no preventDefault / no stopPropagation, so stock ttyd pointer
+        // behavior is unchanged. Locked → swallow before xterm sees it.
+        if (!window.__cwTerminalLocked) return;
+        if (e && typeof e.stopImmediatePropagation === 'function') {
+            e.stopImmediatePropagation();
+        }
+        // wheel / touch* are frequently non-cancelable; only preventDefault
+        // when the event actually allows it to avoid a console warning.
+        if (e && e.cancelable && typeof e.preventDefault === 'function') {
+            e.preventDefault();
+        }
+    }
+
+    var pointerGuardAttached = false;
+    function attachPointerGuard() {
+        var t = window.term;
+        var el = t && t.element;
+        if (!el || pointerGuardAttached ||
+            typeof el.addEventListener !== 'function') return;
+        for (var i = 0; i < POINTER_GUARD_EVENTS.length; i++) {
+            // capture:true → run ahead of xterm's own handlers;
+            // passive:false → preventDefault actually cancels wheel/touch.
+            el.addEventListener(
+                POINTER_GUARD_EVENTS[i], pointerGuard,
+                { capture: true, passive: false }
+            );
+        }
+        pointerGuardAttached = true;
+    }
+
     function init() {
         ensureButton();
         attachKeyGuard();
+        attachPointerGuard();
     }
 
     if (document.readyState === 'loading') {
@@ -1009,12 +1074,14 @@ LOCK_TOGGLE_JS = """<script id="lock-toggle-injected">
     }
 
     // ttyd builds window.term asynchronously after the WS connects, so
-    // it may be absent on first paint. Poll until BOTH the button is
-    // mounted and the key guard is attached, then stop (mirrors the
-    // autodark reapply poll; negligible cost).
+    // it may be absent on first paint. Poll until the button is mounted
+    // AND both the key guard and the pointer guard are attached, then
+    // stop (mirrors the autodark reapply poll; negligible cost).
     var iv = setInterval(function() {
         init();
-        if (btn && handlerAttached) { clearInterval(iv); }
+        if (btn && handlerAttached && pointerGuardAttached) {
+            clearInterval(iv);
+        }
     }, 1000);
 
     // Auto-lock wiring. Skipped entirely when disabled (0) so an opted-out
