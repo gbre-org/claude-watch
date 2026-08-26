@@ -8,10 +8,10 @@ drifts.
 
 - **`claude-watch.json`** (uid `claude-watch`) — the daemon dashboard: status,
   heartbeat, context, watchers, hook reminders/fallbacks, interrupts, and
-  token usage. Build Info (version/commit/PR of the running binary) is pure
-  Prometheus — no token, no GitHub call. One separate, optional panel
-  ("Latest Merged PR") needs the Infinity datasource; see
-  [Infinity](#infinity--optional-one-panel-in-claude-watchjson) below.
+  token usage. Build Info (commit/PR of the running binary, plus GitHub's
+  latest-merged PR) is `-- Mixed --`: two tiles from Prometheus, one from the
+  Infinity datasource; see
+  [Infinity](#infinity--one-mixed-tile-in-build-info) below.
 - **`claude-events.json`** (uid `claude-events`) — the event bus: backlog
   depth, oldest-unconsumed age, emission rate split by producer and by tag,
   emitted-vs-consumed, and cumulative totals. Needs
@@ -72,37 +72,44 @@ jq '(.. | objects | select(.type? == "prometheus") | .uid) = "YOUR_UID"' \
   claude-watch.json > /path/to/deployment/dashboards/claude-watch.json
 ```
 
-### Infinity — optional, one panel in `claude-watch.json`
+### Infinity — one Mixed tile, in Build Info
 
-One panel is not Prometheus: **Latest Merged PR** queries GitHub's REST API
-directly through the
+**Build Info** is `-- Mixed --`: two tiles (commit, PR) come from Prometheus,
+the third ("latest merged") queries GitHub's REST API directly through the
 [Infinity](https://grafana.com/grafana/plugins/yesoreyeram-infinity-datasource/)
 datasource. It is the only Infinity target in this repo, and it is
 deliberately exporter-free: a local exporter scraping GitHub for one number is
 a service to run, restart and forget, and the number is already public.
 
-This panel used to be a third tile inside **Build Info**, sharing that panel's
-`-- Mixed --` datasource with the two Prometheus tiles (version/commit/PR).
-That was the recurring failure mode Andrew hit as #5482/#5548: Grafana's
-`/api/ds/query` batches every target of a Mixed-datasource panel into one
-request and fails the WHOLE response the instant any one target errors, so a
-GitHub rate-limit (below) or a missing Infinity plugin/datasource blanked the
-two otherwise-healthy Prometheus tiles too, not just the GitHub one — a
-"skip it and only that tile fails to render" assumption that does not hold in
-practice (verified against Grafana 13.1.3). As of 2026-08-25 this is its own
-panel on its own single datasource, so a GitHub outage is confined to this one
-panel and can never again take the build-identity tiles down with it.
+This tile spent 2026-08-25–08-26 as its own standalone panel ("Latest Merged
+PR", #716/#5548, then #717): Grafana's `/api/ds/query` batches every target of
+a Mixed-datasource panel into one request and fails the WHOLE response the
+instant any one target errors, so an *unauthenticated* GitHub rate-limit or a
+missing Infinity plugin/datasource used to blank the two otherwise-healthy
+Prometheus tiles too, not just the GitHub one (verified against Grafana
+13.1.3). It moved back into Build Info as a Mixed tile on 2026-08-26 (Andrew
+#5629) because the Infinity datasource is now provisioned with a GitHub token
+(andrew-sf-tools, 5,000 req/hour) rather than calling anonymously — at that
+rate the batched-failure risk this datasource used to carry is low enough to
+accept trading it back for one panel instead of two. **The failure mode is
+still real, just rarer**: if the Infinity datasource is missing, misconfigured,
+or the token is revoked/exhausted, Build Info's commit/PR tiles blank along
+with "latest merged" — they are one panel again, not two.
 
 This repo ships no Grafana service — nothing here provisions one, so there is
-no compose file to add the plugin to. A deployment that wants the panel needs
-two things in **its own** Grafana:
+no compose file to add the plugin to. A deployment that wants the tile needs
+three things in **its own** Grafana:
 
 1. The plugin installed. On the official image that is one env var —
    `GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource` (verified against
    plugin 4.0.0) — or `grafana-cli plugins install
    yesoreyeram-infinity-datasource` on a package install.
 2. The datasource provisioned with the stable uid the dashboard binds to,
-   exactly as with `uid: prometheus` above:
+   exactly as with `uid: prometheus` above.
+3. A GitHub token in that datasource's config (bearer auth header), so the
+   call runs at 5,000 req/hour instead of 60 req/hour/IP anonymous —
+   otherwise the rate-limit exposure described below reappears, now against
+   the whole Build Info panel rather than one tile.
 
 ```yaml
 # provisioning/datasources/infinity.yml
@@ -113,28 +120,26 @@ datasources:
     uid: infinity
     access: proxy
     jsonData: {}
+    # + a secureJsonData bearer token for the GitHub call, in deployments
+    # that want the 5,000/hour authenticated rate limit above.
 ```
 
-Skip both and nothing else breaks: this one panel does not render (Grafana
-flags the missing datasource on it), and Build Info's Prometheus tiles are
-unaffected — they are on a different panel now, not just a different tile.
+Skip the datasource entirely and the whole **Build Info** panel goes
+warning-icon-blank (Grafana batches the missing-datasource error in with the
+two healthy Prometheus targets) — this is the tradeoff #5629 explicitly
+accepted, not an oversight.
 
-**Rate limit is the design constraint here, and it is what sets this
-dashboard's refresh.** The call is unauthenticated, so GitHub allows 60
-requests/hour/IP, and Grafana has no per-panel refresh interval — while the
+**Rate limit is still the design constraint, and it still sets this
+dashboard's refresh.** Grafana has no per-panel refresh interval — while the
 panel is in the viewport it fetches once per *dashboard* refresh (panels
-scrolled out of view are not queried). At the `30s` this file used to ship,
-that is ~120/hour worst case: a viewport parked on the panel exhausts the
-budget in half an hour, GitHub answers 403, and the tile shows a query error
-until the hour rolls. The panel's `interval: 5m` documents the intended
-ceiling but does not enforce it, because Infinity ignores min interval.
-
-So `refresh` is `5m` (2026-08-22), which puts the worst case at 12/hour. It
-costs this board nothing: the fastest-moving tiles are second-resolution ages
-a viewer reads as "roughly how long", and every alerting decision is made by
-the Prometheus rules in `monitoring/prometheus/`, never by a rendered panel.
-A deployment that genuinely wants sub-minute refresh should give the Infinity
-datasource a GitHub token (5,000/hour) first, and only then lower `refresh`.
+scrolled out of view are not queried). Authenticated at 5,000/hour, the
+`refresh: 5m` this dashboard ships with (12 fetches/hour) is nowhere near the
+ceiling; it was originally sized (2026-08-22) for the *unauthenticated*
+60/hour case, where a viewport parked on the panel at `30s` refresh exhausted
+the hour's budget in 30 minutes and GitHub answered 403 until the window
+rolled. The panel's `interval: 5m` documents the intended ceiling but does not
+enforce it, because Infinity ignores min interval — the dashboard `refresh` is
+what actually caps the call rate.
 
 The query ranks by `merged_at`, not by PR number — number order and merge order
 diverge whenever two PRs are open at once — via the JSONata root selector
@@ -170,7 +175,7 @@ decides the answer is redone in the selector.
   build. No dashboard tile since 2026-08-23 (the Build Info panel is about
   the daemon, not the exporter); read it with `curl -s localhost:9099/metrics
   | grep build_info`. See `monitoring/prometheus/README.md`.
-- "latest merged" (Latest Merged PR panel) → no metric at all: Infinity
+- "latest merged" (Build Info's third tile) → no metric at all: Infinity
   fetches `api.github.com/repos/hndrewaall/claude-watch/pulls` at render time
 
 Alerting on the same metrics lives in `monitoring/prometheus/`.
