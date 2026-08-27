@@ -2851,7 +2851,23 @@ pub(crate) const MALFORMED_POST_CLEAR_GRACE_SECS: f64 = 60.0;
 /// captured pane tail is necessarily PRE-clear scrollback residue rather than a
 /// live malform from the current (freshly-reset) context?
 ///
-/// Either signal suffices:
+/// `active_ui` is checked FIRST and short-circuits to `false` (never
+/// suppress): it is the same positive-liveness signal
+/// (`status::pane_shows_active_ui`) the fresh-session-inject gate uses
+/// (operator #5620) — a thinking indicator, agent-roster row, or
+/// background-work marker on screen is proof the low/zero `tokens` reading is
+/// a PARSE MISS (the bare context total scrolled behind the marker), not a
+/// genuinely fresh/near-empty context. Without this check, a long, busy,
+/// many-agent session — exactly the shape most likely to emit a malformed
+/// tool-call, and the most costly to miss — reads `tokens == 0` on
+/// essentially every poll (2026-06-17 / 2026-08-25 incidents) and this
+/// predicate returned `true` (suppress) for the ENTIRE session, silently
+/// neutering the detector (2026-08-27 regression: the detector went silent
+/// for a whole session while a `court`-prefixed malformed-invoke block sat
+/// unrecovered in the transcript).
+///
+/// Absent that positive signal, either of the original signals still
+/// suffices:
 ///   * `tokens < CONTEXT_FRESH_TOKEN_THRESHOLD` — the context is freshly
 ///     cleared / near-empty (the same low-token threshold used elsewhere to
 ///     mean "just cleared / boot state"). A near-empty context cannot have
@@ -2869,7 +2885,10 @@ pub(crate) const MALFORMED_POST_CLEAR_GRACE_SECS: f64 = 60.0;
 /// `/clear` was being classified MALFORMED purely because the pre-clear turn's
 /// `<invoke>` block was still in the captured scrollback. The freshly-reset
 /// context is exempt for the boundary window.
-pub(crate) fn malformed_detection_post_clear(state: &State, tokens: u64) -> bool {
+pub(crate) fn malformed_detection_post_clear(state: &State, tokens: u64, active_ui: bool) -> bool {
+    if active_ui {
+        return false;
+    }
     if tokens < CONTEXT_FRESH_TOKEN_THRESHOLD {
         return true;
     }
@@ -6536,7 +6555,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // false-flags the very first post-clear turn (the reported bug). At such
         // a boundary skip detection this cycle — the resulting `None` falls
         // through to the reset arm below, ending any in-flight episode cleanly.
-        let malformed_fingerprint = if malformed_detection_post_clear(state, tokens) {
+        let malformed_fingerprint = if malformed_detection_post_clear(state, tokens, active_ui) {
             debug!(
                 tokens,
                 "malformed tool-call detection suppressed — fresh-/clear / \
@@ -8759,11 +8778,11 @@ cooldown = 300
         // episode, so it is exempt.
         let state = State::default();
         assert!(
-            malformed_detection_post_clear(&state, 4_200),
+            malformed_detection_post_clear(&state, 4_200, false),
             "low-token (freshly-cleared) context must be exempt from malformed detection"
         );
         assert!(
-            malformed_detection_post_clear(&state, 0),
+            malformed_detection_post_clear(&state, 0, false),
             "tokens=0 (just-landed clear) must be exempt"
         );
     }
@@ -8778,7 +8797,7 @@ cooldown = 300
         let mut state = State::default();
         state.last_context_clear = Some(Utc::now().to_rfc3339());
         assert!(
-            malformed_detection_post_clear(&state, 120_000),
+            malformed_detection_post_clear(&state, 120_000, false),
             "a clear within the grace window must exempt even a high-token boundary turn"
         );
     }
@@ -8789,7 +8808,7 @@ cooldown = 300
         // (high tokens, no recent clear) is fully subject to detection.
         let state = State::default();
         assert!(
-            !malformed_detection_post_clear(&state, 120_000),
+            !malformed_detection_post_clear(&state, 120_000, false),
             "a normal high-token turn with no recent clear must NOT be exempt — \
              genuine malforms still fire"
         );
@@ -8805,8 +8824,32 @@ cooldown = 300
             - chrono::Duration::seconds(MALFORMED_POST_CLEAR_GRACE_SECS as i64 + 120);
         state.last_context_clear = Some(stale.to_rfc3339());
         assert!(
-            !malformed_detection_post_clear(&state, 120_000),
+            !malformed_detection_post_clear(&state, 120_000, false),
             "a clear older than the grace window must not exempt a later malform"
+        );
+    }
+
+    #[test]
+    fn test_malformed_post_clear_active_ui_never_suppresses() {
+        // 2026-08-27 regression: a long, busy, many-agent session reads
+        // tokens==0 on essentially every poll (the bare context total is
+        // scrolled behind the thinking indicator / agent roster / background
+        // work markers), which used to make this predicate return `true`
+        // (suppress) for the WHOLE session -- silently neutering the
+        // malformed-tool-call detector exactly when it matters most. A
+        // positive active_ui signal must short-circuit to "not a boundary"
+        // regardless of how low `tokens` reads, and regardless of a recent
+        // `last_context_clear` timestamp.
+        let state = State::default();
+        assert!(
+            !malformed_detection_post_clear(&state, 0, true),
+            "active_ui must override the low-token fresh-boundary exemption"
+        );
+        let mut state_recent_clear = State::default();
+        state_recent_clear.last_context_clear = Some(Utc::now().to_rfc3339());
+        assert!(
+            !malformed_detection_post_clear(&state_recent_clear, 120_000, true),
+            "active_ui must override the recent-clear-grace-window exemption too"
         );
     }
 
