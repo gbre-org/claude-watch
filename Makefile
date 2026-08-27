@@ -67,6 +67,7 @@
 .PHONY: test-claude-event test-pr-branches test-event-must-act
 .PHONY: test-self-clear test-self-login test-self-login-tmux test-watchers
 .PHONY: test-claude-events-exporter test-work-queue-exporter test-dashboard
+.PHONY: test-agent-psi-exporter
 # Tests — container image
 .PHONY: test-trust-workspace test-claude-tmux-env test-cron-toggle
 .PHONY: test-hooks-shim test-entrypoint
@@ -301,6 +302,14 @@ test-claude-events-exporter: ## claude-events-exporter queue-metric tests
 test-work-queue-exporter: ## work-queue-exporter owner-liveness tests
 	uv run --python 3.11 --with prometheus_client \
 		python3 exporters/work-queue-exporter/test_work_queue_exporter.py
+
+# Same shape as the exporter suites above: self-contained, pure-function
+# categorizer + two-agent some/full pressure math against synthetic
+# transcripts, plus one end-to-end scrape over a tmpdir projects dir. uv
+# supplies prometheus_client so no checked-in venv is needed.
+test-agent-psi-exporter: ## agent-psi-exporter categorizer + pressure tests
+	uv run --python 3.11 --with prometheus_client \
+		python3 exporters/agent-psi-exporter/test_agent_psi_exporter.py
 
 # Run the dashboard parser tests (sources dashboard-lib.sh in a bash
 # subshell and exercises conf_get / conf_windows / has_split / expected_panes
