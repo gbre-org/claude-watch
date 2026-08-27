@@ -205,12 +205,28 @@ pub(crate) fn is_agent_roster_row(line: &str) -> bool {
 /// Scans the WHOLE pane (markers can sit well above the bottom-10 window when
 /// an overlay panel pushes the tail up), mirroring the whole-pane marker scan
 /// in `parse_status_bar_with_diag`.
+///
+/// Also recognizes the completion-tail line Claude Code prints after a
+/// thinking burst ends while background work (shells, background tasks, or
+/// Monitor-tool watches) is still outstanding — e.g. `✻ Brewed for 47m 32s ·
+/// 2 monitors still running` — and the bare `· N monitors ·` status-bar
+/// counter. Both are positive proof of a live, non-fresh session even when
+/// the bare context total is off-screen (2026-08-27 regression: Andrew's
+/// screenshot showed the "fresh session" resume prompt fire mid-session on
+/// exactly this line, because neither the completion-tail phrasing nor the
+/// "monitors" counter word were recognized as active-work markers).
 pub(crate) fn pane_shows_active_ui(pane_text: &str) -> bool {
     let thinking_re =
         Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
+    // Bare status-bar concurrent-task counters that are NOT already covered
+    // by a more specific check below (`monitor(?:s)?` mirrors the
+    // `bash_re` alternation added to `parse_status_bar_with_diag`'s
+    // token/task parser for the same underlying regression).
+    let counter_re = Regex::new(r"\d+\s+(?:active\s+)?monitors?\b").unwrap();
     pane_text.lines().any(|line| {
         is_agent_roster_row(line)
             || thinking_re.is_match(line)
+            || counter_re.is_match(line)
             || line.contains("Background tasks")
             || line.contains("active shells")
             || line.contains("active shell")
@@ -218,6 +234,12 @@ pub(crate) fn pane_shows_active_ui(pane_text: &str) -> bool {
             || line.contains("active agent")
             || line.contains("Local agents")
             || line.contains(" Shells (")
+            // Completion-tail "N <shells|background tasks|monitors> still
+            // running" (or the pane-width-truncated "still…" form) — printed
+            // whenever background work outlives the thinking burst that
+            // preceded it, regardless of which noun names the work.
+            || line.contains("still running")
+            || line.contains("still\u{2026}")
     })
 }
 
@@ -302,8 +324,17 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
     // / `(?:s)?` for it to behave correctly. Same trap applies to `tasks?`
     // and `shells?` — write them as `task(?:s)?` and `shell(?:s)?` to be
     // safe.
+    //
+    // `monitor(?:s)?` covers the Monitor-tool background-watch counter
+    // Claude Code's status bar renders as `· 2 monitors ·` (2026-08-27
+    // corruption-detector regression): it is a concurrent-task count exactly
+    // like bashes/background-tasks/shells, but was missing from this
+    // alternation, so a pane with live Monitor-tool watches and no other
+    // running shell/task parsed `bashes == 0` — the FIRST domino in the
+    // "tokens==0 && bashes==0 -> dead process" misfire (see
+    // `pane_shows_active_ui` below for the second line of defense).
     let bash_re = Regex::new(
-        r"(\d+)\s+(?:active\s+)?(?:bash(?:es)?|background\s+task(?:s)?|shell(?:s)?)\b",
+        r"(\d+)\s+(?:active\s+)?(?:bash(?:es)?|background\s+task(?:s)?|shell(?:s)?|monitor(?:s)?)\b",
     )
     .unwrap();
     let compact_re = Regex::new(r"Context left until auto-compact:\s*(\d+)%").unwrap();
@@ -2228,6 +2259,35 @@ mod tests {
     }
 
     #[test]
+    fn active_ui_true_for_monitors_still_running_completion_tail() {
+        // 2026-08-27 regression, confirmed from Andrew's screenshot: the
+        // "fresh session" resume prompt fired while the pane showed exactly
+        // this completion-tail line -- 47 minutes into an active session with
+        // two live Monitor-tool watches, not a fresh/idle pane.
+        let pane = "\u{273b} Brewed for 47m 32s \u{00b7} 2 monitors still running\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_background_tasks_still_running_completion_tail() {
+        let pane = "\u{273b} Cogitated for 2m 11s \u{00b7} 6 background tasks still running\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_truncated_still_running_completion_tail() {
+        // Narrow-pane truncation renders "still…" instead of "still running".
+        let pane = "\u{273b} Cogitated for 2m 11s \u{00b7} 6 tasks still\u{2026}\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_bare_monitors_status_bar_counter() {
+        let pane = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 2 monitors \u{00b7} \u{2190} for agents \u{00b7} \u{2193} to manage\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
     fn test_watcher_runtime_file_age_secs_none_when_no_files() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -2633,6 +2693,26 @@ mod tests {
         let input = "7 shells";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.bashes, Some(7));
+    }
+
+    #[test]
+    fn test_parse_status_bar_monitors() {
+        // 2026-08-27 regression: Claude Code's status bar renders live
+        // Monitor-tool background watches as `· N monitors ·`, exactly like
+        // shells/background-tasks/bashes. Before this fix `monitor(s)?` was
+        // missing from the alternation, so a pane with 0 bashes but 2 live
+        // monitors parsed `bashes == 0` -- the first domino in the
+        // "tokens==0 && bashes==0 -> dead process" misfire.
+        let input = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 2 monitors \u{00b7} \u{2190} for agents \u{00b7} \u{2193} to manage";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(2));
+    }
+
+    #[test]
+    fn test_parse_status_bar_singular_monitor() {
+        let input = "1 monitor";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(1));
     }
 
     #[test]
