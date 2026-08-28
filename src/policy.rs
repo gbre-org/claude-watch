@@ -417,7 +417,7 @@ pub(crate) fn obligation_escalation_decision(
 /// one. Context-low is the rung whose whole job is to rescue a loop that is
 /// about to run out of context, and on a dispatcher that keeps subagents in
 /// flight the count is essentially never zero — so the obligation arms once
-/// and then HOLDS forever, re-emitting the same "auto-clear pending" alert
+/// and then HOLDS forever, re-emitting the same "SELF-CLEAR NOW" alert
 /// every cycle while the context keeps climbing into the hard wall. Waiting
 /// for a quiet moment is not a recovery strategy when the thing being waited
 /// on is the very loop that is stuck.
@@ -6375,9 +6375,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         // child remains the hard context backstop and is spawned
                         // only on Escalate below.
                         let ctx_msg = format!(
-                            "[CLAUDE-WATCH] Context at {:.0}% — auto-clear pending. \
-                            Commit/push in-flight work and save state NOW before compaction.",
-                            pct
+                            "[CLAUDE-WATCH] Context at {:.0}% — SELF-CLEAR NOW. \
+                            Run: (1) `session-task set '<state to resume>'`, \
+                            (2) commit + push in-flight repo work, (3) `self-clear`. \
+                            Auto-clear will be forced in {}s if you don't act.",
+                            pct, config.context_monitor.max_armed_secs
                         );
                         let _ = crate::obligation_arm::arm_alert_obligation(
                             &ctx_msg,
