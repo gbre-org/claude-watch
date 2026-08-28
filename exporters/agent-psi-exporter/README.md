@@ -88,8 +88,10 @@ Tunables (env): `PORT`, `CLAUDE_PROJECTS_DIR`, `AGENT_PSI_MAX_GAP_SECONDS`
 ## Scrape target
 
 Point Prometheus at `agent-psi-exporter:9104` (or `localhost:9104` on the host).
-The scrape config and a Grafana dashboard are intentionally **not** wired here —
-they live in the operator's monitoring stack.
+The scrape config is intentionally **not** wired here — it lives in the
+operator's monitoring stack. A Grafana dashboard for this exporter's metrics
+ships in-repo at `monitoring/dashboards/agent-psi.json` (uid `agent-psi`); see
+`monitoring/dashboards/README.md`.
 
 ## Test
 

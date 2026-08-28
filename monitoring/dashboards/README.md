@@ -20,6 +20,10 @@ drifts.
   status and priority breakdowns, active groups, throughput, wait/run/total
   latency quantiles, a run-duration heatmap, and a table of currently-running
   items with elapsed time. Needs `exporters/work-queue-exporter/`.
+- **`agent-psi.json`** (uid `agent-psi`) — pressure-stall (PSI) metrics over
+  the Claude Code agent fleet: live-agent count, fleet inference/tool
+  pressure at multiple sliding windows, and per-agent duty cycle. Needs
+  `exporters/agent-psi-exporter/`.
 
 Validate with `jq empty monitoring/dashboards/*.json`.
 
@@ -171,6 +175,7 @@ decides the answer is redone in the selector.
   textfile collector (`src/metrics.rs`)
 - `claude_events_*` → `exporters/claude-events-exporter/`
 - `worktask_queue_*` → `exporters/work-queue-exporter/`
+- `agent_psi_*` / `agent_duty_ratio` → `exporters/agent-psi-exporter/`
 - `worktask_exporter_build_info` → the work-queue-exporter, stamped at image
   build. No dashboard tile since 2026-08-23 (the Build Info panel is about
   the daemon, not the exporter); read it with `curl -s localhost:9099/metrics

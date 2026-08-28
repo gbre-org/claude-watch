@@ -2,7 +2,7 @@
 
 This directory holds the version-controlled Grafana dashboard JSON for
 claude-watch's own metrics (`claude-watch.json`, `claude-events.json`,
-`work-queue.json`). It is the **upstream template** and the source of truth
+`work-queue.json`, `agent-psi.json`). It is the **upstream template** and the source of truth
 *for the project*: an improvement belongs here so every deployment can pick it
 up from one place.
 

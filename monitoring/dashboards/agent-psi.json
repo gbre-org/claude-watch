@@ -1,0 +1,317 @@
+{
+  "title": "agent-PSI \u2014 Claude Code fleet pressure",
+  "uid": "agent-psi",
+  "tags": [
+    "claude",
+    "agent-psi"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "style": "dark",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Live agents",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_live_agents",
+          "legendFormat": "live agents",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "description": "Total live agent transcripts seen this scrape (main loops + sub-agents active within the live window, default 900s). >0 whenever any Claude Code session is running."
+    },
+    {
+      "id": 2,
+      "title": "Fleet inference_full (60s)",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\"}",
+          "legendFormat": "inference_full 60s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Fleet inference_full (300s)",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"300\"}",
+          "legendFormat": "inference_full 300s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Fleet tool_full (60s)",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_tool_full{scope=\"fleet\",window=\"60\"}",
+          "legendFormat": "tool_full 60s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Fleet inference pressure (full) \u2014 every live agent stalled on the model at once (API / rate-limit bound)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_inference_full{scope=\"fleet\"}",
+          "legendFormat": "inference_full \u00b7 {{window}}s window",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "description": "Fraction of the trailing window in which EVERY active agent in the fleet was blocked on inference at once. The money metric: sustained high values mean the fleet is API / rate-limit bound, so adding parallelism buys nothing. One line per sliding window (10/60/300s)."
+    },
+    {
+      "id": 6,
+      "title": "Per-agent duty cycle \u2014 share of ACTIVE time by category (stacked per agent)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_duty_ratio",
+          "legendFormat": "{{agent_id}} \u00b7 {{category}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "description": "Per-agent duty cycle: share of ACTIVE time (total \u2212 idle \u2212 waiting_human) spent on inference / tool / overhead. agent_id is a sub-agent id or main_loop:<session>. Stacked per agent \u2014 for a serial agent this equals its some==full pressure."
+    }
+  ]
+}
