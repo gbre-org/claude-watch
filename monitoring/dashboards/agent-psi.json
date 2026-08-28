@@ -1,5 +1,5 @@
 {
-  "title": "agent-PSI \u2014 Claude Code fleet pressure",
+  "title": "agent-PSI — Claude Code fleet pressure",
   "uid": "agent-psi",
   "tags": [
     "claude",
@@ -20,7 +20,7 @@
       "title": "Live subagents",
       "type": "stat",
       "gridPos": {
-        "h": 4,
+        "h": 5,
         "w": 4,
         "x": 0,
         "y": 0
@@ -67,15 +67,15 @@
         "justifyMode": "auto",
         "textMode": "auto"
       },
-      "description": "Total live SUB-AGENT transcripts this scrape (workers active within the live window, default 900s). The main loop is deliberately excluded \u2014 it is a dispatcher, not a worker."
+      "description": "Total live SUB-AGENT transcripts this scrape (workers active within the live window, default 900s). The main loop is deliberately excluded — it is a dispatcher, not a worker."
     },
     {
       "id": 2,
-      "title": "Main \u00b7 inference full (60s)",
+      "title": "inference full (60s)",
       "type": "stat",
       "gridPos": {
-        "h": 4,
-        "w": 5,
+        "h": 5,
+        "w": 12,
         "x": 4,
         "y": 0
       },
@@ -86,560 +86,23 @@
       "targets": [
         {
           "expr": "agent_psi_inference_full{scope=\"main\",window=\"60\",model=\"all\"}",
-          "legendFormat": "Main \u00b7 inference full (60s)",
+          "legendFormat": "Main",
           "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
         },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      },
-      "description": "Fraction of the last 60s the MAIN LOOP was blocked on inference. The dispatcher on its own \u2014 read side-by-side with the fleet tile."
-    },
-    {
-      "id": 3,
-      "title": "Fleet \u00b7 inference full (60s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 5,
-        "x": 9,
-        "y": 0
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
         {
           "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
-          "legendFormat": "Fleet \u00b7 inference full (60s)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
+          "legendFormat": "Fleet",
+          "refId": "B"
         },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      },
-      "description": "Fraction of the last 60s EVERY active sub-agent was blocked on inference at once \u2014 the money metric. Sustained high => API / rate-limit bound, more parallelism buys nothing. Main loop excluded."
-    },
-    {
-      "id": 4,
-      "title": "Main \u00b7 tool full (60s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 5,
-        "x": 14,
-        "y": 0
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
         {
-          "expr": "agent_psi_tool_full{scope=\"main\",window=\"60\",model=\"all\"}",
-          "legendFormat": "Main \u00b7 tool full (60s)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
+          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"opus\"}",
+          "legendFormat": "opus",
+          "refId": "C"
         },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      },
-      "description": "Fraction of the last 60s the MAIN LOOP was blocked on a tool."
-    },
-    {
-      "id": 5,
-      "title": "Fleet \u00b7 tool full (60s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 5,
-        "x": 19,
-        "y": 0
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
         {
-          "expr": "agent_psi_tool_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
-          "legendFormat": "Fleet \u00b7 tool full (60s)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      },
-      "description": "Fraction of the last 60s every active sub-agent was blocked on a tool at once. Main loop excluded."
-    },
-    {
-      "id": 6,
-      "title": "Main \u00b7 inference full (300s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "agent_psi_inference_full{scope=\"main\",window=\"300\",model=\"all\"}",
-          "legendFormat": "Main \u00b7 inference full (300s)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      },
-      "description": "Sustained (5-min) main-loop inference pressure."
-    },
-    {
-      "id": 7,
-      "title": "Fleet \u00b7 inference full (300s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"300\",model=\"all\"}",
-          "legendFormat": "Fleet \u00b7 inference full (300s)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      },
-      "description": "Sustained (5-min) fleet inference pressure \u2014 the money metric over a longer window. Main loop excluded."
-    },
-    {
-      "id": 8,
-      "title": "Main \u00b7 tool full (300s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 12,
-        "y": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "agent_psi_tool_full{scope=\"main\",window=\"300\",model=\"all\"}",
-          "legendFormat": "Main \u00b7 tool full (300s)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      },
-      "description": "Sustained (5-min) main-loop tool pressure."
-    },
-    {
-      "id": 9,
-      "title": "Fleet \u00b7 tool full (300s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "agent_psi_tool_full{scope=\"fleet\",window=\"300\",model=\"all\"}",
-          "legendFormat": "Fleet \u00b7 tool full (300s)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      },
-      "description": "Sustained (5-min) fleet tool pressure. Main loop excluded."
-    },
-    {
-      "id": 10,
-      "title": "Fleet \u00b7 inference full by model (60s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 5,
-        "w": 24,
-        "x": 0,
-        "y": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model!=\"all\"}",
-          "legendFormat": "{{model}}",
-          "refId": "A"
+          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"sonnet\"}",
+          "legendFormat": "sonnet",
+          "refId": "D"
         }
       ],
       "fieldConfig": {
@@ -688,17 +151,239 @@
         "justifyMode": "auto",
         "textMode": "value_and_name"
       },
-      "description": "Fleet inference-full restricted to each model family (the same some/full math over just the workers on that model). One tile per live model \u2014 a single model pinned near 1.0 is that model rate-limiting the fleet."
+      "description": "The money metric (60s window). Main = fraction of the last 60s the MAIN LOOP was blocked on inference (dispatcher, read side-by-side with Fleet). Fleet = fraction of the last 60s EVERY active sub-agent was blocked on inference at once — sustained high => API / rate-limit bound, more parallelism buys nothing (main loop excluded). opus / sonnet = the same some/full math over just the fleet workers on that model; a single model pinned near 1.0 is that model rate-limiting the fleet."
+    },
+    {
+      "id": 3,
+      "title": "inference full (300s)",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_inference_full{scope=\"main\",window=\"300\",model=\"all\"}",
+          "legendFormat": "Main",
+          "refId": "A"
+        },
+        {
+          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"300\",model=\"all\"}",
+          "legendFormat": "Fleet",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 0.5
+              },
+              {
+                "color": "#cb4b16",
+                "value": 0.75
+              },
+              {
+                "color": "#dc322f",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      },
+      "description": "Sustained (5-min) inference pressure — the money metric over a longer window. Main = main-loop inference pressure. Fleet = fraction of the trailing 300s every active sub-agent was blocked on inference at once (main loop excluded)."
+    },
+    {
+      "id": 4,
+      "title": "tool full (60s)",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_tool_full{scope=\"main\",window=\"60\",model=\"all\"}",
+          "legendFormat": "Main",
+          "refId": "A"
+        },
+        {
+          "expr": "agent_psi_tool_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "legendFormat": "Fleet",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 0.5
+              },
+              {
+                "color": "#cb4b16",
+                "value": 0.75
+              },
+              {
+                "color": "#dc322f",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      },
+      "description": "Fraction of the last 60s blocked on a tool. Main = the MAIN LOOP. Fleet = every active sub-agent blocked on a tool at once (main loop excluded)."
+    },
+    {
+      "id": 5,
+      "title": "tool full (300s)",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_tool_full{scope=\"main\",window=\"300\",model=\"all\"}",
+          "legendFormat": "Main",
+          "refId": "A"
+        },
+        {
+          "expr": "agent_psi_tool_full{scope=\"fleet\",window=\"300\",model=\"all\"}",
+          "legendFormat": "Fleet",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 0.5
+              },
+              {
+                "color": "#cb4b16",
+                "value": 0.75
+              },
+              {
+                "color": "#dc322f",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      },
+      "description": "Sustained (5-min) tool pressure. Main = main-loop tool pressure. Fleet = every active sub-agent blocked on a tool at once over the trailing 300s (main loop excluded)."
     },
     {
       "id": 11,
-      "title": "Main vs fleet \u2014 inference full (60s)",
+      "title": "Main vs fleet — inference full (60s)",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 13
+        "y": 10
       },
       "datasource": {
         "type": "prometheus",
@@ -748,13 +433,13 @@
     },
     {
       "id": 12,
-      "title": "Fleet inference pressure (full) \u2014 API / rate-limit bound",
+      "title": "Fleet inference pressure (full) — API / rate-limit bound",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 21
+        "y": 18
       },
       "datasource": {
         "type": "prometheus",
@@ -763,7 +448,7 @@
       "targets": [
         {
           "expr": "agent_psi_inference_full{scope=\"fleet\",model=\"all\"}",
-          "legendFormat": "inference_full \u00b7 {{window}}s window",
+          "legendFormat": "inference_full · {{window}}s window",
           "refId": "A"
         }
       ],
@@ -799,13 +484,13 @@
     },
     {
       "id": 13,
-      "title": "Per-agent duty cycle \u2014 share of ACTIVE time by category (stacked per agent)",
+      "title": "Per-agent duty cycle — share of ACTIVE time by category (stacked per agent)",
       "type": "timeseries",
       "gridPos": {
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 29
+        "y": 26
       },
       "datasource": {
         "type": "prometheus",
@@ -814,7 +499,7 @@
       "targets": [
         {
           "expr": "agent_duty_ratio",
-          "legendFormat": "{{agent_id}} \u00b7 {{category}}",
+          "legendFormat": "{{agent_id}} · {{category}}",
           "refId": "A"
         }
       ],
@@ -849,7 +534,7 @@
           "mode": "multi"
         }
       },
-      "description": "Per-agent duty cycle: share of ACTIVE time (total \u2212 idle \u2212 waiting_human) spent on inference / tool / overhead. agent_id is a sub-agent id or main_loop:<session>. Stacked per agent \u2014 for a serial agent this equals its some==full pressure."
+      "description": "Per-agent duty cycle: share of ACTIVE time (total − idle − waiting_human) spent on inference / tool / overhead. agent_id is a sub-agent id or main_loop:<session>. Stacked per agent — for a serial agent this equals its some==full pressure."
     }
   ]
 }
