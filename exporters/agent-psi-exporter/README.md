@@ -46,14 +46,20 @@ windows:
 
 | metric | labels | meaning |
 |---|---|---|
-| `agent_psi_inference_some` | `scope`, `window` | fraction of the window ≥1 agent in scope was blocked on inference |
-| `agent_psi_inference_full` | `scope`, `window` | fraction ALL active agents were blocked on inference at once — the money metric (API/rate-limit bound) |
-| `agent_psi_tool_some` / `agent_psi_tool_full` | `scope`, `window` | same, for tool |
-| `agent_psi_scope_agents` | `scope` | live agents contributing to each scope |
-| `agent_psi_live_agents` | — | total live transcripts this scrape |
+| `agent_psi_inference_some` | `scope`, `window`, `model` | fraction of the window ≥1 agent in scope was blocked on inference |
+| `agent_psi_inference_full` | `scope`, `window`, `model` | fraction ALL active agents were blocked on inference at once — the money metric (API/rate-limit bound) |
+| `agent_psi_tool_some` / `agent_psi_tool_full` | `scope`, `window`, `model` | same, for tool |
+| `agent_psi_scope_agents` | `scope`, `model` | live agents contributing to each (scope, model) line |
+| `agent_psi_live_agents` | — | total live **sub-agent** transcripts this scrape (main loop excluded) |
 
-`scope` is `fleet` (all live transcripts) or `session:<8-char id>` (a main loop
-+ its live sub-agents — the subtree). `window` is `10` / `60` / `300`.
+`scope` is `fleet` (**sub-agents only** — the main loop is excluded), `main`
+(the main loop / dispatcher on its own — its profile is idle-heavy and unlike a
+worker, so it is reported side-by-side rather than blended in), or
+`session:<8-char id>` (a main loop + its live sub-agents — the subtree).
+`window` is `10` / `60` / `300`. `model` is `all` for the cross-model aggregate,
+or a model family (`opus` / `sonnet` / `haiku` / `fable` / …) for the per-model
+breakdown emitted on the `fleet` scope — so a single model's rate-limiting reads
+off `agent_psi_inference_full{scope="fleet",model="opus"}`.
 
 Byproduct — per-agent duty-cycle (a serial agent's some==full):
 
