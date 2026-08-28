@@ -71,11 +71,11 @@
     },
     {
       "id": 2,
-      "title": "inference full (60s)",
+      "title": "Inference — productive vs stalled (60s)",
       "type": "stat",
       "gridPos": {
         "h": 5,
-        "w": 12,
+        "w": 10,
         "x": 4,
         "y": 0
       },
@@ -85,24 +85,24 @@
       },
       "targets": [
         {
-          "expr": "agent_psi_inference_full{scope=\"main\",window=\"60\",model=\"all\"}",
-          "legendFormat": "Main",
-          "refId": "A"
+          "expr": "clamp_min(agent_psi_inference_full{scope=\"main\",window=\"60\",model=\"all\"} - agent_psi_inference_stalled_full{scope=\"main\",window=\"60\",model=\"all\"}, 0)",
+          "refId": "A",
+          "legendFormat": "Main productive"
         },
         {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
-          "legendFormat": "Fleet",
-          "refId": "B"
+          "expr": "agent_psi_inference_stalled_full{scope=\"main\",window=\"60\",model=\"all\"}",
+          "refId": "B",
+          "legendFormat": "Main stalled"
         },
         {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"opus\"}",
-          "legendFormat": "opus",
-          "refId": "C"
+          "expr": "clamp_min(agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"} - agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}, 0)",
+          "refId": "C",
+          "legendFormat": "Fleet productive"
         },
         {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"sonnet\"}",
-          "legendFormat": "sonnet",
-          "refId": "D"
+          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "refId": "D",
+          "legendFormat": "Fleet stalled"
         }
       ],
       "fieldConfig": {
@@ -136,7 +136,72 @@
           "max": 1,
           "decimals": 0
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Main productive"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#859900"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Fleet productive"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#859900"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Main stalled"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#dc322f"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Fleet stalled"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#dc322f"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "reduceOptions": {
@@ -151,16 +216,16 @@
         "justifyMode": "auto",
         "textMode": "value_and_name"
       },
-      "description": "The money metric (60s window). Main = fraction of the last 60s the MAIN LOOP was blocked on inference (dispatcher, read side-by-side with Fleet). Fleet = fraction of the last 60s EVERY active sub-agent was blocked on inference at once — sustained high => API / rate-limit bound, more parallelism buys nothing (main loop excluded). opus / sonnet = the same some/full math over just the fleet workers on that model; a single model pinned near 1.0 is that model rate-limiting the fleet."
+      "description": "The money metric (60s window), split into PRODUCTIVE vs STALLED so total pressure is never read as one number. Productive = fraction of the last 60s every active worker was blocked on inference AND generating tokens (compute-bound, healthy). Stalled = the subset where the model was blocked but NOT generating (throughput below the stall floor: 429 back-off / network / TTFT / queueing => rate-limit bound, more parallelism buys nothing). Main = the dispatcher, read side-by-side with Fleet (main loop excluded from Fleet). productive = full − stalled, clamped at 0."
     },
     {
       "id": 3,
-      "title": "inference full (300s)",
+      "title": "Inference — productive vs stalled (300s)",
       "type": "stat",
       "gridPos": {
         "h": 5,
-        "w": 8,
-        "x": 16,
+        "w": 10,
+        "x": 14,
         "y": 0
       },
       "datasource": {
@@ -169,14 +234,24 @@
       },
       "targets": [
         {
-          "expr": "agent_psi_inference_full{scope=\"main\",window=\"300\",model=\"all\"}",
-          "legendFormat": "Main",
-          "refId": "A"
+          "expr": "clamp_min(agent_psi_inference_full{scope=\"main\",window=\"300\",model=\"all\"} - agent_psi_inference_stalled_full{scope=\"main\",window=\"300\",model=\"all\"}, 0)",
+          "refId": "A",
+          "legendFormat": "Main productive"
         },
         {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"300\",model=\"all\"}",
-          "legendFormat": "Fleet",
-          "refId": "B"
+          "expr": "agent_psi_inference_stalled_full{scope=\"main\",window=\"300\",model=\"all\"}",
+          "refId": "B",
+          "legendFormat": "Main stalled"
+        },
+        {
+          "expr": "clamp_min(agent_psi_inference_full{scope=\"fleet\",window=\"300\",model=\"all\"} - agent_psi_inference_stalled_full{scope=\"fleet\",window=\"300\",model=\"all\"}, 0)",
+          "refId": "C",
+          "legendFormat": "Fleet productive"
+        },
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"300\",model=\"all\"}",
+          "refId": "D",
+          "legendFormat": "Fleet stalled"
         }
       ],
       "fieldConfig": {
@@ -210,7 +285,72 @@
           "max": 1,
           "decimals": 0
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Main productive"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#859900"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Fleet productive"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#859900"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Main stalled"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#dc322f"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Fleet stalled"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#dc322f"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "reduceOptions": {
@@ -225,7 +365,7 @@
         "justifyMode": "auto",
         "textMode": "value_and_name"
       },
-      "description": "Sustained (5-min) inference pressure — the money metric over a longer window. Main = main-loop inference pressure. Fleet = fraction of the trailing 300s every active sub-agent was blocked on inference at once (main loop excluded)."
+      "description": "Sustained (5-min) inference pressure, split PRODUCTIVE vs STALLED. Productive = every active worker blocked on inference AND generating tokens over the trailing 300s (compute-bound). Stalled = the low-throughput subset (429 / network / TTFT / queueing => rate-limit bound). Main = the dispatcher; Fleet excludes the main loop. productive = full − stalled, clamped at 0."
     },
     {
       "id": 4,
@@ -377,11 +517,11 @@
     },
     {
       "id": 6,
-      "title": "stalled inference full (60s)",
+      "title": "By-model inference — productive vs stalled (fleet, 60s)",
       "type": "stat",
       "gridPos": {
         "h": 5,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 10
       },
@@ -391,24 +531,24 @@
       },
       "targets": [
         {
-          "expr": "agent_psi_inference_stalled_full{scope=\"main\",window=\"60\",model=\"all\"}",
-          "legendFormat": "Main",
-          "refId": "A"
-        },
-        {
-          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
-          "legendFormat": "Fleet",
-          "refId": "B"
+          "expr": "clamp_min(agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"opus\"} - agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"opus\"}, 0)",
+          "refId": "A",
+          "legendFormat": "opus productive"
         },
         {
           "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"opus\"}",
-          "legendFormat": "opus",
-          "refId": "C"
+          "refId": "B",
+          "legendFormat": "opus stalled"
+        },
+        {
+          "expr": "clamp_min(agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"sonnet\"} - agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"sonnet\"}, 0)",
+          "refId": "C",
+          "legendFormat": "sonnet productive"
         },
         {
           "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"sonnet\"}",
-          "legendFormat": "sonnet",
-          "refId": "D"
+          "refId": "D",
+          "legendFormat": "sonnet stalled"
         }
       ],
       "fieldConfig": {
@@ -442,81 +582,72 @@
           "max": 1,
           "decimals": 0
         },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "textMode": "value_and_name"
-      },
-      "description": "The STALLED slice of inference-full (60s window) — the subset of inference pressure where the model was blocked but NOT generating (throughput below the stall floor: 429 back-off / network / TTFT / queueing). Fleet high while inference-full is also high means every active worker is rate-limited at once, NOT generating hard. Main = the dispatcher. opus / sonnet = the same over just the fleet workers on that model, so a single rate-limited model isolates."
-    },
-    {
-      "id": 7,
-      "title": "stalled inference full (300s)",
-      "type": "stat",
-      "gridPos": {
-        "h": 5,
-        "w": 12,
-        "x": 12,
-        "y": 10
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "agent_psi_inference_stalled_full{scope=\"main\",window=\"300\",model=\"all\"}",
-          "legendFormat": "Main",
-          "refId": "A"
-        },
-        {
-          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"300\",model=\"all\"}",
-          "legendFormat": "Fleet",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "opus productive"
+            },
+            "properties": [
               {
-                "color": "#859900",
-                "value": null
+                "id": "color.mode",
+                "value": "fixed"
               },
               {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#cb4b16",
-                "value": 0.75
-              },
-              {
-                "color": "#dc322f",
-                "value": 0.9
+                "id": "color.fixedColor",
+                "value": "#859900"
               }
             ]
           },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0
-        },
-        "overrides": []
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sonnet productive"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#859900"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "opus stalled"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#dc322f"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sonnet stalled"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#dc322f"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "reduceOptions": {
@@ -531,7 +662,7 @@
         "justifyMode": "auto",
         "textMode": "value_and_name"
       },
-      "description": "Sustained (5-min) STALLED inference pressure — the low-throughput subset of inference-full over the longer window. Main = the dispatcher; Fleet = fraction of the trailing 300s every active sub-agent was in a stalled (non-generating) inference gap at once (main loop excluded)."
+      "description": "Per-model fleet inference pressure (60s), split PRODUCTIVE vs STALLED over just the fleet workers on that model. A single model whose STALLED share is pinned high is that model rate-limiting the fleet (429 / network / TTFT), while the others still generate — so the split isolates which model is the bottleneck. productive = full − stalled, clamped at 0. Main loop excluded."
     },
     {
       "id": 11,
@@ -541,7 +672,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 23
       },
       "datasource": {
         "type": "prometheus",
@@ -591,13 +722,13 @@
     },
     {
       "id": 12,
-      "title": "Fleet inference pressure (full) — API / rate-limit bound",
+      "title": "Fleet inference — productive vs stalled (60s, stacked)",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 23
+        "y": 15
       },
       "datasource": {
         "type": "prometheus",
@@ -605,9 +736,14 @@
       },
       "targets": [
         {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",model=\"all\"}",
-          "legendFormat": "inference_full · {{window}}s window",
-          "refId": "A"
+          "expr": "clamp_min(agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"} - agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}, 0)",
+          "refId": "A",
+          "legendFormat": "productive (generating)"
+        },
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "refId": "B",
+          "legendFormat": "stalled (rate-limit / network)"
         }
       ],
       "fieldConfig": {
@@ -618,16 +754,52 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 2,
-            "fillOpacity": 10,
+            "fillOpacity": 35,
             "showPoints": "auto",
             "pointSize": 5,
-            "spanNulls": false
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal"
+            }
           },
           "unit": "percentunit",
           "min": 0,
           "max": 1
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "productive (generating)"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#859900"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "stalled (rate-limit / network)"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#dc322f"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
@@ -638,63 +810,7 @@
           "mode": "multi"
         }
       },
-      "description": "Fraction of the trailing window in which EVERY active sub-agent in the fleet was blocked on inference at once. Sustained high values mean the fleet is API / rate-limit bound. One line per sliding window (10/60/300s). Main loop excluded (model=all aggregate)."
-    },
-    {
-      "id": 14,
-      "title": "Fleet STALLED inference pressure (full) — rate-limit bound",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 31
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",model=\"all\"}",
-          "legendFormat": "stalled_full · {{window}}s window",
-          "refId": "A"
-        },
-        {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
-          "legendFormat": "inference_full · 60s (total, for reference)",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "description": "Fraction of the trailing window in which EVERY active sub-agent was in a STALLED inference gap at once (low output-token throughput => 429 / network / TTFT / queueing, not generation). One line per sliding window (10/60/300s). The total inference_full (60s) is overlaid for reference: the GAP between total and stalled is the fleet's PRODUCTIVE inference — when the two lines converge high, the fleet is rate-limit bound, not compute-bound. Main loop excluded."
+      "description": "THE headline view: fleet inference pressure (60s window) split into two stacked bands. The stack HEIGHT is total inference-full (fraction of the window every active worker was blocked on inference at once); the COLOR split shows how much of that was PRODUCTIVE (green — generating tokens, compute-bound) versus STALLED (red — blocked but not generating: 429 back-off / network / TTFT / queueing, i.e. rate-limit bound). When the red band dominates a tall stack, more parallelism buys nothing. productive = full − stalled, clamped at 0. Main loop excluded."
     },
     {
       "id": 13,
@@ -704,7 +820,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 31
       },
       "datasource": {
         "type": "prometheus",
