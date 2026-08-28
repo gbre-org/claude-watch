@@ -48,9 +48,10 @@ windows:
 |---|---|---|
 | `agent_psi_inference_some` | `scope`, `window`, `model` | fraction of the window ≥1 agent in scope was blocked on inference |
 | `agent_psi_inference_full` | `scope`, `window`, `model` | fraction ALL active agents were blocked on inference at once — the money metric (API/rate-limit bound) |
+| `agent_psi_inference_stalled_some` / `agent_psi_inference_stalled_full` | `scope`, `window`, `model` | the **stalled** subset of the above: inference gaps whose output-token throughput fell below the stall floor (429 back-off / network / TTFT / queueing, not generation). `stalled_full` near 1 = the fleet is rate-limit bound, disentangled from "everyone generating hard" |
 | `agent_psi_tool_some` / `agent_psi_tool_full` | `scope`, `window`, `model` | same, for tool |
 | `agent_psi_scope_agents` | `scope`, `model` | live agents contributing to each (scope, model) line |
-| `agent_psi_live_agents` | — | total live **sub-agent** transcripts this scrape (main loop excluded) |
+| `agent_psi_live_agents` | — | **sub-agents actually still running** this scrape (main loop excluded) — transcript not ended in a completed final turn, so a finished agent drops immediately while a mid-tool-wait agent stays counted |
 
 `scope` is `fleet` (**sub-agents only** — the main loop is excluded), `main`
 (the main loop / dispatcher on its own — its profile is idle-heavy and unlike a
@@ -89,7 +90,9 @@ Container: build with the repo root as context
 
 Tunables (env): `PORT`, `CLAUDE_PROJECTS_DIR`, `AGENT_PSI_MAX_GAP_SECONDS`
 (default 300), `AGENT_PSI_LIVE_WINDOW_SECONDS` (default 900), `AGENT_PSI_WINDOWS`
-(default `10,60,300`).
+(default `10,60,300`), `AGENT_PSI_STALLED_TOKENS_PER_SEC` (default 8 — inference
+throughput below this reads as stall, not generation), `AGENT_PSI_MIN_STALL_GAP_SECONDS`
+(default 5 — gaps shorter than this are never judged stalled).
 
 ## Scrape target
 
@@ -112,3 +115,9 @@ python3 test_agent_psi_exporter.py   # exits 0/1; uv supplies prometheus_client 
   subtree to a session).
 - Tighter `other` split (idle vs waiting_human vs overhead) and tool-kind
   labels (compute-tool vs wait-tool), refined from the live series.
+- True **intra-turn** stall detection. The current stalled split is turn-granular
+  (throughput over a whole completed inference gap) and cannot flag an in-flight
+  turn or measure time-to-first-token / inter-delta gaps / explicit 429
+  `Retry-After`. That needs instrumentation at the SDK / HTTP streaming layer
+  (timestamp SSE deltas per request, capture 429 events) — the transcript alone
+  does not carry it.

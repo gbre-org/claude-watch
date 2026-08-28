@@ -376,6 +376,164 @@
       "description": "Sustained (5-min) tool pressure. Main = main-loop tool pressure. Fleet = every active sub-agent blocked on a tool at once over the trailing 300s (main loop excluded)."
     },
     {
+      "id": 6,
+      "title": "stalled inference full (60s)",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"main\",window=\"60\",model=\"all\"}",
+          "legendFormat": "Main",
+          "refId": "A"
+        },
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "legendFormat": "Fleet",
+          "refId": "B"
+        },
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"opus\"}",
+          "legendFormat": "opus",
+          "refId": "C"
+        },
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"sonnet\"}",
+          "legendFormat": "sonnet",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 0.5
+              },
+              {
+                "color": "#cb4b16",
+                "value": 0.75
+              },
+              {
+                "color": "#dc322f",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      },
+      "description": "The STALLED slice of inference-full (60s window) — the subset of inference pressure where the model was blocked but NOT generating (throughput below the stall floor: 429 back-off / network / TTFT / queueing). Fleet high while inference-full is also high means every active worker is rate-limited at once, NOT generating hard. Main = the dispatcher. opus / sonnet = the same over just the fleet workers on that model, so a single rate-limited model isolates."
+    },
+    {
+      "id": 7,
+      "title": "stalled inference full (300s)",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"main\",window=\"300\",model=\"all\"}",
+          "legendFormat": "Main",
+          "refId": "A"
+        },
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"300\",model=\"all\"}",
+          "legendFormat": "Fleet",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 0.5
+              },
+              {
+                "color": "#cb4b16",
+                "value": 0.75
+              },
+              {
+                "color": "#dc322f",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      },
+      "description": "Sustained (5-min) STALLED inference pressure — the low-throughput subset of inference-full over the longer window. Main = the dispatcher; Fleet = fraction of the trailing 300s every active sub-agent was in a stalled (non-generating) inference gap at once (main loop excluded)."
+    },
+    {
       "id": 11,
       "title": "Main vs fleet — inference full (60s)",
       "type": "timeseries",
@@ -383,7 +541,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 10
+        "y": 15
       },
       "datasource": {
         "type": "prometheus",
@@ -439,7 +597,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 23
       },
       "datasource": {
         "type": "prometheus",
@@ -483,6 +641,62 @@
       "description": "Fraction of the trailing window in which EVERY active sub-agent in the fleet was blocked on inference at once. Sustained high values mean the fleet is API / rate-limit bound. One line per sliding window (10/60/300s). Main loop excluded (model=all aggregate)."
     },
     {
+      "id": 14,
+      "title": "Fleet STALLED inference pressure (full) — rate-limit bound",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",model=\"all\"}",
+          "legendFormat": "stalled_full · {{window}}s window",
+          "refId": "A"
+        },
+        {
+          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "legendFormat": "inference_full · 60s (total, for reference)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "description": "Fraction of the trailing window in which EVERY active sub-agent was in a STALLED inference gap at once (low output-token throughput => 429 / network / TTFT / queueing, not generation). One line per sliding window (10/60/300s). The total inference_full (60s) is overlaid for reference: the GAP between total and stalled is the fleet's PRODUCTIVE inference — when the two lines converge high, the fleet is rate-limit bound, not compute-bound. Main loop excluded."
+    },
+    {
       "id": 13,
       "title": "Per-agent duty cycle — share of ACTIVE time by category (stacked per agent)",
       "type": "timeseries",
@@ -490,7 +704,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 39
       },
       "datasource": {
         "type": "prometheus",

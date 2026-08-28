@@ -76,6 +76,33 @@ the idle tail was the main-loop idle undercount.
 
 This is a first-cut classifier, refined against the live Grafana series, not
 a perfect offline model.
+
+PRODUCTIVE vs STALLED INFERENCE (throughput split)
+--------------------------------------------------
+An ``inference`` interval only tells us the loop was blocked on the model — it
+cannot, on wall-time alone, tell steady token generation apart from a stall
+(429 back-off, network / TTFT latency, server-side queueing). But the assistant
+entry that BOUNDS the end of a closed inference gap carries
+``message.usage.output_tokens`` (which already folds in
+``output_tokens_details.thinking_tokens`` — extended thinking is productive
+output), so for that gap we can compute an effective throughput:
+
+    tok/s = output_tokens(of the turn that ended the gap) / gap_duration
+
+A gap whose throughput is far BELOW a normal generation rate means the
+wall-time was mostly stall, not generation, and we tag the interval
+``stalled``. Guards: gaps shorter than ``MIN_STALL_GAP_SECONDS`` are never
+tagged (a 1s / 100-token gap is obviously productive and TTFT dominates a short
+gap), and a gap with no ``output_tokens`` datum is left un-tagged (we do not cry
+wolf without evidence). The TRAILING open inference interval (an in-flight next
+turn whose token count is not yet known) is likewise never tagged — true
+intra-turn stall detection needs streaming-layer instrumentation the
+turn-granular transcript does not have (see the exporter's follow-up scoping).
+
+``stalled`` is a SUBSET flag on ``inference`` intervals, never a new category:
+the existing ``inference_some``/``inference_full`` remain the TOTAL inference
+pressure, and ``compute_stalled_inference_pressure`` reports the stalled slice
+of it with the same some/full semantics.
 """
 
 from __future__ import annotations
@@ -107,20 +134,44 @@ DEFAULT_MAX_GAP_SECONDS = 300.0
 # excluded from fleet/subtree pressure (matches cw-agent-stats' notion).
 DEFAULT_LIVE_WINDOW_SECONDS = 900.0
 
+# Effective-throughput floor (output tokens / second over an inference gap)
+# below which the gap's wall-time is judged to be mostly STALL (429 back-off /
+# network / TTFT / queueing) rather than generation. Claude's real output rate,
+# thinking tokens included, runs in the tens of tok/s; 8 tok/s sits well under
+# that floor so a healthy-but-slow turn is not mis-flagged, while a gap that
+# yielded only a handful of tokens over several seconds reads as the stall it
+# is. Tunable via AGENT_PSI_STALLED_TOKENS_PER_SEC.
+DEFAULT_STALLED_TOKENS_PER_SEC = 8.0
+# Inference gaps shorter than this are never tagged stalled: a sub-second /
+# few-second gap is dominated by fixed TTFT overhead, and a small-but-fast gap
+# (e.g. 100 tokens in 1s) is obviously productive. Guards divide-by-tiny noise.
+DEFAULT_MIN_STALL_GAP_SECONDS = 5.0
+
 # Decaying-window sizes (seconds) the exporter emits pressure for. Phase 1
 # uses fixed sliding windows ending at ``now``; a true exponential decay is a
 # phase-2 refinement.
 DEFAULT_WINDOWS = (10, 60, 300)
 
-Interval = namedtuple("Interval", ("start", "end", "category"))
+Interval = namedtuple("Interval", ("start", "end", "category", "stalled"))
+# ``stalled`` is meaningful only on an ``inference`` interval: True when the
+# gap's effective throughput fell below the stall floor. Defaults False so every
+# existing 3-arg Interval(...) construction (and the tests') stays valid and
+# reads as productive/not-applicable.
+Interval.__new__.__defaults__ = (False,)
 # A transcript's parsed intervals plus identity/liveness metadata. ``model`` is
 # the short model family the agent ran on (opus / sonnet / haiku / fable /
 # ...), fixed for the agent's lifetime, so per-model pressure = the same
 # some/full math restricted to agents sharing a ``model``.
+# ``running`` is True when the transcript does NOT end in a completed final turn
+# (see ``is_running_transcript``) — the accurate "still executing right now"
+# signal, so a finished sub-agent drops from the live count immediately instead
+# of lingering for the whole file-mtime live window.
 Transcript = namedtuple(
     "Transcript",
-    ("agent_id", "session_id", "is_main_loop", "model", "mtime", "intervals"),
+    ("agent_id", "session_id", "is_main_loop", "model", "mtime", "intervals",
+     "running"),
 )
+Transcript.__new__.__defaults__ = (True,)
 
 # Known short model families, matched as substrings of the raw transcript model
 # string (``claude-opus-5`` / ``claude-sonnet-5`` / bare ``opus`` all fold to a
@@ -133,7 +184,13 @@ _SYNTHETIC_MODEL = "<synthetic>"
 UNKNOWN_MODEL = "unknown"
 
 # Internal moment: one timestamped point on the transcript timeline.
-_Moment = namedtuple("_Moment", ("ts", "kind", "stop_reason", "tool_use_ids"))
+# ``output_tokens`` is the assistant turn's usage.output_tokens (thinking
+# included), used to judge inference-gap throughput; None on non-assistant
+# moments and when the usage datum is absent.
+_Moment = namedtuple(
+    "_Moment", ("ts", "kind", "stop_reason", "tool_use_ids", "output_tokens")
+)
+_Moment.__new__.__defaults__ = (None,)
 _ASST = "asst"
 _RESULT = "result"
 _PROMPT = "prompt"
@@ -212,15 +269,21 @@ def _entry_to_moment(entry):
 
     if etype == "assistant":
         stop = None
+        out_tokens = None
         msg = entry.get("message")
         if isinstance(msg, dict):
             stop = msg.get("stop_reason")
+            usage = msg.get("usage")
+            if isinstance(usage, dict):
+                ot = usage.get("output_tokens")
+                if isinstance(ot, (int, float)):
+                    out_tokens = ot
         tu_ids = [
             b.get("id")
             for b in _content_blocks(entry)
             if isinstance(b, dict) and b.get("type") == "tool_use"
         ]
-        return _Moment(ts, _ASST, stop, [i for i in tu_ids if i])
+        return _Moment(ts, _ASST, stop, [i for i in tu_ids if i], out_tokens)
 
     if etype == "user":
         blocks = _content_blocks(entry)
@@ -266,6 +329,22 @@ def _classify_gap(prev, cur, max_gap):
     if cur.kind == _PROMPT:
         return WAITING_HUMAN if prev.kind == _ASST else IDLE
     return OVERHEAD  # _BOOK
+
+
+def _is_stalled_inference(duration, output_tokens, stalled_tps, min_gap):
+    """True when an inference gap's effective throughput marks it a STALL.
+
+    ``output_tokens`` is the token count of the assistant turn that ENDED the
+    gap. Returns False (productive / not-judged) for: a gap shorter than
+    ``min_gap`` (TTFT-dominated, too short to judge), a non-positive duration
+    (divide-by-zero guard), or a missing token datum (no evidence). Otherwise
+    the gap is stalled iff output_tokens / duration < ``stalled_tps``.
+    """
+    if duration < min_gap or duration <= 0:
+        return False
+    if output_tokens is None:
+        return False
+    return (output_tokens / duration) < stalled_tps
 
 
 def _tail_interval(last, now, pending_tools, max_gap):
@@ -314,12 +393,19 @@ def _tail_interval(last, now, pending_tools, max_gap):
     return Interval(last.ts, now, category)
 
 
-def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS):
+def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
+                    stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
+                    min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS):
     """Ordered JSONL entries (dicts) -> list[Interval].
 
     ``entries`` need not be sorted; moments are sorted by timestamp. When
     ``now`` is given a trailing open interval is appended for the agent's
     current state (what makes the live fleet PSI reflect the present).
+
+    Each ``inference`` interval also carries a ``stalled`` flag set from the
+    ending assistant turn's output-token throughput (see
+    ``_is_stalled_inference``); the trailing open interval is never flagged
+    (its token count is not yet known).
     """
     moments = [m for m in (_entry_to_moment(e) for e in entries) if m is not None]
     moments.sort(key=lambda m: m.ts)
@@ -330,7 +416,11 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS):
     for prev, cur in zip(moments, moments[1:]):
         if cur.ts <= prev.ts:
             continue
-        intervals.append(Interval(prev.ts, cur.ts, _classify_gap(prev, cur, max_gap)))
+        cat = _classify_gap(prev, cur, max_gap)
+        stalled = cat == INFERENCE and _is_stalled_inference(
+            cur.ts - prev.ts, cur.output_tokens, stalled_tps, min_stall_gap
+        )
+        intervals.append(Interval(prev.ts, cur.ts, cat, stalled))
 
     result_ids = _all_result_ids(entries)
     last = moments[-1]
@@ -339,6 +429,37 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS):
     if tail is not None and tail.end > tail.start:
         intervals.append(tail)
     return intervals
+
+
+def is_running_transcript(entries):
+    """True if the transcript does NOT end in a completed final turn.
+
+    Liveness by state, not by file mtime: a sub-agent that returned its final
+    answer ends with an assistant ``end_turn`` that dispatched no still-pending
+    tool -> FINISHED (drop it from the live count immediately). Every other
+    trailing state is a running agent and stays live:
+
+    * last line is a ``tool_result`` — the next inference turn is pending;
+    * last line is an assistant turn with tools still in flight (their results
+      not yet in) — a blocking tool / bash wait that can legitimately leave the
+      transcript un-written for up to ``max_gap`` seconds;
+    * last line is an assistant turn whose ``stop_reason`` is not ``end_turn``
+      (still mid-turn), or a human/injected prompt.
+
+    An empty / unreadable transcript is not running.
+    """
+    moments = [m for m in (_entry_to_moment(e) for e in entries) if m is not None]
+    if not moments:
+        return False
+    moments.sort(key=lambda m: m.ts)
+    last = moments[-1]
+    if last.kind != _ASST:
+        return True
+    result_ids = _all_result_ids(entries)
+    pending = [i for i in last.tool_use_ids if i not in result_ids]
+    if pending:
+        return True
+    return last.stop_reason != "end_turn"
 
 
 # --- duty cycle ----------------------------------------------------------
@@ -378,6 +499,14 @@ def _state_at(intervals, t):
     for iv in intervals:
         if iv.start <= t < iv.end:
             return iv.category
+    return None
+
+
+def _interval_at(intervals, t):
+    """The interval covering instant ``t`` (start<=t<end), or None."""
+    for iv in intervals:
+        if iv.start <= t < iv.end:
+            return iv
     return None
 
 
@@ -427,6 +556,59 @@ def compute_pressure(agent_intervals, window_start, window_end):
     return {k: v / W for k, v in acc.items()}
 
 
+def compute_stalled_inference_pressure(agent_intervals, window_start, window_end):
+    """some/full pressure for the STALLED slice of inference over the window.
+
+    Mirrors ``compute_pressure`` exactly (same boundary sweep, same active-set
+    and PSI ``some``/``full`` semantics) but restricted to inference intervals
+    flagged ``stalled``. Returns {"some": x, "full": y} in [0, 1].
+
+    * ``some`` — fraction of the window in which >=1 agent is in a stalled
+      inference gap.
+    * ``full`` — fraction in which there is >=1 ACTIVE agent and EVERY active
+      agent is in a stalled inference gap (an agent in tool / productive
+      inference / overhead is active-but-not-stalled and so breaks ``full``).
+
+    Fleet ``full`` here is the "everyone is rate-limited right now" signal,
+    disentangled from "everyone generating hard" which ``inference_full``
+    conflated.
+    """
+    W = window_end - window_start
+    acc = {"some": 0.0, "full": 0.0}
+    if W <= 0:
+        return acc
+
+    points = {window_start, window_end}
+    for ivs in agent_intervals.values():
+        for iv in ivs:
+            if iv.end <= window_start or iv.start >= window_end:
+                continue
+            points.add(max(iv.start, window_start))
+            points.add(min(iv.end, window_end))
+    points = sorted(p for p in points if window_start <= p <= window_end)
+
+    for a, b in zip(points, points[1:]):
+        d = b - a
+        if d <= 0:
+            continue
+        mid = (a + b) / 2.0
+        active = 0
+        stalled = 0
+        for ivs in agent_intervals.values():
+            iv = _interval_at(ivs, mid)
+            if iv is None or iv.category not in ACTIVE_CATEGORIES:
+                continue
+            active += 1
+            if iv.category == INFERENCE and iv.stalled:
+                stalled += 1
+        if stalled >= 1:
+            acc["some"] += d
+        if active >= 1 and stalled == active:
+            acc["full"] += d
+
+    return {k: v / W for k, v in acc.items()}
+
+
 # --- transcript discovery + reading -------------------------------------
 def _agent_id_from_path(path):
     base = os.path.basename(path)
@@ -436,7 +618,9 @@ def _agent_id_from_path(path):
 
 
 def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
-                    is_main_loop=False, session_id=None):
+                    is_main_loop=False, session_id=None,
+                    stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
+                    min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS):
     """Read one transcript file -> Transcript, tolerant of malformed lines.
 
     Returns None if the file can't be read at all. Individual bad JSONL lines
@@ -461,9 +645,15 @@ def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
         agent_id = "main_loop:" + (session_id or "")[:8]
     else:
         agent_id = _agent_id_from_path(path) or os.path.basename(path)
-    intervals = parse_intervals(entries, now=now, max_gap=max_gap)
+    intervals = parse_intervals(
+        entries, now=now, max_gap=max_gap,
+        stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
+    )
     model = extract_model(entries)
-    return Transcript(agent_id, session_id, is_main_loop, model, mtime, intervals)
+    running = is_running_transcript(entries)
+    return Transcript(
+        agent_id, session_id, is_main_loop, model, mtime, intervals, running
+    )
 
 
 def discover_transcripts(projects_dir):
@@ -506,7 +696,9 @@ def discover_transcripts(projects_dir):
 
 
 def collect_live_transcripts(projects_dir, now, max_gap=DEFAULT_MAX_GAP_SECONDS,
-                             live_window=DEFAULT_LIVE_WINDOW_SECONDS):
+                             live_window=DEFAULT_LIVE_WINDOW_SECONDS,
+                             stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
+                             min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS):
     """Read every transcript whose file was modified within ``live_window`` of
     ``now``. Returns list[Transcript]."""
     live = []
@@ -520,6 +712,7 @@ def collect_live_transcripts(projects_dir, now, max_gap=DEFAULT_MAX_GAP_SECONDS,
         t = read_transcript(
             path, now=now, max_gap=max_gap,
             is_main_loop=is_main, session_id=session_id,
+            stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
         )
         if t is not None:
             live.append(t)
