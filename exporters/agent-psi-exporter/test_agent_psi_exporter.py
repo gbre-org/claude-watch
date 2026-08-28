@@ -29,7 +29,17 @@ Scenarios:
       (fable) and one sub-agent transcript (opus) -> live_agents=1 (subagents
       only, main excluded), fleet scope excludes the main loop, a separate
       `main` scope, per-model fleet lines (opus present, fable absent),
-      pressure gauges in [0,1], build_info emitted.
+      pressure gauges in [0,1] (inference/tool AND the stalled subset),
+      build_info emitted.
+  (6) Inference-gap throughput split: a fast-tokens gap is productive, a long
+      low-token gap is stalled, a sub-min-gap gap is never stalled, a gap with
+      no output_tokens is not judged, and the zero-duration guard holds.
+  (7) Stalled-inference some/full mirrors the inference some/full math (idle
+      agents don't block full), and demonstrates the disentangling: an
+      all-productive fleet has inference_full=1 but stalled_full=0.
+  (8) live_agents reflects STILL-RUNNING sub-agents (transcript not ended in a
+      completed final turn), not merely file-recent: a finished agent drops
+      immediately, a mid-tool-wait agent stays live.
 
 Run:  python3 test_agent_psi_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
@@ -57,7 +67,8 @@ def iso(epoch):
     )
 
 
-def assistant(ts, *, tool_use_ids=(), stop_reason=None, model=None):
+def assistant(ts, *, tool_use_ids=(), stop_reason=None, model=None,
+              output_tokens=None):
     content = [{"type": "text", "text": "..."}]
     for tid in tool_use_ids:
         content.append({"type": "tool_use", "id": tid, "name": "Bash"})
@@ -66,6 +77,13 @@ def assistant(ts, *, tool_use_ids=(), stop_reason=None, model=None):
     msg = {"role": "assistant", "content": content, "stop_reason": stop_reason}
     if model is not None:
         msg["model"] = model
+    if output_tokens is not None:
+        # Mirror the real transcript shape: usage.output_tokens already folds in
+        # output_tokens_details.thinking_tokens.
+        msg["usage"] = {
+            "output_tokens": output_tokens,
+            "output_tokens_details": {"thinking_tokens": 0},
+        }
     return {
         "type": "assistant",
         "timestamp": iso(ts),
@@ -280,6 +298,65 @@ def run():
           and approx(p_sonnet[(agent_psi.INFERENCE, "full")], 0.0),
           f"got {p_sonnet}")
 
+    # ---- Scenario 6: productive vs stalled inference classification ----
+    print("\nScenario 6: inference-gap throughput -> productive / stalled")
+
+    def only_inference(entries):
+        ivs = agent_psi.parse_intervals(entries, now=None)
+        inf = [iv for iv in ivs if iv.category == agent_psi.INFERENCE]
+        assert len(inf) == 1, f"expected 1 inference interval, got {inf}"
+        return inf[0]
+
+    # Fast tokens over a multi-second gap -> productive (stalled=False).
+    fast = only_inference([tool_result(0, "X"), assistant(10, output_tokens=500)])
+    check("fast-tokens inference gap is productive (50 tok/s)",
+          fast.stalled is False, f"got stalled={fast.stalled}")
+    # Long gap, few tokens -> stalled (2 tok/s < 8 floor).
+    slow = only_inference([tool_result(0, "X"), assistant(30, output_tokens=60)])
+    check("long low-token inference gap is stalled (2 tok/s)",
+          slow.stalled is True, f"got stalled={slow.stalled}")
+    # Tiny gap below the min-gap guard is never stalled, even at 0.5 tok/s.
+    tiny = only_inference([tool_result(0, "X"), assistant(2, output_tokens=1)])
+    check("sub-min-gap inference gap is never stalled (guard)",
+          tiny.stalled is False, f"got stalled={tiny.stalled}")
+    # No usage datum -> not judged stalled (no evidence, no false alarm).
+    notok = only_inference([tool_result(0, "X"), assistant(30)])
+    check("inference gap with no output_tokens is not stalled",
+          notok.stalled is False, f"got stalled={notok.stalled}")
+    # Direct divide-by-zero / degenerate-duration guard on the helper.
+    check("_is_stalled_inference guards zero duration",
+          agent_psi._is_stalled_inference(0.0, 100, 8.0, 5.0) is False,
+          "zero-duration gap classified stalled")
+
+    # ---- Scenario 7: stalled-inference some/full pressure --------------
+    print("\nScenario 7: stalled-inference some/full mirrors inference some/full")
+    # A stalled the whole window; B productive [0,5] then stalled [5,10].
+    a_s = [I(0, 10, agent_psi.INFERENCE, True)]
+    b_s = [I(0, 5, agent_psi.INFERENCE, False), I(5, 10, agent_psi.INFERENCE, True)]
+    ps = agent_psi.compute_stalled_inference_pressure({"a": a_s, "b": b_s}, 0, 10)
+    check("stalled some = 1.0 (>=1 agent stalled throughout)",
+          approx(ps["some"], 1.0), f"got {ps['some']}")
+    check("stalled full = 0.5 (both stalled only in [5,10])",
+          approx(ps["full"], 0.5), f"got {ps['full']}")
+    # An idle agent must NOT block stalled full (mirrors the inference_full rule).
+    idle = [I(0, 10, agent_psi.IDLE)]
+    ps2 = agent_psi.compute_stalled_inference_pressure({"a": a_s, "c": idle}, 0, 10)
+    check("idle agent doesn't block stalled full",
+          approx(ps2["full"], 1.0), f"got {ps2['full']}")
+    # The disentangling: a fleet all PRODUCTIVELY on inference has inference_full
+    # = 1.0 but stalled_full = 0 (this is exactly what the split buys us).
+    prod = {
+        "a": [I(0, 10, agent_psi.INFERENCE, False)],
+        "b": [I(0, 10, agent_psi.INFERENCE, False)],
+    }
+    p_inf = agent_psi.compute_pressure(prod, 0, 10)
+    p_stall = agent_psi.compute_stalled_inference_pressure(prod, 0, 10)
+    check("all-productive fleet: inference_full=1 but stalled_full=0",
+          approx(p_inf[(agent_psi.INFERENCE, "full")], 1.0)
+          and approx(p_stall["full"], 0.0),
+          f"got inference_full={p_inf[(agent_psi.INFERENCE, 'full')]} "
+          f"stalled_full={p_stall['full']}")
+
     # ---- Scenario 5: end-to-end scrape ---------------------------------
     print("\nScenario 5: end-to-end scrape over a synthetic projects dir")
     import time
@@ -359,12 +436,77 @@ def run():
                        model="opus")
     check("per-model opus inference_full emitted in [0,1]",
           opus_full is not None and 0.0 <= opus_full <= 1.0, f"got {opus_full}")
+    # Stalled-inference gauges are emitted with the same scope/window/model
+    # label scheme, values in [0,1] (the synthetic worker has no output_tokens
+    # so it is not judged stalled -> 0, but the series must exist).
+    stalled_some = sample("agent_psi_inference_stalled_some", scope="fleet",
+                          window="60", model="all")
+    check("fleet inference_stalled_some emitted in [0,1]",
+          stalled_some is not None and 0.0 <= stalled_some <= 1.0,
+          f"got {stalled_some}")
+    stalled_full_main = sample("agent_psi_inference_stalled_full", scope="main",
+                               window="60", model="all")
+    check("main inference_stalled_full emitted in [0,1]",
+          stalled_full_main is not None and 0.0 <= stalled_full_main <= 1.0,
+          f"got {stalled_full_main}")
     session_scope = sample("agent_psi_scope_agents", scope="session:abcd1234",
                            model="all")
     check("session subtree scope emitted", session_scope == 2, f"got {session_scope}")
     build = sample("agent_psi_exporter_build_info", commit="unknown",
                    version="0.0.0", source="host")
     check("build_info emitted", build == 1, f"got {build}")
+
+    # ---- Scenario 8: live_agents = still-running, not file-recent ------
+    print("\nScenario 8: live_agents reflects still-running agents")
+    # is_running by trailing state (pure).
+    finished = [prompt(0), assistant(2, tool_use_ids=["X"]),
+                tool_result(4, "X"), assistant(5)]  # ends end_turn, no pending
+    check("finished agent (trailing end_turn) is NOT running",
+          agent_psi.is_running_transcript(finished) is False, "reported running")
+    mid_tool = [prompt(0), assistant(2, tool_use_ids=["W"])]  # tool in flight
+    check("mid-tool-wait agent stays running",
+          agent_psi.is_running_transcript(mid_tool) is True, "reported finished")
+    pending_turn = [assistant(0, tool_use_ids=["R"]), tool_result(1, "R")]
+    check("trailing tool_result (next turn pending) is running",
+          agent_psi.is_running_transcript(pending_turn) is True,
+          "reported finished")
+    check("empty transcript is not running",
+          agent_psi.is_running_transcript([]) is False, "reported running")
+
+    # End-to-end: a running worker + a FINISHED worker, both file-recent within
+    # the live window -> live_agents drops the finished one immediately (1), yet
+    # both still count toward fleet scope membership (2), because the finished
+    # one legitimately contributed to the trailing window.
+    tmp2 = tempfile.mkdtemp(prefix="agent-psi-live-")
+    slug2 = os.path.join(tmp2, "-home-someone")
+    sess2 = "beef5678-0000-0000-0000-000000000000"
+    subs2 = os.path.join(slug2, sess2, "subagents")
+    os.makedirs(subs2)
+    now2 = time.time()
+    running_worker = [
+        prompt(now2 - 8),
+        assistant(now2 - 6, tool_use_ids=["A"], model="claude-opus-5"),
+        tool_result(now2 - 1, "A"),  # trailing tool_result -> running
+    ]
+    finished_worker = [
+        prompt(now2 - 40),
+        assistant(now2 - 38, tool_use_ids=["B"], model="claude-opus-5"),
+        tool_result(now2 - 35, "B"),
+        assistant(now2 - 30, model="claude-opus-5"),  # end_turn -> finished
+    ]
+    with open(os.path.join(subs2, "agent-1111.jsonl"), "w") as fh:
+        for e in running_worker:
+            fh.write(json.dumps(e) + "\n")
+    with open(os.path.join(subs2, "agent-2222.jsonl"), "w") as fh:
+        for e in finished_worker:
+            fh.write(json.dumps(e) + "\n")
+    live_ts = agent_psi.collect_live_transcripts(tmp2, now2)
+    running_ct = sum(1 for t in live_ts if not t.is_main_loop and t.running)
+    filerecent_ct = sum(1 for t in live_ts if not t.is_main_loop)
+    check("both workers are file-recent (in live window)", filerecent_ct == 2,
+          f"got {filerecent_ct}")
+    check("only the running worker counts as live", running_ct == 1,
+          f"got {running_ct}")
 
     # ---- summary -------------------------------------------------------
     print()

@@ -30,6 +30,17 @@ Metrics
         Fraction of the trailing ``window`` seconds in which, for the set of
         agents named by ``scope``, >=1 agent (some) / every active agent
         (full) was blocked on inference / tool. ``scope`` is "fleet"
+  - agent_psi_inference_stalled_some{scope,window,model} gauge [HEADLINE]
+  - agent_psi_inference_stalled_full{scope,window,model} gauge [HEADLINE]
+        The STALLED slice of inference pressure: same some/full semantics and
+        the same scope/window/model labels as agent_psi_inference_{some,full},
+        but restricted to inference gaps whose output-token throughput fell
+        below AGENT_PSI_STALLED_TOKENS_PER_SEC (429 back-off / network / TTFT /
+        queueing rather than generation). It is a SUBSET of inference_* — the
+        latter stays the total. Fleet ``stalled_full`` near 1.0 means every
+        live worker is rate-limited at once, disentangled from "everyone
+        generating hard" (which inference_full alone conflated). ``scope`` is
+        "fleet"
         (sub-agents only — the main loop is EXCLUDED), "main" (the main loop /
         dispatcher on its own), or "session:<8-char id>" (a main loop + its
         live sub-agents). ``window`` is "10" / "60" / "300". ``model`` is "all"
@@ -40,8 +51,12 @@ Metrics
   - agent_psi_scope_agents{scope,model}      gauge
         Count of live agents contributing to each (scope, model) pressure line.
   - agent_psi_live_agents                    gauge
-        Total live SUB-AGENT transcripts seen this scrape (the main loop is
-        excluded — it is a dispatcher, not a worker).
+        SUB-AGENTS actually still running this scrape (the main loop is excluded
+        — it is a dispatcher, not a worker). "Running" = the transcript does not
+        end in a completed final turn (an assistant end_turn with no pending
+        tool); a finished agent drops immediately instead of lingering for the
+        file-mtime live window, and an agent mid-turn / mid-tool-wait (open
+        trailing interval) stays counted.
   - agent_duty_ratio{agent_id,category}      gauge
         Per-agent duty-cycle: share of ACTIVE time (total − idle −
         waiting_human) for category in {inference,tool,overhead}. For a serial
@@ -94,6 +109,18 @@ WINDOWS = tuple(
     ).split(",")
     if w.strip()
 )
+STALLED_TOKENS_PER_SEC = float(
+    os.environ.get(
+        "AGENT_PSI_STALLED_TOKENS_PER_SEC",
+        str(agent_psi.DEFAULT_STALLED_TOKENS_PER_SEC),
+    )
+)
+MIN_STALL_GAP_SECONDS = float(
+    os.environ.get(
+        "AGENT_PSI_MIN_STALL_GAP_SECONDS",
+        str(agent_psi.DEFAULT_MIN_STALL_GAP_SECONDS),
+    )
+)
 
 EXPORTER_COMMIT = os.environ.get("AGENT_PSI_EXPORTER_COMMIT", "").strip() or "unknown"
 EXPORTER_VERSION = os.environ.get("AGENT_PSI_EXPORTER_VERSION", "").strip() or "0.0.0"
@@ -118,6 +145,24 @@ for _cat in agent_psi.STALL_CATEGORIES:
             registry=REG,
         )
 
+# Stalled-inference pressure — the low-throughput subset of inference_*, same
+# scope/window/model label scheme so the dashboard consumes it identically.
+_STALLED_GAUGES = {}
+for _kind in ("some", "full"):
+    _STALLED_GAUGES[_kind] = Gauge(
+        f"agent_psi_inference_stalled_{_kind}",
+        (
+            f"Fraction of the trailing `window` seconds in which "
+            f"{'>=1 agent' if _kind == 'some' else 'every active agent'} in "
+            f"`scope` (restricted to `model`, or model=all) was in a STALLED "
+            f"inference gap (output-token throughput below the stall floor: "
+            f"429 back-off / network / TTFT / queueing). Subset of "
+            f"agent_psi_inference_{_kind}."
+        ),
+        ["scope", "window", "model"],
+        registry=REG,
+    )
+
 g_scope_agents = Gauge(
     "agent_psi_scope_agents",
     "Count of live agents contributing to each (scope, model) pressure line.",
@@ -126,7 +171,11 @@ g_scope_agents = Gauge(
 )
 g_live_agents = Gauge(
     "agent_psi_live_agents",
-    "Total live SUB-AGENT transcripts seen this scrape (main loop excluded).",
+    (
+        "SUB-AGENTS actually still running this scrape — transcript not ended "
+        "in a completed final turn (main loop excluded). A finished agent drops "
+        "immediately; a mid-tool-wait agent stays counted."
+    ),
     registry=REG,
 )
 g_duty_ratio = Gauge(
@@ -169,11 +218,19 @@ g_build_info.labels(
 
 
 def _emit_pressure(scope, agent_intervals, now, model="all"):
-    """Emit some/full for every stall category and window for one scope+model."""
+    """Emit some/full for every stall category and window for one scope+model,
+    plus the stalled-inference some/full subset."""
     for window in WINDOWS:
         ratios = agent_psi.compute_pressure(agent_intervals, now - window, now)
         for (cat, kind), value in ratios.items():
             _PRESSURE_GAUGES[(cat, kind)].labels(
+                scope=scope, window=str(window), model=model
+            ).set(value)
+        stalled = agent_psi.compute_stalled_inference_pressure(
+            agent_intervals, now - window, now
+        )
+        for kind, value in stalled.items():
+            _STALLED_GAUGES[kind].labels(
                 scope=scope, window=str(window), model=model
             ).set(value)
 
@@ -185,6 +242,8 @@ def collect():
         transcripts = agent_psi.collect_live_transcripts(
             PROJECTS_DIR, now,
             max_gap=MAX_GAP_SECONDS, live_window=LIVE_WINDOW_SECONDS,
+            stalled_tps=STALLED_TOKENS_PER_SEC,
+            min_stall_gap=MIN_STALL_GAP_SECONDS,
         )
     except Exception as e:  # pragma: no cover - defensive
         log.error("Failed to read %s: %s", PROJECTS_DIR, e)
@@ -192,6 +251,8 @@ def collect():
         return
 
     for gauge in _PRESSURE_GAUGES.values():
+        gauge.clear()
+    for gauge in _STALLED_GAUGES.values():
         gauge.clear()
     g_scope_agents.clear()
     g_duty_ratio.clear()
@@ -203,7 +264,13 @@ def collect():
     sub_transcripts = [t for t in transcripts if not t.is_main_loop]
     main_transcripts = [t for t in transcripts if t.is_main_loop]
 
-    g_live_agents.set(len(sub_transcripts))
+    # live_agents = sub-agents ACTUALLY still running now (transcript not ended
+    # in a completed final turn), not merely file-recent. A finished sub-agent
+    # drops immediately instead of lingering for the whole file-mtime live
+    # window; a mid-tool-wait agent (open trailing interval) stays counted.
+    # Pressure/scope membership still spans every file-recent sub-agent, since
+    # one that finished mid-window legitimately contributed to that window.
+    g_live_agents.set(sum(1 for t in sub_transcripts if t.running))
 
     # Per-agent duty cycle (byproduct) — every live transcript, main + workers.
     for t in transcripts:
@@ -271,6 +338,10 @@ def main():
     log.info(
         "Build: commit=%s version=%s source=%s",
         EXPORTER_COMMIT, EXPORTER_VERSION, EXPORTER_SOURCE,
+    )
+    log.info(
+        "Stall split: <%.1f tok/s over a >=%.1fs inference gap => stalled",
+        STALLED_TOKENS_PER_SEC, MIN_STALL_GAP_SECONDS,
     )
     collect()
     HTTPServer(("0.0.0.0", PORT), MetricsHandler).serve_forever()
