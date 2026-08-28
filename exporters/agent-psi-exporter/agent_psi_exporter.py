@@ -23,19 +23,25 @@ per scrape.
 
 Metrics
 -------
-  - agent_psi_inference_some{scope,window}   gauge  [HEADLINE]
-  - agent_psi_inference_full{scope,window}   gauge  [HEADLINE]
-  - agent_psi_tool_some{scope,window}        gauge  [HEADLINE]
-  - agent_psi_tool_full{scope,window}        gauge  [HEADLINE]
+  - agent_psi_inference_some{scope,window,model}   gauge  [HEADLINE]
+  - agent_psi_inference_full{scope,window,model}   gauge  [HEADLINE]
+  - agent_psi_tool_some{scope,window,model}        gauge  [HEADLINE]
+  - agent_psi_tool_full{scope,window,model}        gauge  [HEADLINE]
         Fraction of the trailing ``window`` seconds in which, for the set of
         agents named by ``scope``, >=1 agent (some) / every active agent
-        (full) was blocked on inference / tool. ``scope`` is "fleet" (all live
-        transcripts) or "session:<8-char id>" (a main loop + its live
-        sub-agents). ``window`` is "10" / "60" / "300".
-  - agent_psi_scope_agents{scope}            gauge
-        Count of live agents contributing to each pressure scope.
+        (full) was blocked on inference / tool. ``scope`` is "fleet"
+        (sub-agents only — the main loop is EXCLUDED), "main" (the main loop /
+        dispatcher on its own), or "session:<8-char id>" (a main loop + its
+        live sub-agents). ``window`` is "10" / "60" / "300". ``model`` is "all"
+        for the cross-model aggregate, or a model family (opus / sonnet / ...)
+        for the per-model breakdown emitted on the "fleet" scope so a single
+        model's rate-limiting isolates as e.g.
+        agent_psi_inference_full{scope="fleet",model="opus"}.
+  - agent_psi_scope_agents{scope,model}      gauge
+        Count of live agents contributing to each (scope, model) pressure line.
   - agent_psi_live_agents                    gauge
-        Total live transcripts seen this scrape.
+        Total live SUB-AGENT transcripts seen this scrape (the main loop is
+        excluded — it is a dispatcher, not a worker).
   - agent_duty_ratio{agent_id,category}      gauge
         Per-agent duty-cycle: share of ACTIVE time (total − idle −
         waiting_human) for category in {inference,tool,overhead}. For a serial
@@ -105,21 +111,22 @@ for _cat in agent_psi.STALL_CATEGORIES:
             (
                 f"Fraction of the trailing `window` seconds in which "
                 f"{'>=1 agent' if _kind == 'some' else 'every active agent'} in "
-                f"`scope` was blocked on {_cat}."
+                f"`scope` (restricted to `model`, or model=all) was blocked on "
+                f"{_cat}."
             ),
-            ["scope", "window"],
+            ["scope", "window", "model"],
             registry=REG,
         )
 
 g_scope_agents = Gauge(
     "agent_psi_scope_agents",
-    "Count of live agents contributing to each pressure scope.",
-    ["scope"],
+    "Count of live agents contributing to each (scope, model) pressure line.",
+    ["scope", "model"],
     registry=REG,
 )
 g_live_agents = Gauge(
     "agent_psi_live_agents",
-    "Total live transcripts seen this scrape.",
+    "Total live SUB-AGENT transcripts seen this scrape (main loop excluded).",
     registry=REG,
 )
 g_duty_ratio = Gauge(
@@ -161,13 +168,13 @@ g_build_info.labels(
 ).set(1)
 
 
-def _emit_pressure(scope, agent_intervals, now):
-    """Emit some/full for every stall category and window for one scope."""
+def _emit_pressure(scope, agent_intervals, now, model="all"):
+    """Emit some/full for every stall category and window for one scope+model."""
     for window in WINDOWS:
         ratios = agent_psi.compute_pressure(agent_intervals, now - window, now)
         for (cat, kind), value in ratios.items():
             _PRESSURE_GAUGES[(cat, kind)].labels(
-                scope=scope, window=str(window)
+                scope=scope, window=str(window), model=model
             ).set(value)
 
 
@@ -190,9 +197,15 @@ def collect():
     g_duty_ratio.clear()
     g_duty_seconds.clear()
 
-    g_live_agents.set(len(transcripts))
+    # The main loop is a dispatcher (mostly parked between turns); its profile
+    # is nothing like a worker sub-agent, so it is split out of the fleet and
+    # the live-agent count, and reported under its own scope side-by-side.
+    sub_transcripts = [t for t in transcripts if not t.is_main_loop]
+    main_transcripts = [t for t in transcripts if t.is_main_loop]
 
-    # Per-agent duty cycle (byproduct).
+    g_live_agents.set(len(sub_transcripts))
+
+    # Per-agent duty cycle (byproduct) — every live transcript, main + workers.
     for t in transcripts:
         secs, total, active, ratios = agent_psi.duty_cycle(t.intervals)
         for cat, value in secs.items():
@@ -200,19 +213,35 @@ def collect():
         for cat, value in ratios.items():
             g_duty_ratio.labels(agent_id=t.agent_id, category=cat).set(value)
 
-    # Fleet pressure (headline).
-    fleet = {t.agent_id: t.intervals for t in transcripts}
-    _emit_pressure("fleet", fleet, now)
-    g_scope_agents.labels(scope="fleet").set(len(fleet))
+    # Fleet pressure (headline) — SUB-AGENTS ONLY, main loop excluded.
+    fleet = {t.agent_id: t.intervals for t in sub_transcripts}
+    _emit_pressure("fleet", fleet, now, model="all")
+    g_scope_agents.labels(scope="fleet", model="all").set(len(fleet))
 
-    # Per-session subtree pressure (headline).
+    # Per-model fleet pressure (headline) — the same some/full math restricted
+    # to the workers on each model family, so per-model rate-limiting isolates.
+    by_model = {}
+    for t in sub_transcripts:
+        by_model.setdefault(t.model or agent_psi.UNKNOWN_MODEL, {})[
+            t.agent_id
+        ] = t.intervals
+    for model, members in by_model.items():
+        _emit_pressure("fleet", members, now, model=model)
+        g_scope_agents.labels(scope="fleet", model=model).set(len(members))
+
+    # Main-loop pressure (headline) — the dispatcher on its own scope/line.
+    main = {t.agent_id: t.intervals for t in main_transcripts}
+    _emit_pressure("main", main, now, model="all")
+    g_scope_agents.labels(scope="main", model="all").set(len(main))
+
+    # Per-session subtree pressure (headline) — main loop + its live workers.
     by_session = {}
     for t in transcripts:
         by_session.setdefault(t.session_id or "unknown", {})[t.agent_id] = t.intervals
     for session_id, members in by_session.items():
         scope = "session:" + (session_id or "unknown")[:8]
-        _emit_pressure(scope, members, now)
-        g_scope_agents.labels(scope=scope).set(len(members))
+        _emit_pressure(scope, members, now, model="all")
+        g_scope_agents.labels(scope=scope, model="all").set(len(members))
 
 
 class MetricsHandler(BaseHTTPRequestHandler):

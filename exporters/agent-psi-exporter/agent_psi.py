@@ -42,9 +42,14 @@ some/full form a hierarchy:
 * subtree — an agent plus its live sub-agents. Here we scope it to a session:
   the main-loop transcript plus every live sub-agent transcript under that
   session. ``some``/``full`` diverge once >1 member is live.
-* fleet — every live transcript across all sessions. Fleet ``full`` on
-  inference is the money metric: every live agent stalled on the model at
-  once means we are API / rate-limit bound and more parallelism buys nothing.
+* fleet — every live SUB-AGENT transcript across all sessions. The main loop is
+  a dispatcher, mostly parked between turns; blending its idle-heavy profile
+  into the worker fleet pollutes the signal, so it is EXCLUDED from ``fleet``
+  and reported under its own ``main`` scope side-by-side. Fleet ``full`` on
+  inference is the money metric: every live worker stalled on the model at once
+  means we are API / rate-limit bound and more parallelism buys nothing. Fleet
+  pressure is also computed per model family (the same math restricted to the
+  workers on that model), so a single model's rate-limiting is isolatable.
 
 CLASSIFIER (deliberately rough — phase 1)
 -----------------------------------------
@@ -58,12 +63,16 @@ each gap by what BOUNDS its end:
   produced output, else ``idle``.
 * gap ending at a bookkeeping line   -> ``overhead``.
 
-A gap longer than ``MAX_GAP_SECONDS`` that does NOT end at a tool_result is
-reclassified ``idle`` (a dormant / resumed-session gap should not read as a
+A closed gap longer than ``MAX_GAP_SECONDS`` that does NOT end at a tool_result
+is reclassified ``idle`` (a dormant / resumed-session gap should not read as a
 multi-minute inference stall; a genuinely long tool — a slow build — DOES end
 at a tool_result and stays ``tool``, uncapped). A trailing open interval from
-the last moment to ``now`` captures the agent's CURRENT state so the live
-fleet PSI reflects "are we blocked right now".
+the last moment to ``now`` captures the agent's CURRENT state so the live fleet
+PSI reflects "are we blocked right now". That trailing state is decided first,
+then the cap applies only to an inference/overhead tail: a parked-idle tail (a
+dispatcher between turns) and an in-flight-tool tail (a foreground blocking Bash
+wait) are counted at their TRUE wall-clock length, never truncated — capping
+the idle tail was the main-loop idle undercount.
 
 This is a first-cut classifier, refined against the live Grafana series, not
 a perfect offline model.
@@ -104,11 +113,24 @@ DEFAULT_LIVE_WINDOW_SECONDS = 900.0
 DEFAULT_WINDOWS = (10, 60, 300)
 
 Interval = namedtuple("Interval", ("start", "end", "category"))
-# A transcript's parsed intervals plus identity/liveness metadata.
+# A transcript's parsed intervals plus identity/liveness metadata. ``model`` is
+# the short model family the agent ran on (opus / sonnet / haiku / fable /
+# ...), fixed for the agent's lifetime, so per-model pressure = the same
+# some/full math restricted to agents sharing a ``model``.
 Transcript = namedtuple(
     "Transcript",
-    ("agent_id", "session_id", "is_main_loop", "mtime", "intervals"),
+    ("agent_id", "session_id", "is_main_loop", "model", "mtime", "intervals"),
 )
+
+# Known short model families, matched as substrings of the raw transcript model
+# string (``claude-opus-5`` / ``claude-sonnet-5`` / bare ``opus`` all fold to a
+# family). Kept explicit so an unrecognised value is surfaced verbatim rather
+# than silently bucketed.
+MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+# Placeholder the transcript uses for injected / non-inference assistant lines;
+# never a real model, so it must not count toward an agent's model.
+_SYNTHETIC_MODEL = "<synthetic>"
+UNKNOWN_MODEL = "unknown"
 
 # Internal moment: one timestamped point on the transcript timeline.
 _Moment = namedtuple("_Moment", ("ts", "kind", "stop_reason", "tool_use_ids"))
@@ -128,6 +150,49 @@ def parse_ts(value):
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError):
         return None
+
+
+def model_family(raw):
+    """Map a raw transcript model string to a short family label, or None.
+
+    ``claude-opus-5`` / ``claude-opus-4-8`` / bare ``opus`` -> ``"opus"``. The
+    ``<synthetic>`` placeholder and empty / non-string values return None (not a
+    real model). An unrecognised but non-empty value is returned lower-cased and
+    verbatim so it is visible rather than silently dropped.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip().lower()
+    if not s or s == _SYNTHETIC_MODEL:
+        return None
+    for fam in MODEL_FAMILIES:
+        if fam in s:
+            return fam
+    return s
+
+
+def extract_model(entries):
+    """Dominant real model family across an entries list, or ``UNKNOWN_MODEL``.
+
+    The model is fixed for an agent's lifetime; we still take the most common
+    real (non-synthetic) family seen across the assistant turns so a stray
+    placeholder line can't shift the label.
+    """
+    from collections import Counter
+
+    counts = Counter()
+    for e in entries:
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message")
+        if not isinstance(msg, dict):
+            continue
+        fam = model_family(msg.get("model"))
+        if fam:
+            counts[fam] += 1
+    if not counts:
+        return UNKNOWN_MODEL
+    return counts.most_common(1)[0][0]
 
 
 def _content_blocks(entry):
@@ -205,18 +270,33 @@ def _classify_gap(prev, cur, max_gap):
 
 def _tail_interval(last, now, pending_tools, max_gap):
     """Open interval from the last moment to ``now`` = the agent's current
-    state, or None if the agent is dormant / ``now`` precedes it."""
+    state, or None if ``now`` precedes the last moment.
+
+    The current state is decided FIRST, from what the loop last did, and only
+    then is the max-gap cap applied — and only to an inference/overhead tail.
+    Two states are counted at their TRUE wall-clock length, never truncated:
+
+    * ``idle`` — a loop parked between turns (a returned ``end_turn`` with no
+      tool dispatched) is genuinely idle for however long it waits. Capping it
+      was the main-loop idle undercount: a dispatcher is mostly idle, and a
+      multi-minute parked wait must read as multi-minutes of idle, not 300s.
+    * ``tool`` — a dispatched-but-unfinished tool is a real ``tool_use`` in
+      flight (a foreground blocking Bash wait — an ``until``-loop, a ``sleep``,
+      a slow build — is the loop actively IN a tool). It is tool time, not
+      idle, no matter how long it runs.
+
+    Only an ``inference`` / ``overhead`` tail longer than ``max_gap`` is capped
+    to idle: a multi-minute gap with no tool running and no return-of-control is
+    far more likely a dormant / resumed-session gap than a genuine multi-minute
+    model stall, and must not read as sustained inference pressure.
+    """
     if now is None or now <= last.ts:
         return None
-    end = now
-    if now - last.ts > max_gap:
-        # Dormant since the last event — call it idle up to the cap, no more.
-        return Interval(last.ts, min(now, last.ts + max_gap), IDLE)
     if last.kind == _ASST:
         if pending_tools:
             category = TOOL  # tools dispatched, results not yet in.
         elif last.stop_reason == "end_turn":
-            category = IDLE  # returned control; waiting.
+            category = IDLE  # returned control; parked, waiting.
         else:
             category = INFERENCE
     elif last.kind == _RESULT:
@@ -225,7 +305,13 @@ def _tail_interval(last, now, pending_tools, max_gap):
         category = INFERENCE
     else:
         category = OVERHEAD
-    return Interval(last.ts, end, category)
+    if category in (IDLE, TOOL):
+        # Parked-idle and in-flight tool are true wall-clock, never capped.
+        return Interval(last.ts, now, category)
+    if now - last.ts > max_gap:
+        # Dormant / resumed-session gap; not a multi-minute model stall.
+        return Interval(last.ts, min(now, last.ts + max_gap), IDLE)
+    return Interval(last.ts, now, category)
 
 
 def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS):
@@ -376,7 +462,8 @@ def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
     else:
         agent_id = _agent_id_from_path(path) or os.path.basename(path)
     intervals = parse_intervals(entries, now=now, max_gap=max_gap)
-    return Transcript(agent_id, session_id, is_main_loop, mtime, intervals)
+    model = extract_model(entries)
+    return Transcript(agent_id, session_id, is_main_loop, model, mtime, intervals)
 
 
 def discover_transcripts(projects_dir):
