@@ -64,6 +64,14 @@ max_context_tokens = 1000000
 # heartbeat_file was REMOVED 2026-08-22 -- liveness is the age of the main
 # loop's last event ack ([ack] below), not a file the loop touches.
 relaunch_script = "/var/run/claude/claude-relaunch.sh"
+# Bypass-Permissions consent dialog handling (see config.toml for the full
+# rationale). In the container the relaunch argv passes
+# `--setting-sources project,local --settings <shim>`, which DROPS the user
+# settings tier -- so the pre-accept also writes the acceptance into the shim
+# file named by CLAUDE_SHIM_SETTINGS_PATH when it already exists.
+handle_bypass_dialog = true
+pre_accept_bypass_dialog = true
+bypass_dialog_wait_secs = 60
 
 [dead_process]
 checks_required = 3

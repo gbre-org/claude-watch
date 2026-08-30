@@ -65,6 +65,29 @@ max_context_tokens = 1000000
 # the key parses fine; the daemon logs one warning and ignores it.
 # Relaunch script path (written on restart)
 relaunch_script = "/var/run/claude/claude-relaunch.sh"
+# Handle Claude Code's Bypass-Permissions consent dialog on relaunch.
+#
+# Every relaunch this daemon performs passes `--dangerously-skip-permissions`,
+# and Claude Code renders a full-screen consent dialog at startup unless the
+# acceptance is persisted in settings. The dialog's cancel row renders the same
+# `>` cursor glyph the idle-prompt detector keys on, so an unhandled dialog
+# looks like a ready prompt -- the resume prompt gets typed into it and the
+# default-selected "No, exit" makes Claude exit.
+#
+# true (default): record the acceptance in the Claude Code settings file AND
+# watch the pane after each relaunch, selecting "Yes, I accept" if the dialog
+# shows up anyway. false: leave the dialog entirely to a human.
+handle_bypass_dialog = true
+# Whether claude-watch may WRITE the acceptance key into the Claude Code
+# settings file (the same key the dialog writes when a human accepts). The
+# write is surgical (one inserted line, no reflow), atomic, idempotent, and
+# never clobbers a settings file it cannot parse. Set false to keep
+# claude-watch out of the settings file and rely only on pane acceptance.
+pre_accept_bypass_dialog = true
+# Seconds to wait for the dialog to appear after a relaunch, and separately for
+# a real idle prompt after accepting it. Exits early the moment a genuine idle
+# prompt is seen, so the no-dialog path costs one pane capture.
+bypass_dialog_wait_secs = 60
 
 [dead_process]
 # Consecutive zero-token checks before declaring dead

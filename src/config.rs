@@ -191,6 +191,50 @@ pub struct TmuxConfig {
 pub struct ClaudeConfig {
     pub max_context_tokens: u64,
     pub relaunch_script: String,
+    /// Handle the Bypass-Permissions launch dialog on every relaunch.
+    ///
+    /// Claude Code renders a full-screen consent dialog when it starts with
+    /// `--dangerously-skip-permissions` and the acceptance is not persisted in
+    /// settings. Every relaunch this daemon performs passes that flag. The
+    /// dialog's cancel row renders the same `❯` glyph the idle-prompt detector
+    /// keys on, so an unhandled dialog looks like a ready prompt: the resume
+    /// prompt gets typed into it, the default-selected "No, exit" submits, and
+    /// Claude exits (operator-observed on Claude Code 2.1.251, 2026-08-29).
+    ///
+    /// When true (default) the relaunch paths (a) pre-accept the dialog by
+    /// setting the acceptance key in the Claude Code settings file, and (b)
+    /// still watch the pane for the dialog after the relaunch and select
+    /// "Yes, I accept" if it shows up anyway. Set to false to leave the dialog
+    /// entirely to a human.
+    #[serde(default = "default_handle_bypass_dialog")]
+    pub handle_bypass_dialog: bool,
+    /// Whether the relaunch paths may WRITE the acceptance key into the Claude
+    /// Code settings file (the same key the dialog itself writes when a human
+    /// accepts it). The write is surgical (one inserted line, no reflow),
+    /// atomic, idempotent, and never clobbers a settings file it cannot parse
+    /// — see `bypass_consent`. Set to false to keep claude-watch out of the
+    /// settings file entirely and rely only on the pane-side acceptance.
+    #[serde(default = "default_pre_accept_bypass_dialog")]
+    pub pre_accept_bypass_dialog: bool,
+    /// Seconds to wait for the Bypass-Permissions dialog to appear after a
+    /// relaunch, and (separately) for Claude to reach a real idle prompt after
+    /// the dialog is accepted. The appear-wait exits early the moment the pane
+    /// shows a genuine idle prompt, so on the overwhelmingly common no-dialog
+    /// path this costs one capture, not the full budget.
+    #[serde(default = "default_bypass_dialog_wait_secs")]
+    pub bypass_dialog_wait_secs: u64,
+}
+
+fn default_handle_bypass_dialog() -> bool {
+    true
+}
+
+fn default_pre_accept_bypass_dialog() -> bool {
+    true
+}
+
+fn default_bypass_dialog_wait_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]

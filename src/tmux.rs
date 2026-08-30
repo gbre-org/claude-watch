@@ -334,6 +334,14 @@ pub async fn is_interactive_prompt(pane: &str) -> bool {
 ///     positive only DELAYS a resume-inject. (Deliberately NOT added to the
 ///     narrower `blocking_question_visible` — the agent-view is a passive
 ///     viewer, not a blocking question; see #485.)
+///  6. The Bypass-Permissions launch dialog ("WARNING: Claude Code running in
+///     Bypass Permissions mode" + "Yes, I accept"). Claude Code renders it at
+///     STARTUP under `--dangerously-skip-permissions` when the acceptance has
+///     not been persisted. Its cancel row is a bare `❯ No, exit` and its
+///     footer says "Enter to confirm · Esc to cancel" (no "to select"), so
+///     none of (1)–(5) match it — yet an inject here submits the
+///     default-selected "No, exit" and Claude EXITS. See
+///     `bypass_permissions_dialog_visible`.
 ///
 /// ## Conservative bias
 ///
@@ -407,6 +415,16 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
     // Delegated to a shared detector so `policy::run_auto_update` can reuse
     // the exact same signature it dismisses.
     if background_work_exit_dialog_visible(pane_output) {
+        return true;
+    }
+
+    // (6) The Bypass-Permissions launch dialog. Its footer reads "Enter to
+    // confirm · Esc to cancel" with NO "to select", so signature (2) misses
+    // it, and its cancel row (`❯ No, exit`) carries no digit or bullet, so
+    // signature (3)/(5) miss it too. Left unmatched, the bare `❯` reads as an
+    // idle prompt and an inject submits the default "No, exit" — which exits
+    // Claude. Delegated to the shared detector `policy` also acts on.
+    if bypass_permissions_dialog_visible(pane_output) {
         return true;
     }
 
@@ -540,6 +558,105 @@ pub(crate) fn background_work_exit_dialog_visible(pane_output: &str) -> bool {
         }
     }
     false
+}
+
+/// Keys that move the Bypass-Permissions launch dialog's selection from its
+/// default ("No, exit") onto the confirm option ("Yes, I accept") and submit.
+///
+/// The dialog renders the cancel option FIRST and starts with it focused:
+///
+/// ```text
+/// ❯ No, exit
+///   Yes, I accept
+/// ```
+///
+/// One `Down` moves the cursor onto the confirm row; `Enter` submits it.
+/// Option indexes are hidden on this dialog, so there is no number-key
+/// shortcut — the arrow is the only way to move the selection. Exposed as a
+/// constant (rather than inlined at the send site) so the sequence itself is
+/// unit-testable.
+pub(crate) const BYPASS_PERMISSIONS_ACCEPT_KEYS: [&str; 2] = ["Down", "Enter"];
+
+/// Pure function: does the pane show Claude Code's Bypass-Permissions launch
+/// dialog — the full-screen consent screen rendered when Claude Code starts
+/// with `--dangerously-skip-permissions` and the acceptance has not been
+/// persisted to settings?
+///
+/// ```text
+///   WARNING: Claude Code running in Bypass Permissions mode
+///   In Bypass Permissions mode, Claude Code will not ask for your approval
+///   before running potentially dangerous commands.
+///   …
+/// ❯ No, exit
+///   Yes, I accept
+///   Enter to confirm · Esc to cancel
+/// ```
+///
+/// Why this matters to the daemon: the dialog's cancel row renders the SAME
+/// `❯` cursor glyph that `check_lines_for_idle_prompt` treats as "Claude is
+/// idle and ready for input". So a relaunch that lands on this dialog LOOKS
+/// idle, the resume prompt gets typed into the dialog, and the
+/// default-selected "No, exit" submits — Claude exits with code 0, the prompt
+/// text spills into the bare pane shell, and the session is left
+/// half-attached (operator-observed on Claude Code 2.1.251, 2026-08-29).
+///
+/// ## Both markers are required
+///
+/// A live Claude Code TUI running in bypass mode renders a PERSISTENT status
+/// indicator containing "bypass permissions" on essentially every frame, so
+/// that phrase alone is not a signature — matching on it would report the
+/// dialog for the entire lifetime of a normal session. The confirm label
+/// ("Yes, I accept") exists only while the dialog itself is on screen.
+/// Requiring BOTH the dialog's mode wording and the confirm label is a
+/// signature the status indicator can never satisfy.
+///
+/// Scoped to the recent tail (like the sibling detectors) so a scrollback
+/// mention — this doc read into a pane, a transcript quoting the dialog —
+/// does not trip it.
+pub(crate) fn bypass_permissions_dialog_visible(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    let mut saw_mode = false;
+    let mut saw_confirm_label = false;
+    for line in &lines[start..] {
+        let lower = line.trim().to_lowercase();
+        if lower.contains("bypass permissions mode") {
+            saw_mode = true;
+        }
+        if lower.contains("yes, i accept") {
+            saw_confirm_label = true;
+        }
+    }
+    saw_mode && saw_confirm_label
+}
+
+/// Pure function: is the pane at a Claude idle prompt that is NOT the
+/// Bypass-Permissions dialog's cancel row?
+///
+/// `check_lines_for_idle_prompt` keys on the bare `❯` glyph, which the dialog
+/// also renders (`❯ No, exit`). Callers that must distinguish "ready for the
+/// resume prompt" from "sitting on the consent dialog" use this instead.
+pub fn idle_prompt_without_bypass_dialog(pane_output: &str) -> bool {
+    check_lines_for_idle_prompt(pane_output) && !bypass_permissions_dialog_visible(pane_output)
+}
+
+/// Send the accept sequence for the Bypass-Permissions launch dialog.
+///
+/// `Down` then `Enter` as two separate `send-keys` calls with a short gap:
+/// the dialog re-renders between keystrokes, and batching both into a single
+/// `send-keys` gives it no render in between. The gap is cheap (this runs at
+/// most a few times per relaunch) and removes the class of failure where the
+/// `Enter` lands on the pre-move selection — which on this dialog means
+/// "No, exit".
+pub async fn accept_bypass_permissions_dialog(pane: &str) {
+    for key in BYPASS_PERMISSIONS_ACCEPT_KEYS {
+        send_keys(pane, &[key]).await;
+        sleep(std::time::Duration::from_millis(300)).await;
+    }
 }
 
 /// Check if pane shows exit teardown indicators ("Goodbye!" or "Background command was stopped").
@@ -3700,6 +3817,101 @@ mod tests {
     fn background_work_exit_dialog_not_fired_on_idle() {
         let output = "Claude Code is running\nTokens: 50000\n\u{276f} ";
         assert!(!background_work_exit_dialog_visible(output));
+    }
+
+    // bypass_permissions_dialog_visible — the launch-time consent dialog
+    // Claude Code renders under `--dangerously-skip-permissions` when the
+    // acceptance is not persisted in settings. Verbatim capture of the pane
+    // the daemon injected into on 2026-08-29 (Claude Code 2.1.251), which
+    // exited Claude because the default selection is "No, exit".
+    const BYPASS_DIALOG_PANE: &str = include_str!("../tests/fixtures/bypass_permissions_dialog.txt");
+
+    #[test]
+    fn bypass_permissions_dialog_matches_the_captured_pane() {
+        assert!(bypass_permissions_dialog_visible(BYPASS_DIALOG_PANE));
+    }
+
+    #[test]
+    fn bypass_permissions_dialog_not_fired_on_a_live_bypass_session() {
+        // The running TUI renders a PERSISTENT bypass-permissions status line
+        // on essentially every frame. That must never read as the dialog, or
+        // the daemon would think a modal is up for the whole session.
+        let output = "\u{25cf} Brewed for 12s\n\
+                      ─────────────\n\
+                      \u{276f}\n\
+                      ─────────────\n\
+                      \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        assert!(!bypass_permissions_dialog_visible(output));
+    }
+
+    #[test]
+    fn bypass_permissions_dialog_needs_both_markers() {
+        // Title without the confirm label (e.g. the warning scrolled past in
+        // conversation text) is not the dialog.
+        let title_only = "WARNING: Claude Code running in Bypass Permissions mode\n\u{276f}";
+        assert!(!bypass_permissions_dialog_visible(title_only));
+        // Confirm label without the mode wording is some other dialog.
+        let label_only = "  Do the thing?\n\u{276f} No, exit\n  Yes, I accept";
+        assert!(!bypass_permissions_dialog_visible(label_only));
+    }
+
+    #[test]
+    fn bypass_permissions_dialog_ignores_old_scrollback() {
+        // The dialog text 40 lines up (a transcript, this doc read into the
+        // pane) is history, not a live modal.
+        let mut lines = vec!["scrollback".to_string(); 40];
+        lines.insert(0, BYPASS_DIALOG_PANE.to_string());
+        assert!(!bypass_permissions_dialog_visible(&lines.join("\n")));
+    }
+
+    #[test]
+    fn bypass_permissions_dialog_reads_as_an_interactive_prompt() {
+        // The whole bug: the dialog's `❯ No, exit` row satisfies the bare-`❯`
+        // idle check, so every inject guard must see it as a live prompt.
+        assert!(check_lines_for_idle_prompt(BYPASS_DIALOG_PANE));
+        assert!(interactive_prompt_visible(BYPASS_DIALOG_PANE));
+        assert!(!idle_prompt_without_bypass_dialog(BYPASS_DIALOG_PANE));
+    }
+
+    #[test]
+    fn idle_prompt_without_bypass_dialog_still_matches_a_real_prompt() {
+        let output = "\u{25cf} Done\n\u{276f} \n\
+                      \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+        assert!(idle_prompt_without_bypass_dialog(output));
+    }
+
+    #[test]
+    fn bypass_permissions_accept_keys_move_off_the_default_then_confirm() {
+        // The dialog is rendered cancel-first with the cancel row focused
+        // ("❯ No, exit" above "Yes, I accept"), and hides option indexes — so
+        // a bare Enter picks "No, exit" (which is what exited Claude) and
+        // there is no number-key shortcut. Exactly one Down, then Enter.
+        assert_eq!(BYPASS_PERMISSIONS_ACCEPT_KEYS, ["Down", "Enter"]);
+
+        // Assert that against the rendered option order rather than trusting
+        // the constant: count the rows between the cursor and the confirm
+        // label in the captured pane.
+        let rows: Vec<&str> = BYPASS_DIALOG_PANE
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.ends_with("No, exit") || *l == "Yes, I accept")
+            .collect();
+        assert_eq!(rows, vec!["\u{276f} No, exit", "Yes, I accept"]);
+        let cursor_row = rows
+            .iter()
+            .position(|l| l.starts_with('\u{276f}'))
+            .expect("cursor row");
+        let confirm_row = rows
+            .iter()
+            .position(|l| l.contains("Yes, I accept"))
+            .expect("confirm row");
+        let downs = confirm_row - cursor_row;
+        assert_eq!(downs, 1, "one Down moves from the default to the confirm row");
+        assert_eq!(
+            BYPASS_PERMISSIONS_ACCEPT_KEYS.iter().filter(|k| **k == "Down").count(),
+            downs
+        );
+        assert_eq!(*BYPASS_PERMISSIONS_ACCEPT_KEYS.last().unwrap(), "Enter");
     }
 
     #[test]
