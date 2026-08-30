@@ -1317,6 +1317,14 @@ fn record_reminder_latency_if_recent(kind: ReminderType, state: &mut State, shor
 async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::ClaudeConfig) {
     let now = Local::now().to_rfc3339();
 
+    // The launch argv below carries `--dangerously-skip-permissions`, so
+    // Claude Code renders its Bypass-Permissions consent dialog at startup
+    // unless the acceptance is persisted in settings. Record it now;
+    // the post-restart resume-inject block also refuses to inject while that
+    // dialog is up (and accepts it), so this is an optimisation, not the
+    // safety belt.
+    pre_accept_bypass_permissions(config);
+
     // Try to find session ID from pane history
     let mut session_id: Option<String> = None;
     if let Some(out) = tmux::capture_pane_history(pane, 100).await {
@@ -4261,6 +4269,197 @@ fn build_relaunch_inject_cmd(script_path: &str, launch: &str) -> String {
     format!("[ -f {p} ] && bash {p} || {{ {launch}; }}", p = script_path, launch = launch)
 }
 
+/// Maximum times the daemon presses "Yes, I accept" on the
+/// Bypass-Permissions dialog during a single relaunch.
+///
+/// More than one press is only ever useful when a keystroke lands mid-render
+/// and is dropped. Beyond that, pressing again is not just noise: once the
+/// dialog is gone an extra `Enter` submits an empty prompt into the live TUI.
+/// So the presses are capped and the rest of the budget is spent WATCHING.
+const BYPASS_DIALOG_MAX_ACCEPT_ATTEMPTS: u32 = 3;
+
+/// Outcome of the post-relaunch Bypass-Permissions dialog gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BypassDialogGate {
+    /// Nothing is in the way — carry on with the resume inject exactly as
+    /// before this gate existed. Either handling is disabled, the pane
+    /// reached a genuine idle prompt, or the dialog never appeared.
+    Proceed,
+    /// The dialog appeared, was accepted, and Claude reached an idle prompt.
+    Accepted,
+    /// The dialog appeared but the pane never reached an idle prompt within
+    /// the budget. The caller must NOT inject: typing into a pane in this
+    /// state is exactly what caused the incident this gate exists for.
+    Stuck,
+}
+
+/// Pre-accept the Bypass-Permissions dialog by writing the acceptance key into
+/// the Claude Code settings file(s), so the relaunched process never renders
+/// the dialog in the first place.
+///
+/// Best-effort and idempotent: a settings tier we cannot see, or a settings
+/// file we refuse to edit, just means the dialog still appears and
+/// [`settle_bypass_permissions_dialog`] handles it on the pane. See
+/// `crate::bypass_consent` for the write discipline.
+fn pre_accept_bypass_permissions(claude_config: &crate::config::ClaudeConfig) {
+    if !claude_config.handle_bypass_dialog || !claude_config.pre_accept_bypass_dialog {
+        return;
+    }
+    for (path, outcome) in crate::bypass_consent::ensure_accepted_everywhere() {
+        match outcome {
+            crate::bypass_consent::ConsentWrite::AlreadySet => {
+                debug!(path = %path.display(), "bypass-consent: acceptance already recorded")
+            }
+            crate::bypass_consent::ConsentWrite::Inserted
+            | crate::bypass_consent::ConsentWrite::Created => {
+                info!(
+                    path = %path.display(),
+                    outcome = ?outcome,
+                    "bypass-consent: recorded the Bypass-Permissions acceptance in settings"
+                )
+            }
+            crate::bypass_consent::ConsentWrite::Skipped => {
+                debug!(
+                    path = %path.display(),
+                    "bypass-consent: left settings file untouched (will accept the dialog on the pane if it appears)"
+                )
+            }
+        }
+    }
+}
+
+/// Post-relaunch gate: get past Claude Code's Bypass-Permissions launch dialog
+/// BEFORE anything injects a resume prompt.
+///
+/// ## Why this exists
+///
+/// Claude Code renders a full-screen consent dialog at startup under
+/// `--dangerously-skip-permissions` when the acceptance is not persisted in
+/// settings — which is every relaunch this daemon performs on a host where the
+/// key has never been written. Its cancel row is `❯ No, exit`, and the bare
+/// `❯` is exactly what `wait_for_idle_prompt` treats as "ready for input". So
+/// the daemon's own idle detector reports READY while a modal is up, the
+/// resume prompt is typed into it, and the default selection ("No, exit")
+/// submits: Claude exits 0, the prompt text spills into the bare pane shell,
+/// and the pane is left half-attached needing a manual dashboard reinit
+/// (operator-observed on Claude Code 2.1.251, 2026-08-29).
+///
+/// ## Shape
+///
+/// Two bounded phases, each capped by `[claude] bypass_dialog_wait_secs`:
+///
+/// 1. **Appear.** Poll the pane. A dialog → phase 2. A genuine idle prompt
+///    (the `❯` WITHOUT the dialog markers) → `Proceed`, which is the fast path
+///    and costs one capture. Budget exhausted with neither → `Proceed`, i.e.
+///    behave exactly as before this gate existed and let the caller's own
+///    idle-prompt wait deal with a slow start.
+/// 2. **Accept + settle.** Press `Down`+`Enter` (at most
+///    `BYPASS_DIALOG_MAX_ACCEPT_ATTEMPTS` times) and watch for the dialog to
+///    go away and a real prompt to appear → `Accepted`. If it never does →
+///    `Stuck`: alert loudly and let the caller abandon the inject rather than
+///    type into an unknown pane.
+///
+/// Note the asymmetry that decides every ambiguous case here: NOT injecting
+/// costs one delayed resume (the operator, or the next check cycle, recovers
+/// it); injecting into the dialog EXITS Claude. So this gate never guesses in
+/// favour of injecting.
+async fn settle_bypass_permissions_dialog(pane: &str, config: &Config) -> BypassDialogGate {
+    if !config.claude.handle_bypass_dialog {
+        return BypassDialogGate::Proceed;
+    }
+    let budget = std::time::Duration::from_secs(config.claude.bypass_dialog_wait_secs);
+
+    // Phase 1: does the dialog show up at all?
+    let appear_deadline = tokio::time::Instant::now() + budget;
+    let mut saw_dialog = false;
+    while tokio::time::Instant::now() < appear_deadline {
+        if let Some(out) = tmux::capture_pane(pane).await {
+            if tmux::bypass_permissions_dialog_visible(&out) {
+                saw_dialog = true;
+                break;
+            }
+            if tmux::idle_prompt_without_bypass_dialog(&out) {
+                debug!("bypass-dialog: pane is at an idle prompt, no consent dialog");
+                return BypassDialogGate::Proceed;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if !saw_dialog {
+        debug!(
+            wait_secs = config.claude.bypass_dialog_wait_secs,
+            "bypass-dialog: no consent dialog observed after relaunch"
+        );
+        return BypassDialogGate::Proceed;
+    }
+
+    info!("bypass-dialog: Bypass-Permissions consent dialog detected — selecting 'Yes, I accept'");
+    write_jsonl_log(
+        &config.general.log_file,
+        "bypass_permissions_dialog_detected",
+        serde_json::json!({"pane": pane}),
+    );
+
+    // Phase 2: accept, then wait for a REAL prompt (not the dialog's cursor).
+    let settle_deadline = tokio::time::Instant::now() + budget;
+    let mut attempts: u32 = 0;
+    while tokio::time::Instant::now() < settle_deadline {
+        let Some(out) = tmux::capture_pane(pane).await else {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        };
+        if tmux::bypass_permissions_dialog_visible(&out) {
+            if attempts < BYPASS_DIALOG_MAX_ACCEPT_ATTEMPTS {
+                attempts += 1;
+                tmux::accept_bypass_permissions_dialog(pane).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            } else {
+                // Presses exhausted — keep watching, never keep typing.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            continue;
+        }
+        if tmux::idle_prompt_without_bypass_dialog(&out) {
+            info!(
+                attempts,
+                "bypass-dialog: accepted; Claude is at an idle prompt"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "bypass_permissions_dialog_accepted",
+                serde_json::json!({"attempts": attempts}),
+            );
+            return BypassDialogGate::Accepted;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    warn!(
+        attempts,
+        wait_secs = config.claude.bypass_dialog_wait_secs,
+        "bypass-dialog: Claude never reached an idle prompt after accepting the \
+         consent dialog -- ABORTING the resume inject (never type into an unknown pane)"
+    );
+    write_jsonl_log(
+        &config.general.log_file,
+        "bypass_permissions_dialog_stuck",
+        serde_json::json!({
+            "attempts": attempts,
+            "wait_secs": config.claude.bypass_dialog_wait_secs,
+        }),
+    );
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "bypass-dialog-stuck",
+        stuck_reason: "bypass-permissions consent dialog was accepted but Claude never reached an idle prompt; resume-inject aborted",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::High,
+        message: "claude-watch: Claude Code is sitting on (or just past) the Bypass Permissions consent dialog and never reached a prompt. The resume prompt was NOT injected. Operator must check the pane.",
+    })
+    .await;
+    BypassDialogGate::Stuck
+}
+
 /// Container auto-update relaunch path: clean `tmux respawn-pane -k` via the
 /// configured `[auto_update] relaunch_command` (default `["cwsr",
 /// "--no-upgrade"]`) INSTEAD of the interactive `/exit` + shell-inject flow.
@@ -4335,6 +4534,20 @@ async fn run_auto_update_clean_relaunch(
     }
     info!("auto-update: Claude binary is up (clean-relaunch)");
 
+    // Get past the Bypass-Permissions consent dialog before anything types
+    // into the pane. The relaunch argv carries `--dangerously-skip-permissions`,
+    // so Claude Code renders that dialog at startup unless the acceptance is
+    // persisted in settings — and its `❯ No, exit` row reads as an idle prompt
+    // to the wait below. See `settle_bypass_permissions_dialog`.
+    if settle_bypass_permissions_dialog(pane, config).await == BypassDialogGate::Stuck {
+        write_jsonl_log(
+            &config.general.log_file,
+            "auto_update_failed",
+            serde_json::json!({"reason": "bypass_dialog_stuck_after_clean_relaunch"}),
+        );
+        return;
+    }
+
     // Wait for the idle prompt (best-effort — binary is confirmed up).
     info!("auto-update: waiting for idle prompt (clean-relaunch)...");
     if !tmux::wait_for_idle_prompt(pane, 90).await {
@@ -4393,6 +4606,12 @@ async fn run_auto_update_clean_relaunch(
 
 /// Execute the auto-update sequence: interrupt → /exit → wait → relaunch → resume.
 async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, config: &Config) {
+    // Before anything else: record the Bypass-Permissions acceptance in
+    // settings so the relaunched process (every relaunch path below passes
+    // `--dangerously-skip-permissions`) never renders the consent dialog.
+    // Best-effort — `settle_bypass_permissions_dialog` still watches for it.
+    pre_accept_bypass_permissions(&config.claude);
+
     info!("auto-update: interrupting Claude Code...");
     write_jsonl_log(
         &config.general.log_file,
@@ -4674,6 +4893,25 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
             return;
         }
         info!("auto-update: clean-restart fallback brought Claude back up");
+    }
+
+    // Step 7b: Get past the Bypass-Permissions consent dialog.
+    //
+    // The relaunch argv carries `--dangerously-skip-permissions`, so Claude
+    // Code renders a full-screen consent dialog at startup unless the
+    // acceptance is persisted in settings. Its cancel row is `❯ No, exit` —
+    // the same `❯` Step 8's `wait_for_idle_prompt` reads as "ready", so
+    // without this gate Step 9 types the resume prompt INTO the dialog and
+    // the default selection exits Claude (operator-observed, 2026-08-29).
+    // `Stuck` means we could not get the pane to a real prompt: abort rather
+    // than inject blind.
+    if settle_bypass_permissions_dialog(pane, config).await == BypassDialogGate::Stuck {
+        write_jsonl_log(
+            &config.general.log_file,
+            "auto_update_failed",
+            serde_json::json!({"reason": "bypass_dialog_stuck_after_relaunch"}),
+        );
+        return;
     }
 
     // Step 8: Wait for the idle prompt (Claude Code is ready for input).
@@ -5249,6 +5487,27 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
+        }
+        // The restarted process was launched with
+        // `--dangerously-skip-permissions`, so Claude Code may be sitting on
+        // its Bypass-Permissions consent dialog. That dialog renders `❯ No,
+        // exit`, which the `is_idle` check below reads as a ready prompt —
+        // injecting there submits "No, exit" and Claude EXITS. Accept it and
+        // come back next cycle (the interactive-prompt guard below also
+        // matches the dialog, so a missed acceptance only delays the resume).
+        if let Some(out) = tmux::capture_pane(pane).await {
+            if tmux::bypass_permissions_dialog_visible(&out) {
+                info!(
+                    "post-restart: Bypass-Permissions consent dialog is up -- \
+                     selecting 'Yes, I accept' and deferring the resume inject"
+                );
+                if config.claude.handle_bypass_dialog {
+                    tmux::accept_bypass_permissions_dialog(pane).await;
+                }
+                state.last_check = Some(now);
+                crate::state::save_state(&config.general.state_file, state);
+                return;
+            }
         }
         // Don't inject while an interactive prompt (AskUserQuestion menu,
         // tool-permission confirmation, selection overlay) is awaiting the

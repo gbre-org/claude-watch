@@ -193,6 +193,7 @@ Full test suite (including e2e): `cargo nextest run` (~49s, 292 tests in paralle
 - `src/daemon.rs` — main monitoring loop, ack-age/token tracking
 - `src/config.rs` — configuration loading
 - `src/actions.rs` — recovery actions (inject resume, etc.)
+- `src/bypass_consent.rs` — persists the Bypass-Permissions acceptance into Claude Code's settings so a relaunch never lands on the consent dialog
 - `tests/fixtures/` — saved tmux captures for fixture tests
 
 ## Dashboard Scripts

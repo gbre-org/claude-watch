@@ -50,6 +50,46 @@ claude-watch captures the Claude Code tmux pane every few seconds and parses it 
 - **Recovery actions**: Injects prompts to resume stalled sessions, triggers context clears, sends push-notification alerts (via a pluggable `pingme` shim — wire it to whatever notification service you prefer)
 - **Fresh session detection**: Detects when Claude Code starts fresh (via `dashboard --recreate --fresh`) and injects a resume prompt
 - **Task monitoring**: Watches Claude Code's background task output files, tracks agent lifecycle, cleans up orphaned tmux panes
+- **Bypass-Permissions consent dialog**: Gets a relaunched Claude past the startup consent dialog before anything types into the pane — see below
+
+### The Bypass-Permissions consent dialog
+
+Every relaunch claude-watch performs (auto-update, crash recovery) passes
+`--dangerously-skip-permissions`, and Claude Code answers that with a
+full-screen consent dialog at startup unless the acceptance has been persisted
+to settings:
+
+```text
+ WARNING: Claude Code running in Bypass Permissions mode
+ …
+❯ No, exit
+  Yes, I accept
+ Enter to confirm · Esc to cancel
+```
+
+That dialog is hostile to an automated restart for one specific reason: its
+cancel row renders the same `❯` glyph the idle-prompt detector keys on. The
+pane therefore looks *ready for input* while a modal is up — so the resume
+prompt gets typed into the dialog, the **default-selected "No, exit"** submits,
+Claude exits, and the prompt text spills into the bare pane shell.
+
+claude-watch handles it on two levels, both governed by `[claude]` config keys:
+
+1. **Pre-accept** (`pre_accept_bypass_dialog`, default on): before a relaunch,
+   record the acceptance in the Claude Code settings file(s) — the same key the
+   dialog itself writes when a human accepts it — so the dialog never renders.
+   The write is surgical (one inserted line, no reflow), atomic, idempotent,
+   and never touches a settings file it cannot parse.
+2. **Accept on the pane** (`handle_bypass_dialog`, default on): after the
+   relaunch, watch the pane for the dialog's signature and select
+   "Yes, I accept" (`Down`, `Enter` — the dialog hides option indexes, so the
+   arrow is the only way off the default). The resume prompt is injected only
+   once the pane reaches a real idle prompt. If it never does within
+   `bypass_dialog_wait_secs`, claude-watch raises a high-severity alert and
+   injects **nothing** — not injecting costs one delayed resume, injecting into
+   the dialog exits Claude.
+
+Set `handle_bypass_dialog = false` to leave the dialog entirely to a human.
 
 ## Alerting hierarchy
 
@@ -166,6 +206,7 @@ claude-watch (systemd service)
 | `status.rs` | Status bar parsing (tokens, bashes, compact %) |
 | `task_watch.rs` | Background task and agent lifecycle monitoring |
 | `alert.rs` | Push notifications (via the `pingme` shim) |
+| `bypass_consent.rs` | Persists the Bypass-Permissions acceptance into Claude Code settings |
 | `config.rs` | TOML configuration |
 
 ### Dashboard scripts
@@ -451,6 +492,12 @@ dashboard_pane = ""   # auto-detected from /var/run/claude/pane-id
 # Claude Code writes background task output here. claude-watch auto-discovers
 # the path by scanning /proc for the Claude Code process, but you can override:
 # tasks_dir = "/run/user/1000/claude/tasks"
+
+[claude]
+# Bypass-Permissions consent dialog (see "What it does" above).
+handle_bypass_dialog = true      # accept it on the pane after a relaunch
+pre_accept_bypass_dialog = true  # also record the acceptance in settings
+bypass_dialog_wait_secs = 60     # budget to see it, and to settle after accepting
 
 [thresholds]
 dead_process_checks = 5        # consecutive dead checks before action

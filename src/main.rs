@@ -22,6 +22,7 @@
 mod active_agents;
 mod agent;
 mod alert;
+mod bypass_consent;
 mod cadence;
 mod cmd;
 mod config;
