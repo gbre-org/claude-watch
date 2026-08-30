@@ -309,6 +309,121 @@ pub fn collect_token_usage_at(projects_dir: &Path, cache_path: &Path, month_pref
     summarize(&all_days, month_prefix)
 }
 
+/// Tail-read window for locating the CURRENT context-window size of the
+/// active main session — distinct from `collect_token_usage`'s full-history
+/// cumulative scan above. Matches `MAIN_TAIL_BYTES` in
+/// `tools/cw-agent-stats/agentstats.py` (`find_main_transcript` /
+/// `parse_main_tail`), which this is a direct Rust port of.
+const MAIN_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Newest top-level `<slug>/<session-uuid>.jsonl` transcript = the active
+/// main loop (one active main session per `~/.claude/projects` tree, matching
+/// cw's topology). Only descends one level (slug dirs, then their direct
+/// `*.jsonl` children) — a subagent transcript lives one level deeper, under
+/// `<slug>/<session-uuid>/subagents/agent-*.jsonl`, so it is never a
+/// candidate here even though `collect_transcript_files` above recurses into
+/// it for the cumulative counters.
+fn find_main_transcript(projects_dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    let slugs = std::fs::read_dir(projects_dir).ok()?;
+    for slug in slugs.flatten() {
+        let Ok(file_type) = slug.file_type() else { continue };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(slug.path()) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(mtime) = meta.modified() else { continue };
+            let is_newer = best.as_ref().is_none_or(|(_, best_mtime)| mtime > *best_mtime);
+            if is_newer {
+                best = Some((path, mtime));
+            }
+        }
+    }
+    best.map(|(path, _)| path)
+}
+
+/// Read the last `tail_bytes` of `path` as a (lossily-decoded) string,
+/// dropping the partial first line when we seeked mid-file. `None` on any
+/// I/O error (missing file, permission denied, etc.).
+fn read_tail(path: &Path, tail_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let size = std::fs::metadata(path).ok()?.len();
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    if size > tail_bytes {
+        file.seek(SeekFrom::Start(size - tail_bytes)).ok()?;
+        file.read_to_end(&mut buf).ok()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            buf.drain(..=pos);
+        }
+    } else {
+        file.read_to_end(&mut buf).ok()?;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Latest `message.usage` context size (`input_tokens +
+/// cache_creation_input_tokens + cache_read_input_tokens`) found in `tail`.
+/// Pure: no I/O. Walks in file order and keeps the LAST usage-bearing
+/// assistant line whose sum is non-zero, matching `parse_main_tail`'s
+/// `ctx = val` overwrite semantics (later turns are always more current).
+fn latest_context_tokens(tail: &str) -> Option<u64> {
+    let mut ctx = None;
+    for line in tail.lines() {
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        let obj: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let usage = match obj.get("message").and_then(|m| m.get("usage")) {
+            Some(u) => u,
+            None => continue,
+        };
+        let val = usage_field(usage, "input_tokens")
+            + usage_field(usage, "cache_creation_input_tokens")
+            + usage_field(usage, "cache_read_input_tokens");
+        if val > 0 {
+            ctx = Some(val);
+        }
+    }
+    ctx
+}
+
+/// Current context-window size of the active main session, read directly
+/// from its JSONL transcript tail — the robust replacement for scraping the
+/// tmux status bar (which freezes when an auto-update banner or other
+/// overlay clobbers the status line; see `status::get_claude_status`).
+///
+/// `None` means "couldn't determine it" (no projects dir, no transcript, or
+/// no usage-bearing line in the tail yet) — callers should fall back to
+/// their existing reading (e.g. the tmux-scraped value) rather than treat
+/// `None`/0 as "context is empty".
+pub fn current_context_tokens() -> Option<u64> {
+    current_context_tokens_at(&default_projects_dir())
+}
+
+/// Same as `current_context_tokens` but with an injected projects dir, so
+/// tests can point at a tempdir.
+pub fn current_context_tokens_at(projects_dir: &Path) -> Option<u64> {
+    let path = find_main_transcript(projects_dir)?;
+    let tail = read_tail(&path, MAIN_TAIL_BYTES)?;
+    latest_context_tokens(&tail)
+}
+
 /// Render the token-usage Prometheus textfile lines. Pure + tested; appended
 /// to the existing `claude-watch metrics` output by `metrics::cmd_metrics`.
 pub fn token_metric_lines(usage: &TokenUsage) -> Vec<String> {
@@ -498,5 +613,117 @@ mod tests {
         assert_eq!(u, TokenUsage::default());
         let raw = std::fs::read_to_string(&cache).unwrap();
         assert!(!raw.contains("s.jsonl"), "stale entry not pruned: {raw}");
+    }
+
+    // --- current_context_tokens (JSONL-transcript context-size reader) ---
+
+    #[test]
+    fn latest_context_tokens_takes_the_last_nonzero_usage() {
+        // input=100, cache_creation=20, cache_read=30 -> sum 150; then a
+        // later, smaller turn -> sum 60. The LATER turn wins (current
+        // context size, not a max/total).
+        let a = line("2026-06-27T05:00:00.000Z", "msg_a", 100, 5, 20, 30);
+        let b = line("2026-06-27T05:05:00.000Z", "msg_b", 40, 5, 10, 10);
+        let ctx = latest_context_tokens(&format!("{a}\n{b}\n"));
+        assert_eq!(ctx, Some(60));
+    }
+
+    #[test]
+    fn latest_context_tokens_ignores_non_assistant_and_zero_usage() {
+        let user = r#"{"type":"user","message":{"content":"hi"}}"#;
+        let zero = r#"{"type":"assistant","message":{"id":"z","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+        let real = line("2026-06-27T05:00:00.000Z", "msg_real", 42, 1, 0, 0);
+        // The zero-usage line must NOT overwrite a real reading that follows
+        // it in iteration order being absent here — but it must also not be
+        // mistaken for a valid (zero) context size on its own.
+        let ctx = latest_context_tokens(&format!("{user}\n{zero}\n{real}\n"));
+        assert_eq!(ctx, Some(42));
+    }
+
+    #[test]
+    fn latest_context_tokens_none_when_no_usage_present() {
+        let user = r#"{"type":"user","message":{"content":"hi, no usage here"}}"#;
+        assert_eq!(latest_context_tokens(user), None);
+    }
+
+    #[test]
+    fn find_main_transcript_picks_newest_top_level_file_across_slugs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let slug_a = projects.join("-home-a");
+        let slug_b = projects.join("-home-b");
+        std::fs::create_dir_all(&slug_a).unwrap();
+        std::fs::create_dir_all(&slug_b).unwrap();
+
+        let older = slug_a.join("older-session.jsonl");
+        let newer = slug_b.join("newer-session.jsonl");
+        std::fs::write(&older, "{}\n").unwrap();
+        // Ensure a distinct, later mtime than `older` regardless of
+        // filesystem mtime-resolution granularity.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&newer, "{}\n").unwrap();
+
+        let found = find_main_transcript(&projects).expect("a transcript should be found");
+        assert_eq!(found, newer, "expected the newer top-level transcript across slugs");
+    }
+
+    #[test]
+    fn find_main_transcript_ignores_nested_subagent_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let slug = projects.join("-home-x");
+        let subagents = slug.join("uuid-1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+
+        let main_transcript = slug.join("uuid-1.jsonl");
+        std::fs::write(&main_transcript, "{}\n").unwrap();
+        // Subagent file written LATER (newer mtime) must still be ignored —
+        // only top-level <slug>/<session>.jsonl files are candidates.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(subagents.join("agent-a.jsonl"), "{}\n").unwrap();
+
+        let found = find_main_transcript(&projects).expect("main transcript should be found");
+        assert_eq!(found, main_transcript);
+    }
+
+    #[test]
+    fn current_context_tokens_at_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let slug = projects.join("-home-x");
+        std::fs::create_dir_all(&slug).unwrap();
+        let a = line("2026-06-27T05:00:00.000Z", "msg_a", 100, 5, 20, 30); // sum 150
+        let b = line("2026-06-27T05:05:00.000Z", "msg_b", 40, 5, 10, 10); // sum 60
+        std::fs::write(slug.join("uuid-1.jsonl"), format!("{a}\n{b}\n")).unwrap();
+
+        assert_eq!(current_context_tokens_at(&projects), Some(60));
+    }
+
+    #[test]
+    fn current_context_tokens_at_missing_projects_dir_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(current_context_tokens_at(&tmp.path().join("does-not-exist")), None);
+    }
+
+    #[test]
+    fn read_tail_truncates_large_files_and_drops_partial_first_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.jsonl");
+        // Pad the file past the tail window with filler lines, then a real
+        // usage line near the end, so only the tail read can see it.
+        let filler = "x".repeat(1024);
+        let mut content = String::new();
+        for _ in 0..300 {
+            content.push_str(&filler);
+            content.push('\n');
+        }
+        content.push_str(&line("2026-06-27T05:00:00.000Z", "msg_tail", 77, 1, 0, 0));
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+        assert!(content.len() as u64 > MAIN_TAIL_BYTES, "test file must exceed the tail window");
+
+        let tail = read_tail(&path, MAIN_TAIL_BYTES).expect("tail read should succeed");
+        assert!(tail.contains("msg_tail"), "the real usage line must survive truncation");
+        assert_eq!(latest_context_tokens(&tail), Some(77));
     }
 }
