@@ -6543,10 +6543,26 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // stamped, "Since Clear" kept counting from the previous day).
     if config.context_monitor.enabled {
         // Reset path runs first so it can observe the pre-update last_seen_tokens.
-        maybe_reset_context_clear(config, state, tokens, &now);
+        //
+        // Use `context_tokens` (JSONL-preferred, tmux-fallback — see the
+        // `state.last_known_tokens` assignment above) rather than the raw
+        // tmux-scraped `tokens`. `context_reset_signal` detects a clear by
+        // comparing consecutive samples for a drop; if an overlay (auto-update
+        // banner, dialog) clobbers the status line right after a real clear,
+        // `tokens` can freeze at the stale PRE-clear reading for one or more
+        // cycles, so the comparison never sees a drop and the clear goes
+        // undetected — the dashboard's "Since Clear" tile then keeps counting
+        // from the previous clear (real incident 2026-08-22: a poll landed on
+        // a frozen 907979 sample instead of the JSONL-visible drop to 77185).
+        // `context_tokens` reads the session transcript directly and isn't
+        // subject to that overlay clobber.
+        maybe_reset_context_clear(config, state, context_tokens, &now);
         // Always record the latest token sample (even tokens=0) so the next
         // cycle's "previously high → now low" detector sees the right history.
-        state.last_seen_tokens = Some(tokens);
+        // Recorded on the SAME basis as the value just passed above — mixing
+        // a JSONL-derived current sample against a tmux-derived previous
+        // sample (or vice versa) would make the drop comparison meaningless.
+        state.last_seen_tokens = Some(context_tokens);
     }
     if config.context_monitor.enabled && tokens > 0 {
         if let Some((pct, _by_compact)) = check_context_threshold_with_margin(
@@ -6790,7 +6806,15 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // we require N consecutive cycles before firing. Shared with the
     // `cs.is_none()` early-return path so a wedge that hides the status bar
     // (and thus makes the session read as "not running") is still recovered.
-    handle_wedged_pane(config, state, &effective_pane, api_retrying, tokens, &now).await;
+    // Pass the same JSONL-preferred `context_tokens` used above (not the raw,
+    // overlay-fragile `tokens`) so the `wedged_clear`/`wedged_clear_retry`
+    // diagnostic log line records the true context size rather than a
+    // possibly-stale tmux scrape — consistent with the reset-detection fix
+    // just above. `detect_wedged` itself stays banner-text-only by design
+    // (see the `wedged_now` comment earlier in this function): the wedge
+    // determination and recovery confirmation never depended on either token
+    // source, so this only tightens what gets logged.
+    handle_wedged_pane(config, state, &effective_pane, api_retrying, context_tokens, &now).await;
 
     // --- Malformed-tool-call detection (non-namespaced invoke/parameter) ---
     //
