@@ -14,6 +14,7 @@ use crate::reminders::{seconds_since_fire, should_defer_to_hook, ReminderType};
 use crate::state::{FailureDetail, State, StatusSnapshot, WatcherState};
 use crate::status;
 use crate::tmux;
+use crate::token_usage;
 
 /// Parse elapsed seconds since an ISO datetime string.
 pub(crate) fn elapsed_since(dt_str: &str) -> Option<f64> {
@@ -5602,8 +5603,17 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // Only update tokens/bashes when we got a valid parse (non-zero) to avoid
     // writing 0 to Prometheus during transient status bar parsing failures.
     state.last_known_pane = effective_pane.clone();
-    if tokens > 0 {
-        state.last_known_tokens = tokens;
+    // Prefer the JSONL-transcript-derived context size — read directly from
+    // the active session's own usage record, so it can't be clobbered by an
+    // overlay (auto-update banner, dialog) blanking the tmux status line the
+    // way `cs.tokens` can. Fall back to the tmux-scraped `tokens` when the
+    // JSONL read comes back empty/zero (no transcript yet, mid-write, races)
+    // rather than regress to 0/stale. See `token_usage::current_context_tokens`.
+    let context_tokens = token_usage::current_context_tokens()
+        .filter(|&t| t > 0)
+        .unwrap_or(tokens);
+    if context_tokens > 0 {
+        state.last_known_tokens = context_tokens;
     }
     if bashes > 0 || tokens > 0 {
         state.last_known_bashes = bashes;
@@ -5694,8 +5704,13 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     );
                     state.consecutive_dead_checks = 0;
                     state.last_known_pane = retry.pane.clone();
-                    if retry.tokens > 0 {
-                        state.last_known_tokens = retry.tokens;
+                    // Same JSONL-preferred / tmux-fallback policy as the
+                    // primary set site above.
+                    let recovered_context_tokens = token_usage::current_context_tokens()
+                        .filter(|&t| t > 0)
+                        .unwrap_or(retry.tokens);
+                    if recovered_context_tokens > 0 {
+                        state.last_known_tokens = recovered_context_tokens;
                     }
                     if retry.bashes > 0 || retry.tokens > 0 {
                         state.last_known_bashes = retry.bashes;
