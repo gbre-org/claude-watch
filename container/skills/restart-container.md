@@ -25,7 +25,7 @@ Re-seed behavior is EMPIRICALLY CONFIRMED: a `docker compose restart` was observ
    - **Preferred (mirrors `make deploy-container`):** point `COMPOSE_FILE` at the base + config-dir override and restart the service by its compose name. Via `host-bash` `run_script` (so the `:`-joined `COMPOSE_FILE` and the conditional are handled verbatim):
 
      ```bash
-     base=/Users/hallandrew/repos/claude-watch/examples/compose/docker-compose.yml
+     base=$HOME/repos/claude-watch/examples/compose/docker-compose.yml
      override=$HOME/.config/claude-container/docker-compose.override.yml
      if [ -f "$override" ]; then
        COMPOSE_FILE="$base:$override" docker compose restart claude-container

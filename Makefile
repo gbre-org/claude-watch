@@ -1113,9 +1113,16 @@ install-mcp-host-bash-server: ## Build + install the host-bash MCP server to ~/b
 # interpreter -- see the plist's own header comment). Idempotent: bootout is
 # best-effort (no-op if not yet loaded), then bootstrap + kickstart -k always
 # leaves exactly one fresh instance running.
+#
+# The tracked plist is a TEMPLATE: launchd needs absolute paths, and every one
+# of them is rooted at the operator's home, so the checked-in file carries the
+# `__HOME__` placeholder instead of any particular account's home dir. Rendering
+# it with sed at install time is what keeps the repo free of operator-specific
+# paths while still installing a fully-resolved plist.
 install-cw-agent-stats-launchd: ## Install + kickstart the cw-agent-stats LaunchAgent (host producer)
 	@mkdir -p $(HOME)/Library/LaunchAgents
-	@cp tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist $(HOME)/Library/LaunchAgents/
+	@sed 's|__HOME__|$(HOME)|g' tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist \
+		> $(HOME)/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
 	@launchctl bootout gui/$$(id -u)/org.claude-watch.cw-agent-stats 2>/dev/null || true
 	@launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
 	@launchctl kickstart -k gui/$$(id -u)/org.claude-watch.cw-agent-stats

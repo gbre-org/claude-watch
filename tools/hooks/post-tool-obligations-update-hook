@@ -138,8 +138,8 @@ def _output_file_path_for_task(task_id: str) -> str | None:
     instead of the project directory. Those differ whenever the project
     cwd isn't the account's home dir -- e.g. this container, where
     ``HOME=/home/hndrewaall`` but sessions run against
-    ``CLAUDE_HOST_PROJECT_DIR=/Users/hallandrew/repos`` (slug
-    ``-Users-hallandrew-repos``). The HOME-based guess never matched any
+    ``CLAUDE_HOST_PROJECT_DIR=/Users/operator/repos`` (slug
+    ``-Users-operator-repos``). The HOME-based guess never matched any
     real directory, so EVERY sidecar registration silently failed
     (``sidecar-no-session-uuid`` in obligations-hook-errors.log, 40/40
     observed) and the ``no_pending_watcher_outputs`` gate was permanently
