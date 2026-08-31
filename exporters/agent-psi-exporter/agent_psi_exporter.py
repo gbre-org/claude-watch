@@ -36,7 +36,9 @@ Metrics
         the same scope/window/model labels as agent_psi_inference_{some,full},
         but restricted to inference gaps whose output-token throughput fell
         below AGENT_PSI_STALLED_TOKENS_PER_SEC (429 back-off / network / TTFT /
-        queueing rather than generation). It is a SUBSET of inference_* — the
+        queueing rather than generation), gaps that ended in an API error, and
+        in-flight turns silent for AGENT_PSI_API_STALL_TAIL_SECONDS (a client
+        parked in retry back-off). It is a SUBSET of inference_* — the
         latter stays the total. Fleet ``stalled_full`` near 1.0 means every
         live worker is rate-limited at once, disentangled from "everyone
         generating hard" (which inference_full alone conflated). ``scope`` is
@@ -119,6 +121,22 @@ MIN_STALL_GAP_SECONDS = float(
     os.environ.get(
         "AGENT_PSI_MIN_STALL_GAP_SECONDS",
         str(agent_psi.DEFAULT_MIN_STALL_GAP_SECONDS),
+    )
+)
+# An in-flight turn that has produced nothing for this long is an API stall
+# (retry back-off / network / queueing) rather than generation.
+API_STALL_TAIL_SECONDS = float(
+    os.environ.get(
+        "AGENT_PSI_API_STALL_TAIL_SECONDS",
+        str(agent_psi.DEFAULT_API_STALL_TAIL_SECONDS),
+    )
+)
+# Ceiling on silent wall-time attributable to an API stall; past it a silent
+# transcript reads as dormant, as before.
+API_STALL_MAX_SECONDS = float(
+    os.environ.get(
+        "AGENT_PSI_API_STALL_MAX_SECONDS",
+        str(agent_psi.DEFAULT_API_STALL_MAX_SECONDS),
     )
 )
 
@@ -244,6 +262,8 @@ def collect():
             max_gap=MAX_GAP_SECONDS, live_window=LIVE_WINDOW_SECONDS,
             stalled_tps=STALLED_TOKENS_PER_SEC,
             min_stall_gap=MIN_STALL_GAP_SECONDS,
+            api_stall_tail=API_STALL_TAIL_SECONDS,
+            api_stall_max=API_STALL_MAX_SECONDS,
         )
     except Exception as e:  # pragma: no cover - defensive
         log.error("Failed to read %s: %s", PROJECTS_DIR, e)
@@ -342,6 +362,10 @@ def main():
     log.info(
         "Stall split: <%.1f tok/s over a >=%.1fs inference gap => stalled",
         STALLED_TOKENS_PER_SEC, MIN_STALL_GAP_SECONDS,
+    )
+    log.info(
+        "API stall: in-flight turn silent >=%.0fs => stalled (capped at %.0fs)",
+        API_STALL_TAIL_SECONDS, API_STALL_MAX_SECONDS,
     )
     collect()
     HTTPServer(("0.0.0.0", PORT), MetricsHandler).serve_forever()
