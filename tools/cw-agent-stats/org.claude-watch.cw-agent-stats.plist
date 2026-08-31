@@ -48,9 +48,18 @@
   instead of the anonymous, unqualified "python" (see launchagents/README.md
   rule 3 in claude-config for the anti-pattern this avoids).
 
-  Install (or `make install-cw-agent-stats-launchd` from the repo root):
-    cp tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist \
-       ~/Library/LaunchAgents/
+  TEMPLATE -- NOT installable as-is. launchd resolves no variables and needs
+  absolute paths, but every path here is rooted at the operator's home, so the
+  tracked file carries the `__HOME__` placeholder rather than one account's
+  home dir. Render it (substitute your own home for `__HOME__`) on the way into
+  ~/Library/LaunchAgents; a verbatim `cp` installs a job whose program does not
+  exist, and launchd fails it silently.
+
+  Install (or `make install-cw-agent-stats-launchd` from the repo root, which
+  does exactly this):
+    sed "s|__HOME__|$HOME|g" \
+       tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist \
+       > ~/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
     launchctl bootstrap gui/$(id -u) \
        ~/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
 
@@ -67,30 +76,30 @@
     <string>org.claude-watch.cw-agent-stats</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/hallandrew/repos/claude-watch/tools/cw-agent-stats/cw-agent-stats</string>
+        <string>__HOME__/repos/claude-watch/tools/cw-agent-stats/cw-agent-stats</string>
         <string>--loop</string>
         <string>--duration</string>
         <string>58</string>
         <string>--interval</string>
         <string>4</string>
         <string>--out</string>
-        <string>/Users/hallandrew/repos/botchat-data/agent-stats.json</string>
+        <string>__HOME__/repos/botchat-data/agent-stats.json</string>
     </array>
     <key>StartInterval</key>
     <integer>60</integer>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/hallandrew/bin:/usr/sbin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>__HOME__/bin:/usr/sbin:/usr/bin:/bin:/opt/homebrew/bin</string>
         <key>HOME</key>
-        <string>/Users/hallandrew</string>
+        <string>__HOME__</string>
         <key>CW_AGENT_STATS_PROM_FILE</key>
-        <string>/Users/hallandrew/repos/.claude-watch-textfile/claude_agent_stats.prom</string>
+        <string>__HOME__/repos/.claude-watch-textfile/claude_agent_stats.prom</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>/Users/hallandrew/Library/Logs/cw-agent-stats.log</string>
+    <string>__HOME__/Library/Logs/cw-agent-stats.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/hallandrew/Library/Logs/cw-agent-stats.log</string>
+    <string>__HOME__/Library/Logs/cw-agent-stats.log</string>
     <key>RunAtLoad</key>
     <true/>
 </dict>

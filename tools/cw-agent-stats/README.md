@@ -15,7 +15,7 @@ Self-contained, stdlib only:
 | `cw-agent-stats` | The CLI (`#!/usr/bin/env python3`). `--once` / `--loop`, writes the JSON snapshot + the `.prom` file atomically. |
 | `agentstats.py` | The transcript survey / fold library the CLI imports (resolved relative to the script's real path, so the `~/bin` symlink works). |
 | `tests/test_agent_stats.py` | pytest suite: the fold, the snapshot schema pin, `--out` resolution, prom rendering, an end-to-end `--once` run. `make test-cw-agent-stats`. |
-| `org.claude-watch.cw-agent-stats.plist` | macOS LaunchAgent (`make install-cw-agent-stats-launchd`). |
+| `org.claude-watch.cw-agent-stats.plist` | macOS LaunchAgent **template** — its absolute paths carry a `__HOME__` placeholder that `make install-cw-agent-stats-launchd` renders to `$HOME` on the way into `~/Library/LaunchAgents`. Never `cp` it verbatim. |
 
 History: written as `botchat/bin/botchat-agent-stats` + `botchat/src/botchat/agentstats.py`
 for botchat's header badge (botchat #2955/#2956). The scheduling moved here

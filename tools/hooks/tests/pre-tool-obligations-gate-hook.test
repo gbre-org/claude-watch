@@ -1037,7 +1037,7 @@ def main() -> int:
         # the slug from $HOME, which never matches the REAL slug (the
         # project cwd) whenever cwd != HOME -- e.g. this container, where
         # HOME=/home/hndrewaall but sessions run against
-        # /Users/hallandrew/repos. That mismatch made session-uuid
+        # /Users/operator/repos. That mismatch made session-uuid
         # resolution fail 100% of the time in production (40/40 observed
         # `sidecar-no-session-uuid` log entries, sidecar dir never even
         # created) -- the gate was permanently inert. Using an

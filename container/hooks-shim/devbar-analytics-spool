@@ -25,7 +25,7 @@ helper instead of the live bridge. We:
   2. Rewrite container->host absolute path prefixes inside the JSON so the
      host devbar daemon can open the referenced files. `~/.claude` is
      bind-mounted to BOTH `/home/hndrewaall/.claude` (container) and
-     `/Users/hallandrew/.claude` (host) — same files, different path — so the
+     `/Users/operator/.claude` (host) — same files, different path — so the
      `transcript_path` in the payload must be rewritten to the host path or
      the host daemon's per-session token scraper can't read it.
   3. Write the rewritten JSON ATOMICALLY (temp + rename) into a spool dir on
@@ -134,7 +134,7 @@ def derive_default_map() -> dict[str, str]:
 
     if not host_home and project_dir:
         # CLAUDE_HOST_PROJECT_DIR is the host repos path in the standard
-        # compose (e.g. /Users/hallandrew/repos); its parent is the host home.
+        # compose (e.g. /Users/operator/repos); its parent is the host home.
         host_home = _strip_trailing_slash(os.path.dirname(project_dir))
     if not host_repos:
         host_repos = project_dir or (f"{host_home}/repos" if host_home else "")

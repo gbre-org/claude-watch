@@ -33,29 +33,29 @@ There are three distinct operations. Pick by what you need to pick up:
 
 ## The full redeploy sequence (recurring-recreate-recovery playbook)
 
-Run each step HOST-SIDE via `host-bash`. Paths are HOST paths (`/Users/hallandrew/...`).
+Run each step HOST-SIDE via `host-bash`. Paths are HOST paths, written below under `/Users/operator/...` — a stand-in for the operator's own host home; substitute the real one (`echo $HOME` on the host) before running any of these.
 
 a. **Refresh the durable build worktree** `~/repos/.worktrees/claude-watch/main` to `origin/main` (this is build-scratch — hard-reset is fine; never hold real work here; do NOT build from the operator's main clone, which is routinely dirty / behind):
 
    ```bash
-   git -C /Users/hallandrew/repos/.worktrees/claude-watch/main fetch origin
-   git -C /Users/hallandrew/repos/.worktrees/claude-watch/main reset --hard origin/main
+   git -C /Users/operator/repos/.worktrees/claude-watch/main fetch origin
+   git -C /Users/operator/repos/.worktrees/claude-watch/main reset --hard origin/main
    ```
 
 b. **`make container-build` — ONLY if the image changed** (a daemon / Dockerfile / baked-file / skill / watcher change; SKIP for pure bind-mounted-CLI changes to `tools/obligations/*` etc., which need only the main-clone sync in step c). The build is LONG and blows past the host-bash 30s cap — drive it via `hostjob`:
 
    ```bash
-   hostjob run --label cw-build --cwd /Users/hallandrew/repos/.worktrees/claude-watch/main -- make container-build
+   hostjob run --label cw-build --cwd /Users/operator/repos/.worktrees/claude-watch/main -- make container-build
    hostjob wait cw-build   # blocks <=25s then exits 75 if still running — re-invoke on 75 until "done rc=0"
    ```
 
 c. **Sync the operator MAIN CLONE `~/repos/claude-watch` to `origin/main`** — REQUIRED so bind-mounted fixes go live. The compose bind-mount `${HOME}/repos/ → /home/hndrewaall/repos/ (ro)` mounts the operator's MAIN CLONE, NOT the build worktree, and the in-container `obligations` / `session-task` CLIs (+ `tools/obligations/*`) resolve from it via PATH BEFORE the baked `/usr/local/bin` copy. A stale main clone SHADOWS merged+baked Python-CLI fixes and `make deploy-container` alone won't activate them (the recreate just re-mounts the same stale clone). Use the convenience target (ff-only, refuses rather than clobbering divergent local work) or the explicit fetch+merge:
 
    ```bash
-   make -C /Users/hallandrew/repos/claude-watch sync-main-clone
+   make -C /Users/operator/repos/claude-watch sync-main-clone
    # equivalent:
-   #   git -C /Users/hallandrew/repos/claude-watch fetch origin \
-   #     && git -C /Users/hallandrew/repos/claude-watch merge --ff-only origin/main
+   #   git -C /Users/operator/repos/claude-watch fetch origin \
+   #     && git -C /Users/operator/repos/claude-watch merge --ff-only origin/main
    ```
 
    Do this even for a compiled-daemon-only change: the daemon IS baked (step b handles it), but the Python CLI surface is bind-mounted, so a current main clone is the only way bind-mounted fixes go live.
@@ -63,7 +63,7 @@ c. **Sync the operator MAIN CLONE `~/repos/claude-watch` to `origin/main`** — 
 d. **`make deploy-container`** — the single force-recreate. Run it FROM the durable build worktree so the freshly-built image + the correct `COMPOSE_BASE` are used. Fire it via `hostjob` (mirroring step b's build) so the launch survives the host-bash 30s cap cleanly. This KILLS the session:
 
    ```bash
-   hostjob run --label cw-deploy --cwd /Users/hallandrew/repos/.worktrees/claude-watch/main -- make deploy-container
+   hostjob run --label cw-deploy --cwd /Users/operator/repos/.worktrees/claude-watch/main -- make deploy-container
    ```
 
    NUANCE vs step b's `hostjob wait cw-build`: `make deploy-container` KILLS this session mid-run (the recreate tears down the issuing container), so — unlike the build — you will NOT get to `hostjob wait cw-deploy` it; the recreate ends this session first. Firing it via `hostjob` is exactly what lets the HOST daemon carry the recreate to completion even though the issuing session dies — the fresh session then resumes automatically via `CLAUDE_AUTO_CONTINUE`. (If you already ran `make container-build` in step b and want to skip the re-build the `deploy-container` dependency triggers, that's fine — an unchanged image rebuild is a fast no-op given BuildKit layer caching.) `make deploy-container` is still a SINGLE atomic host-daemon operation — no `&`, no `nohup`, no split; `hostjob` only detaches the launch so it outlives the 30s cap and this session's teardown.
@@ -85,7 +85,7 @@ e. **Post-recreate validation** (in the FRESH session): confirm the container is
 `make deploy-container` handles this for you (it sets `COMPOSE_FILE` to base + config-dir override), but if you ever invoke `docker compose … --force-recreate` DIRECTLY, a BARE invocation from the wrong cwd fails with **"no configuration file provided: not found"** — docker only auto-discovers a compose file literally named `docker-compose.yml` in the current dir, and the gitignored override never lives in a worktree. So a direct recreate from a worktree merges ZERO override and recreates with NONE of the operator's personal bind-mounts (the recurring "clipboard / cron mount missing after recreate" bug). Point `COMPOSE_FILE` at the base + config-dir override yourself (mirrors what the Makefile does) via `host-bash` `run_script` (the `:`-joined `COMPOSE_FILE` and the conditional belong in `run_script`, not `run_command`):
 
 ```bash
-base=/Users/hallandrew/repos/claude-watch/examples/compose/docker-compose.yml
+base=$HOME/repos/claude-watch/examples/compose/docker-compose.yml
 override=$HOME/.config/claude-container/docker-compose.override.yml
 if [ -f "$override" ]; then
   COMPOSE_FILE="$base:$override" docker compose up -d --force-recreate claude-container
