@@ -16,7 +16,8 @@ Scenarios:
       gap before a human prompt is waiting_human; a long closed gap ending at an
       assistant turn is capped to idle; a long PARKED idle tail is NOT capped
       (the main-loop idle undercount fix); a long blocking-Bash tool tail stays
-      tool; a long inference tail is still capped to idle.
+      tool; an inference tail past the API-stall ceiling is still capped to
+      idle.
   (3) Trailing open interval: an in-flight tool (dispatched, no result yet)
       reads as current tool time to `now`; a returned end_turn reads as idle;
       a pending next turn (last line a tool_result) reads as inference.
@@ -40,6 +41,11 @@ Scenarios:
   (8) live_agents reflects STILL-RUNNING sub-agents (transcript not ended in a
       completed final turn), not merely file-recent: a finished agent drops
       immediately, a mid-tool-wait agent stays live.
+  (9) API retry back-off reads as stall: a long-silent in-flight turn is
+      stalled inference (and lifts stalled_full), a brief blip is not, a gap
+      ending at an API-error entry escapes the dormancy cap and is stalled
+      while the same gap without the marker does not, and both rules stop at
+      the API-stall ceiling.
 
 Run:  python3 test_agent_psi_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
@@ -89,6 +95,16 @@ def assistant(ts, *, tool_use_ids=(), stop_reason=None, model=None,
         "timestamp": iso(ts),
         "message": msg,
     }
+
+
+def api_error(ts, text="API Error: 529 Overloaded", output_tokens=0):
+    """The synthetic assistant line Claude Code writes when a request finally
+    fails: model "<synthetic>", isApiErrorMessage true, zero output tokens."""
+    e = assistant(ts, model="<synthetic>", stop_reason="stop_sequence",
+                  output_tokens=output_tokens)
+    e["message"]["content"] = [{"type": "text", "text": text}]
+    e["isApiErrorMessage"] = True
+    return e
 
 
 def tool_result(ts, tool_use_id):
@@ -202,13 +218,15 @@ def run():
           approx(secs_tool[agent_psi.TOOL], 1000.0)
           and approx(secs_tool[agent_psi.IDLE], 0.0),
           f"got {secs_tool}")
-    # An inference/overhead tail longer than max_gap is still capped to idle
-    # (a dormant / resumed-session gap, not a multi-minute model stall).
+    # An inference tail past the API-stall ceiling (and any overhead tail past
+    # max_gap) is still capped to idle: a dormant / resumed-session gap, not a
+    # model stall. Between the API-stall threshold and that ceiling it reads as
+    # stalled inference instead -- scenario 9.
     dormant = [assistant(0, tool_use_ids=["R"]), tool_result(1, "R")]  # pending turn
     secs_dorm = agent_psi.duty_seconds(
         agent_psi.parse_intervals(dormant, now=1 + 1000)
     )
-    check("long inference tail still capped to idle",
+    check("inference tail past the API-stall ceiling still capped to idle",
           approx(secs_dorm[agent_psi.IDLE], 300.0)
           and approx(secs_dorm[agent_psi.INFERENCE], 0.0),
           f"got {secs_dorm}")
@@ -507,6 +525,89 @@ def run():
           f"got {filerecent_ct}")
     check("only the running worker counts as live", running_ct == 1,
           f"got {running_ct}")
+
+    # ---- Scenario 9: API retry back-off reads as stall -----------------
+    print("\nScenario 9: API retry back-off counts as stalled inference")
+    TAIL = agent_psi.DEFAULT_API_STALL_TAIL_SECONDS   # 120
+    AMAX = agent_psi.DEFAULT_API_STALL_MAX_SECONDS    # 900
+
+    def tail_iv(entries, now):
+        """The trailing open interval of a parsed transcript."""
+        ivs = agent_psi.parse_intervals(entries, now=now)
+        return ivs[-1] if ivs else None
+
+    # The reported case: a turn dispatched, then the client sits in
+    # "Waiting for API response - will retry in 1m 14s" writing nothing.
+    stuck = [assistant(0, tool_use_ids=["R"]), tool_result(1, "R")]
+    iv = tail_iv(stuck, now=1 + 400)
+    check("in-flight turn silent 400s -> stalled inference at true length",
+          iv is not None and iv.category == agent_psi.INFERENCE and iv.stalled
+          and approx(iv.end - iv.start, 400.0),
+          f"got {iv}")
+
+    # ... and it shows up in the stalled pressure the dashboards read.
+    p = agent_psi.compute_stalled_inference_pressure(
+        {"stuck": agent_psi.parse_intervals(stuck, now=1 + 400)}, 1 + 100, 1 + 400
+    )
+    check("stuck agent -> stalled_full = 1.0", approx(p["full"], 1.0),
+          f"got {p}")
+
+    # Hysteresis: a brief retry blip / a normal turn is NOT a stall. Measured
+    # p99 of real inference gaps is 29s, max 68s -- all well under the 120s
+    # threshold.
+    iv = tail_iv(stuck, now=1 + 30)
+    check("brief in-flight turn (30s) -> inference, NOT stalled",
+          iv is not None and iv.category == agent_psi.INFERENCE
+          and not iv.stalled and approx(iv.end - iv.start, 30.0),
+          f"got {iv}")
+    iv = tail_iv(stuck, now=1 + TAIL - 1)
+    check("just under the tail threshold -> not stalled",
+          iv is not None and not iv.stalled, f"got {iv}")
+
+    # Past the API-stall ceiling the transcript is dormant/killed, not
+    # stalled: the old max-gap idle cap still applies (scenario 2's case).
+    iv = tail_iv(stuck, now=1 + AMAX + 100)
+    check("silent past the ceiling -> idle-capped, not stalled",
+          iv is not None and iv.category == agent_psi.IDLE and not iv.stalled
+          and approx(iv.end - iv.start, 300.0),
+          f"got {iv}")
+
+    # A closed gap ending at an API-error entry is inference for its whole
+    # length -- exempt from the dormancy cap -- and always stalled. A real
+    # overload episode runs ~220-240s per failed request; a slower endpoint
+    # pushes it past the 300s cap, where it used to vanish into idle.
+    errored = [tool_result(0, "Z"), api_error(400)]
+    secs = agent_psi.duty_seconds(agent_psi.parse_intervals(errored, now=None))
+    check("400s gap ending in an API error -> inference, not idle",
+          approx(secs[agent_psi.INFERENCE], 400.0)
+          and approx(secs[agent_psi.IDLE], 0.0),
+          f"got {secs}")
+    ivs = agent_psi.parse_intervals(errored, now=None)
+    check("that gap is tagged stalled", ivs[0].stalled, f"got {ivs}")
+
+    # Same shape without the API-error marker stays capped to idle (the
+    # sabotage control: the marker is what does the work, not the duration).
+    plain = [tool_result(0, "Z"), assistant(400, output_tokens=0)]
+    secs = agent_psi.duty_seconds(agent_psi.parse_intervals(plain, now=None))
+    check("same gap without the API-error marker -> still idle-capped",
+          approx(secs[agent_psi.IDLE], 400.0)
+          and approx(secs[agent_psi.INFERENCE], 0.0),
+          f"got {secs}")
+
+    # An API-error gap past the ceiling is dormancy again, not a 20-minute
+    # stall (a resumed session whose first request failed).
+    stale_err = [tool_result(0, "Z"), api_error(AMAX + 100)]
+    secs = agent_psi.duty_seconds(agent_psi.parse_intervals(stale_err, now=None))
+    check("API-error gap past the ceiling -> idle",
+          approx(secs[agent_psi.IDLE], AMAX + 100)
+          and approx(secs[agent_psi.INFERENCE], 0.0),
+          f"got {secs}")
+
+    # A fast failure is still too short to judge (min-stall-gap guard).
+    quick_err = [tool_result(0, "Z"), api_error(2)]
+    ivs = agent_psi.parse_intervals(quick_err, now=None)
+    check("2s API-error gap -> not stalled (under min gap)",
+          not ivs[0].stalled, f"got {ivs}")
 
     # ---- summary -------------------------------------------------------
     print()

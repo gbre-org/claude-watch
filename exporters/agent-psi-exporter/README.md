@@ -39,6 +39,26 @@ Grafana series, not on paper. See the `agent_psi.py` module docstring for the
 exact rules (including the max-gap idle cap and the trailing open interval that
 captures each agent's *current* state).
 
+### API retry back-off counts as stall
+
+A client sitting in retry back-off ("Waiting for API response · will retry in
+1m 14s · check your network") writes nothing to its transcript, so wall-time
+that is pure API stall used to read as a healthy in-flight turn — and, past the
+300s dormancy cap, as `idle`. Two rules fix that:
+
+- a gap that **ends at an API-error entry** (`isApiErrorMessage`, e.g. "API
+  Error: 529 Overloaded") is inference for its whole length, exempt from the
+  dormancy cap, and always `stalled` — zero tokens landed. Real overload
+  episodes run ~220-240s per failed request, right against that cap;
+- a **trailing in-flight turn** silent for more than
+  `AGENT_PSI_API_STALL_TAIL_SECONDS` (default 120) is `stalled` at its true
+  length. That threshold is the hysteresis keeping normal turns and one-shot
+  retry blips out of the series: across 8.5k real inference gaps, p99 was 29s
+  and the longest was 68s.
+
+Both stop at `AGENT_PSI_API_STALL_MAX_SECONDS` (default 900, the live window),
+past which a silent transcript reads as dormant/killed rather than stalled.
+
 ## What it emits (`/metrics`, default port 9104)
 
 Headline — fleet & per-session-subtree pressure over 10s / 60s / 300s sliding
@@ -48,7 +68,7 @@ windows:
 |---|---|---|
 | `agent_psi_inference_some` | `scope`, `window`, `model` | fraction of the window ≥1 agent in scope was blocked on inference |
 | `agent_psi_inference_full` | `scope`, `window`, `model` | fraction ALL active agents were blocked on inference at once — the money metric (API/rate-limit bound) |
-| `agent_psi_inference_stalled_some` / `agent_psi_inference_stalled_full` | `scope`, `window`, `model` | the **stalled** subset of the above: inference gaps whose output-token throughput fell below the stall floor (429 back-off / network / TTFT / queueing, not generation). `stalled_full` near 1 = the fleet is rate-limit bound, disentangled from "everyone generating hard" |
+| `agent_psi_inference_stalled_some` / `agent_psi_inference_stalled_full` | `scope`, `window`, `model` | the **stalled** subset of the above: inference gaps whose output-token throughput fell below the stall floor (429 back-off / network / TTFT / queueing, not generation), gaps that ended in an API error, and in-flight turns that have been silent past the API-stall threshold (a client parked in retry back-off — see below). `stalled_full` near 1 = the fleet is rate-limit bound, disentangled from "everyone generating hard" |
 | `agent_psi_tool_some` / `agent_psi_tool_full` | `scope`, `window`, `model` | same, for tool |
 | `agent_psi_scope_agents` | `scope`, `model` | live agents contributing to each (scope, model) line |
 | `agent_psi_live_agents` | — | **sub-agents actually still running** this scrape (main loop excluded) — transcript not ended in a completed final turn, so a finished agent drops immediately while a mid-tool-wait agent stays counted |
@@ -92,7 +112,10 @@ Tunables (env): `PORT`, `CLAUDE_PROJECTS_DIR`, `AGENT_PSI_MAX_GAP_SECONDS`
 (default 300), `AGENT_PSI_LIVE_WINDOW_SECONDS` (default 900), `AGENT_PSI_WINDOWS`
 (default `10,60,300`), `AGENT_PSI_STALLED_TOKENS_PER_SEC` (default 8 — inference
 throughput below this reads as stall, not generation), `AGENT_PSI_MIN_STALL_GAP_SECONDS`
-(default 5 — gaps shorter than this are never judged stalled).
+(default 5 — gaps shorter than this are never judged stalled),
+`AGENT_PSI_API_STALL_TAIL_SECONDS` (default 120 — an in-flight turn silent this
+long reads as an API stall), `AGENT_PSI_API_STALL_MAX_SECONDS` (default 900 —
+ceiling on silent time attributable to an API stall).
 
 ## Scrape target
 
@@ -115,9 +138,9 @@ python3 test_agent_psi_exporter.py   # exits 0/1; uv supplies prometheus_client 
   subtree to a session).
 - Tighter `other` split (idle vs waiting_human vs overhead) and tool-kind
   labels (compute-tool vs wait-tool), refined from the live series.
-- True **intra-turn** stall detection. The current stalled split is turn-granular
-  (throughput over a whole completed inference gap) and cannot flag an in-flight
-  turn or measure time-to-first-token / inter-delta gaps / explicit 429
-  `Retry-After`. That needs instrumentation at the SDK / HTTP streaming layer
-  (timestamp SSE deltas per request, capture 429 events) — the transcript alone
-  does not carry it.
+- Finer **intra-turn** stall detection. An in-flight turn is now flagged once it
+  has been silent past the API-stall threshold, but that is still a blunt
+  duration test: time-to-first-token, inter-delta gaps and explicit 429
+  `Retry-After` values need instrumentation at the SDK / HTTP streaming layer
+  (timestamp SSE deltas per request, capture 429 events), which the
+  turn-granular transcript does not carry.

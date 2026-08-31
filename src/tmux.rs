@@ -3052,6 +3052,18 @@ pub async fn detect_malformed_tool_call(pane: &str, override_marker: &str) -> Op
 ///      / "API Error: 429" / "Overloaded" / "overloaded_error" marker so we
 ///      know the retry is upstream-API driven.
 ///
+/// ALTERNATIVE (self-contained) signature: the spinner line states the retry
+/// itself, with no separate API-error line to pair with —
+///
+///   ✳ Waiting for API response · will retry in 1m 14s · check your network
+///
+/// That banner is only ever painted by the client's retry loop, and it carries
+/// its own countdown, so "waiting for API response" + a "retry in <duration>"
+/// countdown is accepted on its own. Without this, a session parked on a
+/// flaky endpoint (no 5xx line, no "attempt N/M") read as normal activity and
+/// the daemon happily interrupted it — the exact livelock this guard exists to
+/// prevent.
+///
 /// We intentionally scope the inspection to the LAST ~25 lines so the cue must
 /// be currently visible (not just somewhere in scrollback chat history).
 pub(crate) fn check_lines_for_api_retry(pane_output: &str) -> bool {
@@ -3063,6 +3075,18 @@ pub(crate) fn check_lines_for_api_retry(pane_output: &str) -> bool {
     };
     let tail = &lines[start..];
     let lower: String = tail.join("\n").to_lowercase();
+
+    // Self-contained banner: "Waiting for API response · will retry in <dur>".
+    // The countdown is what makes it a retry state rather than a plain
+    // in-flight request, and the phrase pair is painted only by the retry
+    // loop, so no separate error marker is required.
+    let waiting_for_api = lower.contains("waiting for api response");
+    let retry_countdown = regex_lite::Regex::new(r"retry in\s+\d+\s*(h|m|s)")
+        .ok()
+        .is_some_and(|re| re.is_match(&lower));
+    if waiting_for_api && retry_countdown {
+        return true;
+    }
 
     // Cue 1: "Retrying in Ns" or "attempt N/M" must be present in the live
     // tail. Both phrases are emitted directly by Claude Code's retry loop
@@ -5391,6 +5415,45 @@ Retrying in 32s\n\
         let output = "\
 \u{276f} Now processing your request\n\
 \u{2731} Thinking\u{2026} (3s)\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_waiting_for_api_response_banner() {
+        // The self-contained spinner banner: no 5xx line, no "attempt N/M",
+        // just the client's own countdown. Seen on a flaky endpoint, where it
+        // previously read as normal activity.
+        let output = "\
+\u{276f} run the deploy\n\
+\u{2731} Waiting for API response\u{2026} (836k tokens \u{00b7} will retry in 1m 14s \u{00b7} check your network)\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_waiting_banner_seconds_only() {
+        let output = "\
+\u{2731} Waiting for API response \u{00b7} will retry in 45s \u{00b7} check your network\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_waiting_without_countdown() {
+        // A plain in-flight request is NOT a retry state — the countdown is
+        // the load-bearing half of the banner.
+        let output = "\
+\u{2731} Waiting for API response\u{2026} (12s \u{00b7} esc to interrupt)\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_countdown_without_waiting_banner() {
+        // "retry in" prose in chat history, with no banner and no error cue.
+        let output = "\
+\u{276f} the workload will retry in 30s if the lock is held\n\
 ";
         assert!(!check_lines_for_api_retry(output));
     }

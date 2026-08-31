@@ -72,7 +72,8 @@ PSI reflects "are we blocked right now". That trailing state is decided first,
 then the cap applies only to an inference/overhead tail: a parked-idle tail (a
 dispatcher between turns) and an in-flight-tool tail (a foreground blocking Bash
 wait) are counted at their TRUE wall-clock length, never truncated — capping
-the idle tail was the main-loop idle undercount.
+the idle tail was the main-loop idle undercount. An inference tail is likewise
+uncapped while it reads as an API stall (see the next-but-one section).
 
 This is a first-cut classifier, refined against the live Grafana series, not
 a perfect offline model.
@@ -94,15 +95,43 @@ wall-time was mostly stall, not generation, and we tag the interval
 ``stalled``. Guards: gaps shorter than ``MIN_STALL_GAP_SECONDS`` are never
 tagged (a 1s / 100-token gap is obviously productive and TTFT dominates a short
 gap), and a gap with no ``output_tokens`` datum is left un-tagged (we do not cry
-wolf without evidence). The TRAILING open inference interval (an in-flight next
-turn whose token count is not yet known) is likewise never tagged — true
-intra-turn stall detection needs streaming-layer instrumentation the
-turn-granular transcript does not have (see the exporter's follow-up scoping).
+wolf without evidence).
 
 ``stalled`` is a SUBSET flag on ``inference`` intervals, never a new category:
 the existing ``inference_some``/``inference_full`` remain the TOTAL inference
 pressure, and ``compute_stalled_inference_pressure`` reports the stalled slice
 of it with the same some/full semantics.
+
+API-STALL: RETRY BACK-OFF AND FAILED REQUESTS
+---------------------------------------------
+The throughput split above is turn-granular: it can only judge a gap once an
+assistant turn CLOSES it. That left the loudest stall of all invisible — a
+client sitting in API retry back-off, showing "Waiting for API response · will
+retry in 1m 14s · check your network" for minutes at a time while the
+transcript stays silent. Two rules close that hole, both from evidence the
+transcript does carry:
+
+1. A gap that ENDS at an API-error entry (Claude Code writes a synthetic
+   assistant line with ``isApiErrorMessage: true`` when a request finally
+   fails — "API Error: 529 Overloaded", "Login expired", …) is inference the
+   whole way: that wall-time was the client in the request/retry loop, so it
+   is never re-read as a dormant gap, and it is always ``stalled`` (zero
+   output tokens landed). Measured on a real overload episode, these gaps run
+   ~220-240s each — right against the 300s dormancy cap, so the longer ones
+   were silently disappearing into ``idle``.
+
+2. The TRAILING open inference interval — an in-flight turn whose token count
+   is not yet known — is tagged ``stalled`` once it exceeds
+   ``API_STALL_TAIL_SECONDS``. Nothing has been produced for that long, so its
+   throughput-so-far is 0 tok/s by construction. The threshold is the
+   hysteresis that keeps a normal turn (and a one-shot retry blip) out of the
+   metric: across 8.5k real inference gaps the p99 was 29s and the longest was
+   68s, so a 120s default sits well clear of healthy generation.
+
+Both rules stop at ``API_STALL_MAX_SECONDS``: past that, a silent transcript is
+better explained by a dormant / resumed / killed session than by an API wait,
+and the old dormancy cap applies. It matches the exporter's live window, past
+which the transcript drops out of the fleet anyway.
 """
 
 from __future__ import annotations
@@ -147,6 +176,23 @@ DEFAULT_STALLED_TOKENS_PER_SEC = 8.0
 # (e.g. 100 tokens in 1s) is obviously productive. Guards divide-by-tiny noise.
 DEFAULT_MIN_STALL_GAP_SECONDS = 5.0
 
+# An in-flight (trailing, open) inference interval longer than this is tagged
+# STALLED: no output has landed for that long, so its throughput-so-far is 0
+# tok/s. This is the hysteresis knob for API retry back-off — a quick retry
+# blip, and every healthy turn, must stay under it. Measured against 8.5k real
+# inference gaps: p99 = 29s, max = 68s, so 120s clears normal generation by
+# ~2x while catching a client parked in "will retry in 1m 14s".
+# Tunable via AGENT_PSI_API_STALL_TAIL_SECONDS.
+DEFAULT_API_STALL_TAIL_SECONDS = 120.0
+# Ceiling on how much silent wall-time may be attributed to an API stall
+# (both the trailing in-flight interval and a gap ending at an API-error
+# entry). Past this, a silent transcript is better explained by a dormant /
+# resumed / killed session than by an API wait, and the max-gap dormancy cap
+# applies as before. Defaults to the exporter's live window, past which the
+# transcript leaves the live fleet anyway.
+# Tunable via AGENT_PSI_API_STALL_MAX_SECONDS.
+DEFAULT_API_STALL_MAX_SECONDS = 900.0
+
 # Decaying-window sizes (seconds) the exporter emits pressure for. Phase 1
 # uses fixed sliding windows ending at ``now``; a true exponential decay is a
 # phase-2 refinement.
@@ -186,11 +232,15 @@ UNKNOWN_MODEL = "unknown"
 # Internal moment: one timestamped point on the transcript timeline.
 # ``output_tokens`` is the assistant turn's usage.output_tokens (thinking
 # included), used to judge inference-gap throughput; None on non-assistant
-# moments and when the usage datum is absent.
+# moments and when the usage datum is absent. ``api_error`` marks the
+# synthetic assistant line Claude Code writes when a request finally fails
+# (``isApiErrorMessage: true``) — proof that the gap ending here was the
+# client in the API request/retry loop, not a dormant session.
 _Moment = namedtuple(
-    "_Moment", ("ts", "kind", "stop_reason", "tool_use_ids", "output_tokens")
+    "_Moment",
+    ("ts", "kind", "stop_reason", "tool_use_ids", "output_tokens", "api_error"),
 )
-_Moment.__new__.__defaults__ = (None,)
+_Moment.__new__.__defaults__ = (None, False)
 _ASST = "asst"
 _RESULT = "result"
 _PROMPT = "prompt"
@@ -283,7 +333,14 @@ def _entry_to_moment(entry):
             for b in _content_blocks(entry)
             if isinstance(b, dict) and b.get("type") == "tool_use"
         ]
-        return _Moment(ts, _ASST, stop, [i for i in tu_ids if i], out_tokens)
+        return _Moment(
+            ts,
+            _ASST,
+            stop,
+            [i for i in tu_ids if i],
+            out_tokens,
+            entry.get("isApiErrorMessage") is True,
+        )
 
     if etype == "user":
         blocks = _content_blocks(entry)
@@ -315,12 +372,18 @@ def _all_result_ids(entries):
     return ids
 
 
-def _classify_gap(prev, cur, max_gap):
+def _classify_gap(prev, cur, max_gap, api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
     """Category for the interval [prev.ts, cur.ts], bounded by ``cur``."""
     d = cur.ts - prev.ts
     if cur.kind == _RESULT:
         # A tool ran during the gap — real tool time, never capped.
         return TOOL
+    if cur.kind == _ASST and cur.api_error and d <= api_stall_max:
+        # The gap ended in an API error, so the client spent it inside the
+        # request/retry loop — measured API stall, not a dormant gap. Exempt
+        # from the max-gap cap up to api_stall_max (a real overload episode
+        # runs ~4 min per failed request, right against the 300s cap).
+        return INFERENCE
     if d > max_gap:
         # Dormant / resumed-session gap; not a multi-minute inference stall.
         return IDLE
@@ -331,7 +394,8 @@ def _classify_gap(prev, cur, max_gap):
     return OVERHEAD  # _BOOK
 
 
-def _is_stalled_inference(duration, output_tokens, stalled_tps, min_gap):
+def _is_stalled_inference(duration, output_tokens, stalled_tps, min_gap,
+                          api_error=False):
     """True when an inference gap's effective throughput marks it a STALL.
 
     ``output_tokens`` is the token count of the assistant turn that ENDED the
@@ -339,15 +403,23 @@ def _is_stalled_inference(duration, output_tokens, stalled_tps, min_gap):
     ``min_gap`` (TTFT-dominated, too short to judge), a non-positive duration
     (divide-by-zero guard), or a missing token datum (no evidence). Otherwise
     the gap is stalled iff output_tokens / duration < ``stalled_tps``.
+
+    ``api_error`` (the gap ended at an ``isApiErrorMessage`` line) is stall by
+    definition — the request produced nothing at all — so it is judged without
+    needing a usage datum, which those synthetic entries do not always carry.
     """
     if duration < min_gap or duration <= 0:
         return False
+    if api_error:
+        return True
     if output_tokens is None:
         return False
     return (output_tokens / duration) < stalled_tps
 
 
-def _tail_interval(last, now, pending_tools, max_gap):
+def _tail_interval(last, now, pending_tools, max_gap,
+                   api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
+                   api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
     """Open interval from the last moment to ``now`` = the agent's current
     state, or None if ``now`` precedes the last moment.
 
@@ -364,10 +436,18 @@ def _tail_interval(last, now, pending_tools, max_gap):
       a slow build — is the loop actively IN a tool). It is tool time, not
       idle, no matter how long it runs.
 
-    Only an ``inference`` / ``overhead`` tail longer than ``max_gap`` is capped
-    to idle: a multi-minute gap with no tool running and no return-of-control is
-    far more likely a dormant / resumed-session gap than a genuine multi-minute
-    model stall, and must not read as sustained inference pressure.
+    An ``inference`` tail is the in-flight turn, and it is where API retry
+    back-off shows up — a client parked on "will retry in 1m 14s" writes
+    nothing at all. Past ``api_stall_tail`` seconds with no output it is
+    counted at true wall-clock length and tagged ``stalled`` (0 tok/s so far),
+    up to ``api_stall_max``; the threshold is the hysteresis that keeps normal
+    turns and one-shot retry blips out of the stalled series.
+
+    Only an ``overhead`` tail, or an ``inference`` tail past ``api_stall_max``,
+    is capped to idle: a silent stretch that long with no tool running and no
+    return-of-control is far more likely a dormant / resumed / killed session
+    than a genuine model stall, and must not read as sustained inference
+    pressure.
     """
     if now is None or now <= last.ts:
         return None
@@ -387,7 +467,12 @@ def _tail_interval(last, now, pending_tools, max_gap):
     if category in (IDLE, TOOL):
         # Parked-idle and in-flight tool are true wall-clock, never capped.
         return Interval(last.ts, now, category)
-    if now - last.ts > max_gap:
+    d = now - last.ts
+    if category == INFERENCE and api_stall_tail <= d <= api_stall_max:
+        # In-flight turn with nothing produced for this long: an API stall
+        # (retry back-off / network / queueing), counted at true length.
+        return Interval(last.ts, now, INFERENCE, True)
+    if d > max_gap:
         # Dormant / resumed-session gap; not a multi-minute model stall.
         return Interval(last.ts, min(now, last.ts + max_gap), IDLE)
     return Interval(last.ts, now, category)
@@ -395,7 +480,9 @@ def _tail_interval(last, now, pending_tools, max_gap):
 
 def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
                     stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
-                    min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS):
+                    min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
+                    api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
+                    api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
     """Ordered JSONL entries (dicts) -> list[Interval].
 
     ``entries`` need not be sorted; moments are sorted by timestamp. When
@@ -404,8 +491,9 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
 
     Each ``inference`` interval also carries a ``stalled`` flag set from the
     ending assistant turn's output-token throughput (see
-    ``_is_stalled_inference``); the trailing open interval is never flagged
-    (its token count is not yet known).
+    ``_is_stalled_inference``), from the gap having ended in an API error, or
+    — for the trailing open interval — from the in-flight turn having produced
+    nothing for ``api_stall_tail`` seconds (API retry back-off).
     """
     moments = [m for m in (_entry_to_moment(e) for e in entries) if m is not None]
     moments.sort(key=lambda m: m.ts)
@@ -416,16 +504,19 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
     for prev, cur in zip(moments, moments[1:]):
         if cur.ts <= prev.ts:
             continue
-        cat = _classify_gap(prev, cur, max_gap)
+        cat = _classify_gap(prev, cur, max_gap, api_stall_max)
         stalled = cat == INFERENCE and _is_stalled_inference(
-            cur.ts - prev.ts, cur.output_tokens, stalled_tps, min_stall_gap
+            cur.ts - prev.ts, cur.output_tokens, stalled_tps, min_stall_gap,
+            api_error=cur.api_error,
         )
         intervals.append(Interval(prev.ts, cur.ts, cat, stalled))
 
     result_ids = _all_result_ids(entries)
     last = moments[-1]
     pending = [i for i in last.tool_use_ids if i not in result_ids]
-    tail = _tail_interval(last, now, pending, max_gap)
+    tail = _tail_interval(
+        last, now, pending, max_gap, api_stall_tail, api_stall_max
+    )
     if tail is not None and tail.end > tail.start:
         intervals.append(tail)
     return intervals
@@ -620,7 +711,9 @@ def _agent_id_from_path(path):
 def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
                     is_main_loop=False, session_id=None,
                     stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
-                    min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS):
+                    min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
+                    api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
+                    api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
     """Read one transcript file -> Transcript, tolerant of malformed lines.
 
     Returns None if the file can't be read at all. Individual bad JSONL lines
@@ -648,6 +741,7 @@ def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
     intervals = parse_intervals(
         entries, now=now, max_gap=max_gap,
         stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
+        api_stall_tail=api_stall_tail, api_stall_max=api_stall_max,
     )
     model = extract_model(entries)
     running = is_running_transcript(entries)
@@ -698,7 +792,9 @@ def discover_transcripts(projects_dir):
 def collect_live_transcripts(projects_dir, now, max_gap=DEFAULT_MAX_GAP_SECONDS,
                              live_window=DEFAULT_LIVE_WINDOW_SECONDS,
                              stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
-                             min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS):
+                             min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
+                             api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
+                             api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
     """Read every transcript whose file was modified within ``live_window`` of
     ``now``. Returns list[Transcript]."""
     live = []
@@ -713,6 +809,7 @@ def collect_live_transcripts(projects_dir, now, max_gap=DEFAULT_MAX_GAP_SECONDS,
             path, now=now, max_gap=max_gap,
             is_main_loop=is_main, session_id=session_id,
             stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
+            api_stall_tail=api_stall_tail, api_stall_max=api_stall_max,
         )
         if t is not None:
             live.append(t)

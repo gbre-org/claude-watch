@@ -216,7 +216,7 @@
         "justifyMode": "auto",
         "textMode": "value_and_name"
       },
-      "description": "The money metric (60s window), split into PRODUCTIVE vs STALLED so total pressure is never read as one number. Productive = fraction of the last 60s every active worker was blocked on inference AND generating tokens (compute-bound, healthy). Stalled = the subset where the model was blocked but NOT generating (throughput below the stall floor: 429 back-off / network / TTFT / queueing => rate-limit bound, more parallelism buys nothing). Main = the dispatcher, read side-by-side with Fleet (main loop excluded from Fleet). productive = full − stalled, clamped at 0."
+      "description": "The money metric (60s window), split into PRODUCTIVE vs STALLED so total pressure is never read as one number. Productive = fraction of the last 60s every active worker was blocked on inference AND generating tokens (compute-bound, healthy). Stalled = the subset where the model was blocked but NOT generating (throughput below the stall floor, a request that ended in an API error, or an in-flight turn silent past the API-stall threshold: 429 back-off / retry back-off / network / TTFT / queueing => rate-limit bound, more parallelism buys nothing). Main = the dispatcher, read side-by-side with Fleet (main loop excluded from Fleet). productive = full − stalled, clamped at 0."
     },
     {
       "id": 3,
