@@ -2050,15 +2050,38 @@ def _hostjob_effective_terminal(
         with open(sp, "r", encoding="utf-8", errors="replace") as f:
             st = json.load(f)
     except FileNotFoundError:
-        # No state dir. Either the job finished and `hostjob clean` removed it
-        # (clean REFUSES to remove a still-running job, so an absent dir means
-        # it had reached a terminal state), or we're inside the launch race
-        # where the runner registers the queue row a beat before writing
-        # status.json. Gate on the starting window to exclude that race; beyond
-        # it, treat the job as finished-and-cleaned. The rc is unrecoverable, so
-        # present it as a plain done (no evidence of failure to justify errored).
+        # No status.json for this label. TWO very different causes we MUST
+        # distinguish before fabricating a terminal state:
+        #   (a) the job finished and `hostjob clean` removed its dir (clean
+        #       REFUSES to remove a still-running job), or we're inside the
+        #       launch race where the runner registers the queue row a beat
+        #       before status.json lands; OR
+        #   (b) the minisite simply CANNOT SEE the hostjob state surface at all
+        #       -- the host ~/.cache/hostjob bind mount is missing / points at
+        #       the wrong path (e.g. HOSTJOB_LOG_DIR unset so it defaults under
+        #       $HOME to a dir that does not exist in this container), so EVERY
+        #       hostjob's status.json reads absent regardless of whether the job
+        #       is actually live.
+        # Fabricating `done` in case (b) demotes EVERY genuinely-running hostjob
+        # out of the running column into the time-capped done window, where it
+        # effectively disappears -- exactly the "hostjob items don't appear in
+        # the UI" deployment fault (main-loop items, never reconciled, still
+        # show, which is why the failure looks hostjob-specific). So only infer
+        # finished-and-cleaned when we have POSITIVE evidence the state surface
+        # is visible AND populated: the base HOSTJOB_LOG_DIR exists and holds at
+        # least one entry. Otherwise trust the queue's AUTHORITATIVE `running`
+        # status and keep the item visible. Mirrors the work-queue-exporter's
+        # `have_owner_signal` guard, which likewise stays silent when its input
+        # dir is unreadable rather than flagging the whole queue on a mount fault.
+        surface_visible = False
+        try:
+            with os.scandir(HOSTJOB_LOG_DIR) as _entries:
+                surface_visible = any(True for _ in _entries)
+        except OSError:
+            surface_visible = False
         if (
-            running_age_seconds is not None
+            surface_visible
+            and running_age_seconds is not None
             and running_age_seconds > STARTING_WINDOW_SECONDS
         ):
             return {"status": "done", "exit_code": ""}
