@@ -110,11 +110,39 @@ class HostjobReconcileTest(unittest.TestCase):
     # -- status.json absent (cleaned / launch race) -----------------------
 
     def test_missing_state_dir_past_starting_window_reconciles_to_done(self):
-        # No status.json + old registration => finished-and-cleaned.
+        # This job's status.json is gone, but the hostjob state surface is
+        # VISIBLE and POPULATED (another job's dir is present) => positive
+        # evidence the mount works and THIS job was finished-and-cleaned.
+        self._write_status("otherjob", {"status": "done", "rc": 0})
         s = self._shape(self._running_item("gonejob", age_seconds=3600))
         self.assertEqual(s["status"], "done")
         self.assertTrue(s["is_reconciled_hostjob"])
         self.assertEqual(s["hostjob_exit_code"], "")
+
+    def test_missing_state_dir_but_surface_unpopulated_keeps_running(self):
+        # The base HOSTJOB_LOG_DIR is EMPTY -- the minisite cannot see the
+        # hostjob state surface at all (missing / misconfigured bind mount).
+        # We CANNOT distinguish "finished-and-cleaned" from "unmounted", so we
+        # trust the queue's AUTHORITATIVE `running` status and keep the item
+        # VISIBLE. Fabricating `done` here is the "hostjob items don't appear
+        # in the UI" deployment fault (Andrew #6269).
+        s = self._shape(self._running_item("gonejob", age_seconds=3600))
+        self.assertEqual(s["status"], "running")
+        self.assertFalse(s["is_reconciled_hostjob"])
+
+    def test_missing_base_dir_keeps_running(self):
+        # HOSTJOB_LOG_DIR points at a path that does not exist at all (e.g.
+        # HOSTJOB_LOG_DIR unset so it defaulted under $HOME in a container
+        # without the mount). scandir raises OSError -> surface not visible ->
+        # keep running rather than fabricate a terminal state.
+        orig = appmod.HOSTJOB_LOG_DIR
+        appmod.HOSTJOB_LOG_DIR = str(Path(self._tmp.name) / "does-not-exist")
+        try:
+            s = self._shape(self._running_item("gonejob", age_seconds=3600))
+        finally:
+            appmod.HOSTJOB_LOG_DIR = orig
+        self.assertEqual(s["status"], "running")
+        self.assertFalse(s["is_reconciled_hostjob"])
 
     def test_missing_state_dir_within_starting_window_keeps_running(self):
         # Just launched — status.json may land a beat after the queue row
