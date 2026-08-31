@@ -1364,6 +1364,22 @@ COPY container/bin/self-clear /usr/local/bin/self-clear
 # into it, so the host chain and the image run the same bytes.
 COPY container/bin/self-login /usr/local/bin/self-login
 
+# self-mcp-reconnect — the /mcp counterpart to self-clear/self-login. Drives
+# the interactive "Manage MCP servers" picker end-to-end (open /mcp -> select
+# a server by name -> "Reconnect" -> confirm the inline Reconnected/Failed
+# result) to force a stale MCP server's TOOL DISCOVERY to refresh, e.g. after
+# `mcp-adaptor` is re-authenticated on the host and `claude mcp list` already
+# says Connected but the session's cached tool list (missing `doc_search`,
+# etc.) is stale. The older `mcp-reconnect` script only opens the /mcp list
+# and leaves it sitting there — it never drives an actual reconnect.
+#
+# It IMPORTS self-clear as a sibling for the shared pane primitives (pane
+# resolution, FleetView focus return, interrupt-and-wait), so it must land in
+# the SAME directory as the baked self-clear above. Same source-of-truth
+# arrangement: container/bin/self-mcp-reconnect is the file,
+# tools/watchers/self-mcp-reconnect is a symlink into it.
+COPY container/bin/self-mcp-reconnect /usr/local/bin/self-mcp-reconnect
+
 # cw-theme-sync — make Claude Code's TUI theme follow the browser theme.
 # Long-lived process-compose process (see container/process-compose.yml):
 # watches the theme-report file the clipboard-upload sidecar writes on the
@@ -1416,6 +1432,7 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
              /usr/local/bin/xclip \
              /usr/local/bin/self-clear \
              /usr/local/bin/self-login \
+             /usr/local/bin/self-mcp-reconnect \
              /usr/local/bin/cw-theme-sync \
              /usr/local/bin/cw-watcher-health-check \
              /usr/local/bin/cw-cron-run \

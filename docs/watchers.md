@@ -496,6 +496,6 @@ doing anything at all scrolls the old banner off long before that.
 ## Tests
 
 ```
-make test-watchers         # claude-event-watch fast-path + self-clear/self-login
+make test-watchers         # claude-event-watch fast-path + self-clear/self-login/self-mcp-reconnect
 make test-self-login-tmux  # self-login end-to-end against a throwaway tmux pane
 ```

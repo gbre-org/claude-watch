@@ -65,7 +65,8 @@
 .PHONY: test-session-task test-obligations-init test-cw-agent-stats
 .PHONY: test-queue-minisite test-hooks test-agent-msg test-agent-tail
 .PHONY: test-claude-event test-pr-branches test-event-must-act
-.PHONY: test-self-clear test-self-login test-self-login-tmux test-watchers
+.PHONY: test-self-clear test-self-login test-self-login-tmux test-self-mcp-reconnect
+.PHONY: test-watchers
 .PHONY: test-claude-events-exporter test-work-queue-exporter test-dashboard
 .PHONY: test-agent-psi-exporter
 # Tests — container image
@@ -280,8 +281,16 @@ test-self-login: ## self-login unit tests (pane predicates, code validation, con
 test-self-login-tmux: ## self-login end-to-end against a real tmux pane
 	tools/watchers/tests/test_self_login_tmux.sh
 
+# self-mcp-reconnect pure predicates/parsers (menu-visibility, server/action
+# row parsing, result-line parsing) + config paths. No terminal needed — the
+# actual `/mcp` menu navigation (do_reconnect) needs a real Claude Code pane
+# and is exercised manually per the empirical transcript in the script's
+# module docstring / container/skills/self-mcp-reconnect.md.
+test-self-mcp-reconnect: ## self-mcp-reconnect unit tests (menu parsers, config)
+	python3 tools/watchers/tests/test_self_mcp_reconnect.py
+
 # Run the claude-event-watch fast-path smoke test.
-test-watchers: test-self-clear test-self-login ## claude-event-watch fast-path + self-clear/self-login
+test-watchers: test-self-clear test-self-login test-self-mcp-reconnect ## claude-event-watch fast-path + self-clear/self-login/self-mcp-reconnect
 	tools/watchers/tests/test_claude_event_watch.sh
 
 # Run the claude-events-exporter suite: the heartbeat gauge that backs the
@@ -668,6 +677,7 @@ TOOL_LINKS := \
 	claude-event-watch=tools/watchers/claude-event-watch \
 	self-clear=tools/watchers/self-clear \
 	self-login=tools/watchers/self-login \
+	self-mcp-reconnect=tools/watchers/self-mcp-reconnect \
 	event-classify=tools/event-must-act/event-classify \
 	event-ack=tools/event-must-act/event-ack \
 	eval-event-must-act=tools/event-must-act/eval-event-must-act \
