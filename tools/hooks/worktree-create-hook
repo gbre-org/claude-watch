@@ -377,6 +377,63 @@ def _detect_mode(payload: dict) -> str:
     return "unknown"
 
 
+def _authoritative_identity(upstream: Path, runner) -> tuple[str, str] | None:
+    """Return the (name, email) a worktree of ``upstream`` must commit as, or
+    ``None`` to leave the inherited config untouched.
+
+    This NEVER guesses. regrello repos -> Andrew's Salesforce/EMU address;
+    anything else -> the host's configured global identity (personal). If no
+    identity can be resolved, returns ``None`` (caller leaves config alone)
+    rather than inventing one. KEEP the regrello address in sync with the
+    per-repo config set on the ~/repos/regrello* clones and the approved-
+    identities list in claude-config/githooks/.
+    """
+    try:
+        origin = runner(
+            ["git", "-C", str(upstream), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        origin = ""
+    if "regrello" in origin.lower():
+        return ("Andrew Hall", "hallandrew@salesforce.com")
+    try:
+        name = runner(["git", "config", "--global", "user.name"],
+                      capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+        email = runner(["git", "config", "--global", "user.email"],
+                       capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (name, email) if name and email else None
+
+
+def _ensure_worktree_identity(upstream: Path, wt_path: Path, runner) -> None:
+    """Stamp the freshly-created worktree with the authoritative git identity so
+    it is *born correct* -- no agent can then commit under a fabricated author/
+    committer email. Worktree-scoped (``extensions.worktreeConfig``) so the
+    upstream repo's own identity is left untouched. Best-effort: an identity
+    failure must never fail worktree allocation.
+    """
+    ident = _authoritative_identity(upstream, runner)
+    if ident is None:
+        _log({"event": "identity", "decision": "skip",
+              "reason": "no authoritative identity resolved", "upstream": str(upstream)})
+        return
+    name, email = ident
+    try:
+        runner(["git", "-C", str(upstream), "config", "extensions.worktreeConfig", "true"],
+               capture_output=True, text=True, timeout=5, check=False)
+        runner(["git", "-C", str(wt_path), "config", "--worktree", "user.name", name],
+               capture_output=True, text=True, timeout=5, check=False)
+        runner(["git", "-C", str(wt_path), "config", "--worktree", "user.email", email],
+               capture_output=True, text=True, timeout=5, check=False)
+        _log({"event": "identity", "decision": "set",
+              "name": name, "email": email, "worktree_path": str(wt_path)})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log({"event": "identity", "decision": "error",
+              "reason": str(exc), "worktree_path": str(wt_path)})
+
+
 def handle_create(
     payload: dict,
     *,
@@ -471,6 +528,10 @@ def handle_create(
             "stdout": (proc.stdout or "")[:500],
         })
         return ""
+
+    # Born-correct git identity: stamp the new worktree before any commit can
+    # happen, so a fabricated author/committer email is impossible here.
+    _ensure_worktree_identity(upstream, wt_path, runner)
 
     _log({
         "event": "create",
@@ -672,6 +733,39 @@ def _run_tests() -> int:  # noqa: C901
             and loaded[0][1].search("~/repos/claude-watch") is not None,
             f"loaded={loaded}",
         )
+
+    print("=== Git-identity resolver tests ===")
+
+    class _R:  # minimal fake completed-process
+        def __init__(self, out=""):
+            self.stdout = out
+            self.returncode = 0
+
+    def _fake_runner(kind, origin, gname, gemail):
+        def run(cmd, **_kw):
+            if "remote" in cmd and "get-url" in cmd:
+                return _R(origin)
+            if cmd[:3] == ["git", "config", "--global"]:
+                return _R(gname if cmd[-1] == "user.name" else gemail)
+            return _R("")
+        return run
+
+    r = _fake_runner("regrello",
+                     "https://github.com/regrello-sf/regrello-pce-infra.git", "", "")
+    _check("ID1. regrello origin -> Salesforce address",
+           _authoritative_identity(Path("/x"), r) == ("Andrew Hall", "hallandrew@salesforce.com"),
+           f"got={_authoritative_identity(Path('/x'), r)}")
+
+    r = _fake_runner("personal", "git@github.com:hndrewaall/claude-watch.git",
+                     "Andrew Hall", "hndrewaall@gmail.com")
+    _check("ID2. non-regrello origin -> host global identity",
+           _authoritative_identity(Path("/x"), r) == ("Andrew Hall", "hndrewaall@gmail.com"),
+           f"got={_authoritative_identity(Path('/x'), r)}")
+
+    r = _fake_runner("personal", "git@github.com:hndrewaall/x.git", "", "")
+    _check("ID3. non-regrello with no global identity -> None (never guesses)",
+           _authoritative_identity(Path("/x"), r) is None,
+           f"got={_authoritative_identity(Path('/x'), r)}")
 
     print("=== Integration tests (real git repo) ===")
 
