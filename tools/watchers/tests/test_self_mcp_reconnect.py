@@ -23,6 +23,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "tools" / "watchers" / "self-mcp-reconnect"
@@ -218,6 +219,91 @@ class FindLastResultTest(unittest.TestCase):
 
     def test_no_result_present(self):
         self.assertIsNone(self.mod.find_last_result("just a normal chat reply\n"))
+
+
+class DoReconnectNonCancellingTest(unittest.TestCase):
+    """Regression test for Andrew #6168-6171: driving `/mcp` must NOT
+    interrupt the pane's in-flight turn.
+
+    `do_reconnect` used to call `sc.interrupt_and_wait` (an active Escape
+    blast) and inject `/mcp` with `escape=True` (the CANCELLING
+    `claude-watch inject` path) — both cancel whatever turn is running.
+    The fix routes the `/mcp` open through the injector's NON-CANCELLING
+    default (no `--escape`) and drops the interrupt call entirely. This
+    drives the full `do_reconnect` happy path with `sc.run`/`sc.inject`/
+    `sc.interrupt_and_wait` mocked (no live tmux) and asserts both the
+    outcome and the injection choreography used to get there.
+    """
+
+    def setUp(self):
+        self.mod = _import_self_mcp_reconnect()
+
+    def test_do_reconnect_never_interrupts_and_opens_mcp_non_cancelling(self):
+        mod = self.mod
+        pane = "claude-container:0.0"
+
+        # One capture-pane response per `capture(pane)` call `do_reconnect`
+        # makes: (1) pre-existing result check, (2) top-level /mcp menu,
+        # (3) mcp-adaptor's detail screen, (4) the post-reconnect result.
+        capture_queue = [
+            "❯ some prior chat text\n",
+            (
+                "  Manage MCP servers\n"
+                " ❯ host-bash \xb7 ✔ connected \xb7 2 tools\n"
+                "   mcp-adaptor \xb7 ✘ failed\n"
+                "  ↑/↓ to navigate \xb7 Enter to confirm \xb7 Esc to cancel\n"
+            ),
+            (
+                "  mcp-adaptor\n"
+                " ❯ 1. Reconnect\n"
+                "   2. Disable\n"
+                "  ↑/↓ to navigate \xb7 Enter to select \xb7 Esc to back\n"
+            ),
+            "Reconnected to mcp-adaptor.\n",
+        ]
+
+        def fake_run(cmd, timeout=10):
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return capture_queue.pop(0), 0
+            # tmux send-keys (navigation) and any other shell-out: no-op ok.
+            return "", 0
+
+        mod.sc.run = mock.MagicMock(side_effect=fake_run)
+        mod.sc.capture_pane_text = mock.MagicMock(return_value="<mocked pane>")
+        mod.sc.ensure_main_loop_focus = mock.MagicMock(return_value=True)
+        # If do_reconnect ever calls this again, fail loudly: it is an
+        # active Escape blast and must not be part of the /mcp flow.
+        mod.sc.interrupt_and_wait = mock.MagicMock(
+            side_effect=AssertionError(
+                "do_reconnect must not call interrupt_and_wait -- that Escape "
+                "blast cancels the pane's in-flight turn (Andrew #6168-6171)"
+            )
+        )
+        mod.sc.inject = mock.MagicMock()
+
+        result = mod.do_reconnect(
+            pane, "mcp-adaptor", menu_timeout=5.0, result_timeout=5.0
+        )
+
+        self.assertEqual(result, {
+            "ok": True, "server": "mcp-adaptor", "reason": None, "code": 0,
+            "tools_before": "✘ failed",
+        })
+        mod.sc.interrupt_and_wait.assert_not_called()
+
+        mcp_open_calls = [
+            c for c in mod.sc.inject.call_args_list
+            if len(c.args) >= 2 and c.args[1] == "/mcp"
+        ]
+        self.assertEqual(len(mcp_open_calls), 1, "expected exactly one /mcp inject call")
+        _, kwargs = mcp_open_calls[0]
+        self.assertFalse(
+            kwargs.get("escape", False),
+            "opening /mcp must use claude-watch inject's non-cancelling "
+            "default (escape=False) -- escape=True Escape-blasts the pane "
+            "and cancels the in-flight turn",
+        )
+        self.assertTrue(kwargs.get("slash_command", False))
 
 
 if __name__ == "__main__":

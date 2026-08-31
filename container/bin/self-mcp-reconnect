@@ -375,15 +375,21 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
     if not sc.ensure_main_loop_focus(pane):
         log("  proceeding despite unconfirmed main-loop focus (see WARNING above)")
 
-    # /mcp is a sanctioned --escape (cancelling) consumer (src/main.rs) —
-    # the modal must land on a clean prompt line, and this legitimately
-    # interrupts an in-flight turn, same as self-clear's /clear. Seize the
-    # pane first, exactly like self-clear does.
-    if not sc.interrupt_and_wait(pane, timeout=menu_timeout):
-        log("  WARNING: interrupt_and_wait timed out; proceeding best-effort")
-
-    log("  injecting /mcp")
-    sc.inject(pane, "/mcp", label="mcp-open", slash_command=True, escape=True)
+    # NON-CANCELLING by design (Andrew #6168-6171): do NOT call
+    # `sc.interrupt_and_wait` and do NOT pass `escape=True` here. Both of
+    # those lead with an Escape blast, and an Escape is exactly what CANCELS
+    # the pane's in-flight turn (confirmed empirically — it interrupted the
+    # main loop mid-work). `claude-watch inject`'s default (no `--escape`)
+    # path is the injector's no-interrupt mode: it enters INSERT and submits
+    # with a bare Enter, never sending Escape, so a `/mcp` typed while a turn
+    # is generating is QUEUED by Claude Code rather than injected — the
+    # active turn (and any running background agents) is left intact. The
+    # queued `/mcp` is delivered at the next turn boundary, which is exactly
+    # why `run` still forks below: without the fork, this very Bash tool
+    # call IS that turn, and the queued `/mcp` would sit behind a turn that
+    # can't end until this script (blocked polling for the menu) returns.
+    log("  injecting /mcp (non-cancelling: no interrupt, no --escape)")
+    sc.inject(pane, "/mcp", label="mcp-open", slash_command=True, escape=False)
 
     text = _poll_until(pane, top_menu_visible, timeout=menu_timeout)
     if not top_menu_visible(text):
@@ -527,9 +533,11 @@ def main():
                         help="Run synchronously instead of forking. Use this for an "
                              "OUT-OF-SESSION invocation (docker exec, cron). From INSIDE "
                              "the session being targeted, omit this — self-mcp-reconnect "
-                             "must fork so the calling Bash tool call returns first, exactly "
-                             "like self-clear (the interrupt it sends would otherwise be "
-                             "cancelling its own in-flight turn).")
+                             "must fork so the calling Bash tool call returns first. The "
+                             "/mcp injection itself is non-cancelling (no interrupt), but "
+                             "it is typed-and-queued: without the fork, the queued /mcp "
+                             "would sit behind this very turn, which can't end until this "
+                             "script — still blocked polling for the menu — returns.")
     p_run.add_argument("--json", action="store_true", help="Emit one JSON result object on stdout")
 
     sub.add_parser("status", help="Print the last run's state file as JSON")
@@ -555,10 +563,14 @@ def main():
     # Fork so the calling Bash tool call returns immediately, mirroring
     # self-clear: the parent returns, the shell/tool call completes, Claude
     # Code's OWN turn (the one that ran this command) gets to finish and go
-    # idle, and only then does the child seize the pane. Without this, a
-    # self-serve invocation from inside the very session it targets would
-    # have its interrupt cancel the Bash tool call that is still waiting on
-    # this process.
+    # idle, and only then does the child type-and-queue `/mcp` into the pane.
+    # The `/mcp` injection itself is non-cancelling (no interrupt) -- but it
+    # is still typed-and-submitted text, and Claude Code QUEUES rather than
+    # runs a submitted message while a turn is generating. Without the fork,
+    # a self-serve invocation from inside the very session it targets would
+    # deadlock: the queued `/mcp` can't be delivered until this turn ends,
+    # and this turn can't end until this process (still blocked polling for
+    # the menu) returns.
     lock_fd = None
     try:
         Path(LOCKFILE).parent.mkdir(parents=True, exist_ok=True)
