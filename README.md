@@ -285,8 +285,26 @@ version_fallback_secs = 900      # wait 15 min after version_update hook before 
   usage (counter), aggregated from the JSONL transcripts under
   `~/.claude/projects/`. Labels: `input`, `output`, `cache_creation`,
   `cache_read`. Drives a per-day bar chart via `increase(...[1d])`.
+  **Monotonic by construction**: Claude Code prunes transcripts older
+  than `cleanupPeriodDays`, so a plain sum over what is on disk today
+  would step DOWN roughly daily — and `rate()` reads any decrease as a
+  counter reset and charges the whole cumulative value to that one
+  window (measured: a ~3–6M-token prune out of ~300M rendering as
+  ~65,000,000 tokens/min against a 341 tokens/min median). The
+  token-usage cache therefore doubles as an accrual ledger: a vanished
+  transcript keeps contributing its last-known per-day sums, and after
+  a week of absence those sums are folded into a day-keyed `retired`
+  map so the ledger stays bounded. A failed scan holds the last known
+  totals rather than emitting zeros, for the same reason.
 - `claude_code_tokens_month_to_date{type=...}` — token usage for the
   current calendar month (gauge), resets on the 1st. Same `type` labels.
+
+The `type` labels are NOT interchangeable for spend: `cache_read` is
+billed at roughly 0.1× the input rate and `cache_creation` at 1.25–2×,
+so any panel that wants a burn-rate proxy must pick its labels
+deliberately (the shipped one uses `{type!="cache_read"}`) — a bare
+`sum(claude_code_tokens_total)` is dominated by cache reads and is not
+proportional to cost.
 
 Ratio `fallback_injections_total / reminder_fires_total` = how often
 Claude ignored the conversational hint.
