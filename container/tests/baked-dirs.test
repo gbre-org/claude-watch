@@ -247,6 +247,37 @@ if self_clear.is_file():
         f"(inject /clear + resume), got: {first_content_line(text)!r}",
     )
 
+# 3e. self-mcp-reconnect.md present + references `self-mcp-reconnect` (the
+#     backing tool). Drives the /mcp picker end-to-end to force a stale MCP
+#     server's tool discovery to refresh — distinct from the older
+#     mcp-reconnect (opens the list, never confirms a reconnect).
+self_mcp_reconnect = SKILLS_DIR / "self-mcp-reconnect.md"
+expect(
+    self_mcp_reconnect.is_file(),
+    f"{self_mcp_reconnect} missing — the /claude-container:self-mcp-reconnect "
+    f"skill wraps the baked /usr/local/bin/self-mcp-reconnect tool (MCP "
+    f"tool-discovery refresh) and must ship as its own skill",
+)
+if self_mcp_reconnect.is_file():
+    text = self_mcp_reconnect.read_text(encoding="utf-8")
+    expect(
+        len(text) > 200,
+        f"{self_mcp_reconnect} suspiciously short (<200 chars)",
+    )
+    expect(
+        "self-mcp-reconnect" in text,
+        f"{self_mcp_reconnect} should reference `self-mcp-reconnect` (the "
+        f"in-container tool baked at /usr/local/bin/self-mcp-reconnect). "
+        f"Without it the skill has no backing tool.",
+    )
+    first_line = first_content_line(text).lower()
+    expect(
+        "mcp" in first_line and ("reconnect" in first_line or "discovery" in first_line),
+        f"{self_mcp_reconnect} first line should describe forcing an MCP "
+        f"server's tool discovery to refresh / reconnect, got: "
+        f"{first_content_line(text)!r}",
+    )
+
 # 3e. distill.md present — the distillation metaskill. Structured
 #     superset of the terse host /generalize one-liner; must reference
 #     /generalize (the relationship it supersedes/sits-beside) and the

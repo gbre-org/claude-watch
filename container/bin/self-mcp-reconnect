@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""On-demand MCP server reconnect, driven from OUTSIDE (or inside) the session.
+
+`self-clear` injects `/clear` into the running Claude Code TUI and drives it
+to completion. `self-mcp-reconnect` is the same trick for `/mcp`: it opens the
+"Manage MCP servers" picker, navigates to a named server, selects "Reconnect",
+and confirms the server actually came back — all via `tmux send-keys`, no
+human at the terminal required.
+
+Why it exists: an MCP server (typically an HTTP-bridged one like
+`mcp-adaptor`) can be re-authenticated or restarted on the HOST side without
+the IN-CONTAINER session noticing. `claude mcp list` may already report the
+transport as "Connected", but the session's TOOL DISCOVERY (its cached
+`tools/list` result — e.g. missing `doc_search` tools) is stale until the
+session drives a fresh MCP handshake itself. The only user-facing way to force
+that is `/mcp` -> select the server -> "Reconnect", and `/mcp` is an
+INTERACTIVE MODAL (confirmed empirically 2026-08-31 in a scratch tmux pane
+running a throwaway `claude` session — see container/skills/mcp-reconnect.md
+for the full transcript): opening it does NOT itself retry any connection:
+
+    /mcp
+      -> "Manage MCP servers" list, one line per server:
+           <name> · <status glyph> <status text>[ · N tools]
+         cursor starts on the FIRST (alphabetically-sorted) server.
+    Down x N, Enter
+      -> that server's detail screen: "1. <action>" / "2. <action>" / ...
+         (a FAILED server's menu starts "1. Reconnect / 2. Disable"; a
+         CONNECTED server's starts "1. View tools / 2. Clear authentication /
+         3. Reconnect / 4. Disable" — the position of "Reconnect" varies by
+         current status, so it must be located by text, never hardcoded).
+    Down x M (to "Reconnect"), Enter
+      -> fires the actual reconnect attempt. The menu closes ON ITS OWN back
+         to the normal chat prompt (no trailing Escape needed) and appends
+         one of:
+           "Reconnected to <name>."
+           "Failed to reconnect to <name>: <error>"
+
+So a correct reconnect needs real menu navigation with text-based lookups at
+each step, not a blind `/mcp` + Enter (the OLD `mcp-reconnect` script's
+approach, which only opened the list and left it sitting there — kept below
+as a deprecated wrapper around this script for any existing callers).
+
+Subcommands
+-----------
+  run [--server NAME]   Drive the full reconnect flow for one server
+                         (default NAME: $CLAUDE_SELF_MCP_RECONNECT_SERVER or
+                         "mcp-adaptor" — the documented stale-discovery case).
+  status                Print the state file as JSON.
+
+`run` is usable programmatically: `--foreground --json` makes it block and
+emit a single JSON object on stdout, so a caller (an agent, a cron producer)
+can drive the whole flow without a human watching.
+
+FAIL LOUD is the contract. "Server not found in the list", "menu never
+opened", "reconnect result never appeared" are all distinct, named failures —
+never a quiet success.
+
+Configuration (defaults portable; override via CLI flag or env var):
+  --log-file PATH    (env $CLAUDE_SELF_MCP_RECONNECT_LOG)
+  --lock-file PATH   (env $CLAUDE_SELF_MCP_RECONNECT_LOCK)
+  --state-file PATH  (env $CLAUDE_SELF_MCP_RECONNECT_STATE)
+
+Exit codes:
+  0  reconnect confirmed (the inline result line named our target server and
+     said "Reconnected to <name>.").
+  1  usage / no Claude Code pane / internal error.
+  4  the server was not in the `/mcp` list, the "Reconnect" action was not
+     found on its detail screen, or the menu never rendered — a shape change
+     in Claude Code's `/mcp` UI, not a transient failure.
+  5  the reconnect was attempted and Claude Code reported failure
+     ("Failed to reconnect to <name>: <error>") — the error text is in the
+     result payload / log; this is a real MCP-server-side problem, not a
+     scripting bug.
+  6  the result never appeared within the poll window (ambiguous — the menu
+     may still be open; best-effort Escape x2 is sent before exiting).
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+_HOME = os.path.expanduser("~")
+
+# Augment PATH so claude-watch / tmux are findable regardless of how the
+# script was launched (cron, tmux-inject, manual). Append-only. Mirrors
+# self-clear / self-login.
+for _p in (f"{_HOME}/bin", f"{_HOME}/.local/bin", "/usr/local/bin", "/usr/bin", "/bin"):
+    _existing = os.environ.get("PATH", "").split(os.pathsep)
+    if _p not in _existing:
+        _existing.append(_p)
+        os.environ["PATH"] = os.pathsep.join(p for p in _existing if p)
+
+
+# ---------------------------------------------------------------------------
+# Shared tmux/pane primitives come from self-clear — see self-login for the
+# precedent. self-clear already owns the hard-won, test-covered versions of
+# pane resolution, FleetView focus-return, interrupt-and-wait, and idle
+# detection. Re-typing them here is exactly the drift that produced FOUR
+# divergent copies of the inject choreography before `claude-watch inject`
+# centralized it. So we IMPORT the sibling instead of hand-rolling a second
+# copy. The script has no `.py` suffix and runs no top-level work beyond
+# defining helpers, so a SourceFileLoader import is safe.
+# ---------------------------------------------------------------------------
+
+def _load_self_clear():
+    """Import the sibling `self-clear` script as a module.
+
+    Hard-fails: without it we have no pane resolution, and a silent fallback
+    to a hand-rolled copy is how the two drift apart.
+    """
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "self-clear",
+        here.parent.parent / "container" / "bin" / "self-clear",
+    ]
+    for path in candidates:
+        if path.is_file():
+            loader = importlib.machinery.SourceFileLoader("_cw_self_clear", str(path))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise SystemExit(
+        "ERROR: could not locate the `self-clear` sibling script "
+        f"(looked in: {', '.join(str(c) for c in candidates)}). "
+        "self-mcp-reconnect reuses its tmux pane primitives and will not "
+        "hand-roll a second copy."
+    )
+
+
+sc = _load_self_clear()
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def _state_dir() -> Path:
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg:
+        return Path(xdg) / "claude-watch"
+    home_state = Path(_HOME) / ".local" / "state"
+    if home_state.is_dir() or not Path("/var/log/claude-watch").is_dir():
+        return home_state / "claude-watch"
+    return Path("/var/log/claude-watch")
+
+
+def _default_log_file() -> str:
+    env = os.environ.get("CLAUDE_SELF_MCP_RECONNECT_LOG", "").strip()
+    if env:
+        return env
+    return str(_state_dir() / "self-mcp-reconnect.log")
+
+
+def _default_state_file() -> str:
+    env = os.environ.get("CLAUDE_SELF_MCP_RECONNECT_STATE", "").strip()
+    if env:
+        return env
+    return str(_state_dir() / "self-mcp-reconnect.json")
+
+
+def _default_lock_file() -> str:
+    env = os.environ.get("CLAUDE_SELF_MCP_RECONNECT_LOCK", "").strip()
+    if env:
+        return env
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return str(Path(runtime) / "claude-self-mcp-reconnect.lock")
+    if Path("/var/run/claude").is_dir():
+        return "/var/run/claude/claude-self-mcp-reconnect.lock"
+    return "/tmp/claude-self-mcp-reconnect.lock"
+
+
+def _default_server() -> str:
+    env = os.environ.get("CLAUDE_SELF_MCP_RECONNECT_SERVER", "").strip()
+    return env or "mcp-adaptor"
+
+
+LOG_FILE = _default_log_file()
+STATE_FILE = _default_state_file()
+LOCKFILE = _default_lock_file()
+
+
+def log(msg: str) -> None:
+    """Append a timestamped line to the self-mcp-reconnect log (never raises)."""
+    try:
+        Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _bind_shared_log() -> None:
+    """Point self-clear's module-level logger at OUR log file.
+
+    The imported helpers (`interrupt_and_wait`, `ensure_main_loop_focus`, ...)
+    call self-clear's `log()`, which writes to self-clear's own file.
+    Rebinding the global keeps one run's diagnostics in one place.
+    """
+    try:
+        sc.LOG_FILE = LOG_FILE
+    except Exception:
+        pass
+
+
+def _write_state(payload: dict) -> None:
+    try:
+        Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(payload)
+        payload["updated_at"] = datetime.now().isoformat()
+        with open(STATE_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Pane text signatures + parsing for the `/mcp` picker.
+#
+# Sourced from an actual scratch-session transcript (2026-08-31), not
+# guessed. Kept as pure predicates/parsers over captured pane text so they
+# are unit-testable without a live tmux.
+# ---------------------------------------------------------------------------
+
+TOP_MENU_TITLE = "manage mcp servers"
+TOP_MENU_FOOTER = "enter to confirm"          # "... · Enter to confirm · Esc to cancel"
+DETAIL_MENU_FOOTER = "enter to select"        # "... · Enter to select · Esc to back"
+
+# A server row in the top-level list, e.g.:
+#   "   host-bash · ✔ connected · 3 tools"
+#   " ❯ mcp-adaptor · ✘ failed"
+_SERVER_ROW_RE = re.compile(
+    r"^\s*(?P<cursor>\W\s+)?(?P<name>[A-Za-z0-9_.\-]+)\s*\xb7\s*(?P<status>.+?)\s*$"
+)
+_STATUS_GLYPHS = ("✔", "✘", "△")  # ✔ ✘ △
+
+# A numbered action row in a server's detail screen, e.g.:
+#   " ❯ 1. View tools"
+#   "   3. Reconnect"
+_ACTION_ROW_RE = re.compile(r"^\s*(?P<cursor>\W\s+)?(?P<num>\d+)\.\s+(?P<label>.+?)\s*$")
+
+_RESULT_RE = re.compile(
+    r"(Reconnected to (?P<ok_name>[A-Za-z0-9_.\-]+)\.)"
+    r"|(Failed to reconnect to (?P<fail_name>[A-Za-z0-9_.\-]+):\s*(?P<reason>.+))"
+)
+
+
+def capture(pane: str) -> str:
+    """Capture the visible pane text (never the scrollback)."""
+    out, rc = sc.run(["tmux", "capture-pane", "-t", pane, "-p"])
+    if rc != 0 or not out:
+        return ""
+    return out
+
+
+def top_menu_visible(text: str) -> bool:
+    low = text.lower()
+    return TOP_MENU_TITLE in low and TOP_MENU_FOOTER in low
+
+
+def detail_menu_visible(text: str) -> bool:
+    return DETAIL_MENU_FOOTER in text.lower()
+
+
+def any_mcp_menu_visible(text: str) -> bool:
+    return top_menu_visible(text) or detail_menu_visible(text)
+
+
+def parse_server_rows(text: str):
+    """Return [(name, status_text, is_cursor), ...] in on-screen order."""
+    rows = []
+    for raw in text.splitlines():
+        if "\xb7" not in raw or not any(g in raw for g in _STATUS_GLYPHS):
+            continue
+        m = _SERVER_ROW_RE.match(raw)
+        if not m:
+            continue
+        is_cursor = bool(m.group("cursor")) and m.group("cursor").strip() not in ("", ".")
+        # A cursor glyph is a non-word char captured before the name; a plain
+        # multi-space indent captures as None from the optional group.
+        cursor_char = (m.group("cursor") or "").strip()
+        is_cursor = cursor_char != "" and not cursor_char[0].isalnum()
+        rows.append((m.group("name"), m.group("status").strip(), is_cursor))
+    return rows
+
+
+def parse_action_rows(text: str):
+    """Return [(index, label, is_cursor), ...] from a detail screen."""
+    rows = []
+    for raw in text.splitlines():
+        m = _ACTION_ROW_RE.match(raw)
+        if not m:
+            continue
+        cursor_char = (m.group("cursor") or "").strip()
+        is_cursor = cursor_char != "" and not cursor_char[0].isalnum()
+        rows.append((int(m.group("num")), m.group("label").strip(), is_cursor))
+    return rows
+
+
+def find_last_result(text: str):
+    """Return the LAST (status, name, reason) result line in the pane, or None.
+
+    status is "ok" or "fail". Scanning for the last match (not the first)
+    matters because a pane can carry an earlier /mcp attempt's result above
+    ours in scrollback-adjacent visible text.
+    """
+    last = None
+    for m in _RESULT_RE.finditer(text):
+        if m.group("ok_name"):
+            last = ("ok", m.group("ok_name"), None)
+        else:
+            last = ("fail", m.group("fail_name"), m.group("reason"))
+    return last
+
+
+# ---------------------------------------------------------------------------
+# Menu navigation — raw `tmux send-keys` on purpose: this is a MODAL, not the
+# vim-mode chat prompt, and these are NAVIGATION keys (Down/Enter through a
+# picker), not typed text. `claude-watch inject` types a payload; it has no
+# keystroke API, so there is nothing here for it to own. Mirrors self-login's
+# `select_login_method`.
+# ---------------------------------------------------------------------------
+
+def _send_key(pane: str, key: str, settle: float = 0.25) -> None:
+    sc.run(["tmux", "send-keys", "-t", pane, key])
+    time.sleep(settle)
+
+
+def _poll_until(pane: str, predicate, timeout: float, interval: float = 0.4) -> str:
+    """Poll capture(pane) until predicate(text) is true. Returns last text."""
+    deadline = time.time() + timeout
+    text = capture(pane)
+    while time.time() < deadline:
+        if predicate(text):
+            return text
+        time.sleep(interval)
+        text = capture(pane)
+    return text
+
+
+def close_any_menu(pane: str, max_attempts: int = 3) -> bool:
+    """Best-effort: Escape out of any /mcp menu still on screen."""
+    for _ in range(max_attempts):
+        text = capture(pane)
+        if not any_mcp_menu_visible(text):
+            return True
+        _send_key(pane, "Escape", settle=0.4)
+    return not any_mcp_menu_visible(capture(pane))
+
+
+def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: float) -> dict:
+    """Drive the full `/mcp` -> server -> Reconnect flow. Returns a result dict:
+
+    {"ok": bool, "server": str, "reason": str, "code": int, "tools_before": str|None}
+    """
+    log(f"START: pane={pane} server={server}")
+    log(f"  pane state: {sc.capture_pane_text(pane)}")
+
+    pre_result = find_last_result(capture(pane))
+
+    if not sc.ensure_main_loop_focus(pane):
+        log("  proceeding despite unconfirmed main-loop focus (see WARNING above)")
+
+    # /mcp is a sanctioned --escape (cancelling) consumer (src/main.rs) —
+    # the modal must land on a clean prompt line, and this legitimately
+    # interrupts an in-flight turn, same as self-clear's /clear. Seize the
+    # pane first, exactly like self-clear does.
+    if not sc.interrupt_and_wait(pane, timeout=menu_timeout):
+        log("  WARNING: interrupt_and_wait timed out; proceeding best-effort")
+
+    log("  injecting /mcp")
+    sc.inject(pane, "/mcp", label="mcp-open", slash_command=True, escape=True)
+
+    text = _poll_until(pane, top_menu_visible, timeout=menu_timeout)
+    if not top_menu_visible(text):
+        log(f"  FAIL: top-level MCP menu never rendered. pane: {sc.capture_pane_text(pane)}")
+        close_any_menu(pane)
+        return {"ok": False, "server": server, "reason": "menu-did-not-open", "code": 4}
+
+    rows = parse_server_rows(text)
+    names = [r[0] for r in rows]
+    log(f"  server list: {names}")
+    if server not in names:
+        log(f"  FAIL: server {server!r} not in /mcp list {names!r}")
+        close_any_menu(pane)
+        return {
+            "ok": False, "server": server,
+            "reason": f"server not configured / not in /mcp list: {names!r}",
+            "code": 4,
+        }
+
+    target_idx = names.index(server)
+    tools_before = rows[target_idx][1]
+    cursor_idx = next((i for i, r in enumerate(rows) if r[2]), 0)
+    downs = target_idx - cursor_idx
+    log(f"  target row {target_idx} ({tools_before!r}), cursor at {cursor_idx}, sending {downs} Down")
+    for _ in range(max(0, downs)):
+        _send_key(pane, "Down")
+    _send_key(pane, "Enter", settle=0.6)
+
+    text = _poll_until(pane, detail_menu_visible, timeout=menu_timeout)
+    if not detail_menu_visible(text):
+        log(f"  FAIL: detail screen for {server} never rendered. pane: {sc.capture_pane_text(pane)}")
+        close_any_menu(pane)
+        return {"ok": False, "server": server, "reason": "detail-screen-did-not-open", "code": 4}
+
+    actions = parse_action_rows(text)
+    log(f"  actions for {server}: {[(n, l) for n, l, _ in actions]}")
+    reconnect_rows = [(n, l, c) for (n, l, c) in actions if "reconnect" in l.lower()]
+    if not reconnect_rows:
+        log(f"  FAIL: no 'Reconnect' action found for {server}")
+        close_any_menu(pane)
+        return {
+            "ok": False, "server": server,
+            "reason": f"no Reconnect action on detail screen: {[l for _, l, _ in actions]!r}",
+            "code": 4,
+        }
+    target_num = reconnect_rows[0][0]
+    cursor_num = next((n for (n, _, c) in actions if c), actions[0][0] if actions else 1)
+    downs = target_num - cursor_num
+    log(f"  Reconnect is item {target_num}, cursor at item {cursor_num}, sending {downs} Down")
+    for _ in range(max(0, downs)):
+        _send_key(pane, "Down")
+    _send_key(pane, "Enter", settle=0.8)
+
+    def _got_new_result(t: str) -> bool:
+        r = find_last_result(t)
+        return r is not None and r != pre_result and not any_mcp_menu_visible(t)
+
+    text = _poll_until(pane, _got_new_result, timeout=result_timeout)
+    result = find_last_result(text)
+
+    # Regardless of what we found, never leave a menu standing.
+    if any_mcp_menu_visible(text):
+        log("  menu still visible after reconnect confirm; closing best-effort")
+        close_any_menu(pane)
+
+    if result is None or result == pre_result:
+        log(f"  AMBIGUOUS: no new reconnect result appeared within {result_timeout}s. "
+            f"pane: {sc.capture_pane_text(pane)}")
+        return {
+            "ok": False, "server": server,
+            "reason": "no result line appeared within timeout (menu was closed defensively)",
+            "code": 6,
+        }
+
+    status, name, reason = result
+    if name != server:
+        log(f"  MISMATCH: result named {name!r}, expected {server!r} — wrong row was confirmed")
+        return {
+            "ok": False, "server": server,
+            "reason": f"reconnect result named a different server ({name!r}); navigation likely misfired",
+            "code": 4,
+        }
+    if status == "ok":
+        log(f"  SUCCESS: Reconnected to {server}.")
+        return {"ok": True, "server": server, "reason": None, "code": 0, "tools_before": tools_before}
+
+    log(f"  Claude Code reported failure: Failed to reconnect to {server}: {reason}")
+    return {"ok": False, "server": server, "reason": reason, "code": 5, "tools_before": tools_before}
+
+
+def verify_via_cli(server: str) -> str:
+    """Best-effort secondary signal: `claude mcp list` status line for server."""
+    out, rc = sc.run(["claude", "mcp", "list"], timeout=20)
+    if rc != 0 or not out:
+        return "claude mcp list: unavailable"
+    for line in out.splitlines():
+        if line.strip().startswith(server):
+            return line.strip()
+    return f"claude mcp list: {server} not listed"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def do_run(args) -> dict:
+    _bind_shared_log()
+    pane = args.pane or sc.find_claude_pane()
+    if not pane:
+        return {"ok": False, "server": args.server, "reason": "no Claude Code tmux pane found", "code": 1}
+
+    result = do_reconnect(pane, args.server, menu_timeout=args.menu_timeout,
+                           result_timeout=args.result_timeout)
+
+    if args.verify:
+        cli_line = verify_via_cli(args.server)
+        log(f"  verify (claude mcp list): {cli_line}")
+        result["cli_status"] = cli_line
+
+    _write_state({"pane": pane, **result})
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="Drive the full /mcp reconnect flow for one server")
+    p_run.add_argument("--server", default=_default_server(),
+                        help="MCP server name as it appears in /mcp (default: "
+                             "$CLAUDE_SELF_MCP_RECONNECT_SERVER or 'mcp-adaptor')")
+    p_run.add_argument("--pane", default=None, help="Target tmux pane (default: auto-detect)")
+    p_run.add_argument("--menu-timeout", type=float, default=15.0,
+                        help="Max seconds to wait for each menu screen to render (default: 15)")
+    p_run.add_argument("--result-timeout", type=float, default=20.0,
+                        help="Max seconds to wait for the Reconnected/Failed result line (default: 20)")
+    p_run.add_argument("--no-verify", dest="verify", action="store_false",
+                        help="Skip the secondary `claude mcp list` check")
+    p_run.add_argument("--foreground", action="store_true",
+                        help="Run synchronously instead of forking. Use this for an "
+                             "OUT-OF-SESSION invocation (docker exec, cron). From INSIDE "
+                             "the session being targeted, omit this — self-mcp-reconnect "
+                             "must fork so the calling Bash tool call returns first, exactly "
+                             "like self-clear (the interrupt it sends would otherwise be "
+                             "cancelling its own in-flight turn).")
+    p_run.add_argument("--json", action="store_true", help="Emit one JSON result object on stdout")
+
+    sub.add_parser("status", help="Print the last run's state file as JSON")
+
+    args = parser.parse_args()
+
+    if args.cmd == "status":
+        try:
+            print(Path(_default_state_file()).read_text())
+        except FileNotFoundError:
+            print(json.dumps({"ok": None, "reason": "no prior run"}))
+        return
+
+    # cmd == "run"
+    if args.foreground:
+        result = do_run(args)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(f"[self-mcp-reconnect] {result}")
+        sys.exit(result.get("code", 1))
+
+    # Fork so the calling Bash tool call returns immediately, mirroring
+    # self-clear: the parent returns, the shell/tool call completes, Claude
+    # Code's OWN turn (the one that ran this command) gets to finish and go
+    # idle, and only then does the child seize the pane. Without this, a
+    # self-serve invocation from inside the very session it targets would
+    # have its interrupt cancel the Bash tool call that is still waiting on
+    # this process.
+    lock_fd = None
+    try:
+        Path(LOCKFILE).parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(LOCKFILE, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        log("SKIP: another self-mcp-reconnect is already running (lockfile held)")
+        print("[self-mcp-reconnect] another run is already in progress; skipping.")
+        sys.exit(0)
+
+    pid = os.fork()
+    if pid > 0:
+        print(f"self-mcp-reconnect backgrounded (PID {pid}) for server={args.server!r}. "
+              f"Check `self-mcp-reconnect status` or the log at {LOG_FILE} for the result.")
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+        return
+
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+
+    def signal_handler(signum, frame):
+        signame = signal.Signals(signum).name
+        log(f"KILLED: received {signame} ({signum})")
+        sys.exit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGPIPE, signal.SIGALRM):
+        signal.signal(sig, signal_handler)
+
+    try:
+        result = do_run(args)
+        log(f"DONE: {result}")
+    except Exception:
+        log(f"CRASH: {traceback.format_exc()}")
+    finally:
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
