@@ -622,3 +622,8 @@ suites) so the pre-commit hook + CI catch regressions.
 - `/start-watchers` skill: [`container/skills/start-watchers.md`](../container/skills/start-watchers.md)
 - Cardinal rule reference (why watchers are main-loop-only):
   [`docs/watchers.md#cardinal-rule-watchers-belong-to-the-main-loop`](watchers.md#cardinal-rule-watchers-belong-to-the-main-loop)
+
+<!-- Merge queue end-to-end check, 2026-09-01: this branch was cut one commit
+     behind main on purpose, so classic strict protection would have demanded a
+     manual update-branch before merging. The queue rebuilds it on top of main
+     instead. -->
