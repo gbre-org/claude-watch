@@ -21,10 +21,19 @@ with the "2" inside an extended-colour parameter list (`38;2;r;g;b`, and the
 `2` that can appear as a colour index in `38;5;2`), or every ordinary
 coloured run would read as a placeholder and the gate would swing open onto
 text a human really is typing.
+
+The second half of this file covers the EXTERNAL HOOKS (theme-hooks.d): the
+run-parts discovery rules, the frozen argv + env contract, failure/timeout
+isolation, and — most importantly — WHERE in the daemon's decision tree each
+event fires. `changed` firing before the idle gate is the requirement; wiring
+it after would quietly hand every external side effect the gate's unbounded
+latency back.
 """
 
 import importlib.util
+import os
 import sys
+import time as _time
 from pathlib import Path
 
 import pytest
@@ -225,3 +234,538 @@ def test_idle_state_catches_a_human_typing_during_the_recheck(monkeypatch):
 def test_is_idle_wraps_idle_state(monkeypatch):
     _pane(monkeypatch, GHOST_LINE, GHOST_LINE)
     assert mod.is_idle("p") is True
+
+
+# ==========================================================================
+# External hooks (theme-hooks.d)
+#
+# The one hard property: a hook can NEVER break the inject path. Everything
+# below either pins a piece of the published contract (argv shape, env,
+# discovery rules, ordering) or pins that a misbehaving hook is survivable.
+# ==========================================================================
+
+def _hooks_dir(tmp_path, monkeypatch):
+    d = tmp_path / "theme-hooks.d"
+    d.mkdir()
+    monkeypatch.setattr(mod, "HOOKS_DIR", str(d))
+    return d
+
+
+def _hook(d, name, body="#!/bin/sh\nexit 0\n", mode=0o755):
+    p = d / name
+    p.write_text(body)
+    p.chmod(mode)
+    return p
+
+
+@pytest.fixture
+def logged(monkeypatch):
+    """Capture the daemon's log lines instead of writing them anywhere."""
+    lines = []
+    monkeypatch.setattr(mod, "log", lines.append)
+    return lines
+
+
+# --------------------------------------------------------------------------
+# discover_hooks — run-parts conventions
+# --------------------------------------------------------------------------
+
+def test_missing_hooks_dir_is_empty_not_an_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(mod, "HOOKS_DIR", str(tmp_path / "nope"))
+    assert mod.discover_hooks() == []
+
+
+def test_only_executable_files_are_discovered(monkeypatch, tmp_path):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    _hook(d, "10-yes")
+    _hook(d, "20-no", mode=0o644)  # chmod -x is the disable switch
+    assert [h.name for h in mod.discover_hooks()] == ["10-yes"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "10-kiosk.sh",     # any dot at all
+        "20-notify.bak",
+        "30-old.disabled",
+        "40-editor~",      # editor backup
+        ".hidden",
+        "50 spaced",
+    ],
+)
+def test_names_outside_the_run_parts_charset_are_skipped(
+    monkeypatch, tmp_path, name
+):
+    """The name filter is what stops a backup copy firing behind your back."""
+    d = _hooks_dir(tmp_path, monkeypatch)
+    _hook(d, name)
+    assert mod.discover_hooks() == []
+
+
+def test_subdirectories_are_skipped_not_recursed(monkeypatch, tmp_path):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    sub = d / "20-nested"
+    sub.mkdir()
+    _hook(sub, "10-inner")
+    _hook(d, "10-top")
+    assert [h.name for h in mod.discover_hooks()] == ["10-top"]
+
+
+def test_symlink_to_an_executable_is_included(monkeypatch, tmp_path):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    target = tmp_path / "real-tool"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    (d / "10-link").symlink_to(target)
+    assert [h.name for h in mod.discover_hooks()] == ["10-link"]
+
+
+def test_discovery_order_is_byte_not_numeric(monkeypatch, tmp_path):
+    """`10-a` before `2-c`: the contract says BYTE order, like run-parts.
+
+    Pinned explicitly because "sorted by NN prefix" reads as numeric to
+    everyone who has not been bitten by it, and a hook pair whose relative
+    order matters would silently swap.
+    """
+    d = _hooks_dir(tmp_path, monkeypatch)
+    for name in ("20-b", "2-c", "10-a"):
+        _hook(d, name)
+    assert [h.name for h in mod.discover_hooks()] == ["10-a", "2-c", "20-b"]
+
+
+# --------------------------------------------------------------------------
+# Invocation contract — argv stays at two args forever; the rest is env
+# --------------------------------------------------------------------------
+
+DUMP_HOOK = """#!/bin/sh
+{
+  echo "argc=$#"
+  echo "arg1=$1"
+  echo "arg2=$2"
+  echo "cwd=$(pwd)"
+  echo "event=$CW_THEME_EVENT"
+  echo "new=$CW_THEME_NEW"
+  echo "old=$CW_THEME_OLD"
+  echo "reason=$CW_THEME_REASON"
+  echo "source=$CW_THEME_SOURCE_FILE"
+  echo "ts=$CW_THEME_TIMESTAMP"
+  echo "iso=$CW_THEME_TIMESTAMP_ISO"
+  echo "pane=${CW_THEME_PANE-<unset>}"
+  echo "hook=$CW_THEME_HOOK"
+  echo "stdin=$(cat)"
+} > "$HOOK_DUMP"
+"""
+
+
+def _dump(path):
+    return dict(
+        ln.split("=", 1) for ln in path.read_text().splitlines() if "=" in ln
+    )
+
+
+def test_applied_hook_gets_the_full_documented_contract(
+    monkeypatch, tmp_path, logged
+):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    _hook(d, "10-dump", DUMP_HOOK)
+    out = tmp_path / "dump.txt"
+    monkeypatch.setenv("HOOK_DUMP", str(out))
+    monkeypatch.setattr(mod, "THEME_FILE", "/host-clipboard/theme")
+
+    mod.run_hooks(
+        "applied", "dark", old="light", reason="change",
+        pane="claude-container:0.0",
+    )
+
+    got = _dump(out)
+    # argv is frozen at TWO positional args. Growing it is exactly the
+    # compatibility trap this contract exists to avoid.
+    assert got["argc"] == "2"
+    assert got["arg1"] == "applied"
+    assert got["arg2"] == "dark"
+    assert got["cwd"] == "/"
+    assert got["event"] == "applied"
+    assert got["new"] == "dark"
+    assert got["old"] == "light"
+    assert got["reason"] == "change"
+    assert got["source"] == "/host-clipboard/theme"
+    assert got["ts"].isdigit()
+    assert got["iso"].startswith("20") and "T" in got["iso"]
+    assert got["pane"] == "claude-container:0.0"
+    assert got["hook"] == "10-dump"
+    # stdin is /dev/null, so `cat` returns immediately with nothing.
+    assert got["stdin"] == ""
+
+
+def test_changed_hook_has_no_pane_even_when_the_daemon_was_given_one(
+    monkeypatch, tmp_path, logged
+):
+    """CW_THEME_PANE is `applied`-only, and that must hold for the ABSENCE.
+
+    CW_THEME_PANE is also one of the daemon's own config knobs, so a naive
+    "inherit the environment" would leak it into a `changed` fire and invite
+    hooks to trust a pane that has nothing to do with that event.
+    """
+    d = _hooks_dir(tmp_path, monkeypatch)
+    _hook(d, "10-dump", DUMP_HOOK)
+    out = tmp_path / "dump.txt"
+    monkeypatch.setenv("HOOK_DUMP", str(out))
+    monkeypatch.setenv("CW_THEME_PANE", "configured:0.0")
+
+    mod.run_hooks("changed", "light", old=None, reason="startup")
+
+    got = _dump(out)
+    assert got["pane"] == "<unset>"
+    assert got["old"] == ""       # empty on the first observation
+    assert got["reason"] == "startup"
+
+
+def test_hook_environment_inherits_the_daemon_environment(
+    monkeypatch, tmp_path, logged
+):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    out = tmp_path / "dump.txt"
+    _hook(d, "10-inherit", f'#!/bin/sh\necho "$SOME_SITE_VAR" > "{out}"\n')
+    monkeypatch.setenv("SOME_SITE_VAR", "kept")
+    mod.run_hooks("changed", "dark")
+    assert out.read_text().strip() == "kept"
+
+
+# --------------------------------------------------------------------------
+# Failure isolation — the hard property
+# --------------------------------------------------------------------------
+
+def test_a_failing_hook_is_swallowed_and_does_not_stop_the_next(
+    monkeypatch, tmp_path, logged
+):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    marker = tmp_path / "ran"
+    _hook(d, "10-boom", "#!/bin/sh\necho 'curl: (7) refused' >&2\nexit 1\n")
+    _hook(d, "20-after", f'#!/bin/sh\ntouch "{marker}"\n')
+
+    mod.run_hooks("changed", "dark")  # must not raise
+
+    assert marker.exists(), "a failing hook must not abort the sequence"
+    joined = "\n".join(logged)
+    assert "hook 10-boom (changed dark): FAILED rc=1" in joined
+    assert "curl: (7) refused" in joined
+    assert "hook 20-after (changed dark): ok in" in joined
+
+
+def test_a_hanging_hook_is_killed_at_the_timeout_and_the_rest_still_run(
+    monkeypatch, tmp_path, logged
+):
+    """Bounded worst case.
+
+    `sleep` is a CHILD of the hook shell, so this also pins that the kill goes
+    to the process GROUP: killing only the shell leaves the child alive AND
+    still holding the stdout pipe, which turns a bounded timeout into an
+    unbounded wait.
+    """
+    d = _hooks_dir(tmp_path, monkeypatch)
+    marker = tmp_path / "ran"
+    monkeypatch.setattr(mod, "HOOK_TIMEOUT_SECS", 0.3)
+    _hook(d, "10-slow", "#!/bin/sh\nsleep 30\n")
+    _hook(d, "20-after", f'#!/bin/sh\ntouch "{marker}"\n')
+
+    started = _time.monotonic()
+    mod.run_hooks("applied", "light", pane="p")
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 10, f"the timeout was not bounded ({elapsed:.1f}s)"
+    assert marker.exists()
+    assert "hook 10-slow (applied light): TIMEOUT after 0.3s; killed" in logged
+
+
+def test_a_hook_that_cannot_exec_is_reported_not_raised(
+    monkeypatch, tmp_path, logged
+):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    # Executable bit set, but the interpreter does not exist.
+    _hook(d, "10-broken", "#!/nonexistent/interpreter\n")
+    mod.run_hooks("changed", "dark")
+    assert any("10-broken" in ln and "FAILED" in ln for ln in logged)
+
+
+def test_run_hooks_never_raises_even_if_discovery_explodes(monkeypatch, logged):
+    def boom():
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(mod, "discover_hooks", boom)
+    mod.run_hooks("changed", "dark")  # must not propagate
+    assert any("hook runner error" in ln for ln in logged)
+
+
+def test_hook_output_is_truncated_in_the_log(monkeypatch, tmp_path, logged):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    _hook(
+        d, "10-chatty",
+        "#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8; do echo L$i; done\n",
+    )
+    mod.run_hooks("changed", "dark")
+    line = next(ln for ln in logged if "10-chatty" in ln)
+    assert "L5" in line and "L6" not in line
+    assert "[truncated]" in line
+
+
+# --------------------------------------------------------------------------
+# Forward compatibility — a hook must exit 0 on an event it does not know
+# --------------------------------------------------------------------------
+
+def test_an_unrecognised_event_is_passed_through_verbatim(
+    monkeypatch, tmp_path, logged
+):
+    """Adding a third event later (`failed`, say) must be non-breaking.
+
+    The runner does not police the event name, and a contract-abiding hook
+    exits 0 on one it does not recognise — so it logs `ok`, not `FAILED`.
+    """
+    d = _hooks_dir(tmp_path, monkeypatch)
+    out = tmp_path / "seen"
+    _hook(
+        d, "10-guarded",
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        f'  changed) echo changed > "{out}" ;;\n'
+        "  *) exit 0 ;;\n"   # the documented forward-compat rule
+        "esac\n",
+    )
+    mod.run_hooks("failed", "dark")
+    assert not out.exists()
+    assert any("10-guarded (failed dark): ok in" in ln for ln in logged)
+
+
+# --------------------------------------------------------------------------
+# Re-discovery — installing a hook must not need a restart
+# --------------------------------------------------------------------------
+
+def test_hooks_are_rediscovered_on_every_fire(monkeypatch, tmp_path, logged):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    mod.run_hooks("changed", "dark")
+    assert logged == []
+
+    marker = tmp_path / "late"
+    _hook(d, "10-late", f'#!/bin/sh\ntouch "{marker}"\n')
+    mod.run_hooks("changed", "light")
+    assert marker.exists()
+
+
+# --------------------------------------------------------------------------
+# Off by default, by absence — the regression that keeps this feature free
+# --------------------------------------------------------------------------
+
+def test_no_hooks_dir_spawns_nothing_and_logs_nothing(
+    monkeypatch, tmp_path, logged
+):
+    monkeypatch.setattr(mod, "HOOKS_DIR", str(tmp_path / "absent"))
+
+    def no_subprocesses(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("a hook subprocess was spawned with no hooks dir")
+
+    monkeypatch.setattr(mod.subprocess, "Popen", no_subprocesses)
+    mod.run_hooks("changed", "dark")
+    mod.run_hooks("applied", "dark", pane="p")
+    assert logged == []
+
+
+def test_an_empty_hooks_dir_is_equally_silent(monkeypatch, tmp_path, logged):
+    _hooks_dir(tmp_path, monkeypatch)
+    mod.run_hooks("changed", "dark")
+    assert logged == []
+
+
+# --------------------------------------------------------------------------
+# --status surfaces the dir + what was discovered in it
+# --------------------------------------------------------------------------
+
+def test_status_reports_hooks_dir_and_the_discovered_list(
+    monkeypatch, tmp_path, capsys
+):
+    d = _hooks_dir(tmp_path, monkeypatch)
+    _hook(d, "10-a")
+    _hook(d, "20-b", mode=0o644)  # lost its +x: must NOT be listed
+    monkeypatch.setattr(mod, "resolve_pane", lambda: "p")
+    monkeypatch.setattr(mod, "idle_state", lambda pane: (True, "idle"))
+    monkeypatch.setattr(mod, "read_theme", lambda: "dark")
+    monkeypatch.setattr(mod, "read_settings_theme", lambda: "dark")
+
+    mod.print_status()
+
+    out = capsys.readouterr().out
+    assert f"hooks_dir     : {d}" in out
+    assert "hooks         : 10-a" in out
+    assert "20-b" not in out
+
+
+# ==========================================================================
+# Wiring — WHERE the two events fire in the daemon's decision tree.
+#
+# `changed` before the idle gate is the requirement; wiring it after is the
+# regression that would quietly reintroduce hours of latency on every
+# external side effect.
+# ==========================================================================
+
+class _StopLoop(Exception):
+    """Break out of the daemon's `while True` from a patched sleep."""
+
+
+class _Ticker:
+    """A `time` stand-in that aborts the poll loop after N sleeps."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.calls = 0
+
+    def __getattr__(self, name):
+        return getattr(_time, name)
+
+    def sleep(self, _secs):
+        self.calls += 1
+        if self.calls >= self.limit:
+            raise _StopLoop()
+
+
+def _daemon(monkeypatch, tmp_path, theme="dark", idle=True, inject=True,
+            sleeps=2):
+    """Arm `main()`'s daemon path with recorded hook fires.
+
+    Returns the list a fake `run_hooks` appends
+    `(event, new, old, reason, pane)` tuples to.
+    """
+    theme_file = tmp_path / "theme"
+    theme_file.write_text(theme)
+    monkeypatch.setattr(mod, "THEME_FILE", str(theme_file))
+    monkeypatch.setattr(mod, "LOG_FILE", str(tmp_path / "log"))
+    monkeypatch.setattr(mod, "POLL_SECS", 0.0)
+    monkeypatch.setattr(mod, "IDLE_POLL_SECS", 0.0)
+    monkeypatch.setattr(mod, "resolve_pane", lambda: "claude-container:0.0")
+    monkeypatch.setattr(
+        mod, "idle_state",
+        lambda pane: (True, "idle") if idle else (False, "pane busy"),
+    )
+    monkeypatch.setattr(mod, "inject_theme", lambda pane, t: inject)
+    monkeypatch.setattr(mod, "log", lambda msg: None)
+    monkeypatch.setattr(mod, "time", _Ticker(sleeps))
+    monkeypatch.setattr(sys, "argv", ["cw-theme-sync"])
+
+    fires = []
+    monkeypatch.setattr(
+        mod, "run_hooks",
+        lambda event, new, old=None, reason="change", pane=None: fires.append(
+            (event, new, old, reason, pane)
+        ),
+    )
+    return fires
+
+
+def _run_daemon():
+    with pytest.raises(_StopLoop):
+        mod.main()
+
+
+def test_changed_fires_even_when_the_pane_never_goes_idle(
+    monkeypatch, tmp_path
+):
+    """THE requirement. The idle gate can stay shut for hours, and an
+    external side effect must not inherit that latency."""
+    fires = _daemon(monkeypatch, tmp_path, theme="dark", idle=False)
+    _run_daemon()
+    assert ("changed", "dark", None, "startup", None) in fires
+    assert not [f for f in fires if f[0] == "applied"]
+
+
+def test_startup_fires_changed_with_an_empty_old_value(monkeypatch, tmp_path):
+    fires = _daemon(monkeypatch, tmp_path, theme="light", idle=False)
+    _run_daemon()
+    assert fires[0] == ("changed", "light", None, "startup", None)
+
+
+def test_applied_fires_only_after_a_verified_inject(monkeypatch, tmp_path):
+    fires = _daemon(monkeypatch, tmp_path, theme="dark", idle=True, inject=True)
+    _run_daemon()
+    assert [f[0] for f in fires] == ["changed", "applied"]
+    assert fires[1] == (
+        "applied", "dark", None, "startup", "claude-container:0.0",
+    )
+
+
+def test_applied_does_not_fire_on_a_failed_inject(monkeypatch, tmp_path):
+    fires = _daemon(
+        monkeypatch, tmp_path, theme="dark", idle=True, inject=False,
+    )
+    _run_daemon()
+    assert [f[0] for f in fires] == ["changed"]
+
+
+def test_applied_does_not_fire_on_the_giving_up_path(monkeypatch, tmp_path):
+    """GIVING UP marks the theme applied to stop hammering the prompt line.
+    That bookkeeping must not masquerade as a real apply."""
+    fires = _daemon(
+        monkeypatch, tmp_path, theme="dark", idle=True, inject=False,
+        sleeps=12,
+    )
+    monkeypatch.setattr(mod, "MAX_VERIFY_FAILURES", 1)
+    monkeypatch.setattr(mod, "RETRY_BACKOFF_SECS", (0.0,))
+    _run_daemon()
+    assert [f[0] for f in fires] == ["changed"]
+
+
+def test_a_same_value_rewrite_fires_nothing(monkeypatch, tmp_path):
+    """The daemon already coalesces and is idempotent; hooks inherit that."""
+    fires = _daemon(
+        monkeypatch, tmp_path, theme="dark", idle=False, sleeps=6,
+    )
+    theme_file = Path(mod.THEME_FILE)
+    real_getmtime = os.path.getmtime
+    bumped = {"n": 0}
+
+    def rewriting_getmtime(path):
+        # The browser re-POSTs the SAME value on every page load: a fresh
+        # mtime, an unchanged value.
+        bumped["n"] += 1
+        theme_file.write_text("dark")
+        return real_getmtime(path) + bumped["n"]
+
+    monkeypatch.setattr(os.path, "getmtime", rewriting_getmtime)
+    _run_daemon()
+    assert [f[0] for f in fires] == ["changed"], "only the first read changed"
+
+
+def test_an_unrecognised_file_value_fires_nothing(monkeypatch, tmp_path):
+    fires = _daemon(monkeypatch, tmp_path, theme="chartreuse", idle=False)
+    _run_daemon()
+    assert fires == []
+
+
+def test_force_fires_applied_with_reason_force(monkeypatch, tmp_path):
+    theme_file = tmp_path / "theme"
+    theme_file.write_text("light")
+    monkeypatch.setattr(mod, "THEME_FILE", str(theme_file))
+    monkeypatch.setattr(mod, "resolve_pane", lambda: "p")
+    monkeypatch.setattr(mod, "idle_state", lambda pane: (True, "idle"))
+    monkeypatch.setattr(mod, "inject_theme", lambda pane, t: True)
+    monkeypatch.setattr(mod, "log", lambda msg: None)
+    fires = []
+    monkeypatch.setattr(
+        mod, "run_hooks",
+        lambda event, new, old=None, reason="change", pane=None: fires.append(
+            (event, new, old, reason, pane)
+        ),
+    )
+    assert mod.force_once() == 0
+    # `changed` must NOT fire: --force re-asserts, it does not change anything.
+    assert fires == [("applied", "light", None, "force", "p")]
+
+
+def test_force_fires_nothing_when_the_inject_fails(monkeypatch, tmp_path):
+    theme_file = tmp_path / "theme"
+    theme_file.write_text("light")
+    monkeypatch.setattr(mod, "THEME_FILE", str(theme_file))
+    monkeypatch.setattr(mod, "resolve_pane", lambda: "p")
+    monkeypatch.setattr(mod, "idle_state", lambda pane: (True, "idle"))
+    monkeypatch.setattr(mod, "inject_theme", lambda pane, t: False)
+    monkeypatch.setattr(mod, "log", lambda msg: None)
+    fires = []
+    monkeypatch.setattr(mod, "run_hooks", lambda *a, **kw: fires.append(a))
+    assert mod.force_once() == 3
+    assert fires == []
