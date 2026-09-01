@@ -19,6 +19,15 @@ items from being flagged during the register->spawn window.
 Exempt commands (never denied): same set as eval-event-must-act (session-task,
 obligations, claude-watch-ack, etc.) plus Agent (spawning IS the fix).
 
+Exempt queue items: any item with ``created_by == "hostjob"`` is skipped
+unconditionally, regardless of age. Those items are registered by the
+`hostjob` runner for a detached host-side process, not spawned via the
+Agent tool -- "ready but unspawned" doesn't apply to them, and flagging
+them was a recurring false-positive blocking the main loop
+(ob-2026-08-22-5e6e / 2026-08-31). Anything else (including a missing or
+unrecognized `created_by`) falls through to the pre-existing age check
+unchanged.
+
 Decision mode: exit_code (allow on 0, deny on 1).
 """
 import json
@@ -121,6 +130,14 @@ def main() -> int:
     ready_unspawned = []
     for i in items:
         if i.get("status") != "pending":
+            continue
+        # hostjob-created items are runner-managed (a detached host process,
+        # not an Agent the main loop spawns), so "ready but unspawned" is
+        # meaningless for them -- exempt unconditionally. Anything else
+        # (missing/unknown created_by included) falls through to the
+        # existing age-based check unchanged (default-open only for the
+        # known-safe hostjob case, never a blanket "unknown => exempt").
+        if i.get("created_by") == "hostjob":
             continue
         age = _age_secs(i)
         if age is not None and age < READY_AGE_THRESHOLD_SECS:
