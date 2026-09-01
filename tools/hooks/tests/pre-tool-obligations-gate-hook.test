@@ -1934,7 +1934,7 @@ def main() -> int:
         # --- Test 47: agent_inbox_empty with messages -> deny + why has body ---
         full_inbox = tmpdir / "full-inbox.json"
         full_inbox.write_text(json.dumps([{
-            "from": "andrew@signal", "ts": "2026-04-28",
+            "from": "main-loop", "ts": "2026-04-28",
             "queue_item": "q-test", "text": "hello agent please switch tasks"
         }]))
         ob_ain = _add_ob(
