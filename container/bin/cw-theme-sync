@@ -81,6 +81,19 @@ DESIGN NOTES
     corrected without toggling the browser theme twice. `--force` injects
     the current file value regardless of what we think is applied, and
     SIGHUP makes the running daemon re-assert on its next poll.
+  * The idle gate reads COLOUR, not just glyphs. Claude Code renders a
+    suggestion inside an EMPTY input box as DIM (SGR 2) ghost text. Because
+    the pane was captured WITHOUT `-e`, that attribute was stripped and the
+    ghost was indistinguishable from typed input, so the "input line must be
+    empty" gate latched shut for as long as a suggestion was on screen --
+    hours, and silently. `_capture` now passes `-e` and `_prompt_line`
+    discards dim runs. Do not drop `-e` to "simplify" the capture.
+
+  * A shut gate is LOUD. Waiting for idle used to produce no output
+    whatsoever, so "blocked for three hours" and "daemon dead" looked
+    identical in the log. The daemon now logs which gate is holding, and for
+    how long, every CW_THEME_BLOCKED_LOG_SECS.
+
   * Dependency-free. Pure mtime poll (no inotify), tiny cost; theme
     changes are rare.
 
@@ -108,6 +121,9 @@ Configuration (env, all optional):
                            ~/.claude/settings.json)
   CW_THEME_VERIFY_SECS     how long to wait for settings.json to show the
                            requested theme (default 10.0)
+  CW_THEME_BLOCKED_LOG_SECS
+                           how often to log which gate is blocking a pending
+                           theme change (default 300)
 
 Flags:
   --status   print resolved config, current file value, and whether the
@@ -199,6 +215,12 @@ RETRY_BACKOFF_SECS = (30.0, 120.0, 300.0)
 # genuinely idle rather than being typed into right now.
 PROMPT_RECHECK_SECS = float(_env("CW_THEME_PROMPT_RECHECK_SECS", "0.8"))
 
+# How often to log "still waiting for an idle pane" while a theme change is
+# stuck behind the idle gate. The gate can legitimately stay shut for a long
+# time on a busy main loop, but it must never do so SILENTLY -- silence is
+# how a wedged gate passed for a healthy daemon until 2026-09-01.
+BLOCKED_LOG_SECS = float(_env("CW_THEME_BLOCKED_LOG_SECS", "300"))
+
 # Set by SIGHUP: forget what we think is applied and re-assert.
 _reassert_requested = False
 
@@ -271,7 +293,8 @@ _BUSY_RE = re.compile(r"^\s*[\u2722-\u274b\u00b7\u25cb-\u25d3*+]\s+\S.*\u2026\s*
 
 
 def _capture(pane):
-    """Capture the pane with wrapped lines JOINED (`-J`).
+    """Capture the pane with wrapped lines JOINED (`-J`) and ATTRIBUTES KEPT
+    (`-e`).
 
     `-J` is load-bearing. Without it tmux truncates each visual line at the
     pane width, and the status bar renders as
@@ -279,11 +302,93 @@ def _capture(pane):
     with "esc to interrupt" CUT OFF the end. A busy-check keyed on that string
     then reports idle for a pane with a turn in flight — which is exactly how
     a theme inject got queued behind a live turn on 2026-08-19.
+
+    `-e` is load-bearing too, for the opposite failure. Claude Code renders a
+    SUGGESTION inside an otherwise-EMPTY input box as DIM (SGR 2) ghost text:
+
+        \\x1b[39m❯\\xa0\\x1b[2mrun the nightly rebuild
+
+    A plain (`-p -J`) capture strips the one attribute that separates that
+    ghost from text a human actually typed, so the "input line must be empty"
+    gate read it as pending input and never opened again — the daemon went
+    silent for hours at a stretch (2026-09-01: five consecutive theme reports
+    with zero inject attempts). Colour is not decoration here; it is the only
+    in-band signal for "this is a placeholder".
     """
-    out, rc = run(["tmux", "capture-pane", "-t", pane, "-p", "-J"])
+    out, rc = run(["tmux", "capture-pane", "-t", pane, "-p", "-J", "-e"])
     if rc != 0 or not out:
         return None
     return out
+
+
+# SGR sequences only — `capture-pane -e` emits nothing else.
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_sgr(text):
+    """Drop SGR escapes, leaving the glyphs a reader sees."""
+    return _SGR_RE.sub("", text)
+
+
+def _sgr_dim_after(params, dim):
+    """Apply one SGR parameter list to the current dim state.
+
+    Extended-colour parameters are SKIPPED rather than scanned, because
+    `38;5;2` (a palette colour) contains a literal "2" and a naive scan
+    would read it as SGR 2 / dim — turning every ordinary coloured run into
+    a "placeholder" and reopening the mangling hazard from the other side.
+    """
+    fields = params.split(";") if params else ["0"]
+    i = 0
+    while i < len(fields):
+        f = fields[i] or "0"
+        if f in ("38", "48", "58"):
+            nxt = fields[i + 1] if i + 1 < len(fields) else ""
+            i += 3 if nxt == "5" else 5 if nxt == "2" else 1
+            continue
+        if f == "2":
+            dim = True
+        elif f in ("0", "22"):
+            dim = False
+        i += 1
+    return dim
+
+
+def _typed_input(ansi_line):
+    """The NON-DIM text after `❯` on one ANSI-captured line, or None if the
+    line carries no prompt glyph.
+
+    Dim runs are dropped: they are Claude Code's ghost/placeholder suggestion,
+    which occupies a box the user has not typed into. Real input is rendered
+    at normal intensity, so it survives.
+    """
+    seen = False
+    out = []
+    dim = False
+    pos = 0
+    for m in _SGR_RE.finditer(ansi_line):
+        chunk = ansi_line[pos:m.start()]
+        seen, kept = _consume(chunk, seen, dim)
+        out.append(kept)
+        pos = m.end()
+        dim = _sgr_dim_after(m.group(0)[2:-1], dim)
+    seen, kept = _consume(ansi_line[pos:], seen, dim)
+    out.append(kept)
+    return "".join(out) if seen else None
+
+
+def _consume(chunk, seen, dim):
+    """Fold one attribute-uniform chunk into the prompt-line scan.
+
+    Returns (seen_prompt_glyph, text_to_keep). Everything before the `❯` is
+    box chrome; everything after it counts only when it is not dim.
+    """
+    if not seen:
+        idx = chunk.find("❯")
+        if idx < 0:
+            return False, ""
+        seen, chunk = True, chunk[idx + 1:]
+    return seen, "" if dim else chunk
 
 
 def _busy(pane_text):
@@ -296,26 +401,43 @@ def _busy(pane_text):
         typed during a turn rather than running it. An inject that lands in
         the queue has not been applied and will not be for an unbounded time,
         so verifying it within any fixed window reports a false failure.
+
+    Matched against the SGR-stripped text: `_capture` now keeps attributes,
+    and tmux happily splits a styled run across the phrases above.
     """
-    low = pane_text.lower()
+    plain = strip_sgr(pane_text)
+    low = plain.lower()
     if "esc to interrupt" in low:
         return True
     if "press up to edit queued messages" in low:
         return True
-    return bool(_BUSY_RE.search(pane_text))
+    return bool(_BUSY_RE.search(plain))
 
 
 def _prompt_line(pane_text):
-    """Text currently sitting on the `❯` input line, or None if no prompt
-    is rendered. '' means the input line is empty."""
+    """Text a human has actually typed on the `❯` input line, or None if no
+    prompt is rendered. '' means the input line is empty.
+
+    `pane_text` must come from `_capture` (i.e. `capture-pane -e`); dim ghost
+    text is discarded, so a box showing only a suggestion reads as empty.
+    """
     for line in reversed(pane_text.split("\n")):
         if "❯" in line:
-            return line.split("❯", 1)[1].strip()
+            typed = _typed_input(line)
+            if typed is not None:
+                return typed.strip()
     return None
 
 
-def is_idle(pane):
-    """True only when it is SAFE to type into the pane.
+def idle_state(pane):
+    """(is_idle, reason) -- whether it is SAFE to type into the pane, and if
+    not, WHICH gate is holding it shut.
+
+    The reason is not decoration. This gate can stay closed for hours, and
+    until 2026-09-01 it did so in complete silence: the daemon logged
+    "theme reported: light" and then nothing at all, which is
+    indistinguishable from a dead daemon. The caller logs this string on a
+    throttle so a wedged gate names itself.
 
     The original check -- "is the `❯` glyph anywhere in the last 15 lines"
     -- was far too weak. Claude Code renders that prompt box permanently,
@@ -328,11 +450,13 @@ def is_idle(pane):
       1. A prompt must actually be rendered (`❯` present).
       2. No in-flight turn -- Claude Code shows "esc to interrupt" in the
          status bar for the whole duration of one.
-      3. THE INPUT LINE MUST BE EMPTY. This is the direct guard against the
-         bug: the non-cancelling inject has no `dd` line-clear, so anything
-         already on that line gets our payload glued onto it. If someone (or
-         something) has half-typed input sitting there, typing is exactly the
-         wrong move.
+      3. THE INPUT LINE MUST BE EMPTY OF TYPED TEXT. This is the direct guard
+         against the bug: the non-cancelling inject has no `dd` line-clear, so
+         anything already on that line gets our payload glued onto it. If
+         someone (or something) has half-typed input sitting there, typing is
+         exactly the wrong move. "Empty" means empty of TYPED text -- Claude
+         Code's dim ghost suggestion sits in an empty box and is stripped by
+         `_prompt_line`; counting it as input is what wedged this gate shut.
       4. The input line must still be empty a moment later, so we don't race
          a human who just started typing.
 
@@ -341,15 +465,30 @@ def is_idle(pane):
     such a check would report "never idle".
     """
     out = _capture(pane)
-    if out is None or _busy(out):
-        return False
-    if _prompt_line(out) != "":
-        return False                      # no prompt, or input already there
+    if out is None:
+        return False, f"cannot capture pane {pane}"
+    if _busy(out):
+        return False, "pane busy (turn in flight or message queued)"
+    typed = _prompt_line(out)
+    if typed is None:
+        return False, "no prompt rendered (Claude Code not at an input box?)"
+    if typed != "":
+        return False, f"input line not empty: {typed[:60]!r}"
     time.sleep(PROMPT_RECHECK_SECS)
     out2 = _capture(pane)
-    if out2 is None or _busy(out2):
-        return False
-    return _prompt_line(out2) == ""
+    if out2 is None:
+        return False, f"cannot capture pane {pane} (recheck)"
+    if _busy(out2):
+        return False, "pane went busy during recheck"
+    typed2 = _prompt_line(out2)
+    if typed2 != "":
+        return False, f"input line filled during recheck: {typed2!r}"
+    return True, "idle"
+
+
+def is_idle(pane):
+    """True only when it is SAFE to type into the pane. See `idle_state`."""
+    return idle_state(pane)[0]
 
 
 def read_theme():
@@ -508,7 +647,9 @@ def print_status():
         sync = "OUT OF SYNC (run --force to re-assert)"
     print(f"in_sync       : {sync}")
     print(f"pane          : {pane}")
-    print(f"pane_idle     : {is_idle(pane)}")
+    idle, reason = idle_state(pane)
+    print(f"pane_idle     : {idle}")
+    print(f"idle_reason   : {reason}")
     print(f"lock_file     : {LOCK_FILE}")
     print(f"log_file      : {LOG_FILE}")
     return 0
@@ -534,11 +675,15 @@ def force_once():
         return 1
     pane = resolve_pane()
     deadline = time.monotonic() + FORCE_IDLE_WAIT_SECS
-    while not is_idle(pane):
+    while True:
+        idle, reason = idle_state(pane)
+        if idle:
+            break
         if time.monotonic() >= deadline:
             log(
-                f"--force: pane {pane} still busy after {FORCE_IDLE_WAIT_SECS}s; "
-                f"NOT injecting (would have to seize the turn to do so)"
+                f"--force: pane {pane} not idle after {FORCE_IDLE_WAIT_SECS}s "
+                f"({reason}); NOT injecting (would have to seize the turn to "
+                f"do so)"
             )
             return 2
         time.sleep(IDLE_POLL_SECS)
@@ -584,6 +729,8 @@ def main():
     last_mtime = None
     verify_failures = 0     # consecutive failed verifications of `desired`
     retry_not_before = 0.0  # monotonic deadline enforcing RETRY_BACKOFF_SECS
+    pending_since = None    # when `desired` first went un-appliable
+    blocked_logged_at = 0.0 # throttle for the "waiting for idle" line
 
     while True:
         # SIGHUP asks us to re-assert even though the file value has not
@@ -617,7 +764,10 @@ def main():
                 continue
 
             pane = resolve_pane()
-            if is_idle(pane):
+            idle, idle_reason = idle_state(pane)
+            if idle:
+                pending_since = None
+                blocked_logged_at = 0.0
                 if inject_theme(pane, desired):
                     applied = desired
                     verify_failures = 0
@@ -651,9 +801,25 @@ def main():
                         )
                 time.sleep(POLL_SECS)
                 continue
+
+            # Gate shut. Say so, on a throttle: a theme that never lands used
+            # to look exactly like a dead daemon, because waiting produced no
+            # output at all. One line per BLOCKED_LOG_SECS names the gate and
+            # how long the change has been stuck behind it.
+            now = time.monotonic()
+            if pending_since is None:
+                pending_since = now
+            if now - blocked_logged_at >= BLOCKED_LOG_SECS:
+                blocked_logged_at = now
+                log(
+                    f"theme={desired} pending {now - pending_since:.0f}s: "
+                    f"waiting for an idle pane -- {idle_reason}"
+                )
             time.sleep(min(IDLE_POLL_SECS, POLL_SECS))
             continue
 
+        pending_since = None
+        blocked_logged_at = 0.0
         time.sleep(POLL_SECS)
 
 
