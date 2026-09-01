@@ -1158,7 +1158,7 @@ This session runs inside an isolated container. Strengths and limits:
 
 ## Semantic search — query eichi before grepping
 
-The container has access to [eichi](https://github.com/hndrewaall/eichi), a
+The container has access to [eichi](https://github.com/gbre-org/eichi), a
 local sqlite-vec + sentence-transformers semantic search index. Use it as the
 **default first lookup** for open-ended recall questions ("where is X", "what
 did we decide about Y").

@@ -14,7 +14,7 @@ Force a stale MCP server's tool discovery to refresh by driving Claude Code's `/
 
 ## The `/mcp` picker is a real interactive modal
 
-Confirmed empirically (2026-08-31, in a scratch tmux pane running a throwaway `claude` session — see the transcript notes in [container/bin/self-mcp-reconnect](https://github.com/hndrewaall/claude-watch/blob/main/container/bin/self-mcp-reconnect)'s module docstring): opening `/mcp` does **not** itself retry any connection. The full flow is:
+Confirmed empirically (2026-08-31, in a scratch tmux pane running a throwaway `claude` session — see the transcript notes in [container/bin/self-mcp-reconnect](https://github.com/gbre-org/claude-watch/blob/main/container/bin/self-mcp-reconnect)'s module docstring): opening `/mcp` does **not** itself retry any connection. The full flow is:
 
 ```
 /mcp
@@ -34,7 +34,7 @@ Down x M (to "Reconnect"), Enter
        "Failed to reconnect to <name>: <error>"
 ```
 
-So a correct reconnect needs real menu navigation with text-based lookups at each step — a blind `/mcp` + Enter (the older [`mcp-reconnect`](https://github.com/hndrewaall/claude-watch/blob/main/container/bin/mcp-reconnect) script's approach) only opens the list and leaves it sitting there; it never drives a server's own Reconnect action. `mcp-reconnect` still exists for callers that only need to force the list open (e.g. to eyeball transport status); `self-mcp-reconnect` is the tool for an actual, confirmed reconnect.
+So a correct reconnect needs real menu navigation with text-based lookups at each step — a blind `/mcp` + Enter (the older [`mcp-reconnect`](https://github.com/gbre-org/claude-watch/blob/main/container/bin/mcp-reconnect) script's approach) only opens the list and leaves it sitting there; it never drives a server's own Reconnect action. `mcp-reconnect` still exists for callers that only need to force the list open (e.g. to eyeball transport status); `self-mcp-reconnect` is the tool for an actual, confirmed reconnect.
 
 **Uncertainty flag:** the row-status glyphs, footer text, and action-menu wording above were captured from one live session on one Claude Code version. If a future Claude Code release changes the `/mcp` UI's copy or layout, `self-mcp-reconnect` fails LOUD (see exit codes below) rather than silently reporting success — treat a `menu-did-not-open` / `no Reconnect action` failure as "the UI shape moved, go re-verify in a scratch pane" rather than a transient error to retry blindly.
 
@@ -70,7 +70,7 @@ So a correct reconnect needs real menu navigation with text-based lookups at eac
 
 ## Important
 
-- `self-mcp-reconnect` is baked at `/usr/local/bin/self-mcp-reconnect`. Source: [container/bin/self-mcp-reconnect](https://github.com/hndrewaall/claude-watch/blob/main/container/bin/self-mcp-reconnect).
+- `self-mcp-reconnect` is baked at `/usr/local/bin/self-mcp-reconnect`. Source: [container/bin/self-mcp-reconnect](https://github.com/gbre-org/claude-watch/blob/main/container/bin/self-mcp-reconnect).
 - It IMPORTS `self-clear` as a sibling module for the shared tmux pane primitives (pane auto-discovery, FleetView focus-return, interrupt-and-wait, idle detection) instead of carrying a second copy — it must ship in the same directory as the baked `self-clear`, which `/usr/local/bin` is.
 - It operates on the same Claude Code tmux pane `claude-container:0.0` that `self-clear` and `cwsr` target (auto-discovered the same way).
 - A held lockfile means another `self-mcp-reconnect` run is already in progress; a new invocation no-ops rather than racing keystrokes with it.

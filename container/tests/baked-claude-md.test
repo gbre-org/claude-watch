@@ -359,7 +359,7 @@ if BAKED.exists():
     )
 
     # 5c. Public-repo hygiene. baked-CLAUDE.md ships in a public repo (this
-    #     one — github.com/hndrewaall/claude-watch). Check for accidental
+    #     one — github.com/gbre-org/claude-watch). Check for accidental
     #     private-path leakage. The substrings below are sentinels Andrew
     #     flagged as private-only paths that must never appear in public
     #     artifacts. (We deliberately do not check for "/home/hndrewaall"

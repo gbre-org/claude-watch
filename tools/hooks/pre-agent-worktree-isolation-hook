@@ -31,7 +31,7 @@ hosts that don't have any shared-repo collision risk.
 Sample config (place at /etc/claude-code/worktree-isolation-repos.txt)::
 
     # repo_key | prompt_regex | upstream_path
-    claude-watch|(?:~/repos/claude-watch\b|/home/[^/\s]+/repos/claude-watch\b|\brepos/claude-watch\b|\bhndrewaall/claude-watch\b|\bgithub\.com/hndrewaall/claude-watch\b)|/home/USER/repos/claude-watch
+    claude-watch|(?:~/repos/claude-watch\b|/home/[^/\s]+/repos/claude-watch\b|\brepos/claude-watch\b|\b(?:hndrewaall|gbre-org)/claude-watch\b|\bgithub\.com/(?:hndrewaall|gbre-org)/claude-watch\b)|/home/USER/repos/claude-watch
 
 Decision protocol (matches the other PreToolUse hooks in this directory):
 - Exit 0 with empty JSON ``{}`` -> allow silently.
@@ -456,8 +456,8 @@ _TEST_CW_PATTERN = re.compile(
     r"~/repos/claude-watch\b"
     r"|/home/[^/\s]+/repos/claude-watch\b"
     r"|\brepos/claude-watch\b"
-    r"|\bhndrewaall/claude-watch\b"
-    r"|\bgithub\.com/hndrewaall/claude-watch\b"
+    r"|\b(?:hndrewaall|gbre-org)/claude-watch\b"
+    r"|\bgithub\.com/(?:hndrewaall|gbre-org)/claude-watch\b"
     r")",
     re.IGNORECASE,
 )
@@ -575,9 +575,9 @@ def _run_tests() -> int:  # noqa: C901
 
     out = _evaluate({
         "tool_name": "Agent",
-        "tool_input": {"prompt": "Open a PR at https://github.com/hndrewaall/claude-watch/pulls"},
+        "tool_input": {"prompt": "Open a PR at https://github.com/gbre-org/claude-watch/pulls"},
     }, _TEST_OPTED_IN)
-    _check("13. github.com/hndrewaall/claude-watch URL matches", _is_deny(out), f"out={out}")
+    _check("13. github.com/gbre-org/claude-watch URL matches", _is_deny(out), f"out={out}")
 
     # No opted-in -> hook is no-op even for what would otherwise be denied.
     out = _evaluate({

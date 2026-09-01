@@ -372,7 +372,7 @@
       "links": [
         {
           "title": "merged pull requests",
-          "url": "https://github.com/hndrewaall/claude-watch/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-desc",
+          "url": "https://github.com/gbre-org/claude-watch/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-desc",
           "targetBlank": true
         }
       ],
@@ -397,7 +397,7 @@
           "source": "url",
           "parser": "backend",
           "format": "timeseries",
-          "url": "https://api.github.com/repos/hndrewaall/claude-watch/pulls?state=closed&sort=updated&direction=desc&per_page=100",
+          "url": "https://api.github.com/repos/gbre-org/claude-watch/pulls?state=closed&sort=updated&direction=desc&per_page=100",
           "url_options": {
             "method": "GET"
           },

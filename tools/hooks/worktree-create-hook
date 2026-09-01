@@ -35,7 +35,7 @@ same loader semantics).
 Sample config (place at /etc/claude-code/worktree-isolation-repos.txt)::
 
     # repo_key | prompt_regex | upstream_path
-    claude-watch|(?:~/repos/claude-watch\b|/home/[^/\s]+/repos/claude-watch\b|\brepos/claude-watch\b|\bhndrewaall/claude-watch\b|\bgithub\.com/hndrewaall/claude-watch\b)|/home/USER/repos/claude-watch
+    claude-watch|(?:~/repos/claude-watch\b|/home/[^/\s]+/repos/claude-watch\b|\brepos/claude-watch\b|\b(?:hndrewaall|gbre-org)/claude-watch\b|\bgithub\.com/(?:hndrewaall|gbre-org)/claude-watch\b)|/home/USER/repos/claude-watch
 
 Contract (Claude Code harness, verified 2026-05-19)
 ---------------------------------------------------
@@ -562,8 +562,8 @@ _TEST_CW_PATTERN = re.compile(
     r"~/repos/claude-watch\b"
     r"|/home/[^/\s]+/repos/claude-watch\b"
     r"|\brepos/claude-watch\b"
-    r"|\bhndrewaall/claude-watch\b"
-    r"|\bgithub\.com/hndrewaall/claude-watch\b"
+    r"|\b(?:hndrewaall|gbre-org)/claude-watch\b"
+    r"|\bgithub\.com/(?:hndrewaall|gbre-org)/claude-watch\b"
     r")",
     re.IGNORECASE,
 )
@@ -592,8 +592,14 @@ def _run_tests() -> int:  # noqa: C901
     m = _find_opted_in("Just look at ~/repos/media-tools, no cw.", fixture)
     _check("2. _find_opted_in non-cw passthrough", m is None, f"m={m}")
 
-    m = _find_opted_in("Open PR github.com/hndrewaall/claude-watch/pulls/123", fixture)
+    m = _find_opted_in("Open PR github.com/gbre-org/claude-watch/pulls/123", fixture)
     _check("3. github.com URL matches", m is not None and m[0] == "claude-watch", f"m={m}")
+
+    # The repo moved orgs; the default regex keeps matching the FORMER owner so
+    # older prompts / pasted links still opt in to worktree isolation.
+    m = _find_opted_in("Open PR github.com/hndrewaall/claude-watch/pulls/123", fixture)
+    _check("3b. former-owner github.com URL still matches",
+           m is not None and m[0] == "claude-watch", f"m={m}")
 
     p = _extract_prompt({"tool_name": "Agent", "tool_input": {"prompt": "hello"}})
     _check("4. prompt extracted from tool_input", p == "hello", f"p={p!r}")
