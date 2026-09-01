@@ -302,6 +302,9 @@ jobs:
       - name: Run hostjob detached-runner tests
         run: make test-hostjob
 
+      - name: Run cw-theme-sync idle-gate tests
+        run: make test-cw-theme-sync
+
       - name: Run launchd plist tests
         run: make test-launchd-plist
 

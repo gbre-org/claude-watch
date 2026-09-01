@@ -72,6 +72,7 @@
 # Tests — container image
 .PHONY: test-trust-workspace test-claude-tmux-env test-cron-toggle
 .PHONY: test-eval-queue-ready-unspawned
+.PHONY: test-cw-theme-sync
 .PHONY: test-hooks-shim test-entrypoint
 # Tests — compose stack + host shims
 .PHONY: test-cw test-hostjob test-ttyd-paste-handler test-ttyd-lock-toggle
@@ -358,6 +359,16 @@ test-cron-toggle: ## cw-cron-run / cw-cron-toggle tests
 # with a JSON-fixture stub; no real queue state is touched.
 test-eval-queue-ready-unspawned: ## eval-queue-ready-unspawned obligation evaluator tests
 	container/bin/tests/eval-queue-ready-unspawned.test
+
+# Tests for cw-theme-sync's idle gate. Claude Code renders a suggestion inside
+# an EMPTY input box as DIM (SGR 2) ghost text; capturing the pane without
+# `-e` strips that attribute, so the gate read the ghost as typed input and
+# latched shut — silently, for hours. These pin the dim-vs-typed distinction
+# (including the "2" hiding inside extended-colour parameter lists) and the
+# reason strings a blocked gate now logs. Pure parsing; no tmux needed.
+test-cw-theme-sync: ## cw-theme-sync idle-gate / ghost-text tests
+	uv run --python 3.11 --with pytest pytest -v \
+		container/bin/tests/test_cw_theme_sync.py
 
 # Container hooks-shim suites. All run directly on Linux against synthetic
 # inputs; no container needed:
