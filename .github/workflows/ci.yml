@@ -222,6 +222,9 @@ jobs:
       - name: Run cron-toggle (cw-cron-run + cw-cron-toggle) tests
         run: make test-cron-toggle
 
+      - name: Run eval-queue-ready-unspawned obligation evaluator tests
+        run: make test-eval-queue-ready-unspawned
+
       - name: Run exec-hook shim tests
         run: make test-hooks-shim
 
