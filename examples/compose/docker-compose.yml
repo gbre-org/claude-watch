@@ -11,7 +11,7 @@
 #     claude-watch/        (this repo)
 #       container/         (claude-container source, this-repo subdir)
 #       examples/compose/  (this file)
-#     eichi/               (https://github.com/hndrewaall/eichi)
+#     eichi/               (https://github.com/gbre-org/eichi)
 #
 # In-container paths hardcode the `hndrewaall` user because that is the
 # UID-1000 user baked into the claude-container and eichi search-minisite

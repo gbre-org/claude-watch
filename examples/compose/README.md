@@ -4,7 +4,7 @@ End-to-end `docker compose` example that wires:
 
 - **claude-container** (this repo, under [`container/`](../../container/)) — Claude Code + `claude-watch` + tmux baked into one image.
 - **queue-minisite** (this repo, under `queue-minisite/`) — mobile-friendly Flask UI for the `session-task` work queue.
-- [**eichi**](https://github.com/hndrewaall/eichi) `search-minisite` — Flask UI for the local sqlite-vec + sentence-transformers semantic-search CLI.
+- [**eichi**](https://github.com/gbre-org/eichi) `search-minisite` — Flask UI for the local sqlite-vec + sentence-transformers semantic-search CLI.
 - **ttyd** (this repo, under [`ttyd/`](ttyd/)) — browser-based terminal that attaches to the claude-container's in-container tmux session.
 
 Drop into a freshly cloned setup, run one command, get the integrated experience: a containerised Claude Code shell, a web UI for its work queue at `http://localhost:8000/`, a semantic-search web UI at `http://localhost:8001/`, and a browser terminal at `http://localhost:7681/`.
@@ -26,8 +26,8 @@ eichi search. Clone both repos next to each other:
 
 ```sh
 mkdir -p ~/code && cd ~/code
-git clone https://github.com/hndrewaall/claude-watch.git
-git clone https://github.com/hndrewaall/eichi.git
+git clone https://github.com/gbre-org/claude-watch.git
+git clone https://github.com/gbre-org/eichi.git
 ```
 
 Resulting layout:

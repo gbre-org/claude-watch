@@ -187,8 +187,8 @@ EVENT[<source>/<tag>] <lead> — <full message> [k=v …]
 Before / after for the same event:
 
 ```
-EVENT[cron/pr-status-change] PR hndrewaall/claude-watch#652: CI failure (was: pending) [field=ci_status new_value=failure …]
-EVENT[cron/pr-status-change] PR #652 CI failure — PR hndrewaall/claude-watch#652: CI failure (was: pending) [field=ci_status new_value=failure old_value=pending pr_id=github:hndrewaall/claude-watch#652 pr_url=…]
+EVENT[cron/pr-status-change] PR gbre-org/claude-watch#652: CI failure (was: pending) [field=ci_status new_value=failure …]
+EVENT[cron/pr-status-change] PR #652 CI failure — PR gbre-org/claude-watch#652: CI failure (was: pending) [field=ci_status new_value=failure old_value=pending pr_id=github:gbre-org/claude-watch#652 pr_url=…]
 
 EVENT[claude-watch/claude-watch-alert] [CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/p… [alert_type=context-low severity=high …]
 EVENT[claude-watch/claude-watch-alert] claude-watch alert context-low (high) — [CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/push in-flight work and save state NOW before compaction. [alert_type=context-low severity=high …]

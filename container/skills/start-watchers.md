@@ -56,7 +56,7 @@ The claude-watch daemon's `[watcher_monitor]` is the fallback alert layer: if a 
 
 To add a container-baked watcher in a future PR:
 
-1. Drop `<name>.sh` (executable launcher; MUST follow block-print-exit: block until trigger, print results, exit — do NOT loop forever) and `<name>.toml` (metadata) under [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers) in the claude-watch repo. Authoring guide: `docs/adding-watchers.md`.
+1. Drop `<name>.sh` (executable launcher; MUST follow block-print-exit: block until trigger, print results, exit — do NOT loop forever) and `<name>.toml` (metadata) under [`container/watchers/`](https://github.com/gbre-org/claude-watch/tree/main/container/watchers) in the claude-watch repo. Authoring guide: `docs/adding-watchers.md`.
 2. The `Dockerfile` `COPY` line for `container/watchers/` already lands them at `/opt/claude-container/watchers/<name>.{sh,toml}` (this skill auto-discovers them).
 3. Update `container/watchers/README.md` to document what the watcher does and what events it produces, and register it in `container/watchers.conf` so the daemon's watcher_monitor can alert when it's down.
 4. Rebuild the image and `cwsr` (or `docker compose up -d --force-recreate` if entrypoint-time wiring changed).
@@ -65,4 +65,4 @@ To add a container-baked watcher in a future PR:
 
 - This skill never starts host-side watchers and never schedules host cron jobs. For host-side scheduled work, see the "Host-side scheduled tasks (via `host-bash`)" section of `/etc/claude-code/CLAUDE.md`.
 - The `container/watchers/README.md` documents the on-disk schema (`name`, `description`, `launcher`, `restart_policy`, `log_path`); change there first, then bump the consumers.
-- Source dir in repo: [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers). Baked path inside the container: `/opt/claude-container/watchers/`.
+- Source dir in repo: [`container/watchers/`](https://github.com/gbre-org/claude-watch/tree/main/container/watchers). Baked path inside the container: `/opt/claude-container/watchers/`.

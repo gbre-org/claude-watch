@@ -3,7 +3,7 @@
 #
 # Idempotent. Safe to re-run. Side effects:
 #   1. Checks for docker, git, gh; warns (does not fail) if any missing.
-#   2. Clones https://github.com/hndrewaall/eichi as a sibling of this
+#   2. Clones https://github.com/gbre-org/eichi as a sibling of this
 #      repo if no sibling clone exists.
 #   3. Seeds examples/compose/.env from .env.example if .env doesn't
 #      exist yet — left for the operator to fill in ANTHROPIC_API_KEY.
@@ -57,8 +57,8 @@ echo "Sibling eichi clone"
 if [ -d "$EICHI_DIR/.git" ]; then
     ok "$EICHI_DIR exists"
 else
-    info "Cloning https://github.com/hndrewaall/eichi into $EICHI_DIR"
-    if git clone https://github.com/hndrewaall/eichi.git "$EICHI_DIR"; then
+    info "Cloning https://github.com/gbre-org/eichi into $EICHI_DIR"
+    if git clone https://github.com/gbre-org/eichi.git "$EICHI_DIR"; then
         ok "Clone complete"
     else
         warn "git clone failed — clone $EICHI_DIR manually before docker compose up"

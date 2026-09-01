@@ -1,6 +1,6 @@
 # container/skills/
 
-**CONTAINER-ONLY** slash-command source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each file is one skill that the in-container `claude` process can invoke as `/<plugin>:<name>` (the plugin name is `claude-container`, set by `/opt/claude-container/plugin/.claude-plugin/plugin.json`).
+**CONTAINER-ONLY** slash-command source files baked into the [claude-container](https://github.com/gbre-org/claude-watch/tree/main/container) image. Each file is one skill that the in-container `claude` process can invoke as `/<plugin>:<name>` (the plugin name is `claude-container`, set by `/opt/claude-container/plugin/.claude-plugin/plugin.json`).
 
 ## This dir vs. the shared [`skills/`](../../skills/) dir
 

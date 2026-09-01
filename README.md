@@ -11,7 +11,7 @@ A Rust daemon that monitors [Claude Code](https://claude.ai/code) sessions runni
 Fresh-laptop path (Docker, no native install required):
 
 ```bash
-git clone https://github.com/hndrewaall/claude-watch.git
+git clone https://github.com/gbre-org/claude-watch.git
 cd claude-watch
 make bootstrap              # checks prereqs, clones eichi sibling, seeds .env
 # edit examples/compose/.env (set ANTHROPIC_API_KEY)

@@ -28,7 +28,7 @@ The tool injects keystrokes into the Claude Code tmux pane `claude-container:0.0
 
 ## Triggering it EXTERNALLY from the host (`cw --clear`)
 
-Just as `cwsr` can be fired from the host to roll the inner claude binary, the context reset can be triggered from OUTSIDE the session — no attach required. The `cw` host shim ([examples/compose/bin/cw](https://github.com/hndrewaall/claude-watch/blob/main/examples/compose/bin/cw)) grows a `--clear` flag that runs a one-shot `docker compose exec <svc> self-clear` against the running container:
+Just as `cwsr` can be fired from the host to roll the inner claude binary, the context reset can be triggered from OUTSIDE the session — no attach required. The `cw` host shim ([examples/compose/bin/cw](https://github.com/gbre-org/claude-watch/blob/main/examples/compose/bin/cw)) grows a `--clear` flag that runs a one-shot `docker compose exec <svc> self-clear` against the running container:
 
 ```sh
 cw --clear                                   # /clear + generic resume prompt
@@ -46,7 +46,7 @@ Everything after `--` is forwarded verbatim to the in-container `self-clear`. Th
 
 ## Important
 
-- `self-clear` is baked at `/usr/local/bin/self-clear`. Source: [container/bin/self-clear](https://github.com/hndrewaall/claude-watch/blob/main/container/bin/self-clear).
+- `self-clear` is baked at `/usr/local/bin/self-clear`. Source: [container/bin/self-clear](https://github.com/gbre-org/claude-watch/blob/main/container/bin/self-clear).
 - It operates on the Claude Code tmux pane `claude-container:0.0` (it auto-discovers the pane via `claude-watch status --json`, falling back to a direct tmux pane scan).
 - Defaults are portable (XDG-based log / lock paths with `/var/...` fallbacks); a held lockfile means another self-clear is already running and the new invocation no-ops, so two resets can't race each other's keystrokes.
 - Whatever the fresh session needs to continue MUST be in the resume prompt or in `session-task` — anything left only in the current context is gone after the clear.

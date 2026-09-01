@@ -1,6 +1,6 @@
 # container/watchers/
 
-Watcher source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each watcher is a background task the in-container session launches via the `/start-watchers` skill (defined in [`container/skills/start-watchers.md`](../skills/start-watchers.md)).
+Watcher source files baked into the [claude-container](https://github.com/gbre-org/claude-watch/tree/main/container) image. Each watcher is a background task the in-container session launches via the `/start-watchers` skill (defined in [`container/skills/start-watchers.md`](../skills/start-watchers.md)).
 
 > **Authoring a new watcher?** Read [`docs/adding-watchers.md`](../../docs/adding-watchers.md) — covers the block-print-exit lifecycle contract, the metadata schema below, and a fully-worked example.
 
