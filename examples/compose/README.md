@@ -604,6 +604,23 @@ Requirements + knobs:
 - Tune via `CW_THEME_FILE`, `CW_THEME_PANE`, `CW_THEME_POLL_SECS`
   (see `container/bin/cw-theme-sync`).
 
+**Making something *else* happen on a theme change.** The daemon has
+exactly one built-in job — the `/config theme=` inject. Anything else a
+deployment wants (poke a kiosk display, flip a host application, emit an
+event) goes in an executable drop-in under `CW_THEME_HOOKS_DIR`
+(default `/etc/claude-watch/theme-hooks.d`), rather than a forked copy of
+`cw-theme-sync` with the extra behaviour spliced in. Drop-ins follow
+`run-parts` conventions and are invoked as `<hook> <event> <new_theme>`,
+with the rest of the detail in `CW_THEME_*` environment variables. Two
+events fire: `changed`, on the file's validated value flip and
+**before** the idle gate, and `applied`, only after the inject has been
+verified — the split exists because the idle gate can legitimately stay
+shut for hours and an external side effect must not inherit that
+latency. Failures and timeouts are logged and swallowed; a hook can
+never break the inject path. With no hooks directory the feature is
+completely inert — no subprocess, no log output. Full contract in
+[`docs/theme-hooks.md`](../../docs/theme-hooks.md).
+
 **Alternative producer: the host clipboard-bridge daemon.** The
 `/theme-report` sidecar is only *one* way to write `/host-clipboard/theme`.
 Deployments that already run the host-side `clipboard-bridge-daemon`
