@@ -2932,10 +2932,30 @@ pub(crate) fn check_context_threshold_with_margin(
 ) -> Option<(f64, bool)> {
     let pct = (tokens as f64 / max_context_tokens as f64) * 100.0;
 
-    // Primary: compact_remaining is the most accurate signal when present.
-    if let Some(cr) = compact_remaining {
-        if cr <= compact_trigger_percent {
-            return Some((pct, true));
+    // Real-usage danger zone against the TRUE window — the same bar the
+    // fallback paths use below: a fixed token margin from max when
+    // `threshold_margin` is set, else a percentage of max. For the baked 1M
+    // window with `threshold_margin = 100000` this is 900K == ~90% used
+    // (~10% left) — the point at which a self-clear is wanted, and no earlier.
+    let in_danger_zone = match threshold_margin {
+        Some(margin) => max_context_tokens > margin && tokens >= max_context_tokens - margin,
+        None => pct >= threshold_percent as f64,
+    };
+
+    // Primary: `compact_remaining` is Claude Code's own "Context left until
+    // auto-compact: X%" — the most TIMELY signal, but only trustworthy once
+    // real usage confirms we are actually near full. On a large window (the
+    // 1M-token Claude Code window) Claude Code's auto-compact point is
+    // DECOUPLED from the true window: it reports a low auto-compact % at only
+    // ~48% real usage, so trusting it alone fired a destructive self-clear far
+    // too early (incident 2026-09-01: 484889/1000000 = 48.5%, compact_remaining
+    // = 5 <= compact_trigger_percent = 5). Gate it behind the real-usage danger
+    // zone so a clear never fires before ~10% of the true window remains.
+    if in_danger_zone {
+        if let Some(cr) = compact_remaining {
+            if cr <= compact_trigger_percent {
+                return Some((pct, true));
+            }
         }
     }
 
@@ -8813,6 +8833,35 @@ mod tests {
     }
 
     #[test]
+    fn test_context_threshold_compact_gated_below_danger_on_large_window() {
+        // Regression (incident 2026-09-01): 1M window, ~48% REAL usage, but
+        // Claude Code reported "Context left until auto-compact: 5%" — its
+        // auto-compact point is decoupled from the true 1M window. With
+        // compact_remaining = 5 <= compact_trigger_percent = 5 the old code
+        // fired a destructive self-clear at 48% used. The compact signal is
+        // now gated behind the real-usage danger zone (margin = 100000 => the
+        // 900K point), so this must NOT trigger.
+        let result =
+            check_context_threshold_with_margin(484889, 1_000_000, Some(5), 75, 5, Some(100_000));
+        assert!(
+            result.is_none(),
+            "compact_remaining must not fire at 48% real usage on a 1M window"
+        );
+    }
+
+    #[test]
+    fn test_context_threshold_compact_fires_in_danger_zone_large_window() {
+        // Same 1M window + margin, but now genuinely near full (91% used, i.e.
+        // within margin = max - 100000 = 900K). compact_remaining = 5 must
+        // still fire — the signal is honored once real usage confirms danger.
+        let result =
+            check_context_threshold_with_margin(910000, 1_000_000, Some(5), 75, 5, Some(100_000));
+        assert!(result.is_some(), "should fire at 91% used within margin");
+        let (_, by_compact) = result.unwrap();
+        assert!(by_compact, "should be BY_COMPACT in the danger zone");
+    }
+
+    #[test]
     fn test_context_threshold_fallback_token_percent_triggers() {
         // No compact_remaining, token pct = 80% >= 75% threshold
         let result = check_context_threshold_with_margin(160000, 200000, None, 75, 5, None);
@@ -8907,10 +8956,14 @@ mod tests {
     }
 
     #[test]
-    fn test_context_threshold_compact_wins_over_margin() {
-        // compact_remaining=Some(3) (triggers, <= 5) AND margin would not fire
-        // (tokens at 200K, far from max-margin=900K). compact_remaining takes
-        // precedence — BY_COMPACT path.
+    fn test_context_threshold_compact_gated_below_margin_zone() {
+        // Formerly `test_context_threshold_compact_wins_over_margin`, which
+        // asserted compact_remaining=3 FIRES at 200K/1M (20% real usage) even
+        // though tokens are far below the margin zone (max-margin=900K). That
+        // encoded the 2026-09-01 misfire: a destructive self-clear at 20% of a
+        // 1M window, driven by Claude Code's auto-compact % (decoupled from the
+        // true window). compact_remaining no longer "wins" below the real-usage
+        // danger zone — it is GATED behind it. Expect None here.
         let result = check_context_threshold_with_margin(
             200_000,
             1_000_000,
@@ -8919,9 +8972,10 @@ mod tests {
             5,
             Some(100_000),
         );
-        assert!(result.is_some());
-        let (_, by_compact) = result.unwrap();
-        assert!(by_compact, "compact_remaining=3 should win over margin");
+        assert!(
+            result.is_none(),
+            "compact_remaining must not fire at 20% real usage on a 1M window"
+        );
     }
 
     #[test]

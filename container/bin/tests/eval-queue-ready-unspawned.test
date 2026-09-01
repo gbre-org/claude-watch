@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Tests for container/bin/eval-queue-ready-unspawned (the
+# queue_ready_unspawned obligation evaluator, ob-2026-08-22-5e6e).
+#
+# Exercises:
+#   - a `created_by=hostjob` ready-pending item past the age threshold is
+#     EXEMPT (allow / exit 0) -- the false-positive fix (2026-08-31).
+#   - a non-hostjob (e.g. main-loop-spawned) ready-pending item past the
+#     age threshold still DENIES (exit 1) -- preserves existing behavior.
+#   - a mix of one hostjob + one non-hostjob item still DENIES, counting
+#     only the real (non-hostjob) culprit.
+#   - an item with a MISSING `created_by` still DENIES (the exemption is
+#     narrowly scoped to the literal string "hostjob", never a blanket
+#     "unknown => exempt").
+#   - an item still within the age threshold is not flagged regardless of
+#     created_by (pre-existing behavior, unchanged).
+#   - an exempt command (e.g. `session-task queue list`) always allows,
+#     even with a real ready-unspawned item present (pre-existing behavior,
+#     unchanged).
+#
+# Mocks `session-task` on PATH with a stub that dumps a JSON fixture file
+# named by $FAKE_SESSION_TASK_READY_JSON, so no real queue state is
+# touched. Uses a tempdir for everything.
+#
+# Run:  ./eval-queue-ready-unspawned.test
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL="${HERE}/../eval-queue-ready-unspawned"
+
+TMPDIR_TEST="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_TEST"' EXIT
+
+FAKEBIN="${TMPDIR_TEST}/bin"
+mkdir -p "$FAKEBIN"
+
+cat > "${FAKEBIN}/session-task" <<'EOF'
+#!/usr/bin/env bash
+# Stub: `session-task queue ready --json` dumps the fixture file named by
+# $FAKE_SESSION_TASK_READY_JSON. Anything else exits nonzero (unused here).
+if [ "$1" = "queue" ] && [ "$2" = "ready" ]; then
+    cat "${FAKE_SESSION_TASK_READY_JSON:?unset}"
+    exit 0
+fi
+exit 1
+EOF
+chmod +x "${FAKEBIN}/session-task"
+
+export PATH="${FAKEBIN}:${PATH}"
+export READY_AGE_THRESHOLD_SECS=360
+
+PASS=0
+FAIL=0
+
+ok() { PASS=$((PASS + 1)); echo "ok   - $1"; }
+bad() { FAIL=$((FAIL + 1)); echo "FAIL - $1"; }
+
+OLD_TS="1970-01-01T00:00:00+00:00"   # always past the age threshold
+
+run_eval() {
+    # $1 = fixture json, $2 = stdin command. Sets $rc, $out.
+    export FAKE_SESSION_TASK_READY_JSON="${TMPDIR_TEST}/fixture.json"
+    printf '%s' "$1" > "$FAKE_SESSION_TASK_READY_JSON"
+    set +e
+    out="$(printf '%s' "$2" | python3 "$EVAL" 2>&1)"
+    rc=$?
+    set -e
+}
+
+# --- hostjob item past threshold: EXEMPT (allow) -----------------------
+run_eval '[{"id":"q-1","status":"pending","created_by":"hostjob","registered_at":"'"$OLD_TS"'","summary":"hostjob run"}]' \
+          'ls -la'
+if [ "$rc" -eq 0 ]; then
+    ok "created_by=hostjob ready-pending item is exempt (allow)"
+else
+    bad "created_by=hostjob should allow (got rc=$rc, out=$out)"
+fi
+
+# --- non-hostjob item past threshold: still DENIES ----------------------
+run_eval '[{"id":"q-2","status":"pending","created_by":"main-loop","registered_at":"'"$OLD_TS"'","summary":"real agent work"}]' \
+          'ls -la'
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "DENIED"; then
+    ok "created_by=main-loop ready-pending item still denies"
+else
+    bad "created_by=main-loop should deny (got rc=$rc, out=$out)"
+fi
+
+# --- mix of hostjob + non-hostjob: denies, only real culprit counted ----
+run_eval '[{"id":"q-1","status":"pending","created_by":"hostjob","registered_at":"'"$OLD_TS"'","summary":"hostjob run"},
+           {"id":"q-2","status":"pending","created_by":"main-loop","registered_at":"'"$OLD_TS"'","summary":"real agent work"}]' \
+          'ls -la'
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "1 ready queue item"; then
+    ok "mixed hostjob+non-hostjob denies, counting only the real culprit"
+else
+    bad "mixed set should deny counting 1 item (got rc=$rc, out=$out)"
+fi
+
+# --- missing created_by: still denies (narrow exemption, no blanket) ----
+run_eval '[{"id":"q-3","status":"pending","registered_at":"'"$OLD_TS"'","summary":"no created_by field"}]' \
+          'ls -la'
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "DENIED"; then
+    ok "missing created_by still denies (exemption is not a blanket default-open)"
+else
+    bad "missing created_by should still deny (got rc=$rc, out=$out)"
+fi
+
+# --- item within age threshold: not flagged regardless of created_by ----
+NOW_TS="$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())')"
+run_eval '[{"id":"q-4","status":"pending","created_by":"main-loop","registered_at":"'"$NOW_TS"'","summary":"just registered"}]' \
+          'ls -la'
+if [ "$rc" -eq 0 ]; then
+    ok "freshly-registered non-hostjob item within threshold is not flagged"
+else
+    bad "fresh item within threshold should allow (got rc=$rc, out=$out)"
+fi
+
+# --- exempt command always allows, even with a real ready-unspawned item -
+run_eval '[{"id":"q-2","status":"pending","created_by":"main-loop","registered_at":"'"$OLD_TS"'","summary":"real agent work"}]' \
+          'session-task queue list'
+if [ "$rc" -eq 0 ]; then
+    ok "exempt command (session-task queue list) always allows"
+else
+    bad "exempt command should always allow (got rc=$rc, out=$out)"
+fi
+
+# --- summary --------------------------------------------------------------
+echo ""
+echo "eval-queue-ready-unspawned tests: ${PASS} passed, ${FAIL} failed"
+if [ "$FAIL" -ne 0 ]; then
+    exit 1
+fi

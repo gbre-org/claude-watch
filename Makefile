@@ -71,6 +71,7 @@
 .PHONY: test-agent-psi-exporter
 # Tests — container image
 .PHONY: test-trust-workspace test-claude-tmux-env test-cron-toggle
+.PHONY: test-eval-queue-ready-unspawned
 .PHONY: test-cw-theme-sync
 .PHONY: test-hooks-shim test-entrypoint
 # Tests — compose stack + host shims
@@ -352,6 +353,12 @@ test-claude-tmux-env: ## claude-tmux env / mount passthrough tests
 # cw-cron-toggle CLI). Uses a tempdir flag dir; no cron/root needed.
 test-cron-toggle: ## cw-cron-run / cw-cron-toggle tests
 	container/bin/tests/cw-cron-toggle.test
+
+# Run the eval-queue-ready-unspawned tests (the queue_ready_unspawned
+# obligation evaluator, ob-2026-08-22-5e6e). Mocks `session-task` on PATH
+# with a JSON-fixture stub; no real queue state is touched.
+test-eval-queue-ready-unspawned: ## eval-queue-ready-unspawned obligation evaluator tests
+	container/bin/tests/eval-queue-ready-unspawned.test
 
 # Tests for cw-theme-sync's idle gate. Claude Code renders a suggestion inside
 # an EMPTY input box as DIM (SGR 2) ghost text; capturing the pane without
