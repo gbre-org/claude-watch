@@ -16,7 +16,10 @@ agent's turn loop is blocked on exactly one of:
   between-turn bookkeeping)
 
 Pressure is computed over **active** wall-time only = total − idle −
-waiting_human. `overhead` counts as productive-self, not a stall.
+waiting_human. `overhead` counts as productive-self, not a stall — but it still
+gets its own some/full pair, because inference + tool + overhead partition
+active time, so a panel can show tool use *and* overhead and account for every
+active second.
 
 ## What it reads
 
@@ -70,6 +73,7 @@ windows:
 | `agent_psi_inference_full` | `scope`, `window`, `model` | fraction ALL active agents were blocked on inference at once — the money metric (API/rate-limit bound) |
 | `agent_psi_inference_stalled_some` / `agent_psi_inference_stalled_full` | `scope`, `window`, `model` | the **stalled** subset of the above: inference gaps whose output-token throughput fell below the stall floor (429 back-off / network / TTFT / queueing, not generation), gaps that ended in an API error, and in-flight turns that have been silent past the API-stall threshold (a client parked in retry back-off — see below). `stalled_full` near 1 = the fleet is rate-limit bound, disentangled from "everyone generating hard" |
 | `agent_psi_tool_some` / `agent_psi_tool_full` | `scope`, `window`, `model` | same, for tool |
+| `agent_psi_overhead_some` / `agent_psi_overhead_full` | `scope`, `window`, `model` | same, for overhead — the loop's own between-turn bookkeeping. Not a stall, but the remainder of active time: with inference, tool and overhead all emitted a fleet panel accounts for every active second. Scope-level counterpart of `agent_duty_ratio{category="overhead"}` |
 | `agent_psi_scope_agents` | `scope`, `model` | live agents contributing to each (scope, model) line |
 | `agent_psi_live_agents` | — | **sub-agents actually still running** this scrape (main loop excluded) — transcript not ended in a completed final turn, so a finished agent drops immediately while a mid-tool-wait agent stays counted |
 

@@ -26,12 +26,15 @@ Scenarios:
       agent does NOT block `full`.
   (4b) Model family extraction (opus/sonnet/<synthetic>/unknown) and per-model
       some/full = the fleet math restricted to one model's agents.
+  (4c) Overhead some/full: the same math as the stall categories, an idle agent
+      doesn't block overhead full, an agent in overhead is ACTIVE (so it breaks
+      inference_full), and the three pressure categories partition active time.
   (5) End-to-end scrape: a synthetic projects dir with a main-loop transcript
       (fable) and one sub-agent transcript (opus) -> live_agents=1 (subagents
       only, main excluded), fleet scope excludes the main loop, a separate
       `main` scope, per-model fleet lines (opus present, fable absent),
-      pressure gauges in [0,1] (inference/tool AND the stalled subset),
-      build_info emitted.
+      pressure gauges in [0,1] (inference/tool/overhead AND the stalled
+      subset), build_info emitted.
   (6) Inference-gap throughput split: a fast-tokens gap is productive, a long
       low-token gap is stalled, a sub-min-gap gap is never stalled, a gap with
       no output_tokens is not judged, and the zero-duration guard holds.
@@ -125,6 +128,13 @@ def prompt(ts, text="hi"):
         "timestamp": iso(ts),
         "message": {"role": "user", "content": [{"type": "text", "text": text}]},
     }
+
+
+def bookkeeping(ts, entry_type="system"):
+    """A line that is neither an assistant turn nor a user message (system /
+    queue-operation / attachment / ...): the loop's own between-turn
+    bookkeeping, which bounds an ``overhead`` gap."""
+    return {"type": entry_type, "timestamp": iso(ts), "content": "..."}
 
 
 def approx(a, b, tol=1e-6):
@@ -316,6 +326,63 @@ def run():
           and approx(p_sonnet[(agent_psi.INFERENCE, "full")], 0.0),
           f"got {p_sonnet}")
 
+    # ---- Scenario 4c: overhead some/full -------------------------------
+    print("\nScenario 4c: overhead some/full (the non-stall active category)")
+    check("overhead is a pressure category but not a stall category",
+          agent_psi.OVERHEAD in agent_psi.PRESSURE_CATEGORIES
+          and agent_psi.OVERHEAD not in agent_psi.STALL_CATEGORIES,
+          f"got {agent_psi.PRESSURE_CATEGORIES} / {agent_psi.STALL_CATEGORIES}")
+
+    # A bookkeeping line bounds an overhead gap in a real transcript.
+    booked = [prompt(0), assistant(2), bookkeeping(6)]
+    secs_book = agent_psi.duty_seconds(agent_psi.parse_intervals(booked, now=None))
+    check("gap ending at a bookkeeping line -> overhead",
+          approx(secs_book[agent_psi.OVERHEAD], 4.0), f"got {secs_book}")
+
+    # Same shape as scenario 4, one category over: A always overhead, B tool
+    # then overhead -> some=1.0 over the window, full only where both overlap.
+    a_o = [I(0, 10, agent_psi.OVERHEAD)]
+    b_o = [I(0, 5, agent_psi.TOOL), I(5, 10, agent_psi.OVERHEAD)]
+    po = agent_psi.compute_pressure({"a": a_o, "b": b_o}, 0, 10)
+    check("some_overhead = 1.0", approx(po[(agent_psi.OVERHEAD, "some")], 1.0),
+          f"got {po[(agent_psi.OVERHEAD, 'some')]}")
+    check("full_overhead = 0.5", approx(po[(agent_psi.OVERHEAD, "full")], 0.5),
+          f"got {po[(agent_psi.OVERHEAD, 'full')]}")
+
+    # An idle agent must NOT block full_overhead (mirrors the inference rule).
+    po2 = agent_psi.compute_pressure({"a": a_o, "c": c}, 0, 10)
+    check("idle agent doesn't block full_overhead",
+          approx(po2[(agent_psi.OVERHEAD, "full")], 1.0),
+          f"got {po2[(agent_psi.OVERHEAD, 'full')]}")
+
+    # An agent IN overhead is active-but-not-stalled, so it breaks
+    # full_inference — overhead is emitted, not folded into the stalls.
+    po3 = agent_psi.compute_pressure({"a": a, "o": a_o}, 0, 10)
+    check("overhead agent breaks full_inference",
+          approx(po3[(agent_psi.INFERENCE, "full")], 0.0)
+          and approx(po3[(agent_psi.INFERENCE, "some")], 1.0),
+          f"got {po3}")
+
+    # The three pressure categories partition ACTIVE time: for one always-active
+    # agent (serial, so some == full), the three some values sum to 1.0 — the
+    # accounting that emitting overhead buys the fleet panels.
+    serial = {
+        "s": [
+            I(0, 4, agent_psi.INFERENCE),
+            I(4, 7, agent_psi.TOOL),
+            I(7, 10, agent_psi.OVERHEAD),
+        ]
+    }
+    ps_serial = agent_psi.compute_pressure(serial, 0, 10)
+    total_some = sum(
+        ps_serial[(cat, "some")] for cat in agent_psi.PRESSURE_CATEGORIES
+    )
+    check("inference+tool+overhead some partitions active time (sums to 1.0)",
+          approx(total_some, 1.0)
+          and approx(ps_serial[(agent_psi.OVERHEAD, "some")], 0.3)
+          and approx(ps_serial[(agent_psi.OVERHEAD, "full")], 0.3),
+          f"got {ps_serial}")
+
     # ---- Scenario 6: productive vs stalled inference classification ----
     print("\nScenario 6: inference-gap throughput -> productive / stalled")
 
@@ -384,12 +451,14 @@ def run():
     sess = "abcd1234-0000-0000-0000-000000000000"
     os.makedirs(os.path.join(slug, sess, "subagents"))
     now = time.time()
-    # Main-loop transcript: recent activity so it is "live". Runs on fable.
+    # Main-loop transcript: recent activity so it is "live". Runs on fable, and
+    # ends with a bookkeeping line so the scope has real OVERHEAD time.
     main_entries = [
         prompt(now - 8),
         assistant(now - 6, tool_use_ids=["M"], model="claude-fable-5"),
         tool_result(now - 4, "M"),
         assistant(now - 2, model="claude-fable-5"),
+        bookkeeping(now - 1),
     ]
     with open(os.path.join(slug, f"{sess}.jsonl"), "w") as fh:
         for e in main_entries:
@@ -454,6 +523,26 @@ def run():
                        model="opus")
     check("per-model opus inference_full emitted in [0,1]",
           opus_full is not None and 0.0 <= opus_full <= 1.0, f"got {opus_full}")
+    # Overhead pressure is emitted at scope level with the same label scheme —
+    # the fleet/main panels' "tool use AND overhead" series. The main loop's
+    # trailing bookkeeping makes its 60s overhead_full strictly positive, so
+    # this is not merely an "the series exists" check.
+    overhead_some = sample("agent_psi_overhead_some", scope="fleet",
+                           window="60", model="all")
+    check("fleet overhead_some emitted in [0,1]",
+          overhead_some is not None and 0.0 <= overhead_some <= 1.0,
+          f"got {overhead_some}")
+    overhead_full_main = sample("agent_psi_overhead_full", scope="main",
+                                window="60", model="all")
+    check("main overhead_full emitted and positive (bookkeeping tail)",
+          overhead_full_main is not None and 0.0 < overhead_full_main <= 1.0,
+          f"got {overhead_full_main}")
+    overhead_opus = sample("agent_psi_overhead_full", scope="fleet",
+                           window="60", model="opus")
+    check("per-model overhead_full emitted in [0,1]",
+          overhead_opus is not None and 0.0 <= overhead_opus <= 1.0,
+          f"got {overhead_opus}")
+
     # Stalled-inference gauges are emitted with the same scope/window/model
     # label scheme, values in [0,1] (the synthetic worker has no output_tokens
     # so it is not judged stalled -> 0, but the series must exist).
