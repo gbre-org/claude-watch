@@ -666,7 +666,7 @@
     },
     {
       "id": 11,
-      "title": "Main vs fleet — inference full (60s)",
+      "title": "Main vs fleet — busy full (60s)",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -680,12 +680,12 @@
       },
       "targets": [
         {
-          "expr": "agent_psi_inference_full{scope=\"main\",window=\"60\",model=\"all\"}",
+          "expr": "clamp_max(agent_psi_inference_full{scope=\"main\",window=\"60\",model=\"all\"} + agent_psi_tool_full{scope=\"main\",window=\"60\",model=\"all\"} + agent_psi_overhead_full{scope=\"main\",window=\"60\",model=\"all\"}, 1)",
           "legendFormat": "main",
           "refId": "A"
         },
         {
-          "expr": "agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "expr": "clamp_max(agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"} + agent_psi_tool_full{scope=\"fleet\",window=\"60\",model=\"all\"} + agent_psi_overhead_full{scope=\"fleet\",window=\"60\",model=\"all\"}, 1)",
           "legendFormat": "fleet",
           "refId": "B"
         }
@@ -718,11 +718,11 @@
           "mode": "multi"
         }
       },
-      "description": "Main loop vs sub-agent fleet inference-full over time (60s window), so the dispatcher's idle-heavy profile stays visibly separate from the workers'."
+      "description": "Main loop vs sub-agent fleet busy-full over time (60s window), so the dispatcher idle-heavy profile stays visibly separate from the workers. Busy = inference + tool + overhead; mutually exclusive states, clamped to 100% for measurement-edge noise."
     },
     {
       "id": 12,
-      "title": "Fleet inference — productive vs stalled (60s, stacked)",
+      "title": "Fleet busy — inference / tool / overhead / stalled (60s, stacked)",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -738,7 +738,17 @@
         {
           "expr": "clamp_min(agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"} - agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}, 0)",
           "refId": "A",
-          "legendFormat": "productive (generating)"
+          "legendFormat": "inference (productive)"
+        },
+        {
+          "expr": "agent_psi_tool_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "refId": "C",
+          "legendFormat": "tool use"
+        },
+        {
+          "expr": "agent_psi_overhead_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "refId": "D",
+          "legendFormat": "overhead (bookkeeping)"
         },
         {
           "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
@@ -770,7 +780,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "productive (generating)"
+              "options": "inference (productive)"
             },
             "properties": [
               {
@@ -798,6 +808,38 @@
                 "value": "#dc322f"
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tool use"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#268bd2"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "overhead (bookkeeping)"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#b58900"
+              }
+            ]
           }
         ]
       },
@@ -810,7 +852,7 @@
           "mode": "multi"
         }
       },
-      "description": "THE headline view: fleet inference pressure (60s window) split into two stacked bands. The stack HEIGHT is total inference-full (fraction of the window every active worker was blocked on inference at once); the COLOR split shows how much of that was PRODUCTIVE (green — generating tokens, compute-bound) versus STALLED (red — blocked but not generating: 429 back-off / network / TTFT / queueing, i.e. rate-limit bound). When the red band dominates a tall stack, more parallelism buys nothing. productive = full − stalled, clamped at 0. Main loop excluded."
+      "description": "THE headline view: fleet busy time (60s window) split into four stacked bands. The stack HEIGHT is total busy-full (fraction of the window every active worker was doing something at once); the COLOR split shows what that time went to. INFERENCE (green) is productive generation, compute-bound. TOOL USE (blue) is time inside tool calls. OVERHEAD (yellow) is bookkeeping between the two. STALLED (red) is blocked-but-not-generating: 429 back-off / network / TTFT / queueing, i.e. rate-limit bound. When the red band dominates a tall stack, more parallelism buys nothing. The four categories are mutually exclusive by construction, so the stack is an honest total; inference = inference-full minus stalled, clamped at 0. Main loop excluded."
     },
     {
       "id": 13,
