@@ -125,7 +125,8 @@ happened. See `tools/pr-branches/README.md`.
 ### Liveness ack (narrow ALLOW)
 
 When claude-watch detects that nothing has been acked for `[ack]
-stale_minutes` it injects an instruction to run `event-ack ack-batch` as a
+stale_minutes` it injects an instruction to run `event-ack ack-batch
+--override-reason "<why>"` (the reason is mandatory and audited) as a
 single Bash tool call to restore liveness. But a stale ack frequently
 coincides with a watcher being momentarily down -- so the `watchers_healthy`
 (and often `no_pending_watcher_outputs`) predicate would DENY that very ack.
@@ -138,7 +139,10 @@ gate regardless of obligation state. It is tightly scoped via the AST matcher
 -- the command must be a single top-level segment (no `&&` / `||` / `;` / `|`
 / `&` / newline), its effective head (after stripping env-assignments /
 `sudo` / wrappers) must be `event-ack` (bare or an absolute path), and its
-only non-flag operand must be exactly `ack-batch`. A bundled command
+only non-flag operand must be exactly `ack-batch`. Value-taking flags
+(`--state-dir`, `--action`, and the now-mandatory `--override-reason`) have
+their VALUES skipped so they are not misread as a second operand — the
+exemption survives `event-ack ack-batch --override-reason "<why>"`. A bundled command
 (`event-ack ack-batch && rm -rf x`), a different subcommand, a second
 operand, or `ack-batch` appearing as a flag VALUE (`event-ack clear --action
 ack-batch`) all fall through to the normal gate. Parse failure fails CLOSED

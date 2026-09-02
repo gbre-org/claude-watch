@@ -307,15 +307,24 @@ it the gate is what forces the loop to clear the pending entry. The
 clear-path is the same one used for every batch:
 
 ```sh
-event-ack ack-batch
+event-ack ack-batch --override-reason "<why>"
 ```
 
-One bare command: it acks every pending entry, resets the N-counter, and
-stamps `last-ack-timestamp` -- whose age is claude-watch's liveness signal
-(`[ack] stale_minutes`). `event-ack` is exempt in this evaluator (and in
+`--override-reason` is **mandatory** (mirrors `obligations override`'s
+mandatory-reason escape hatch): a bare batch-ack was being used to
+reflexively bypass the per-event actionable-gate instead of reading each
+event, so `ack-batch` now REFUSES (exit 2, nothing acked) without a
+non-empty reason. It is audited to `<state-dir>/ack-batch-audit.log`
+(timestamp, pid, reason, acked keys) every time it fires. Given a reason,
+it acks every pending entry, resets the N-counter, and stamps
+`last-ack-timestamp` -- whose age is claude-watch's liveness signal (`[ack]
+stale_minutes`). `event-ack` is exempt in this evaluator (and in
 `pre-tool-dispatch-gate-hook`), and `event-ack ack-batch` specifically is
-hardcoded-ALLOWed in `pre-tool-obligations-gate-hook`, so the command that
-discharges the event can never be the command a gate denies.
+hardcoded-ALLOWed in `pre-tool-obligations-gate-hook` regardless of its
+flags -- the AST matcher only cares that `ack-batch` is the sole non-flag
+operand, so `--override-reason "<why>"` (a flag+value, same as the
+pre-existing `--action`) doesn't affect that exemption -- so the command
+that discharges the event can never be the command a gate denies.
 
 Two things this replaced, both retired: a `heartbeat-ack` wrapper (gone
 2026-08-21, once a plain ack was enough) and a `touch

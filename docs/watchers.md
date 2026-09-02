@@ -60,7 +60,7 @@ was read. When acting on an item line (`EVENT[...]` / `BOTCHAT[...]` /
 `SIGNAL[...]`), quote its lead (the text after the prefix, ~80 chars) plus
 what was done — never a bare "Acknowledged" / "Idle". Bad: `Liveness ping —
 status only. Idle.` Good: `EVENT[claude-watch/keepalive] keepalive —
-acked the batch (event-ack ack-batch); nothing else pending.` The arm text and
+acked the batch (event-ack ack-batch --override-reason "..."); nothing else pending.` The arm text and
 `claude-event-watch`'s `[monitor-mode] REPLY RULE:` banner line both restate
 this.
 

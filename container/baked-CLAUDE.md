@@ -1276,7 +1276,8 @@ PR CI failure / merge conflict, workbot-prompt, queue-stale-ready, slack-unread,
 > **`keepalive` = the daemon asking whether you are alive.** Emitted only
 > when nothing has been acked for the quiet window (5 min), so if you ack
 > your batches you never see one. Clear it like any batch:
-> **`event-ack ack-batch`**. The stamp must come from YOU, never the daemon:
+> **`event-ack ack-batch --override-reason "<why>"`** (the reason is
+> mandatory and audited — see step 5). The stamp must come from YOU, never the daemon:
 > that is the wedge detector. Miss it past `[ack] stale_minutes` (20) and
 > claude-watch nudges + alerts. (Was `heartbeat-tick`; the file it told you
 > to `touch` is gone.)
@@ -1311,11 +1312,17 @@ table → fail-LOUD `actionable`. Inspect: `event-classify --list-rules`.
 2. **Restart the watcher immediately** if it exited (before processing).
 3. Ingest is automatic (the watcher does it as it drains).
 4. **Handle the batch**: queue an agent / act directly / dismiss, per event.
-5. **Ack the batch, every batch: `event-ack ack-batch`.** One bare command:
-   clears all pending, resets the N-counter, stamps `last-ack-timestamp`
-   (its age is claude-watch's ONLY liveness signal). Monitor mode prints an
-   `EVENT-ACK REQUIRED:` line per batch as the reminder. Per-key `event-ack
-   ack "<key>"` only to leave part of a batch pending.
+5. **Ack the batch, every batch: `event-ack ack-batch --override-reason
+   "<why>"`.** The `--override-reason` is MANDATORY (refused with exit 2 and
+   nothing acked if omitted or blank) and audited to
+   `<state-dir>/ack-batch-audit.log` — a bare batch-ack was being used to
+   reflexively bypass the per-event actionable gate instead of reading each
+   event, so it now demands a deliberate, human-written reason (mirrors
+   `obligations override`). Given a reason it clears all pending, resets the
+   N-counter, and stamps `last-ack-timestamp` (its age is claude-watch's ONLY
+   liveness signal). Monitor mode prints an `EVENT-ACK REQUIRED:` line per
+   batch as the reminder. Per-key `event-ack ack "<key>"` (unchanged, no
+   reason needed) only to leave part of a batch pending.
 6. **Ambient events** need no action: they surface in the next prompt's
    context via the UserPromptSubmit hook. Ack the batch anyway.
 
@@ -1326,7 +1333,7 @@ table → fail-LOUD `actionable`. Inspect: `event-classify --list-rules`.
 event-ack ingest --source <src> --tag <tag> --message "<msg>"
 
 # Pending-actions surface (actionable tier).
-event-ack ack-batch                        # THE per-batch reflex: ack all + stamp
+event-ack ack-batch --override-reason "<why>"  # THE per-batch reflex: ack all + stamp (reason MANDATORY, audited)
 event-ack add "<key>" [--source "<src>"]   # Manual add (rare)
 event-ack ack "<key>" --action "<text>"    # Ack ONE key (partial batch only)
 event-ack list                             # Show pending + counter

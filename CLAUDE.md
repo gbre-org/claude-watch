@@ -108,7 +108,7 @@ say this; this section is the rule itself.
 
 ```
 BAD   Liveness ping — status only. Idle.
-GOOD  EVENT[claude-watch/keepalive] keepalive — ran event-ack ack-batch; nothing else pending.
+GOOD  EVENT[claude-watch/keepalive] keepalive — ran event-ack ack-batch --override-reason "keepalive, nothing pending"; nothing else pending.
 GOOD  EVENT[cron/pr-status-change] PR #652 CI failure — queued a fix-up agent (q-…).
 ```
 

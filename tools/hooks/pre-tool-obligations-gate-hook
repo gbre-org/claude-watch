@@ -453,7 +453,7 @@ ACK_BATCH_SUBCOMMAND = "ack-batch"
 # Flags `event-ack` accepts that CONSUME the next token. Listed explicitly so a
 # value that happens to look like a subcommand (`--action ack`) is not mistaken
 # for one.
-_ACK_VALUE_FLAGS = {"--state-dir", "--action"}
+_ACK_VALUE_FLAGS = {"--state-dir", "--action", "--override-reason"}
 
 
 def _is_liveness_ack(cmd: str) -> bool:

@@ -139,7 +139,8 @@ ring-buffer log (compact JSON).
 - **Ring buffer max lines**: `$CLAUDE_EVENT_LOG_MAX_LINES` (default 10000).
 - **Liveness stamp**: `$CLAUDE_EVENT_STATE_DIR/last-ack-timestamp` (default
   `~/.config/claude-events/`). `event-ack` writes it on EVERY ack; the main
-  loop's per-batch reflex is `event-ack ack-batch`. Its age is claude-watch's
+  loop's per-batch reflex is `event-ack ack-batch --override-reason "<why>"`
+  (the reason is mandatory and audited). Its age is claude-watch's
   liveness signal (`[ack] stale_minutes`), exported by `claude-watch metrics`
   as `claude_mainloop_last_ack_timestamp_seconds`. Note where it does NOT
   live: **nothing writes state under the queue dir**. A `.state/` subdir
