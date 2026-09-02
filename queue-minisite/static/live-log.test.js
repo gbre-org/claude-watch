@@ -56,6 +56,7 @@ const initialHTML = `<!doctype html>
         <div id="log-meta-rows">
           <div id="log-meta-row-status"></div>
           <div id="log-meta-row-runtime"></div>
+          <div id="log-meta-row-model"></div>
           <div id="log-meta-row-times"></div>
           <div id="log-meta-row-scope"></div>
           <div id="log-meta-row-command"></div>
@@ -70,6 +71,7 @@ const initialHTML = `<!doctype html>
     </div>
     <span id="log-meta-status"></span>
     <span id="log-meta-runtime"></span>
+    <span id="log-meta-model"></span>
     <span id="log-meta-times"></span>
     <span id="log-meta-scope"></span>
     <span id="log-meta-command"></span>
@@ -1062,6 +1064,83 @@ console.log('\ncommand row — template element IDs present');
     tmpl.includes('id="log-meta-row-command"'));
   assert('template has #log-meta-command',
     tmpl.includes('id="log-meta-command"'));
+}
+
+// model row — which model ran the work. The backend resolves it from the
+// agent transcript and sends { model, model_label }; the row shows the
+// family shorthand with the raw id on hover, falls back to the raw id
+// when the family is unrecognised, and stays hidden when no model is
+// attributable. Backend resolution is covered in test_meta.py.
+console.log('\napplyMetaSummary — model row shows family label with raw id on hover');
+{
+  const hooks = window.__liveLog;
+  hooks.resetMetaSummary();
+  const row = window.document.getElementById('log-meta-row-model');
+  const val = window.document.getElementById('log-meta-model');
+
+  hooks.applyMetaSummary({
+    ok: true,
+    status: 'done',
+    scope: ['repo:test'],
+    model: 'claude-opus-5',
+    model_label: 'opus',
+  });
+
+  assert('model: row unhidden', row && row.hidden === false);
+  assert('model: shows family label', val && val.textContent.trim() === 'opus',
+    'got: ' + (val && val.textContent));
+  assert('model: raw id kept as hover title',
+    val && val.innerHTML.includes('title="claude-opus-5"'),
+    'got: ' + (val && val.innerHTML));
+  hooks.resetMetaSummary();
+}
+
+console.log('\napplyMetaSummary — model row falls back to the raw id, never a guess');
+{
+  const hooks = window.__liveLog;
+  hooks.resetMetaSummary();
+  const val = window.document.getElementById('log-meta-model');
+
+  hooks.applyMetaSummary({
+    ok: true,
+    status: 'done',
+    scope: ['repo:test'],
+    model: 'some-future-model-id',
+    model_label: null,
+  });
+
+  assert('unknown family: shows raw id verbatim',
+    val && val.textContent.trim() === 'some-future-model-id',
+    'got: ' + (val && val.textContent));
+  hooks.resetMetaSummary();
+}
+
+console.log('\napplyMetaSummary — model row hidden when no model is attributable');
+{
+  const hooks = window.__liveLog;
+  hooks.resetMetaSummary();
+  const row = window.document.getElementById('log-meta-row-model');
+
+  hooks.applyMetaSummary({
+    ok: true,
+    status: 'running',
+    scope: ['workload:build'],
+    model: null,
+    model_label: null,
+  });
+
+  assert('no model: row hidden', row && row.hidden === true);
+  hooks.resetMetaSummary();
+}
+
+console.log('\nmodel row — template element IDs present');
+{
+  const templatePath = path.resolve(STATIC_DIR, '..', 'templates', 'index.html');
+  const tmpl = fs.readFileSync(templatePath, 'utf8');
+  assert('template has #log-meta-row-model',
+    tmpl.includes('id="log-meta-row-model"'));
+  assert('template has #log-meta-model',
+    tmpl.includes('id="log-meta-model"'));
 }
 
 console.log('\nheadline dedupe (botchat #3363) — data-headline-redundant marking');

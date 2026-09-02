@@ -79,9 +79,16 @@ def _seed_archive_and_parent(
     total_tokens: int,
     tool_uses: int,
     duration_ms: int,
+    model: str | None = None,
 ) -> str:
     """Drop a subagent JSONL into the archive dir + a parent session JSONL
     containing the task-notification enqueue record.
+
+    When ``model`` is given, an assistant record carrying
+    ``message.model`` is appended to the archive — that is where the
+    endpoint reads which model ran the work. Omitting it leaves an
+    archive with no assistant turn, which is the "model unknowable"
+    case.
 
     Returns the relative archive filename (for stamping into queue.json).
     """
@@ -98,8 +105,22 @@ def _seed_archive_and_parent(
         "agentId": agent_id,
         "message": {"role": "user", "content": [{"type": "text", "text": "init"}]},
     }
+    lines = [json.dumps(first_rec)]
+    if model is not None:
+        lines.append(json.dumps({
+            "type": "assistant",
+            "uuid": "00000000-0000-0000-0000-000000000002",
+            "timestamp": "2026-05-11T20:57:09Z",
+            "sessionId": session_id,
+            "agentId": agent_id,
+            "message": {
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "text", "text": "working"}],
+            },
+        }))
     arc_name = f"{qid}.jsonl"
-    (archive_dir / arc_name).write_text(json.dumps(first_rec) + "\n")
+    (archive_dir / arc_name).write_text("\n".join(lines) + "\n")
 
     # Parent session JSONL — single queue-operation enqueue record with
     # the task-notification payload the harness writes when a background
@@ -490,6 +511,198 @@ class MetaEndpointTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         p = r.get_json()
         self.assertIsNone(p["hostjob_command"])
+
+    # ---------- model (which model ran the work) ----------
+
+    def _seed_live_transcript(
+        self, session_id: str, agent_id: str, model: str | None
+    ) -> None:
+        """Write a LIVE (non-archived) subagent transcript under the
+        jsonl root, in the shape `_find_agent_jsonl` resolves."""
+        d = self.jsonl_root / session_id / "subagents"
+        d.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps({
+            "type": "user",
+            "sessionId": session_id,
+            "agentId": agent_id,
+            "message": {"role": "user", "content": "go"},
+        })]
+        if model is not None:
+            lines.append(json.dumps({
+                "type": "assistant",
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "message": {"role": "assistant", "model": model, "content": []},
+            }))
+        (d / f"agent-{agent_id}.jsonl").write_text("\n".join(lines) + "\n")
+
+    def _mark_running(self, item_id: str, agent_id: str) -> None:
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        for it in data["items"]:
+            if it["id"] == item_id:
+                it["status"] = "running"
+                it["registered_at"] = "2026-05-11T20:57:03+00:00"
+                it["agent_id"] = agent_id
+        with open(self.queue_actual, "w") as f:
+            json.dump(data, f)
+
+    def test_model_from_archived_transcript(self):
+        item = _add(self.env, self.queue_actual, "model fixture", ["repo:test"])
+        qid = item["id"]
+        arc = _seed_archive_and_parent(
+            self.archive_dir,
+            self.jsonl_root,
+            qid,
+            session_id="fea2cd3a-76ac-4ec1-b562-15f09872854d",
+            agent_id="a0b6897cbdd7a9478",
+            return_text="done",
+            total_tokens=1,
+            tool_uses=1,
+            duration_ms=1,
+            model="claude-opus-5",
+        )
+        _mark_done(self.queue_actual, qid, archive_path=arc)
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertEqual(p["model"], "claude-opus-5")
+        self.assertEqual(p["model_label"], "opus")
+
+    def test_model_null_when_archive_has_no_assistant_turn(self):
+        # An agent that died before its first response leaves a
+        # transcript with no `message.model` anywhere — that must read
+        # as unknown, never as a default.
+        item = _add(self.env, self.queue_actual, "no model fixture", ["repo:test"])
+        qid = item["id"]
+        arc = _seed_archive_and_parent(
+            self.archive_dir,
+            self.jsonl_root,
+            qid,
+            session_id="fea2cd3a-76ac-4ec1-b562-15f09872854e",
+            agent_id="a0b6897cbdd7a9479",
+            return_text="done",
+            total_tokens=1,
+            tool_uses=1,
+            duration_ms=1,
+        )
+        _mark_done(self.queue_actual, qid, archive_path=arc)
+        self.appmod._cache.fetched_at = 0.0
+
+        p = self.client.get(f"/api/queue/{qid}/meta").get_json()
+        self.assertIsNone(p["model"])
+        self.assertIsNone(p["model_label"])
+
+    def test_model_null_for_workload_item(self):
+        # A workload ran a shell command, not a model.
+        item = _add(
+            self.env, self.queue_actual, "wl item", ["workload:test-model-wl"]
+        )
+        self.appmod._cache.fetched_at = 0.0
+        p = self.client.get(f"/api/queue/{item['id']}/meta").get_json()
+        self.assertIsNone(p["model"])
+        self.assertIsNone(p["model_label"])
+
+    def test_model_label_null_for_unrecognised_id(self):
+        # Unknown family → raw id preserved, label withheld rather than
+        # guessed. The front-end shows the raw id in that case.
+        item = _add(self.env, self.queue_actual, "odd model", ["repo:test"])
+        qid = item["id"]
+        arc = _seed_archive_and_parent(
+            self.archive_dir,
+            self.jsonl_root,
+            qid,
+            session_id="fea2cd3a-76ac-4ec1-b562-15f09872854f",
+            agent_id="a0b6897cbdd7a9480",
+            return_text="done",
+            total_tokens=1,
+            tool_uses=1,
+            duration_ms=1,
+            model="some-future-model-id",
+        )
+        _mark_done(self.queue_actual, qid, archive_path=arc)
+        self.appmod._cache.fetched_at = 0.0
+
+        p = self.client.get(f"/api/queue/{qid}/meta").get_json()
+        self.assertEqual(p["model"], "some-future-model-id")
+        self.assertIsNone(p["model_label"])
+
+    def test_model_from_live_transcript_for_running_item(self):
+        item = _add(self.env, self.queue_actual, "running item", ["repo:test"])
+        qid = item["id"]
+        agent_id = "a1c2d3e4f5a6b7c8d"
+        self._seed_live_transcript(
+            "aaaaaaaa-0000-0000-0000-00000000000a", agent_id, "claude-sonnet-5"
+        )
+        self._mark_running(qid, agent_id)
+        self.appmod._cache.fetched_at = 0.0
+
+        p = self.client.get(f"/api/queue/{qid}/meta").get_json()
+        self.assertEqual(p["model"], "claude-sonnet-5")
+        self.assertEqual(p["model_label"], "sonnet")
+
+    def test_stamped_model_on_record_wins(self):
+        # Nothing writes `model` onto a queue record today, but when
+        # something does it is the most authoritative source (it can
+        # outlive a rotated transcript).
+        item = _add(self.env, self.queue_actual, "stamped", ["repo:test"])
+        qid = item["id"]
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        for it in data["items"]:
+            if it["id"] == qid:
+                it["model"] = "claude-haiku-5"
+        with open(self.queue_actual, "w") as f:
+            json.dump(data, f)
+        self.appmod._cache.fetched_at = 0.0
+
+        p = self.client.get(f"/api/queue/{qid}/meta").get_json()
+        self.assertEqual(p["model"], "claude-haiku-5")
+        self.assertEqual(p["model_label"], "haiku")
+
+    def test_synthetic_model_record_is_skipped(self):
+        # Claude Code stamps model="<synthetic>" on records it fabricated
+        # (interrupt notices, API-error stubs). One can precede the real
+        # first response; the scan must skip past it to the model that
+        # actually ran the work.
+        session_id = "bbbbbbbb-0000-0000-0000-00000000000b"
+        agent_id = "b1c2d3e4f5a6b7c8d"
+        d = self.jsonl_root / session_id / "subagents"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"agent-{agent_id}.jsonl").write_text(
+            json.dumps({
+                "type": "assistant",
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "message": {"role": "assistant", "model": "<synthetic>"},
+            }) + "\n" +
+            json.dumps({
+                "type": "assistant",
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "message": {"role": "assistant", "model": "claude-fable-5"},
+            }) + "\n"
+        )
+        item = _add(self.env, self.queue_actual, "synthetic first", ["repo:test"])
+        qid = item["id"]
+        self._mark_running(qid, agent_id)
+        self.appmod._cache.fetched_at = 0.0
+
+        p = self.client.get(f"/api/queue/{qid}/meta").get_json()
+        self.assertEqual(p["model"], "claude-fable-5")
+        self.assertEqual(p["model_label"], "fable")
+
+    def test_model_family_helper(self):
+        fam = self.appmod._model_family
+        self.assertEqual(fam("claude-opus-5"), "opus")
+        self.assertEqual(fam("claude-sonnet-5"), "sonnet")
+        self.assertEqual(fam("claude-haiku-4-5"), "haiku")
+        self.assertEqual(fam("claude-fable-5[1m]"), "fable")
+        self.assertIsNone(fam("gpt-9"))
+        self.assertIsNone(fam(""))
+        self.assertIsNone(fam(None))
 
 
 if __name__ == "__main__":
