@@ -48,6 +48,7 @@
   const metaRowEls = {
     status:     document.getElementById('log-meta-row-status'),
     runtime:    document.getElementById('log-meta-row-runtime'),
+    model:      document.getElementById('log-meta-row-model'),
     times:      document.getElementById('log-meta-row-times'),
     scope:      document.getElementById('log-meta-row-scope'),
     command:    document.getElementById('log-meta-row-command'),
@@ -61,6 +62,7 @@
   const metaValEls = {
     status:     document.getElementById('log-meta-status'),
     runtime:    document.getElementById('log-meta-runtime'),
+    model:      document.getElementById('log-meta-model'),
     times:      document.getElementById('log-meta-times'),
     scope:      document.getElementById('log-meta-scope'),
     command:    document.getElementById('log-meta-command'),
@@ -607,6 +609,22 @@
       const runtimeVal = metaValEls.runtime;
       if (runtimeRow) runtimeRow.removeAttribute('data-started-at');
       if (runtimeVal) runtimeVal.removeAttribute('data-started-at');
+    }
+
+    // model — which model ran the work, from the agent transcript. The
+    // backend sends the raw id plus a family shorthand ("opus"/"sonnet"/
+    // ...); show the shorthand as a chip with the raw id on hover, and
+    // fall back to the raw id verbatim when the family is unrecognised
+    // rather than labelling it something we can't back up. Null for
+    // workload / hostjob items and for missing transcripts → row hidden.
+    if (meta.model) {
+      const rawModel = String(meta.model);
+      const label = meta.model_label ? String(meta.model_label) : rawModel;
+      const html = '<span class="chip log-meta-model" title="' +
+        esc(rawModel) + '">' + esc(label) + '</span>';
+      setMetaRow('model', html, true);
+    } else {
+      setMetaRow('model', '');
     }
 
     // timestamps — created / started / completed / abandoned (whichever exist)

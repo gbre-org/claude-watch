@@ -1099,6 +1099,15 @@
               <span class="log-meta-label">runtime</span>
               <span class="log-meta-value" id="log-meta-runtime"></span>
             </div>
+            {# model — which model actually ran the work, read from the
+               agent transcript (archived for finished items, live for
+               running ones). Hidden for workload / hostjob items, which
+               ran no model at all, and for agent items whose transcript
+               is no longer on disk — the row is never defaulted. #}
+            <div class="log-meta-row" id="log-meta-row-model" hidden>
+              <span class="log-meta-label">model</span>
+              <span class="log-meta-value" id="log-meta-model"></span>
+            </div>
             <div class="log-meta-row" id="log-meta-row-times" hidden>
               <span class="log-meta-label">timestamps</span>
               <span class="log-meta-value" id="log-meta-times"></span>

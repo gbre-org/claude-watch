@@ -5477,6 +5477,130 @@ def _extract_agent_anchor_from_archive(archive_path: Path) -> tuple[str, str] | 
     return session_id, agent_id
 
 
+# Which MODEL actually ran a queue item's work.
+#
+# The model is not carried in queue.json, nor in claude-watch's
+# active-agents state — but every Claude Code transcript records it on
+# each assistant record as `message.model` (e.g. "claude-opus-5"). That
+# is the only source that reflects what REALLY served the tokens, as
+# opposed to what a spawn was asked for, so it is the one we read.
+#
+# The scan is cheap: assistant records start within the first handful of
+# lines (the transcript opens with the system/user prompt), we stop at
+# the first hit, and a hard line cap bounds the worst case on a
+# transcript that never produced an assistant turn.
+_MODEL_SCAN_MAX_LINES = 400
+
+# Claude Code stamps `"model": "<synthetic>"` on assistant records it
+# fabricated itself (an interrupt notice, an API-error stub) rather than
+# received from a model. Those are not a model that ran anything, and
+# one can sort ahead of the real first response — skip them and keep
+# scanning, so a transcript whose only synthetic record precedes 59 real
+# ones still reports the model that did the work.
+_SYNTHETIC_MODEL = "<synthetic>"
+
+# Model-family shorthand. The raw id is always kept and surfaced as the
+# hover title; this is only the compact label shown in the metadata row.
+# Ordered longest-distinguishing-first is unnecessary here since the
+# families are disjoint substrings of the id.
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+
+
+def _model_family(model_id: str | None) -> str | None:
+    """Return the short family label ("opus"/"sonnet"/...) for a model id.
+
+    None for an unrecognised id — the caller then shows the raw id
+    verbatim rather than inventing a label for it. We never guess: an
+    unknown model is displayed as whatever string the transcript held.
+    """
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    lowered = model_id.lower()
+    for fam in _MODEL_FAMILIES:
+        if fam in lowered:
+            return fam
+    return None
+
+
+def _extract_transcript_model(path: Path) -> str | None:
+    """Return the model id recorded on the first assistant record of a JSONL.
+
+    Reads `message.model` — present on every assistant record Claude Code
+    writes. Stops at the first hit, and gives up after
+    ``_MODEL_SCAN_MAX_LINES`` lines so a long transcript with no assistant
+    turn (an agent that died before its first response) can't turn a
+    metadata fetch into a full-file scan.
+
+    Returns None on any failure — missing file, unreadable, malformed
+    JSON, or no model recorded. The caller omits the row in that case;
+    it never substitutes a default.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for lineno, raw in enumerate(f):
+                if lineno >= _MODEL_SCAN_MAX_LINES:
+                    return None
+                # Cheap pre-filter — most lines are tool results with no
+                # model key, and the per-line JSON parse is the slow part.
+                if '"model"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                model = msg.get("model")
+                if isinstance(model, str) and model and model != _SYNTHETIC_MODEL:
+                    return model
+    except OSError:
+        return None
+    return None
+
+
+def _resolve_item_model(
+    item: dict[str, Any],
+    shaped: dict[str, Any],
+    archive_path: Path | None,
+) -> str | None:
+    """Resolve which model ran this queue item, or None when unknowable.
+
+    Three sources, in order of authority:
+
+      1. A ``model`` string stamped on the queue record itself. Nothing
+         writes this today; honouring it means tooling can record the
+         model explicitly (for an item whose transcript has since been
+         rotated away) without another change here.
+      2. The archived transcript, for done / abandoned items.
+      3. The owning agent's LIVE transcript, for running items — resolved
+         from the owner's agent id the same way the log stream does.
+
+    Returns None when none of the three yields anything: workload and
+    hostjob items ran no model at all, and an agent item whose transcript
+    is gone has no truthful answer. Callers must render that as absent,
+    never as a default.
+    """
+    stamped = item.get("model")
+    if isinstance(stamped, str) and stamped.strip():
+        return stamped.strip()
+
+    if archive_path is not None:
+        model = _extract_transcript_model(archive_path)
+        if model:
+            return model
+
+    owner = shaped.get("owner") or {}
+    owner_agent_id = owner.get("agent_id") if isinstance(owner, dict) else None
+    if isinstance(owner_agent_id, str) and owner_agent_id:
+        live_path = _find_agent_jsonl(owner_agent_id)
+        if live_path is not None:
+            return _extract_transcript_model(live_path)
+    return None
+
+
 def _fetch_agent_completion(
     session_id: str, agent_id: str
 ) -> dict[str, Any] | None:
@@ -5658,6 +5782,7 @@ def api_queue_meta(qid: str) -> Any:
     # transcript content, and the return text doesn't exist until the
     # agent terminates.
     agent_info: dict[str, Any] | None = None
+    archive_path: Path | None = None
     raw_archive = item.get("log_archive_path")
     if (
         isinstance(raw_archive, str)
@@ -5665,8 +5790,9 @@ def api_queue_meta(qid: str) -> Any:
         and "/" not in raw_archive
         and ".." not in raw_archive
     ):
-        archive_path = Path(QUEUE_LOG_ARCHIVE_DIR) / raw_archive
-        if archive_path.is_file():
+        candidate = Path(QUEUE_LOG_ARCHIVE_DIR) / raw_archive
+        if candidate.is_file():
+            archive_path = candidate
             anchor = _extract_agent_anchor_from_archive(archive_path)
             if anchor is not None:
                 session_id, agent_id = anchor
@@ -5677,6 +5803,13 @@ def api_queue_meta(qid: str) -> Any:
                 }
                 if completion is not None:
                     agent_info.update(completion)
+
+    # Which model actually ran this item — read from the transcript
+    # (archived for finished items, live for running ones), so it
+    # reports what served the work rather than what was requested.
+    # None for workload / hostjob items (no model ran) and for agent
+    # items whose transcript is gone; the front-end omits the row.
+    model = _resolve_item_model(item, shaped, archive_path)
 
     # Captured script content for workload-bound items, when the
     # workload command parsed as `<interpreter> <path>` and the
@@ -5736,6 +5869,11 @@ def api_queue_meta(qid: str) -> Any:
         "age": shaped["age"],
         "age_label": shaped["age_label"],
         "runtime_seconds": runtime_seconds,
+        # Raw model id as recorded in the transcript (e.g. "claude-opus-5"),
+        # plus its family shorthand for the compact metadata row. Both null
+        # when no model is attributable — never defaulted or guessed.
+        "model": model,
+        "model_label": _model_family(model),
         "agent": agent_info,
         "script_capture": script_capture,
     }
