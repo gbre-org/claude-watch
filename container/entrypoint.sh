@@ -232,6 +232,12 @@ unset _local_bin
 # keeps the change surgical — no host-native binaries (falcon, slack, devbar)
 # get pulled onto the container PATH. Missing CLIs are skipped (the `-x` guard),
 # so this is a no-op when the botchat repo isn't mounted.
+#
+# pce-aws-creds (PCE/EKS AWS creds helper against envchain `sf-pce-aws`,
+# see claude-config/tools/pce-aws-creds and
+# memory/reference_pce_nemotron_aws_creds_envchain_sf_pce_aws.md) is linked
+# the same way: it's a plain bash script under the bind-mounted claude-config
+# repo, so a symlink into ~/.local/bin is enough — no fork needed.
 _user_bin="${HOME:-/home/hndrewaall}/.local/bin"
 for _script in \
     "${PINGME_SRC:-}" \
@@ -239,7 +245,8 @@ for _script in \
     "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-send" \
     "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-unread-check" \
     "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-show" \
-    "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-history"; do
+    "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-history" \
+    "${HOME:-/home/hndrewaall}/repos/claude-config/tools/pce-aws-creds"; do
     [ -n "$_script" ] || continue
     if [ -x "$_script" ] && [ ! -e "${_user_bin}/$(basename "$_script")" ]; then
         ln -sf "$_script" "${_user_bin}/$(basename "$_script")" 2>/dev/null || true
