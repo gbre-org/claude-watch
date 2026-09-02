@@ -28,10 +28,12 @@ thing, so it is a serial state machine. We map its states onto categories:
 * ``overhead``  — the loop's own between-turn bookkeeping.
 
 Pressure is computed over ACTIVE wall-time only = total − idle −
-waiting_human. ``overhead`` counts as productive-self, not a stall, so it is
-IN the active denominator but is NOT one of the stall categories we compute
-some/full for. This mirrors PSI's rule of not counting time nobody wanted to
-run.
+waiting_human. This mirrors PSI's rule of not counting time nobody wanted to
+run. ``overhead`` counts as productive-self, not a stall — it is never one of
+the STALL categories — but it does get its own some/full pair, because
+inference + tool + overhead partition active time: with all three emitted a
+fleet panel accounts for every active second instead of leaving the remainder
+implicit.
 
 SCOPES
 ------
@@ -152,8 +154,15 @@ CATEGORIES = (INFERENCE, TOOL, IDLE, WAITING_HUMAN, OVERHEAD)
 # the set that can make a full-pressure slice). idle / waiting_human are the
 # time nobody wanted to run and are excluded.
 ACTIVE_CATEGORIES = (INFERENCE, TOOL, OVERHEAD)
-# Categories we compute some/full pressure for.
+# The categories that are a genuine STALL: the loop blocked on something
+# outside itself.
 STALL_CATEGORIES = (INFERENCE, TOOL)
+# Categories we compute some/full pressure for. ``overhead`` is not a stall (it
+# is the loop's own between-turn bookkeeping — productive-self), but it is the
+# remainder of the active denominator, so it gets the same some/full treatment
+# and a fleet panel can account for all of active time. Same set as
+# ACTIVE_CATEGORIES, spelled as "the stalls, plus the non-stall remainder".
+PRESSURE_CATEGORIES = STALL_CATEGORIES + (OVERHEAD,)
 
 # A gap longer than this that does not end at a tool_result is treated as
 # idle rather than a stall (dormant / resumed-session gap). Tool gaps are
@@ -602,10 +611,11 @@ def _interval_at(intervals, t):
 
 
 def compute_pressure(agent_intervals, window_start, window_end):
-    """some/full pressure per stall category over [window_start, window_end].
+    """some/full pressure per pressure category over [window_start, window_end].
 
     ``agent_intervals`` maps agent_id -> list[Interval]. Returns a dict keyed
-    by (category, kind) with kind in {"some", "full"} -> ratio in [0, 1].
+    by (category, kind) for every category in ``PRESSURE_CATEGORIES``, with
+    kind in {"some", "full"} -> ratio in [0, 1].
 
     Exact via a boundary sweep: between consecutive interval boundaries every
     agent's state is constant, so we sample the midpoint of each sub-slice.
@@ -613,9 +623,14 @@ def compute_pressure(agent_intervals, window_start, window_end):
     when there is >=1 ACTIVE agent and every active agent is in the category
     (idle / waiting_human / absent agents don't count as active, matching
     PSI's "every non-idle task stalled").
+
+    ``overhead`` runs through the identical math even though it is not a stall:
+    an agent in overhead is active, so it already broke ``inference_full`` /
+    ``tool_full``, and its own some/full is what makes the three lines add up
+    over active time.
     """
     W = window_end - window_start
-    acc = {(c, k): 0.0 for c in STALL_CATEGORIES for k in ("some", "full")}
+    acc = {(c, k): 0.0 for c in PRESSURE_CATEGORIES for k in ("some", "full")}
     if W <= 0:
         return {k: 0.0 for k in acc}
 
@@ -638,7 +653,7 @@ def compute_pressure(agent_intervals, window_start, window_end):
             cat = _state_at(ivs, mid)
             if cat in ACTIVE_CATEGORIES:
                 active_states.append(cat)
-        for c in STALL_CATEGORIES:
+        for c in PRESSURE_CATEGORIES:
             if any(s == c for s in active_states):
                 acc[(c, "some")] += d
             if active_states and all(s == c for s in active_states):

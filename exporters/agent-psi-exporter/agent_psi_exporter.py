@@ -29,7 +29,16 @@ Metrics
   - agent_psi_tool_full{scope,window,model}        gauge  [HEADLINE]
         Fraction of the trailing ``window`` seconds in which, for the set of
         agents named by ``scope``, >=1 agent (some) / every active agent
-        (full) was blocked on inference / tool. ``scope`` is "fleet"
+        (full) was blocked on inference / tool.
+  - agent_psi_overhead_some{scope,window,model}    gauge  [HEADLINE]
+  - agent_psi_overhead_full{scope,window,model}    gauge  [HEADLINE]
+        The same some/full math and the same scope/window/model labels, for
+        ``overhead`` — the loop's own between-turn bookkeeping. Overhead is NOT
+        a stall (it is productive-self), but inference + tool + overhead
+        partition ACTIVE time, so emitting it lets a fleet panel show tool use
+        AND overhead and account for every active second rather than leaving
+        the remainder implicit. It is the scope-level counterpart of
+        agent_duty_ratio{category="overhead"}.
   - agent_psi_inference_stalled_some{scope,window,model} gauge [HEADLINE]
   - agent_psi_inference_stalled_full{scope,window,model} gauge [HEADLINE]
         The STALLED slice of inference pressure: same some/full semantics and
@@ -41,8 +50,9 @@ Metrics
         parked in retry back-off). It is a SUBSET of inference_* — the
         latter stays the total. Fleet ``stalled_full`` near 1.0 means every
         live worker is rate-limited at once, disentangled from "everyone
-        generating hard" (which inference_full alone conflated). ``scope`` is
-        "fleet"
+        generating hard" (which inference_full alone conflated).
+
+        Across every gauge above, ``scope`` is "fleet"
         (sub-agents only — the main loop is EXCLUDED), "main" (the main loop /
         dispatcher on its own), or "session:<8-char id>" (a main loop + its
         live sub-agents). ``window`` is "10" / "60" / "300". ``model`` is "all"
@@ -146,18 +156,31 @@ EXPORTER_SOURCE = os.environ.get("AGENT_PSI_EXPORTER_SOURCE", "").strip() or "ho
 
 REG = CollectorRegistry()
 
+# What an agent in each pressure category is DOING, for the HELP text. The two
+# stall categories are a block on something outside the loop; overhead is the
+# loop's own bookkeeping, so it reads "in", not "blocked on".
+_CATEGORY_STATE = {
+    agent_psi.INFERENCE: "blocked on inference",
+    agent_psi.TOOL: "blocked on tool",
+    agent_psi.OVERHEAD: (
+        "in overhead (its own between-turn bookkeeping - not a stall, but the "
+        "remainder of ACTIVE time alongside inference and tool)"
+    ),
+}
+
 # One gauge per (category, kind) — names match the design doc's
-# agent_psi_{inference,tool}_{some,full} shape, with scope+window as labels.
+# agent_psi_{inference,tool,overhead}_{some,full} shape, with scope+window as
+# labels.
 _PRESSURE_GAUGES = {}
-for _cat in agent_psi.STALL_CATEGORIES:
+for _cat in agent_psi.PRESSURE_CATEGORIES:
     for _kind in ("some", "full"):
         _PRESSURE_GAUGES[(_cat, _kind)] = Gauge(
             f"agent_psi_{_cat}_{_kind}",
             (
                 f"Fraction of the trailing `window` seconds in which "
                 f"{'>=1 agent' if _kind == 'some' else 'every active agent'} in "
-                f"`scope` (restricted to `model`, or model=all) was blocked on "
-                f"{_cat}."
+                f"`scope` (restricted to `model`, or model=all) was "
+                f"{_CATEGORY_STATE[_cat]}."
             ),
             ["scope", "window", "model"],
             registry=REG,
@@ -236,8 +259,9 @@ g_build_info.labels(
 
 
 def _emit_pressure(scope, agent_intervals, now, model="all"):
-    """Emit some/full for every stall category and window for one scope+model,
-    plus the stalled-inference some/full subset."""
+    """Emit some/full for every pressure category (inference / tool /
+    overhead) and window for one scope+model, plus the stalled-inference
+    some/full subset."""
     for window in WINDOWS:
         ratios = agent_psi.compute_pressure(agent_intervals, now - window, now)
         for (cat, kind), value in ratios.items():
