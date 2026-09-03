@@ -3983,7 +3983,44 @@ pub async fn check_update_trigger(config: &Config, state: &mut State, pane: &str
 }
 
 pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
-    if !config.auto_update.enabled || pane.is_empty() {
+    if !config.auto_update.enabled {
+        // Observability + latent-state hygiene for the config-disabled path.
+        //
+        // A hot-reload runtime override (claude-watch.override.toml) can turn
+        // this feature OFF live. When it does, the daemon otherwise returns
+        // here SILENTLY — no log, no jsonl event — so a stopgap disable is
+        // invisible and can outlive its cause indefinitely. That is exactly what
+        // happened after the version-detection flip-flop fix landed: auto-update
+        // stayed disabled for days while a running-behind-on-disk session never
+        // got the restart nudge, with nothing in the logs to explain why. Emit a
+        // ONE-TIME (per daemon lifetime) notice so `grep auto_update <log>`
+        // reveals the feature is off BY CONFIG, not silently broken.
+        static LOGGED_DISABLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED_DISABLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                "auto-update disabled by config (auto_update.enabled=false) — \
+                 restart nudge on running-behind-on-disk will NOT fire"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_update_disabled",
+                serde_json::json!({ "reason": "config auto_update.enabled=false" }),
+            );
+        }
+        // Clear a stale in-progress flag so it cannot persist forever while
+        // disabled. The staleness-timeout clear below runs ONLY on the enabled
+        // path, so a disable that lands mid-update pins update_in_progress=true
+        // (and its exported gauge) until the feature is re-enabled — observed
+        // stuck true for ~10 days. Clearing here keeps the flag honest.
+        if state.update_in_progress {
+            state.update_in_progress = false;
+            crate::state::save_state(&config.general.state_file, state);
+        }
+        return;
+    }
+
+    if pane.is_empty() {
         return;
     }
 
