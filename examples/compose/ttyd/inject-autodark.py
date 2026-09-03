@@ -61,6 +61,7 @@
 #
 # Output is written in place: index.html is overwritten.
 
+import os
 import re
 import sys
 
@@ -476,6 +477,18 @@ PASTE_EVENT_HANDLER_JS = """<script id="paste-event-handler-injected">
     async function onPaste(e) {
         dbg('paste event fired, types=', e.clipboardData && e.clipboardData.types);
 
+        // Lock guard: when the terminal is locked (lock-toggle-injected
+        // sets window.__cwTerminalLocked), suppress ALL paste — image
+        // AND text — so no clipboard content reaches the live session.
+        // attachCustomKeyEventHandler only vetoes KEY events, not the
+        // browser's separate `paste` event, so the guard is enforced
+        // here too. Block native handling immediately (sync).
+        if (window.__cwTerminalLocked) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return;
+        }
+
         // SYNC branch: only intercept when an image MIME is advertised.
         // Text-only clipboards fall through to xterm.js's native paste
         // (which streams the bytes into the PTY) — this is what makes
@@ -551,14 +564,561 @@ PASTE_EVENT_HANDLER_JS = """<script id="paste-event-handler-injected">
 """
 
 
-def inject(html: str) -> str:
+# JS: report the browser colour-scheme to the server so Claude Code's TUI
+# theme can follow it. The autodark swap above recolours the *terminal*
+# (xterm.js). This block additionally POSTs "dark"/"light" to the
+# clipboard-upload sidecar's /theme-report endpoint (q- dynamic-theme),
+# which writes it to a shared file; the in-container cw-theme-sync daemon
+# then injects `/config theme=<x>` so the CLAUDE-CODE TUI theme (not just
+# the terminal colours) tracks the browser. Fires on initial load and on
+# every prefers-color-scheme change; only POSTs on an actual change, and
+# re-arms on a failed POST so a transient error self-heals on the next flip.
+THEME_REPORT_JS = """<script id="theme-report-injected">
+(function() {
+    'use strict';
+    var REPORT_URL = '/theme-report';
+    var last = null;
+    var timer = null;
+
+    function current() {
+        try {
+            return window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark' : 'light';
+        } catch (e) { return 'dark'; }
+    }
+
+    function report() {
+        var t = current();
+        if (t === last) return;   // debounce: only report real changes
+        last = t;
+        try {
+            fetch(REPORT_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ theme: t }),
+                keepalive: true
+            }).then(function(resp) {
+                if (!resp || !resp.ok) { last = null; }  // re-arm on failure
+            }).catch(function() { last = null; });
+        } catch (e) { last = null; }
+    }
+
+    // Coalesce bursts (e.g. an OS toggle firing multiple mql events).
+    function schedule() {
+        if (timer) { clearTimeout(timer); }
+        timer = setTimeout(report, 300);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', schedule);
+    } else {
+        schedule();
+    }
+
+    try {
+        var mql = window.matchMedia('(prefers-color-scheme: dark)');
+        var onChange = function() { schedule(); };
+        if (mql.addEventListener) {
+            mql.addEventListener('change', onChange);
+        } else if (mql.addListener) {
+            mql.addListener(onChange);
+        }
+    } catch (e) { /* noop */ }
+})();
+</script>
+"""
+
+
+# Lock-toggle CSS. A subtle, transparent padlock button pinned to the
+# TOP-RIGHT corner of the page chrome (mirrors the kiosk-mode toggle in
+# the operator's custom Grafana: near-invisible at rest, brightens on
+# hover, and follows the system color-scheme so it reads on both the
+# Solarized-dark and -light chrome painted by the autodark CSS above).
+#
+# At rest it's ~0.28 opacity so it doesn't distract from the terminal.
+# When the lock is ACTIVE the button gets the `.cw-locked` class: full
+# opacity + a Solarized-orange tint + a subtle ring, so "input is
+# suppressed" is unmistakable at a glance. Colours are chosen from the
+# same Solarized palette the rest of this file uses.
+# --- Auto-lock configuration -----------------------------------------
+#
+# The lock toggle also AUTO-ENGAGES after a period of operator inactivity
+# (Andrew, 2026-08-22). Rationale: the manual padlock only helps when the
+# operator remembers to click it; the common failure it guards against —
+# walking away from a browser tab pointed at a live claude/tmux session
+# and letting a cat / child / colleague / stray keystroke reach the PTY —
+# is exactly the case where nobody is around to press the button.
+#
+# The idle window is configured at IMAGE BUILD time via the
+# TTYD_AUTOLOCK_SECONDS env var (the html-builder stage of the Dockerfile
+# passes it through; docker-compose.yml exposes it as a build arg). The
+# resolved integer is substituted into the injected JS in place of
+# AUTOLOCK_PLACEHOLDER, so the shipped index.html carries a literal
+# `var AUTO_LOCK_SECONDS = <n>;`. 0 disables auto-lock entirely and leaves
+# the manual toggle as the only path.
+#
+# Why build-time rather than a runtime env var: the injection pipeline
+# bakes a single static index.html into the image (ttyd serves it via
+# `-I`), so there is no server-side template render at request time to
+# read a runtime env var from. The injected JS additionally honours a
+# per-tab `?autolock=<seconds>` query param so an operator can override
+# (or disable, with `?autolock=0`) without a rebuild.
+AUTOLOCK_ENV_VAR = "TTYD_AUTOLOCK_SECONDS"
+DEFAULT_AUTOLOCK_SECONDS = 300
+AUTOLOCK_PLACEHOLDER = "__CW_AUTOLOCK_SECONDS__"
+
+
+def resolve_autolock_seconds(env=None) -> int:
+    """Resolve the auto-lock idle window (seconds) from the environment.
+
+    Unset / empty -> DEFAULT_AUTOLOCK_SECONDS (300). `0` disables
+    auto-lock. Anything that is not a non-negative integer is a BUILD
+    FAILURE rather than a silent fallback: a typo'd
+    TTYD_AUTOLOCK_SECONDS that quietly reverted to the default would ship
+    an image whose lock behaviour differs from what the operator asked
+    for, and nothing downstream would notice.
+    """
+    source = os.environ if env is None else env
+    raw = source.get(AUTOLOCK_ENV_VAR)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_AUTOLOCK_SECONDS
+    text = str(raw).strip()
+    try:
+        seconds = int(text)
+    except ValueError:
+        raise SystemExit(
+            f"inject-autodark.py: {AUTOLOCK_ENV_VAR} must be a "
+            f"non-negative integer number of seconds (0 disables), "
+            f"got {text!r}"
+        )
+    if seconds < 0:
+        raise SystemExit(
+            f"inject-autodark.py: {AUTOLOCK_ENV_VAR} must be >= 0 "
+            f"(0 disables), got {seconds}"
+        )
+    return seconds
+
+
+LOCK_TOGGLE_STYLE = """<style id="lock-toggle-injected-style">
+#cw-lock-toggle {
+    position: fixed;
+    top: 6px;
+    right: 8px;
+    z-index: 10000;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    margin: 0;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    color: #93a1a1;            /* base1 — reads on the dark chrome */
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.28;             /* subtle / near-transparent at rest */
+    transition: opacity 0.15s ease, background-color 0.15s ease,
+                color 0.15s ease, border-color 0.15s ease;
+    -webkit-user-select: none;
+    user-select: none;
+}
+#cw-lock-toggle:hover,
+#cw-lock-toggle:focus-visible {
+    opacity: 0.85;
+    outline: none;
+}
+/* Active lock: unmistakable visual cue that keystrokes are ignored. */
+#cw-lock-toggle.cw-locked {
+    opacity: 0.95;
+    color: #cb4b16;                          /* solarized orange */
+    border-color: rgba(203, 75, 22, 0.5);
+    background-color: rgba(203, 75, 22, 0.12);
+}
+@media (prefers-color-scheme: light) {
+    #cw-lock-toggle { color: #586e75; }      /* base01 on light chrome */
+    #cw-lock-toggle.cw-locked { color: #cb4b16; }
+}
+</style>
+"""
+
+# Lock-toggle JS. Builds the top-right padlock button and wires the
+# actual keystroke suppression.
+#
+# Suppression mechanism: xterm.js exposes
+# `term.attachCustomKeyEventHandler(fn)` — the OFFICIAL hook for vetoing
+# key events. Returning `false` tells xterm to NOT process the key, so
+# it is never written to the PTY nor sent over ttyd's input WebSocket
+# (ttyd wires `term.onData -> ws.send('0'+data)`; a key xterm never
+# processes produces no onData). We attach ONE handler that returns
+# `!locked`, so:
+#   - unlocked → returns true → xterm behaves exactly as stock ttyd.
+#   - locked   → returns false → every keystroke is swallowed at the
+#     terminal layer.
+# This is deliberately terminal-scoped rather than a document-level
+# capture-phase keydown trap: it leaves browser-native shortcuts
+# (Cmd/Ctrl+R reload, devtools, Cmd+C copy of a selection, tab switch)
+# untouched — only input destined for the live claude/tmux session is
+# guarded. It also degrades safely: if `window.term` isn't ready on
+# first paint we retry on a poll (ttyd creates `term` asynchronously
+# after the WS connects, same race the autodark reapply defends).
+#
+# The lock state is also mirrored onto `window.__cwTerminalLocked` so
+# the paste handler above can suppress clipboard paste (image AND text)
+# while locked — `attachCustomKeyEventHandler` only vetoes key events,
+# not the browser's separate `paste` event, so the paste path needs its
+# own check for the guard to be complete.
+#
+# For the SAME reason a pointer/mouse guard runs alongside the key veto:
+# `attachCustomKeyEventHandler` does nothing for mouse / wheel / touch
+# input, which xterm.js otherwise turns into selection, focus, scrollback,
+# and mouse-tracking escape sequences bound for the live tmux/claude
+# session. `attachPointerGuard` binds capture-phase listeners on the
+# terminal element (`term.element`) that stopImmediatePropagation +
+# preventDefault the full pointer set while locked, so nothing reaches
+# xterm; unlocked they are pure passthrough. Reading the same
+# `window.__cwTerminalLocked` flag keeps all three guards in lockstep.
+#
+# Persistence: the lock state is stored in localStorage under
+# `cw-terminal-locked` ('1' locked / '0' unlocked). It's read back on
+# page load to seed the initial state (button glyph, aria-pressed, the
+# `.cw-locked` class, `window.__cwTerminalLocked`, and the key-veto), so
+# a locked terminal survives a browser refresh / reconnect instead of
+# silently reverting to unlocked. First load (no stored value) defaults
+# to unlocked; localStorage access is wrapped in try/catch so private
+# mode / disabled storage degrades to in-memory-only rather than breaking
+# the toggle.
+#
+# Auto-lock: the toggle also engages itself after AUTO_LOCK_SECONDS of
+# operator INACTIVITY (default 300, substituted from TTYD_AUTOLOCK_SECONDS
+# at build time — see resolve_autolock_seconds above; 0 disables). Activity
+# is a capture-phase listener on a fixed set of deliberate-input events
+# (keydown / mousedown / pointerdown / touchstart / wheel / paste) that
+# stamps a wall-clock timestamp; a 1 s poll compares Date.now() against it
+# and calls the SAME setLocked() the button does, so an auto-lock is
+# indistinguishable downstream — same glyph, same aria-pressed, same
+# key-veto, same localStorage write (a reload while auto-locked comes back
+# locked). Terminal OUTPUT is deliberately excluded from the activity set:
+# counting it would let a chatty session (build log, `tail -f`, streaming
+# tokens) hold the lock open forever, which is exactly the unattended case
+# this guards. The tick is a no-op while already locked, so a restored or
+# manual lock is never re-locked on top of itself, and an explicit unlock
+# restamps the activity clock so the operator gets the full window back.
+LOCK_TOGGLE_JS = """<script id="lock-toggle-injected">
+(function() {
+    'use strict';
+
+    // Persist the lock state across page reloads in localStorage. Without
+    // this the lock is a per-page in-memory flag, so every browser refresh
+    // / laptop-sleep-driven ttyd reconnect / accidental reload silently
+    // drops back to UNLOCKED — surprising for a safety guard whose whole
+    // point is "don't let stray keystrokes reach the live session". With
+    // persistence a locked terminal STAYS locked until explicitly unlocked.
+    var STORAGE_KEY = 'cw-terminal-locked';
+
+    // Idle window (seconds) before the lock auto-engages. Substituted at
+    // image build time from TTYD_AUTOLOCK_SECONDS (default 300); 0
+    // disables auto-lock and leaves the manual toggle as the only path.
+    var AUTO_LOCK_SECONDS = __CW_AUTOLOCK_SECONDS__;
+
+    // How often the idle deadline is checked. 1 s is coarse enough to be
+    // free and fine enough that the lock lands within a second of the
+    // configured deadline. Deliberately a POLL against a wall-clock
+    // timestamp rather than a setTimeout that every keystroke clears and
+    // re-arms: a suspended laptop freezes timers, so a machine that
+    // sleeps through the deadline would wake UNLOCKED. Comparing
+    // Date.now() against the last-activity stamp locks correctly the
+    // instant the tab wakes up.
+    var IDLE_TICK_MS = 1000;
+
+    // Per-tab runtime override: `?autolock=<seconds>` on the ttyd URL
+    // beats the build-time default (`?autolock=0` disables it for this
+    // tab). The image bakes a single static index.html, so without this
+    // the only way to change the window would be an image rebuild.
+    function readAutoLockOverride() {
+        try {
+            var search = (window.location && window.location.search) || '';
+            var m = /[?&]autolock=(\\d+)/.exec(search);
+            if (m) { return parseInt(m[1], 10); }
+        } catch (e) { /* noop */ }
+        return null;
+    }
+
+    var override = readAutoLockOverride();
+    if (override !== null && isFinite(override) && override >= 0) {
+        AUTO_LOCK_SECONDS = override;
+    }
+    if (!isFinite(AUTO_LOCK_SECONDS) || AUTO_LOCK_SECONDS < 0) {
+        AUTO_LOCK_SECONDS = 0;
+    }
+    var autoLockEnabled = AUTO_LOCK_SECONDS > 0;
+    // Exposed for debugging / tests: the window this page actually used.
+    window.__cwAutoLockSeconds = AUTO_LOCK_SECONDS;
+
+    function readStoredLocked() {
+        // First load (nothing stored) → getItem returns null → false
+        // (unlocked), the safe / stock default. Wrapped in try/catch
+        // because Safari private mode and disabled-storage configs THROW
+        // on any localStorage access rather than returning null.
+        try {
+            return window.localStorage.getItem(STORAGE_KEY) === '1';
+        } catch (e) { return false; }
+    }
+
+    function writeStoredLocked(v) {
+        // Degrade to in-memory-only if storage is unavailable (private
+        // mode / quota / disabled): the lock still works for this session,
+        // it just won't survive a reload. Never let a storage error break
+        // the toggle itself.
+        try {
+            window.localStorage.setItem(STORAGE_KEY, v ? '1' : '0');
+        } catch (e) { /* noop */ }
+    }
+
+    // Seed from persisted state so a reload restores the prior lock. An
+    // AUTO lock persists through exactly the same path as a manual one,
+    // so a reload while auto-locked comes back locked; and because the
+    // idle tick is a no-op while `locked` is already true, a restored
+    // lock is never re-locked on top of itself.
+    var locked = readStoredLocked();
+
+    // What engaged the CURRENT lock — 'user' (button) or 'auto' (idle
+    // deadline). Drives the tooltip only; null while unlocked, and null
+    // for a state restored from a previous page load (we don't persist
+    // the source, only the lock itself).
+    var lockSource = null;
+
+    // Shared flag other injected handlers (the paste handler) read to
+    // suppress input while the terminal is locked. Defined up front AND
+    // seeded from storage so a paste that races button creation still
+    // sees the correct restored value.
+    window.__cwTerminalLocked = locked;
+
+    var LOCK_ICON = '\\uD83D\\uDD12';    // closed padlock
+    var UNLOCK_ICON = '\\uD83D\\uDD13';  // open padlock
+
+    var btn = null;
+
+    function humanIdle() {
+        return (AUTO_LOCK_SECONDS % 60 === 0)
+            ? (AUTO_LOCK_SECONDS / 60) + ' min'
+            : AUTO_LOCK_SECONDS + ' s';
+    }
+
+    function render() {
+        if (!btn) return;
+        btn.textContent = locked ? LOCK_ICON : UNLOCK_ICON;
+        btn.setAttribute('aria-pressed', locked ? 'true' : 'false');
+        if (locked && lockSource === 'auto') {
+            btn.title = 'Terminal input AUTO-LOCKED after ' + humanIdle()
+                + ' idle — keystrokes are ignored. Click to unlock.';
+        } else if (locked) {
+            btn.title = 'Terminal input LOCKED — keystrokes are ignored. '
+                + 'Click to unlock.';
+        } else if (autoLockEnabled) {
+            btn.title = 'Lock terminal input (ignore keystrokes) — '
+                + 'auto-locks after ' + humanIdle() + ' idle';
+        } else {
+            btn.title = 'Lock terminal input (ignore keystrokes)';
+        }
+        if (locked) { btn.classList.add('cw-locked'); }
+        else { btn.classList.remove('cw-locked'); }
+    }
+
+    // ---- idle tracking -------------------------------------------------
+    // Only DELIBERATE operator input counts as activity. Terminal OUTPUT
+    // is deliberately NOT a signal: a chatty session (a build log, a
+    // `tail -f`, Claude Code streaming tokens) would otherwise hold the
+    // lock open forever, which is precisely the unattended case the
+    // auto-lock exists for. Passive pointer MOVEMENT is excluded for the
+    // same reason — a nudged desk is not presence.
+    var ACTIVITY_EVENTS = [
+        'keydown',      // typing
+        'mousedown',    // click / drag-select
+        'pointerdown',  // pen / unified pointer
+        'touchstart',   // tablet + phone, the main non-keyboard client
+        'wheel',        // scrollback
+        'paste'         // Cmd+V, whose image path preventDefaults early
+    ];
+
+    var lastActivityAt = Date.now();
+
+    function markActivity() { lastActivityAt = Date.now(); }
+
+    function wireActivityListeners() {
+        // Capture phase so activity still registers when xterm.js (or our
+        // own paste interceptor) stops propagation on its handlers.
+        for (var i = 0; i < ACTIVITY_EVENTS.length; i++) {
+            document.addEventListener(ACTIVITY_EVENTS[i], markActivity, true);
+        }
+    }
+
+    function idleTick() {
+        if (!autoLockEnabled) return;
+        if (locked) return;   // already locked — nothing to auto-engage
+        if (Date.now() - lastActivityAt >= AUTO_LOCK_SECONDS * 1000) {
+            setLocked(true, 'auto');
+        }
+    }
+
+    function setLocked(v, source) {
+        locked = !!v;
+        lockSource = locked ? (source || 'user') : null;
+        window.__cwTerminalLocked = locked;
+        writeStoredLocked(locked);   // persist so the state survives reload
+        // An explicit unlock restarts the idle countdown from NOW so the
+        // operator gets the full window back — without this, unlocking
+        // after a long idle would re-lock on the very next tick.
+        if (!locked) { markActivity(); }
+        render();
+    }
+
+    function ensureButton() {
+        if (btn || !document.body) return;
+        btn = document.createElement('button');
+        btn.id = 'cw-lock-toggle';
+        btn.type = 'button';
+        btn.setAttribute('aria-label', 'Toggle terminal input lock');
+        btn.addEventListener('click', function(e) {
+            if (e && e.preventDefault) { e.preventDefault(); }
+            if (e && e.stopPropagation) { e.stopPropagation(); }
+            setLocked(!locked, 'user');
+        });
+        // Keep a click on the toggle from bubbling into xterm.js focus /
+        // selection handling.
+        btn.addEventListener('mousedown', function(e) {
+            if (e && e.stopPropagation) { e.stopPropagation(); }
+        });
+        document.body.appendChild(btn);
+        render();
+    }
+
+    var handlerAttached = false;
+    function attachKeyGuard() {
+        var t = window.term;
+        if (!t || handlerAttached) return;
+        if (typeof t.attachCustomKeyEventHandler === 'function') {
+            // false => xterm ignores the key (no PTY write / no WS send)
+            // while locked; true => normal processing.
+            t.attachCustomKeyEventHandler(function() { return !locked; });
+            handlerAttached = true;
+        }
+    }
+
+    // ---- pointer / mouse guard ----------------------------------------
+    // attachCustomKeyEventHandler only vetoes KEY events. Mouse, wheel,
+    // and touch input are a SEPARATE path: xterm.js turns them into
+    // selection, focus, scrollback, and — for a mouse-tracking app like
+    // tmux / vim / Claude Code's TUI — the xterm mouse-reporting escape
+    // sequences that get written to the PTY. Without a guard those still
+    // reach the live session while locked (the exact leak this fixes).
+    //
+    // The listeners are bound to the TERMINAL ELEMENT (`term.element`,
+    // xterm's `.xterm` container) in the CAPTURE phase, so they run before
+    // xterm's own handlers on the descendant screen/viewport nodes and can
+    // swallow the event first. Scoping to that element — rather than
+    // document — keeps browser behavior OUTSIDE the terminal (the padlock
+    // button, page scroll, browser chrome) byte-for-byte identical, the
+    // same containment principle as the terminal-scoped key veto.
+    var POINTER_GUARD_EVENTS = [
+        'mousedown', 'mouseup', 'mousemove', 'click', 'dblclick',
+        'contextmenu', 'wheel',
+        'pointerdown', 'pointerup', 'pointermove',
+        'touchstart', 'touchmove', 'touchend'
+    ];
+
+    function pointerGuard(e) {
+        // Gated ENTIRELY on the lock: unlocked → return immediately with
+        // no preventDefault / no stopPropagation, so stock ttyd pointer
+        // behavior is unchanged. Locked → swallow before xterm sees it.
+        if (!window.__cwTerminalLocked) return;
+        if (e && typeof e.stopImmediatePropagation === 'function') {
+            e.stopImmediatePropagation();
+        }
+        // wheel / touch* are frequently non-cancelable; only preventDefault
+        // when the event actually allows it to avoid a console warning.
+        if (e && e.cancelable && typeof e.preventDefault === 'function') {
+            e.preventDefault();
+        }
+    }
+
+    var pointerGuardAttached = false;
+    function attachPointerGuard() {
+        var t = window.term;
+        var el = t && t.element;
+        if (!el || pointerGuardAttached ||
+            typeof el.addEventListener !== 'function') return;
+        for (var i = 0; i < POINTER_GUARD_EVENTS.length; i++) {
+            // capture:true → run ahead of xterm's own handlers;
+            // passive:false → preventDefault actually cancels wheel/touch.
+            el.addEventListener(
+                POINTER_GUARD_EVENTS[i], pointerGuard,
+                { capture: true, passive: false }
+            );
+        }
+        pointerGuardAttached = true;
+    }
+
+    function init() {
+        ensureButton();
+        attachKeyGuard();
+        attachPointerGuard();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+    // ttyd builds window.term asynchronously after the WS connects, so
+    // it may be absent on first paint. Poll until the button is mounted
+    // AND both the key guard and the pointer guard are attached, then
+    // stop (mirrors the autodark reapply poll; negligible cost).
+    var iv = setInterval(function() {
+        init();
+        if (btn && handlerAttached && pointerGuardAttached) {
+            clearInterval(iv);
+        }
+    }, 1000);
+
+    // Auto-lock wiring. Skipped entirely when disabled (0) so an opted-out
+    // build registers no listeners and no timer at all.
+    if (autoLockEnabled) {
+        wireActivityListeners();
+        setInterval(idleTick, IDLE_TICK_MS);
+    }
+})();
+</script>
+"""
+
+
+def lock_toggle_js(seconds: int) -> str:
+    """LOCK_TOGGLE_JS with the auto-lock idle window substituted in.
+
+    Kept separate from the constant (rather than making LOCK_TOGGLE_JS an
+    f-string) so the template stays a plain module-level string literal —
+    the tests lift it out of the source with `ast` and run it under Node,
+    which needs a real `ast.Constant` to read.
+    """
+    return LOCK_TOGGLE_JS.replace(AUTOLOCK_PLACEHOLDER, str(int(seconds)))
+
+
+def inject(html: str, autolock_seconds: int | None = None) -> str:
     """Inject CSS + JS into the <head> of ttyd's bundled HTML.
 
     ttyd 1.7.7 ships a one-line minified HTML — the `<head>` open and
     close tags are present but everything is on a single line. We
     splice our content RIGHT BEFORE </head> so it loads after ttyd's
     own <style>/<link> definitions and wins on the cascade.
+
+    `autolock_seconds` is the idle window baked into the lock toggle;
+    None resolves it from TTYD_AUTOLOCK_SECONDS (default 300, 0 = off).
     """
+    if autolock_seconds is None:
+        autolock_seconds = resolve_autolock_seconds()
     marker = "</head>"
     if marker not in html:
         # Defensive: if upstream HTML structure ever changes, fail
@@ -568,8 +1128,9 @@ def inject(html: str) -> str:
             "inject-autodark.py: '</head>' marker not found in input HTML"
         )
     injected = (
-        CSS + JS + PASTE_INTERCEPT_JS + PASTE_TOAST_STYLE
-        + PASTE_EVENT_HANDLER_JS + marker
+        CSS + JS + THEME_REPORT_JS + PASTE_INTERCEPT_JS + PASTE_TOAST_STYLE
+        + PASTE_EVENT_HANDLER_JS + LOCK_TOGGLE_STYLE
+        + lock_toggle_js(autolock_seconds) + marker
     )
     # Replace only the FIRST occurrence (xterm.js's inline JS may
     # mention the string '</head>' inside a quoted literal further
@@ -586,12 +1147,15 @@ def main() -> int:
     in_path, out_path = sys.argv[1], sys.argv[2]
     with open(in_path, "r", encoding="utf-8") as f:
         html = f.read()
-    patched = inject(html)
+    autolock_seconds = resolve_autolock_seconds()
+    patched = inject(html, autolock_seconds)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(patched)
     sys.stderr.write(
         f"inject-autodark.py: wrote {len(patched)} bytes to {out_path} "
-        f"(input was {len(html)} bytes)\n"
+        f"(input was {len(html)} bytes; auto-lock "
+        + (f"{autolock_seconds}s" if autolock_seconds else "DISABLED")
+        + ")\n"
     )
     # Sanity-check: our marker classes are present in the output.
     # The floating "Paste image" button was removed 2026-05-20 — Cmd+V
@@ -600,10 +1164,18 @@ def main() -> int:
     # explicitly NOT in this list. The toast surface keeps its
     # `cw-paste-image-toast` id (used by PASTE_EVENT_HANDLER_JS).
     for needle in ("autodark-injected", "prefers-color-scheme",
+                   "theme-report-injected",
                    "paste-intercept-injected",
                    "paste-toast-injected-style",
                    "cw-paste-image-toast",
-                   "paste-event-handler-injected"):
+                   "paste-event-handler-injected",
+                   "lock-toggle-injected-style",
+                   "lock-toggle-injected",
+                   "cw-lock-toggle",
+                   # The auto-lock window really was substituted (a
+                   # surviving placeholder is a JS syntax error that
+                   # would take the whole toggle down at runtime).
+                   f"var AUTO_LOCK_SECONDS = {autolock_seconds};"):
         if needle not in patched:
             sys.stderr.write(
                 f"inject-autodark.py: missing '{needle}' in output — abort\n"
@@ -611,7 +1183,8 @@ def main() -> int:
             return 1
     # And reverse-check: removed markers MUST be absent. Catches
     # accidental partial reverts in code review.
-    for absent in ("paste-image-button-injected", "cw-paste-image-btn"):
+    for absent in ("paste-image-button-injected", "cw-paste-image-btn",
+                   AUTOLOCK_PLACEHOLDER):
         if absent in patched:
             sys.stderr.write(
                 f"inject-autodark.py: removed marker '{absent}' still "

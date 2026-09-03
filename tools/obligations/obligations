@@ -14,10 +14,12 @@ State: ``~/.config/claude/obligations.json`` (0600), schema:
         {
           "id": "ob-YYYY-MM-DD-NNNN",
           "tool_pattern": "Bash" | "Bash:^cat" | "*",
-          "exempt_patterns": ["Bash:^watcher-ctl run", "Read"],  # optional
+          "exempt_patterns": ["Bash:^watcher-ctl run", "Read",
+                              "MonitorArm"],                    # optional
           "predicate": {
             "kind": "file_mtime_within" | "env_present" | "queue_status"
-                  | "file_exists" | "no_pipe_pattern" | "marker_file_present"
+                  | "file_exists" | "no_pipe_pattern" | "no_output_consumed"
+                  | "marker_file_present"
                   | "watchers_healthy" | "is_main_loop" | "all_of"
                   | ...,
             "params": {...}
@@ -29,7 +31,20 @@ State: ``~/.config/claude/obligations.json`` (0600), schema:
           "created_by": "...",
           "satisfied_by": {
             "tool_pattern": "Bash",
-            "command_pattern": "^watcher-ctl run signal-wait-dm"
+            "command_pattern": "^watcher-ctl run signal-wait-dm",
+            # optional: a SECOND, independent regex for the PAYLOAD the
+            # command carried, as opposed to the shape of the command
+            # itself. Searched on its own (not anchored to wherever
+            # command_pattern matched), so payload text that sits on a
+            # different line of the command -- a heredoc body, say -- is
+            # reachable. When set it must ALSO match: it can only narrow.
+            "body_pattern": "delivered:",
+            # optional: flags whose ARGUMENT is a path. When present, the
+            # patterns above are ALSO matched against those files' contents,
+            # so a command that hands its payload over as a file (rather
+            # than inline) can still auto-satisfy. Missing / unreadable /
+            # oversized / non-regular files never count as a match.
+            "file_arg_flags": ["-F", "--file"]
           } | null,
           "deny_message": "..."
         }
@@ -102,6 +117,31 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         or heredoc body does not false-positive-deny. Parse failure falls
         back (fail-closed) to matching the raw command string. (Always
         satisfied for non-Bash tools.)
+
+        PREFER ``no_output_consumed`` for any "do not filter <tool>'s
+        output" rule. A regex over a command string cannot tell a real
+        pipe from a pipe character inside a quoted argument, nor a command
+        that RUNS from a command NAME that merely appears as an argument,
+        so such a regex is always either leaky or over-firing (usually
+        both).
+  - no_output_consumed: {commands, redirect_mode?, include_substitution?}
+        BAN-style, fully AST-based: for Bash commands, satisfied UNLESS a
+        command whose head matches one of ``commands`` has its stdout
+        CONSUMED -- piped into another command, redirected away, or
+        captured by a ``$(...)`` substitution. ``commands`` is a list of
+        command-name specs; each is a literal name (``botchat-show``) or a
+        glob naming a family (``botchat-*``). Matching is against the
+        effective command HEAD (basename, env / wrapper / path stripped),
+        so ``grep -n 'botchat-show' Dockerfile | head`` and
+        ``echo 'botchat-send' | wc -l`` are ALLOWED while
+        ``botchat-show 2008 | head`` and ``botchat-history > /dev/null``
+        are DENIED.
+        ``redirect_mode``: "devnull" (default -- only ``> /dev/null``
+        counts), "any" (any stdout redirection counts), or "none".
+        ``include_substitution`` (default true): a ``$(...)`` / backtick
+        capture counts as consumption.
+        FAIL-CLOSED: an unparseable command is DENIED (with the override
+        hint), never allowed. (Always satisfied for non-Bash tools.)
   - marker_file_present: {path, negate?}
         alias of file_exists for "you owe X" trackers
   - process_alive: {pid_file}
@@ -192,6 +232,39 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         gate self-clears once the main loop dispatches (no separate
         post-tool-satisfy needed -- the predicate flips as soon as the
         item leaves ready+pending state).
+
+  - force_started_unspawned: {queue_id, grace_secs?, grace_from?,
+                              queue_path?, agents_state_path?,
+                              pending_spawns_path?,
+                              pending_spawn_max_age_secs?}
+        Registered by ``session-task queue force-start`` (and the
+        queue-minisite Force-start button, which shells out to it).
+        Satisfied (=allow) iff ANY of:
+          (a) the queue item is no longer ``running`` (moot), OR
+          (b) the call falls inside the dispatch GRACE WINDOW: fewer
+              than ``grace_secs`` seconds have elapsed since the
+              force-start (anchor = ``grace_from`` param if given, else
+              the queue item's ``force_started_at``). Default
+              ``grace_secs`` is 0 (no grace) at the predicate level;
+              session-task registers 60s (env
+              ``OBLIGATIONS_FORCE_START_GRACE_SECS``), OR
+          (c) claude-watch's active-agents JSON shows a LIVE record whose
+              ``queue_id`` matches, OR
+          (d) a fresh pending-spawn record (written by the
+              pre-agent-queue-gate-hook at PreToolUse:Agent time) exists
+              for the queue id.
+        Failure (=deny) means the item is still running, the grace has
+        elapsed, and no agent has been dispatched -- the operator
+        force-started but never spawned.
+
+        SCOPING: the predicate itself is context-blind. session-task
+        registers it as ``all_of [is_main_loop, force_started_unspawned]``
+        so it gates ONLY the main loop (the party that can dispatch); a
+        concurrently-running subagent's tool calls are never denied by a
+        force-start it did not issue and cannot satisfy (regression
+        2026-08-20: three subagents were denied in the seconds between
+        ``force-start`` and the main loop's ``Agent`` call, and fell back
+        to audited bypasses).
 
   - subagent_queue_item_running: {bindings_path?}
         Continuous queue-discipline enforcement for SUBAGENTS. Satisfied
@@ -374,6 +447,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -448,6 +522,20 @@ def _watcher_output_is_noise_only(output_path: str) -> bool:
         if not _WATCHER_OUTPUT_NOISE_RE.match(line):
             return False
     return saw_line
+
+# Special tool_pattern token: matches the Claude Code ``Monitor`` tool ONLY
+# when its ``command`` is exactly a configured monitor-mode watcher's
+# monitor_cmd (the command `watcher-ctl run <name>` prints for a
+# `mode=monitor` watcher; trailing ` 2>&1` tolerated). It is the monitor-mode
+# analogue of the `Bash:^watcher-ctl run` recovery exempt -- arming the
+# Monitor IS the cure for a DOWN monitor-mode watcher -- and is listed both in
+# the universal recovery floor below and in obligations-init's shared
+# DEFAULT_EXEMPT_PATTERNS. Resolution lives in `_monitor_arm_matches`.
+MONITOR_ARM_PATTERN = "MonitorArm"
+
+# Hard cap on how long the MonitorArm resolver may spend shelling out to
+# `watcher-ctl list --json`. Only ever paid on a Monitor tool call.
+MONITOR_ARM_LIST_TIMEOUT_SECS = 3
 
 # Tool/command patterns exempt from the no_pending_watcher_outputs gate.
 # Without exemptions the gate would self-deadlock: the gate fires, but every
@@ -590,6 +678,22 @@ UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
     # no_pending_watcher_outputs fire, the recovery is `watcher-ctl run`
     # / `watcher-restart` / `watcher-status`. Always allow.
     "Bash:^watcher-(ctl|status|restart)\\b",
+    # The MONITOR-MODE cure. For a `mode=monitor` watcher, `watcher-ctl run
+    # <name>` does not exec anything -- it prints the Monitor-tool command
+    # and the main loop must ARM it (Monitor tool, persistent: true). That
+    # Monitor call IS the `watcher-ctl run` of monitor mode: the one tool
+    # call that cures a DOWN monitor-mode watcher. Without this floor entry
+    # `watchers_healthy` denied exactly that call (2026-08-21 incident:
+    # "watchers unhealthy -- restart them first" on the arm of the watcher
+    # it named), leaving `obligations override` as the only way out -- the
+    # same deadlock class the recovery-CLI exemptions exist to prevent.
+    # `MonitorArm` is deliberately NARROW (see `_tool_pattern_matches`): it
+    # matches the Monitor tool ONLY when its `command` is exactly a
+    # configured monitor-mode watcher's monitor_cmd (layered watchers.conf
+    # via `watcher-ctl list --json`; trailing ` 2>&1` tolerated). Any other
+    # Monitor call stays gated. Fail-closed: no watcher-ctl / no config /
+    # any parse error => no match => the gate stands.
+    MONITOR_ARM_PATTERN,
     # Process diagnosis -- needed to figure out which watcher is wedged.
     "Bash:^(pgrep|pkill|ps)\\b",
     # Read is UNCONDITIONALLY exempt. Reading a file is inherently
@@ -627,6 +731,7 @@ VALID_PREDICATE_KINDS = {
     "env_present",
     "queue_status",
     "no_pipe_pattern",
+    "no_output_consumed",
     "marker_file_present",
     "process_alive",
     "process_in_pgrep",
@@ -1603,6 +1708,81 @@ def _eval_evaluator_predicate(params, tool_name, command_string, agent_id):
                         f"stdout_preview={stdout_text!r}"))
 
 
+# Appended to every no_output_consumed denial so the escape hatch is always
+# one copy-paste away (the gate is deliberately fail-closed, so an operator
+# who hits a genuine false positive must not have to go hunting).
+OVERRIDE_HINT = ('bypass with: obligations override "<reason>" '
+                 "--duration 5m")
+
+
+def _eval_no_output_consumed(params, tool_name, command_string):
+    """BAN-style predicate: deny when a named command's OUTPUT is consumed.
+
+    Returns ``(satisfied, why)`` like every other predicate: satisfied=True
+    means nothing forbidden was found, so the call is allowed.
+
+    This is the AST replacement for expressing "never filter <tool>'s
+    output" as a ``no_pipe_pattern`` regex. A regex over the raw command
+    string cannot distinguish:
+
+      * a REAL pipe from a ``|`` inside a quoted argument or heredoc body
+        (over-firing: ``grep -n 'botchat-show' Dockerfile | head`` denied
+        even though no botchat command runs), nor
+      * an exhaustively-enumerated consumer list from the ones the author
+        forgot (leaking: a pattern written for ``| tail -N`` / ``| head
+        -N`` silently permitted bare ``| head``, ``| grep``, ``| jq`` and
+        ``> /dev/null``).
+
+    Asking the AST "is this command's stdout consumed?" needs no consumer
+    enumeration at all, and only ever inspects real command heads.
+
+    FAIL-CLOSED: an unparseable command is DENIED (with the override hint).
+    An unparseable command is precisely where a hidden violation would
+    live, so it must not be waved through.
+    """
+    commands = params.get("commands") or []
+    if isinstance(commands, str):
+        commands = [c.strip() for c in commands.split(",") if c.strip()]
+    commands = [c for c in commands if isinstance(c, str) and c]
+    if not commands:
+        return (True, "no commands configured (allow)")
+    if tool_name not in ("Bash",):
+        return (True, f"tool {tool_name} is not Bash (predicate N/A)")
+    cmd = command_string or ""
+    redirect_mode = str(params.get("redirect_mode", "devnull"))
+    if redirect_mode not in ("devnull", "any", "none"):
+        redirect_mode = "devnull"
+    include_substitution = bool(params.get("include_substitution", True))
+
+    if _shell_ast is None:
+        # The gate cannot answer its question without the parser. Denying a
+        # narrow command family beats silently un-enforcing the rule.
+        return (False,
+                "shell_ast parser unavailable -- cannot verify that "
+                f"{commands} output is unfiltered (fail-closed); "
+                + OVERRIDE_HINT)
+    try:
+        reasons = _shell_ast.output_consumed_by(
+            cmd, commands,
+            redirect_mode=redirect_mode,
+            include_substitution=include_substitution,
+        )
+    except _shell_ast.ShellParseError as e:
+        return (False,
+                f"command could not be parsed ({e}) -- refusing to guess "
+                "whether its output is filtered (fail-closed); "
+                + OVERRIDE_HINT)
+    except Exception as e:  # noqa: BLE001 -- a helper bug must not un-gate
+        return (False,
+                f"shell_ast raised {type(e).__name__}: {e} (fail-closed); "
+                + OVERRIDE_HINT)
+    if reasons:
+        return (False, "; ".join(reasons) + " -- read the full output "
+                "instead (if it is too verbose, fix the tool); "
+                + OVERRIDE_HINT)
+    return (True, f"no output of {commands} is piped/redirected/captured")
+
+
 def _eval_predicate(pred, tool_name, command_string, agent_id=None,
                     agent_type=None):
     """Return (satisfied: bool, why: str). 'satisfied' True => obligation met,
@@ -1725,6 +1905,9 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
                     f"command matches forbidden pattern /{regex}/ "
                     "(raw string fallback)")
         return (True, f"command does not match /{regex}/ (raw string fallback)")
+
+    if kind == "no_output_consumed":
+        return _eval_no_output_consumed(params, tool_name, command_string)
 
     if kind == "process_alive":
         pid_file = params.get("pid_file")
@@ -2127,6 +2310,41 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
             return (True,
                     f"queue {qid} status={status!r} (no longer running -- "
                     f"obligation moot)")
+
+        # 1b. Dispatch grace window. The main loop issues `force-start` and
+        # `Agent` back-to-back, but "back-to-back" is still two tool calls
+        # plus model latency, and any bookkeeping call in between (queue
+        # register, a Read of the recovery bundle) would otherwise be
+        # denied the instant the obligation lands. Inside the window the
+        # predicate is satisfied unconditionally; once it elapses the
+        # normal "has an agent been observed" checks below take over, so
+        # a force-started item can never sit `running` with no agent past
+        # the grace. Anchor precedence: explicit `grace_from` param, else
+        # the queue item's own `force_started_at` (epoch secs, written by
+        # session-task at promotion time). No anchor => no grace.
+        # `grace_secs` defaults to 0 so pre-existing rows / callers keep
+        # their exact behavior; session-task opts in explicitly.
+        try:
+            grace_secs = int(params.get("grace_secs", 0) or 0)
+        except (TypeError, ValueError):
+            grace_secs = 0
+        if grace_secs > 0:
+            anchor_raw = params.get("grace_from")
+            if anchor_raw is None:
+                anchor_raw = target.get("force_started_at")
+            anchor = None
+            try:
+                if anchor_raw is not None:
+                    anchor = int(anchor_raw)
+            except (TypeError, ValueError):
+                anchor = None
+            if anchor is not None:
+                age = int(time.time()) - anchor
+                if 0 <= age < grace_secs:
+                    return (True,
+                            f"queue {qid} force-started {age}s ago -- "
+                            f"inside the {grace_secs}s dispatch grace "
+                            f"window (allow)")
 
         # 2. Active-agents check. The state file is written by claude-watch's
         # active-agents poller. It maps each subagent's first user-message
@@ -2614,9 +2832,255 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
 # ---------------------------------------------------------------------------
 
 
+def _bashcmd_name_fallback_re(name):
+    """Word-boundary regex for a ``Bashcmd:`` name in the no-AST fallback.
+
+    Literal names get ``\\bNAME\\b``. A glob (``botchat-*``) is translated
+    piecewise so the fallback keeps the same reach as the AST matcher:
+    ``*`` -> ``\\S*``, ``?`` -> ``\\S``. A trailing ``\\b`` is only added
+    when the pattern ends in a literal character (``\\S*\\b`` would never
+    match at end-of-token).
+    """
+    out = ["\\b"]
+    for ch in name:
+        if ch == "*":
+            out.append(r"\S*")
+        elif ch == "?":
+            out.append(r"\S")
+        else:
+            out.append(re.escape(ch))
+    if name and name[-1] not in ("*", "?"):
+        out.append("\\b")
+    return "".join(out)
+
+
+# host-bash MCP tool names whose ``command_string`` is a JSON rendering of
+# the tool_input carrying the REAL shell command / script body (see the gate
+# hook's ``_short_command_string``). A ``HEAD:REST`` tool_pattern against one
+# of these gets AST-aware command-HEAD matching (mirroring ``Bashcmd:``) when
+# REST is a bare command-NAME spec -- so a gated CLI name that appears only in
+# a ``--body`` arg / heredoc / PR-body no longer body-wide false-matches.
+_HOSTBASH_MCP_HEADS = {
+    "mcp__host-bash__run_command",
+    "mcp__host-bash__run_script",
+}
+
+# A "command-NAME spec" (comma-separated bare names / globs) uses only word
+# chars and ``- . / * ? ,`` plus whitespace. Anything else (``^ $ ( ) [ ] | \\
+# +`` ...) marks REST as a REGEX, which keeps the arg-conditional lookahead
+# exempts (e.g. the botchat mark-read clear-path) on the regex path.
+_COMMAND_NAME_SPEC_RE = re.compile(r"^[\w\-./*?,\s]+$")
+
+
+def _is_command_name_spec(rest):
+    """True iff ``rest`` is a command-NAME spec (bare names / globs) rather
+    than a regex. See ``_COMMAND_NAME_SPEC_RE``."""
+    return bool(rest) and _COMMAND_NAME_SPEC_RE.match(rest) is not None
+
+
+def _hostbash_command_text(head, command_string):
+    """Extract the real shell command / script text a host-bash MCP tool_input
+    carries, from the (usually JSON-rendered) ``command_string``.
+
+    ``run_command`` carries the shell command under ``command``; ``run_script``
+    carries the script body under ``script`` (plus an ``interpreter``). The
+    gate hook renders the tool_input via ``json.dumps`` before matching, so we
+    parse it back out here. FAIL-SAFE: if ``command_string`` is not the
+    expected JSON object (e.g. a raw command was passed directly, as the unit
+    tests do), return it unchanged so head-matching still has something real to
+    work on."""
+    field = "script" if head.endswith("run_script") else "command"
+    s = command_string or ""
+    try:
+        obj = json.loads(s)
+    except (ValueError, TypeError):
+        return s
+    if isinstance(obj, dict):
+        val = obj.get(field)
+        if isinstance(val, str):
+            return val
+        # Tolerate the sibling field name (defensive; never the normal path).
+        other = obj.get("command" if field == "script" else "script")
+        if isinstance(other, str):
+            return other
+    return s
+
+
+def _command_names_present(names, command_string):
+    """AST-aware: True iff any name in ``names`` is the effective command HEAD
+    (basename; ``VAR=val`` / ``sudo`` / ``env`` / ``nohup`` / path prefixes
+    stripped) of a top-level segment of ``command_string``. A name mentioned
+    only inside a quoted arg / heredoc body does NOT match; a glob
+    (``botchat-*``) names a whole family but is still only tested against a
+    real head. FAIL-SAFE (shell_ast missing OR unparseable command): match the
+    name as a whole word anywhere in the raw string, glob-translated the same
+    way, preserving the pre-AST behavior for the unparseable edge."""
+    if not names:
+        return False
+    if _shell_ast is not None:
+        try:
+            return _shell_ast.command_name_present(command_string or "", names)
+        except _shell_ast.ShellParseError:
+            pass  # fall through to fail-safe word-boundary match
+    return any(
+        re.search(_bashcmd_name_fallback_re(n), command_string or "")
+        for n in names
+    )
+
+
+def _command_is_sole(names, command_string):
+    """AST-aware: True iff ``command_string`` is a SINGLE simple command whose
+    effective HEAD basename matches one of ``names``, with NO pipeline, NO
+    redirection, and NO top-level list / compound / background operator.
+
+    This is the ``Bashsole:`` matcher's engine. It differs from
+    ``_command_names_present`` (the ``Bashcmd:`` engine) in ONE way: the
+    named command must be the head of the ONLY, plain segment. So a bare
+    ``botchat-show 42`` matches, but ``botchat-show 42 | tail``,
+    ``botchat-show 42 > f``, and ``botchat-show 42 ; other`` do NOT -- their
+    output is filtered / diverted / has a second stage.
+
+    Its purpose is to scope a READ-CLI exemption to the raw, unfiltered form
+    only: piping a botchat read strips attachment lines, so a piped read
+    must NOT satisfy the exemption (and thus stays gated by the no-pipe /
+    mark-read gates).
+
+    FAIL-CLOSED (the opposite of ``_command_names_present``): shell_ast
+    missing OR the command unparseable => False (NOT sole => the exemption
+    does NOT fire, so the gate stays in force). For an exemption this is the
+    safe direction -- a command we cannot prove is a bare read must not be
+    waved through as one. The escape hatch (`obligations override`) remains
+    for the rare parse-failure-on-a-legit-read case."""
+    if not names:
+        return False
+    if _shell_ast is None:
+        return False
+    try:
+        return _shell_ast.is_sole_command(command_string or "", names)
+    except _shell_ast.ShellParseError:
+        return False
+    except Exception:  # noqa: BLE001 -- a helper bug must not wrongly exempt
+        return False
+
+
+def _normalize_monitor_cmd(cmd):
+    """Canonical form of a Monitor-tool / monitor_cmd command string for
+    equality comparison: whitespace runs collapsed, trailing ``2>&1``
+    redirects (the one thing `watcher-ctl run` APPENDS to the configured
+    monitor_cmd when it prints the arm command; idempotent there) stripped.
+    Returns None for a non-string / empty input."""
+    if not isinstance(cmd, str):
+        return None
+    norm = " ".join(cmd.split())
+    while norm.endswith("2>&1"):
+        norm = norm[: -len("2>&1")].rstrip()
+    return norm or None
+
+
+def _monitor_tool_command(tool_name, command_string):
+    """Extract the normalized ``command`` a Monitor tool call carries.
+
+    The gate hook renders a non-Bash tool_input as JSON (``{"command": ...,
+    "description": ..., "persistent": ...}``), so the JSON path is the one the
+    hook exercises; a raw string (``obligations check --tool Monitor
+    --command-string '<cmd>'``) is accepted as the command itself. None when
+    the tool is not Monitor or no command can be found."""
+    if tool_name != "Monitor" or not command_string:
+        return None
+    raw = command_string
+    try:
+        parsed = json.loads(command_string)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        raw = parsed.get("command")
+    elif isinstance(parsed, str):
+        raw = parsed
+    return _normalize_monitor_cmd(raw)
+
+
+def _locate_watcher_ctl():
+    """Path of the `watcher-ctl` CLI (PATH first, then the usual install
+    locations), or None. Mirrors the watchers_healthy predicate's lookup of
+    `watcher-status` so the two agree on which claude-watch they ask."""
+    cli = shutil.which("watcher-ctl")
+    if cli:
+        return cli
+    for cand in (
+        os.path.expanduser("~/bin/watcher-ctl"),
+        "/usr/local/bin/watcher-ctl",
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _configured_monitor_cmds():
+    """{normalized monitor_cmd: watcher name} for every ENABLED `mode=monitor`
+    entry in the LAYERED watchers.conf, read through `watcher-ctl list
+    --json` (the same loader `watcher-ctl run` prints the arm command from,
+    so the comparison can never drift from what the loop was told to arm).
+
+    FAIL-CLOSED: no CLI, non-zero exit, timeout, or unparseable output =>
+    empty dict => `MonitorArm` matches nothing and the gate stands. That is
+    the safe direction for an exemption (the audited `obligations override`
+    remains)."""
+    cli = _locate_watcher_ctl()
+    if not cli:
+        return {}
+    try:
+        proc = subprocess.run(
+            [cli, "list", "--json"],
+            capture_output=True, text=True,
+            timeout=MONITOR_ARM_LIST_TIMEOUT_SECS, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        entries = json.loads(proc.stdout or "")
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(entries, list):
+        return {}
+    out = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if e.get("mode") != "monitor" or not e.get("enabled", False):
+            continue
+        norm = _normalize_monitor_cmd(e.get("monitor_cmd"))
+        if norm:
+            out[norm] = str(e.get("name", ""))
+    return out
+
+
+def _monitor_arm_matches(tool_name, command_string):
+    """The `MonitorArm` tool_pattern: True iff ``tool_name`` is the Monitor
+    tool AND its command (see `_monitor_tool_command`) equals -- after
+    normalization -- the monitor_cmd of a configured, enabled monitor-mode
+    watcher. Deliberately exact-match (no regex, no prefix): arming the
+    watcher is the cure the gate must never block; arming anything ELSE
+    under a firing gate is still gated."""
+    cmd = _monitor_tool_command(tool_name, command_string)
+    if not cmd:
+        return False
+    return cmd in _configured_monitor_cmds()
+
+
 def _tool_pattern_matches(pattern, tool_name, command_string):
     """A tool_pattern is one of:
         '*'                       => matches every tool
+        'MonitorArm'              => matches when tool_name == 'Monitor' AND
+                                     the Monitor command is exactly (modulo
+                                     whitespace / a trailing `2>&1`) the
+                                     monitor_cmd of an enabled `mode=monitor`
+                                     watcher in the layered watchers.conf
+                                     (`watcher-ctl list --json`). The
+                                     monitor-mode "watcher-ctl run" cure.
+                                     FAIL-CLOSED (no CLI / no config / parse
+                                     error => no match).
         'Bash'                    => matches when tool_name == 'Bash'
         'Bash:<regex>'            => matches when tool_name=='Bash' AND
                                      command_string matches <regex>
@@ -2627,11 +3091,46 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
                                      segment. AST-aware: a name mentioned only
                                      inside a quoted arg / heredoc body does
                                      NOT match, and a path-prefixed / sudo- /
-                                     env-wrapped invocation DOES.
+                                     env-wrapped invocation DOES. A name may
+                                     be a glob naming a whole command family
+                                     ('botchat-*'); the glob is still only
+                                     ever tested against a real command head.
+        'Bashsole:<names>'        => like 'Bashcmd:', but matches ONLY when
+                                     the named command is the SOLE simple
+                                     command -- no pipeline, redirect, list /
+                                     compound / background operator. So
+                                     'botchat-show 42' matches but
+                                     'botchat-show 42 | tail',
+                                     'botchat-show 42 > f', and
+                                     'botchat-show 42 ; x' do NOT. Use for a
+                                     READ-CLI exemption that must apply only
+                                     to the raw, unfiltered form (piping a
+                                     botchat read strips attachment lines, so
+                                     a piped read must stay gated). FAIL-CLOSED
+                                     (parser missing / unparseable => NO match
+                                     => the exemption does not fire), the safe
+                                     direction for an exemption.
+        'mcp__host-bash__run_command:<spec>' / '..._run_script:<spec>'
+                                  => matches when tool_name == the host-bash
+                                     MCP tool AND, when <spec> is a bare
+                                     command-NAME spec, any name is the
+                                     effective command HEAD of the REAL shell
+                                     command / script body the tool_input
+                                     carries (AST-aware, exactly like
+                                     'Bashcmd:'), so a gated name that appears
+                                     only inside a '--body' arg / heredoc /
+                                     PR-body does NOT match. When <spec> is a
+                                     regex (anchors / groups / ...) it stays a
+                                     body-wide re.search for backward compat
+                                     (the arg-conditional clear-path exempts).
+        '<head>:<regex>'          => matches when tool_name == <head> AND
+                                     command_string matches <regex>
         '<name>'                  => matches when tool_name == <name>
     """
     if not pattern or pattern == "*":
         return True
+    if pattern == MONITOR_ARM_PATTERN:
+        return _monitor_arm_matches(tool_name, command_string)
     if ":" in pattern:
         head, rest = pattern.split(":", 1)
         if head == "Bashcmd":
@@ -2639,22 +3138,29 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
             if tool_name != "Bash":
                 return False
             names = {n.strip() for n in rest.split(",") if n.strip()}
-            if _shell_ast is not None:
-                try:
-                    return _shell_ast.command_name_present(
-                        command_string or "", names)
-                except _shell_ast.ShellParseError:
-                    pass  # fall through to fail-safe word-boundary match
-            # Fail-safe (module missing OR unparseable command): match the
-            # name as a whole word anywhere in the raw command. Conservative
-            # (may over-exempt on quoted mentions) but preserves the pre-AST
-            # behavior for the unparseable edge, per shell_ast's contract.
-            return any(
-                re.search(r"\b" + re.escape(n) + r"\b", command_string or "")
-                for n in names
-            )
+            return _command_names_present(names, command_string)
+        if head == "Bashsole":
+            # Like Bashcmd, but the named command must be the SOLE simple
+            # command (no pipeline / redirect / list / background). Scopes a
+            # read-CLI exemption to the raw form only -- a piped botchat read
+            # strips attachments, so it must NOT be exempted here. FAIL-CLOSED.
+            if tool_name != "Bash":
+                return False
+            names = {n.strip() for n in rest.split(",") if n.strip()}
+            return _command_is_sole(names, command_string)
         if tool_name != head:
             return False
+        # host-bash MCP tools: a bare command-NAME spec is matched AST-aware
+        # against the command HEADS of the tool_input's real command / script
+        # body (mirroring Bashcmd:), NOT with a body-wide re.search over the
+        # rendered JSON -- which would false-match a gated name buried in a
+        # quoted arg / heredoc / PR body. A regex spec (anchors, groups, ...)
+        # is left on the re.search path so the arg-conditional lookahead
+        # clear-path exempts keep working unchanged.
+        if head in _HOSTBASH_MCP_HEADS and _is_command_name_spec(rest):
+            names = {n.strip() for n in rest.split(",") if n.strip()}
+            cmd_text = _hostbash_command_text(head, command_string)
+            return _command_names_present(names, cmd_text)
         try:
             return re.search(rest, command_string or "") is not None
         except re.error:
@@ -2861,12 +3367,46 @@ def cmd_add(args):
     now = _now()
     expires_at = now + ttl if ttl > 0 else None
 
+    file_arg_flags = [f for f in (getattr(args, "satisfied_by_file_flag", None)
+                                  or []) if f]
+    body_regex = getattr(args, "satisfied_by_body_regex", None)
+    if file_arg_flags and not (args.satisfied_by_cmd_regex or body_regex):
+        # Refused deliberately. Without a regex there is nothing to look for
+        # in the file, so the obligation would clear on the mere SHAPE of the
+        # command ("this tool ran with a file argument") -- i.e. on any
+        # unrelated file-carrying invocation. That is looser than the bug
+        # this flag exists to fix.
+        print("ERROR: --satisfied-by-file-flag requires "
+              "--satisfied-by-cmd-regex and/or --satisfied-by-body-regex "
+              "(the pattern is the anchor searched inside the file; without "
+              "one, any file-carrying command would satisfy the obligation)",
+              file=sys.stderr)
+        return 2
+
+    for label, rx in (("--satisfied-by-cmd-regex", args.satisfied_by_cmd_regex),
+                      ("--satisfied-by-body-regex", body_regex)):
+        if not rx:
+            continue
+        try:
+            re.compile(rx)
+        except re.error as e:
+            # A pattern that cannot compile is silently skipped at match
+            # time, which would register an obligation that can never
+            # auto-satisfy -- the exact failure this whole area exists to
+            # prevent. Refuse it at the door instead.
+            print(f"ERROR: {label} is not a valid regex: {e}", file=sys.stderr)
+            return 2
+
     satisfied_by = None
-    if args.satisfied_by_tool or args.satisfied_by_cmd_regex:
+    if args.satisfied_by_tool or args.satisfied_by_cmd_regex or body_regex:
         satisfied_by = {
             "tool_pattern": args.satisfied_by_tool or "*",
             "command_pattern": args.satisfied_by_cmd_regex or "",
         }
+        if body_regex:
+            satisfied_by["body_pattern"] = body_regex
+        if file_arg_flags:
+            satisfied_by["file_arg_flags"] = file_arg_flags
 
     # Normalize the exempt patterns list. argparse with action="append"
     # leaves None when the flag was never passed.
@@ -3536,6 +4076,256 @@ def cmd_check(args):
 
 
 # ---------------------------------------------------------------------------
+# satisfied_by: matching the BODY of a file passed as a command argument
+# ---------------------------------------------------------------------------
+#
+# `satisfied_by.command_pattern` is a regex over the Bash command STRING.
+# That is the right anchor when the thing being asserted is visible in the
+# command itself. It is the WRONG anchor when the payload lives in a file
+# that the command merely names -- e.g. a sender CLI whose multi-line input
+# must be handed over as `--file <path>` because piping into it is banned
+# and an inline "line1\nline2" argument would write a literal backslash-n.
+# In that shape the real content never appears in the command string, so a
+# genuine action can never auto-satisfy its own obligation and a hard gate
+# stays standing until a human clears it by hand.
+#
+# `satisfied_by.file_arg_flags` is the opt-in fix: a list of option flags
+# (e.g. ["-F", "--file"]) whose ARGUMENT is a path. When set, the regex is
+# ALSO tried against the contents of those files. It is strictly additive --
+# a command-string match still satisfies on its own, and the anchor still
+# has to be found in real text somewhere. We never relax the pattern.
+#
+# Reading a path lifted out of a command string is a file read driven by
+# matched text, so every step below fails CLOSED (no match) and cheaply:
+#
+#   * paths come from the shell AST, never a regex scrape, so a path-looking
+#     token inside a quoted argument or a heredoc body is not a path;
+#   * a word carrying unexpanded shell syntax ($VAR, `cmd`, globs) is not a
+#     resolvable path -- we decline rather than guess;
+#   * relative paths are declined (the tool's cwd is not ours to assume);
+#   * the file must exist and be a REGULAR file; directories, FIFOs, device
+#     nodes and sockets are refused, and the open is O_NONBLOCK so a FIFO
+#     can never park the matcher;
+#   * oversized files are declined outright rather than partially read, so
+#     the behaviour does not depend on where the cap happens to fall;
+#   * at most a few files are consulted per command.
+#
+# A file that is MISSING at match time -- the common case, since staged
+# scratch files are deliberately short-lived and often auto-unlinked --
+# yields NO match. "The evidence is gone" must never read as "satisfied".
+#
+# ONE PATTERN CANNOT SAY BOTH "which command" AND "carrying what"
+# -------------------------------------------------------------------------
+# `file_arg_flags` alone turned out not to fix the case it was written for,
+# and the reason generalises: a single `command_pattern` is asked to do two
+# unrelated jobs at once.
+#
+#   * It must IDENTIFY THE COMMAND -- otherwise the rule clears on any
+#     unrelated invocation, so it necessarily names the program and its
+#     addressing arguments.
+#   * It must ALSO ASSERT THE PAYLOAD -- otherwise the rule clears on a
+#     send that never mentioned the thing the obligation is about.
+#
+# Written as one regex those two halves fight each other, in both haystacks:
+#
+#   * In the COMMAND STRING the usual shape is `prog\b(?=.*A)(?=.*B)`. The
+#     lookaheads are evaluated at the offset just past the program token and
+#     `.` does not cross newlines, so they can only see the remainder of
+#     THAT line. When the payload is written by an earlier line of the same
+#     command -- a `cat > "$f" <<EOF ... EOF` heredoc staging the body, which
+#     is exactly the shape forced on a CLI that forbids stdin -- the payload
+#     text is present in the command string yet unreachable to the pattern.
+#   * In a FILE BODY the same regex fails for the opposite reason: a payload
+#     file contains the message and nothing else. It has no program token
+#     and no addressing arguments, so a pattern anchored on command shape --
+#     i.e. every pattern that is safe to use -- can never match it. Turning
+#     `file_arg_flags` on does not help; the second haystack is useless to
+#     the only kind of pattern anyone would write.
+#
+# `body_pattern` splits the job in two. `command_pattern` keeps identifying
+# the command; `body_pattern` carries the payload anchor and is searched on
+# its own, over the same haystacks (command string, then any named file
+# bodies). Both must match, so this is STRICTLY NARROWING -- an obligation
+# that adds one becomes harder to satisfy, never easier. What changes is
+# only that each half is now looked for where it actually lives.
+#
+# This matters beyond tidiness. An obligation that CANNOT self-satisfy is
+# worse than one that never existed: the operator does the real work, the
+# gate stays standing and blocks everything it matches, and the only way
+# out is an override. Train that reflex often enough and the override stops
+# being an exception -- which inverts the point of having a gate at all.
+
+# Max bytes of a named file we are willing to read for a satisfied_by match.
+# Files larger than this are declined outright (no partial read): the
+# regex is operator-supplied and we do not want to hand an unbounded
+# haystack to a potentially backtracking pattern.
+SATISFIED_BY_FILE_MAX_BYTES = 256 * 1024
+
+# Max number of distinct files consulted for a single command.
+SATISFIED_BY_FILE_MAX_FILES = 4
+
+# Shell syntax that means "this word is not a literal path". A word
+# containing any of these was going to be expanded by the shell before the
+# real command ever saw it, so whatever we would read is not what ran.
+_UNRESOLVABLE_PATH_CHARS = ("$", "`", "*", "?", "[", "]", "\n")
+
+
+def _file_arg_paths(command_string, flags):
+    """Resolve the path arguments of ``flags`` out of ``command_string``.
+
+    Returns a list of absolute path strings, in command order, deduplicated,
+    capped at ``SATISFIED_BY_FILE_MAX_FILES``. Returns ``[]`` on any parse
+    failure or when nothing resolvable is found -- callers treat an empty
+    list as "no file evidence", never as a match.
+
+    Both ``-F path`` (two words) and ``--file=path`` (one word) are
+    recognised. Path words are taken from the parsed shell AST, so a flag
+    that merely appears inside a quoted argument or a heredoc body is not a
+    flag.
+    """
+    flagset = {f for f in (flags or []) if isinstance(f, str) and f}
+    if not flagset or not command_string:
+        return []
+    if _shell_ast is None:
+        return []
+    try:
+        parsed = _shell_ast.parse(command_string)
+    except Exception:  # noqa: BLE001 -- unparseable => no file evidence
+        return []
+
+    out = []
+    seen = set()
+    for seg in parsed.segments:
+        words = list(seg.words)
+        i = 0
+        while i < len(words):
+            w = words[i]
+            raw = None
+            if w in flagset and i + 1 < len(words):
+                raw = words[i + 1]
+                i += 1
+            else:
+                for f in flagset:
+                    if f.startswith("--") and w.startswith(f + "="):
+                        raw = w[len(f) + 1:]
+                        break
+            i += 1
+            if not raw:
+                continue
+            p = _resolve_literal_path(raw)
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+                if len(out) >= SATISFIED_BY_FILE_MAX_FILES:
+                    return out
+    return out
+
+
+def _resolve_literal_path(word):
+    """Return an absolute path for ``word``, or None if it isn't one.
+
+    Declines anything that still carries shell syntax (so it was never a
+    literal path in the first place) and anything relative (we do not know
+    the tool's working directory, and guessing it would be a file read at an
+    address we invented).
+    """
+    if not isinstance(word, str) or not word:
+        return None
+    if any(c in word for c in _UNRESOLVABLE_PATH_CHARS):
+        return None
+    if word.startswith("~"):
+        expanded = os.path.expanduser(word)
+        if expanded.startswith("~"):  # unknown user => unresolved
+            return None
+        word = expanded
+    if not word.startswith("/"):
+        return None
+    return os.path.normpath(word)
+
+
+def _read_file_for_match(path):
+    """Read ``path`` for satisfied_by matching, or return None.
+
+    None means "no usable evidence here" and is returned for every failure
+    mode: missing, unreadable, not a regular file, too large, or any
+    unexpected OS error. None NEVER counts as a match.
+    """
+    fd = None
+    try:
+        # O_NONBLOCK so opening a FIFO cannot park the matcher waiting for a
+        # writer. We fstat the OPEN descriptor (not the path) so the regular
+        # -file check applies to what we actually read.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_size > SATISFIED_BY_FILE_MAX_BYTES:
+            return None
+        data = os.read(fd, SATISFIED_BY_FILE_MAX_BYTES)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _satisfied_by_pattern_matches(patt, command_string, file_arg_flags):
+    """True iff ``patt`` is found in the command string OR in the body of a
+    file named by one of ``file_arg_flags`` in that command.
+
+    The command-string check is unchanged and comes first, so this is purely
+    additive: nothing that matched before stops matching.
+    """
+    if patt.search(command_string or ""):
+        return True
+    for path in _file_arg_paths(command_string, file_arg_flags):
+        body = _read_file_for_match(path)
+        if body is None:
+            continue
+        if patt.search(body):
+            return True
+    return False
+
+
+def _satisfied_by_regexes_match(sb, command_string):
+    """True iff every regex in ``sb`` matches what just ran.
+
+    ``command_pattern`` and ``body_pattern`` are searched INDEPENDENTLY --
+    each over the command string and, when ``file_arg_flags`` is set, the
+    bodies of the files that command names -- and the results are ANDed. A
+    pattern that is absent imposes no condition; a pattern that does not
+    compile fails CLOSED (no match), so a malformed rule keeps its
+    obligation standing rather than silently clearing it.
+
+    This is the whole satisfied_by regex decision. ``_satisfy_by_completion``
+    calls it after the tool_pattern check; nothing else should reimplement
+    it, so that a change here cannot pass tests that model it separately.
+    """
+    if not isinstance(sb, dict):
+        return False
+    flags = sb.get("file_arg_flags") or []
+    if not isinstance(flags, list):
+        flags = []
+    for src in (sb.get("command_pattern") or "", sb.get("body_pattern") or ""):
+        if not src:
+            continue
+        try:
+            patt = re.compile(src)
+        except re.error:
+            return False
+        if not _satisfied_by_pattern_matches(patt, command_string, flags):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: post-tool-satisfy  -- called by PostToolUse hook
 # ---------------------------------------------------------------------------
 
@@ -3555,21 +4345,17 @@ def _satisfy_by_completion(tool_name, command_string):
                 kept.append(ob)
                 continue
             sb_tool_pat = sb.get("tool_pattern") or "*"
-            sb_cmd_pat = sb.get("command_pattern") or ""
             # tool_pattern check uses our standard matcher
             if not _tool_pattern_matches(sb_tool_pat, tool_name, command_string):
                 kept.append(ob)
                 continue
-            # command_pattern is a regex match against command_string
-            if sb_cmd_pat:
-                try:
-                    patt = re.compile(sb_cmd_pat)
-                except re.error:
-                    kept.append(ob)
-                    continue
-                if not patt.search(command_string or ""):
-                    kept.append(ob)
-                    continue
+            # command_pattern and body_pattern are searched independently and
+            # ANDed; see _satisfied_by_regexes_match, and the design note
+            # above _satisfied_by_pattern_matches for why one combined
+            # pattern cannot express "this command carried this payload".
+            if not _satisfied_by_regexes_match(sb, command_string):
+                kept.append(ob)
+                continue
             removed_ids.append(ob.get("id"))
         data["obligations"] = [
             ob for ob in data["obligations"] if ob.get("id") not in removed_ids
@@ -3695,7 +4481,26 @@ def build_parser():
     p_add.add_argument("--satisfied-by-tool", default=None,
                        help="tool_pattern for auto-satisfy")
     p_add.add_argument("--satisfied-by-cmd-regex", default=None,
-                       help="command regex for auto-satisfy")
+                       help="command regex for auto-satisfy: identifies WHICH "
+                            "command counts (program, addressing args)")
+    p_add.add_argument("--satisfied-by-body-regex", default=None,
+                       help="second, independent regex for the PAYLOAD the "
+                            "command carried. Searched on its own over the "
+                            "command string and any --satisfied-by-file-flag "
+                            "file bodies, so payload text on another line of "
+                            "the command (e.g. a heredoc that stages the "
+                            "body) is reachable. ANDed with "
+                            "--satisfied-by-cmd-regex, so it can only narrow.")
+    p_add.add_argument("--satisfied-by-file-flag", action="append",
+                       default=None, metavar="FLAG",
+                       help="option flag (e.g. -F, --file) whose ARGUMENT is a "
+                            "path; the satisfy regexes are then ALSO "
+                            "matched against that file's contents, so a "
+                            "command that hands its payload over as a file "
+                            "can auto-satisfy. Repeatable. Requires "
+                            "--satisfied-by-cmd-regex and/or "
+                            "--satisfied-by-body-regex (a file body with no "
+                            "anchor to find would be no anchor at all).")
     p_add.add_argument("--created-by", default="manual",
                        help="audit string (e.g. 'main-loop', 'andrew')")
     p_add.add_argument("--mandatory", action="store_true",

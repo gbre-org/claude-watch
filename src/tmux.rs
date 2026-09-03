@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
 /// transition and the dd/i/text sequence in `inject_text`. See
@@ -89,9 +89,75 @@ async fn send_focus_main_keys(pane: &str) {
         keys = ?keys,
         "send_focus_main_keys: returning FleetView selection to main before inject"
     );
+    // Snapshot the input line so we can tell who consumed the keys.
+    let before = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+
     for key in &keys {
         send_keys(pane, &[key.as_str()]).await;
         sleep(Duration::from_millis(150)).await;
+    }
+
+    // WHO ATE THE KEYS?
+    //
+    // These are FleetView NAVIGATION keys, and on this host they are ten
+    // `Up`s (enough to walk the selection cursor to `main` from any row). That
+    // is correct WHILE A FLEETVIEW IS RENDERED. When one is not — the ordinary
+    // case, and the case every routine alert lands in — Claude Code's input
+    // editor receives them instead, and `Up` on an input line means RECALL THE
+    // PREVIOUS PROMPT. Ten of them load a prior submission into what was an
+    // empty line, the caller then types its payload at the recalled text's
+    // cursor position, and the result is two payloads spliced together:
+    //
+    //     ❯ /config theme=light[CLAUDE-WATCH] WATCHER DOWN: 3 event(s)…
+    //
+    // Verified by A/B on a live pane, same binary and same payload, with only
+    // this setting varying: with the keys the line came back spliced, with
+    // `focus_main_keys = []` it came back as exactly the payload. This — not
+    // concurrency — is why injects kept arriving mangled after the inject lock
+    // shipped: ONE injector is enough, because it corrupts its own line.
+    //
+    // So: if the input line changed, the editor ate them, and this inject is
+    // now doomed — the exclusivity check below will refuse the submit rather
+    // than splice onto the recalled text. Say so precisely, because the
+    // symptom (an inject that refuses forever) otherwise looks like a bug in
+    // the refusal rather than in the configuration that caused it.
+    //
+    // We deliberately do NOT try to undo the recall by walking history forward
+    // with `Down`. That looks symmetric and is not: `Up` SATURATES at the
+    // oldest entry, so N `Up`s against a shorter history leave the cursor
+    // somewhere the same N `Down`s do not reverse. Measured on a live pane —
+    // ten `Up`s then ten `Down`s landed on a different entry, not the empty
+    // line it started from. An unreliable repair on a shared input line is
+    // worse than a clean refusal.
+    //
+    // The real fix is configuration: `focus_main_keys` must be empty unless a
+    // FleetView is genuinely being driven, since these keys are only meaningful
+    // while a fleet list is rendered and are destructive whenever it is not.
+    let after = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+    if after != before {
+        warn!(
+            pane = %pane,
+            before = ?before,
+            after = ?after,
+            count = keys.len(),
+            "send_focus_main_keys: the input editor consumed the FleetView keys (no fleet \
+             list was rendered) and recalled prompt history onto the input line. This inject \
+             will be REFUSED rather than spliced. Set [tmux].focus_main_keys = [] unless a \
+             FleetView is actually in use."
+        );
+        // Also to stderr: `claude-watch inject` is a CLI whose callers read
+        // stderr, and it installs no tracing subscriber, so the `warn!` above
+        // reaches the daemon log but NOT the shell tooling. Without this an
+        // operator sees a bare `rc=4` and no reason for it — which is how a
+        // configuration bug gets mistaken for a bug in the refusal.
+        eprintln!(
+            "[claude-watch inject] {} FleetView focus key(s) were eaten by the input editor \
+             (no fleet list rendered) and recalled prompt history onto the line: {:?}. \
+             This inject will be refused. Fix: set [tmux].focus_main_keys = [] in \
+             config.toml unless a FleetView is actually in use.",
+            keys.len(),
+            after.as_deref().unwrap_or("")
+        );
     }
 }
 
@@ -268,6 +334,14 @@ pub async fn is_interactive_prompt(pane: &str) -> bool {
 ///     positive only DELAYS a resume-inject. (Deliberately NOT added to the
 ///     narrower `blocking_question_visible` — the agent-view is a passive
 ///     viewer, not a blocking question; see #485.)
+///  6. The Bypass-Permissions launch dialog ("WARNING: Claude Code running in
+///     Bypass Permissions mode" + "Yes, I accept"). Claude Code renders it at
+///     STARTUP under `--dangerously-skip-permissions` when the acceptance has
+///     not been persisted. Its cancel row is a bare `❯ No, exit` and its
+///     footer says "Enter to confirm · Esc to cancel" (no "to select"), so
+///     none of (1)–(5) match it — yet an inject here submits the
+///     default-selected "No, exit" and Claude EXITS. See
+///     `bypass_permissions_dialog_visible`.
 ///
 /// ## Conservative bias
 ///
@@ -341,6 +415,16 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
     // Delegated to a shared detector so `policy::run_auto_update` can reuse
     // the exact same signature it dismisses.
     if background_work_exit_dialog_visible(pane_output) {
+        return true;
+    }
+
+    // (6) The Bypass-Permissions launch dialog. Its footer reads "Enter to
+    // confirm · Esc to cancel" with NO "to select", so signature (2) misses
+    // it, and its cancel row (`❯ No, exit`) carries no digit or bullet, so
+    // signature (3)/(5) miss it too. Left unmatched, the bare `❯` reads as an
+    // idle prompt and an inject submits the default "No, exit" — which exits
+    // Claude. Delegated to the shared detector `policy` also acts on.
+    if bypass_permissions_dialog_visible(pane_output) {
         return true;
     }
 
@@ -474,6 +558,105 @@ pub(crate) fn background_work_exit_dialog_visible(pane_output: &str) -> bool {
         }
     }
     false
+}
+
+/// Keys that move the Bypass-Permissions launch dialog's selection from its
+/// default ("No, exit") onto the confirm option ("Yes, I accept") and submit.
+///
+/// The dialog renders the cancel option FIRST and starts with it focused:
+///
+/// ```text
+/// ❯ No, exit
+///   Yes, I accept
+/// ```
+///
+/// One `Down` moves the cursor onto the confirm row; `Enter` submits it.
+/// Option indexes are hidden on this dialog, so there is no number-key
+/// shortcut — the arrow is the only way to move the selection. Exposed as a
+/// constant (rather than inlined at the send site) so the sequence itself is
+/// unit-testable.
+pub(crate) const BYPASS_PERMISSIONS_ACCEPT_KEYS: [&str; 2] = ["Down", "Enter"];
+
+/// Pure function: does the pane show Claude Code's Bypass-Permissions launch
+/// dialog — the full-screen consent screen rendered when Claude Code starts
+/// with `--dangerously-skip-permissions` and the acceptance has not been
+/// persisted to settings?
+///
+/// ```text
+///   WARNING: Claude Code running in Bypass Permissions mode
+///   In Bypass Permissions mode, Claude Code will not ask for your approval
+///   before running potentially dangerous commands.
+///   …
+/// ❯ No, exit
+///   Yes, I accept
+///   Enter to confirm · Esc to cancel
+/// ```
+///
+/// Why this matters to the daemon: the dialog's cancel row renders the SAME
+/// `❯` cursor glyph that `check_lines_for_idle_prompt` treats as "Claude is
+/// idle and ready for input". So a relaunch that lands on this dialog LOOKS
+/// idle, the resume prompt gets typed into the dialog, and the
+/// default-selected "No, exit" submits — Claude exits with code 0, the prompt
+/// text spills into the bare pane shell, and the session is left
+/// half-attached (operator-observed on Claude Code 2.1.251, 2026-08-29).
+///
+/// ## Both markers are required
+///
+/// A live Claude Code TUI running in bypass mode renders a PERSISTENT status
+/// indicator containing "bypass permissions" on essentially every frame, so
+/// that phrase alone is not a signature — matching on it would report the
+/// dialog for the entire lifetime of a normal session. The confirm label
+/// ("Yes, I accept") exists only while the dialog itself is on screen.
+/// Requiring BOTH the dialog's mode wording and the confirm label is a
+/// signature the status indicator can never satisfy.
+///
+/// Scoped to the recent tail (like the sibling detectors) so a scrollback
+/// mention — this doc read into a pane, a transcript quoting the dialog —
+/// does not trip it.
+pub(crate) fn bypass_permissions_dialog_visible(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    let mut saw_mode = false;
+    let mut saw_confirm_label = false;
+    for line in &lines[start..] {
+        let lower = line.trim().to_lowercase();
+        if lower.contains("bypass permissions mode") {
+            saw_mode = true;
+        }
+        if lower.contains("yes, i accept") {
+            saw_confirm_label = true;
+        }
+    }
+    saw_mode && saw_confirm_label
+}
+
+/// Pure function: is the pane at a Claude idle prompt that is NOT the
+/// Bypass-Permissions dialog's cancel row?
+///
+/// `check_lines_for_idle_prompt` keys on the bare `❯` glyph, which the dialog
+/// also renders (`❯ No, exit`). Callers that must distinguish "ready for the
+/// resume prompt" from "sitting on the consent dialog" use this instead.
+pub fn idle_prompt_without_bypass_dialog(pane_output: &str) -> bool {
+    check_lines_for_idle_prompt(pane_output) && !bypass_permissions_dialog_visible(pane_output)
+}
+
+/// Send the accept sequence for the Bypass-Permissions launch dialog.
+///
+/// `Down` then `Enter` as two separate `send-keys` calls with a short gap:
+/// the dialog re-renders between keystrokes, and batching both into a single
+/// `send-keys` gives it no render in between. The gap is cheap (this runs at
+/// most a few times per relaunch) and removes the class of failure where the
+/// `Enter` lands on the pre-move selection — which on this dialog means
+/// "No, exit".
+pub async fn accept_bypass_permissions_dialog(pane: &str) {
+    for key in BYPASS_PERMISSIONS_ACCEPT_KEYS {
+        send_keys(pane, &[key]).await;
+        sleep(std::time::Duration::from_millis(300)).await;
+    }
 }
 
 /// Check if pane shows exit teardown indicators ("Goodbye!" or "Background command was stopped").
@@ -738,6 +921,187 @@ async fn reselect_main_loop_pane(pane: &str) {
     }
 }
 
+/// Pure: resolve the `self-clear` coordination lockfile path from the two env
+/// inputs, mirroring `container/bin/self-clear`'s `_default_lock_file()` EXACTLY
+/// so the daemon and the self-clear tool agree on the same file:
+///   1. `env_lock` ($CLAUDE_SELF_CLEAR_LOCK) if set & non-empty,
+///   2. else `$XDG_RUNTIME_DIR/claude-self-clear.lock` if XDG set & non-empty,
+///   3. else `/var/run/claude/claude-self-clear.lock`.
+pub(crate) fn resolve_self_clear_lock_path(
+    env_lock: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> String {
+    if let Some(v) = env_lock {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Some(rt) = xdg_runtime_dir {
+        let rt = rt.trim();
+        if !rt.is_empty() {
+            return format!("{}/claude-self-clear.lock", rt.trim_end_matches('/'));
+        }
+    }
+    "/var/run/claude/claude-self-clear.lock".to_string()
+}
+
+/// Resolve the live `self-clear` lockfile path from the process environment.
+pub(crate) fn self_clear_lock_path() -> String {
+    resolve_self_clear_lock_path(
+        std::env::var("CLAUDE_SELF_CLEAR_LOCK").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+/// Best-effort probe: is the advisory `flock` on `path` currently HELD by some
+/// other process? Non-blocking exclusive acquire: acquired -> release + false;
+/// EWOULDBLOCK -> true; missing file / other error -> false (fail-open). Matches
+/// `container/bin/self-clear`'s `fcntl.flock(LOCK_EX | LOCK_NB)` semantics.
+pub(crate) fn lockfile_held(path: &str) -> bool {
+    use std::os::unix::io::AsRawFd;
+    // Open WITHOUT O_CREAT: a missing lockfile means self-clear never ran.
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is a valid descriptor owned by `file` for this call.
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        unsafe {
+            libc::flock(fd, libc::LOCK_UN);
+        }
+        false
+    } else {
+        matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(e) if e == libc::EWOULDBLOCK
+        )
+    }
+}
+
+/// Is a `self-clear` (`/clear` + resume-handoff tool) currently RUNNING?
+///
+/// self-clear holds an exclusive `flock` on its lockfile for its ENTIRE
+/// lifecycle -- from the `/clear` inject, through polling for the fresh session,
+/// to the resume-prompt inject (see `container/bin/self-clear` main(), which
+/// takes `LOCK_EX | LOCK_NB` and holds it until `child_main` returns). The
+/// daemon MUST NOT `send-keys` into the pane while that handoff is mid-flight: a
+/// daemon stuck-state / alert inject landing between self-clear's `/clear` and
+/// its resume submit OVERWRITES the handoff prompt (operator-reported,
+/// 2026-08-17: the "Daemon detected stuck state" inject clobbered the self-clear
+/// resume prompt after a `/clear`). So both `interrupt_and_wait` and
+/// `inject_dispatch::inject_to_agent*` consult this and DEFER while it is true.
+///
+/// The daemon-spawned self-clear (`policy::spawn_immediate_clear`) inherits the
+/// daemon env with no `--lock-file` override, so `self_clear_lock_path` resolves
+/// to the SAME file. Fail-open so a probe glitch never wedges recovery injects.
+pub(crate) fn self_clear_in_progress() -> bool {
+    lockfile_held(&self_clear_lock_path())
+}
+
+/// Pure: resolve the `self-clear` HANDOFF-COMPLETION marker path from the two
+/// env inputs, mirroring `container/bin/self-clear`'s `_default_handoff_file()`
+/// EXACTLY so the daemon and the self-clear tool agree on the same file:
+///   1. `env_marker` ($CLAUDE_SELF_CLEAR_HANDOFF) if set & non-empty,
+///   2. else `$XDG_RUNTIME_DIR/claude-self-clear-handoff` if XDG set & non-empty,
+///   3. else `/var/run/claude/claude-self-clear-handoff`.
+///
+/// This is DISTINCT from the coordination lockfile: the lock signals "a
+/// self-clear is RUNNING" (held only for the `/clear`->resume handoff), whereas
+/// this marker is TOUCHED once, at the moment the resume prompt is delivered,
+/// so the daemon can suppress its own fresh-session / post-clear injects for a
+/// grace window AFTER the lock releases while the fresh session bootstraps.
+pub(crate) fn resolve_self_clear_handoff_path(
+    env_marker: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> String {
+    if let Some(v) = env_marker {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Some(rt) = xdg_runtime_dir {
+        let rt = rt.trim();
+        if !rt.is_empty() {
+            return format!("{}/claude-self-clear-handoff", rt.trim_end_matches('/'));
+        }
+    }
+    "/var/run/claude/claude-self-clear-handoff".to_string()
+}
+
+/// Resolve the live `self-clear` handoff-marker path from the process env.
+pub(crate) fn self_clear_handoff_path() -> String {
+    resolve_self_clear_handoff_path(
+        std::env::var("CLAUDE_SELF_CLEAR_HANDOFF").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+/// Pure: is a handoff-marker mtime "recent" (within `grace_secs` of `now`)?
+/// A marker in the (small clock-skew) future also counts as recent. `None`
+/// mtime (marker absent) => not recent. `grace_secs == 0` => never recent
+/// (feature disabled) is handled by the caller.
+pub(crate) fn handoff_is_recent(marker_mtime: Option<f64>, now: f64, grace_secs: u64) -> bool {
+    match marker_mtime {
+        Some(m) => m >= now - grace_secs as f64,
+        None => false,
+    }
+}
+
+/// Did a `self-clear` tool FINISH delivering its resume/handoff prompt within
+/// the last `grace_secs`? The self-clear tool touches
+/// `self_clear_handoff_path()` immediately after it submits the resume prompt.
+/// The daemon consults this so its fresh-session / post-clear inject gates DEFER
+/// while the freshly-cleared session is still bootstrapping (tokens still 0,
+/// pane idle) — the window where the daemon would otherwise CLOBBER the handoff
+/// prompt with its generic "You are a fresh session ..." text (operator #4799).
+///
+/// Distinct from `self_clear_in_progress` (lock HELD during the handoff): that
+/// covers only the in-flight window; this covers the post-release bootstrap
+/// window. Fail-open (returns false) so a probe glitch never wedges recovery.
+/// Filesystem mtime (epoch float secs) of the `self-clear` handoff marker, or
+/// `None` when the marker is absent. The `self-clear` tool touches
+/// `self_clear_handoff_path()` the instant it finishes delivering its resume
+/// prompt, so this mtime is the completion time of the most recent self-clear.
+/// Exposed so the daemon can stamp `last_context_clear` from it when the
+/// token-drop detector missed a poll-gap self-clear (see
+/// `policy::maybe_stamp_self_clear_handoff`).
+pub(crate) fn self_clear_handoff_mtime() -> Option<f64> {
+    std::fs::metadata(self_clear_handoff_path())
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+}
+
+pub(crate) fn self_clear_handoff_recent(grace_secs: u64) -> bool {
+    if grace_secs == 0 {
+        return false;
+    }
+    let mtime = self_clear_handoff_mtime();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    handoff_is_recent(mtime, now, grace_secs)
+}
+
+/// Grace window (seconds) for `self_clear_handoff_recent` when consulted from a
+/// lib-level primitive that has no `Config` in hand (e.g. `interrupt_and_wait`).
+/// `$CLAUDE_SELF_CLEAR_HANDOFF_GRACE_SECS` overrides; defaults to 120 to match
+/// `config::default_self_clear_handoff_grace_secs`. The daemon's policy gates
+/// use the config field directly; this env fallback keeps the primitive
+/// config-free (same convention as the lockfile-path env resolution).
+pub(crate) fn self_clear_handoff_grace_secs_env() -> u64 {
+    std::env::var("CLAUDE_SELF_CLEAR_HANDOFF_GRACE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(120)
+}
+
 /// Actively interrupt Claude Code: rapid-fire Escape, periodically Ctrl-B x2.
 /// Returns true if idle state confirmed within `timeout_secs`. Returns false
 /// at the deadline; callers should still proceed with their inject (the
@@ -764,6 +1128,18 @@ async fn reselect_main_loop_pane(pane: &str) {
 ///      path already uses). No-op when `[tmux].focus_main_keys` is empty
 ///      (the default), so zero regression risk for setups not using it.
 pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
+    // Coordinate with an in-flight `self-clear`: if the self-clear tool is
+    // mid-handoff (holding its lockfile), DEFER -- an Escape blast here would
+    // clobber the `/clear`->resume-prompt sequence it drives into this same pane
+    // (operator-reported, 2026-08-17). Fail-open. See `self_clear_in_progress`.
+    if self_clear_in_progress() || self_clear_handoff_recent(self_clear_handoff_grace_secs_env())
+    {
+        info!(
+            pane = %pane,
+            "interrupt_and_wait: self-clear in progress or recent handoff -- deferring interrupt (not seizing pane)"
+        );
+        return false;
+    }
     // Andrew #1803/#1804: an interrupt must ONLY ever land on the main loop.
     // Reselect the main-loop tmux pane (if some other pane is active) and
     // return Claude Code's in-pane FleetView selection to main BEFORE the
@@ -862,6 +1238,71 @@ pub async fn inject_text(pane: &str, text: &str) {
     }
 }
 
+/// Pure: after sending a single `i` keystroke, did it land as a LITERAL char
+/// appended to the prompt-line input, rather than being consumed as a vim
+/// NORMAL->INSERT mode switch? True iff the prompt-line text after the `i` is
+/// exactly the before-text with a trailing `i` appended.
+///
+/// editorMode-agnostic signal (Andrew 2026-08-17): in vim NORMAL mode `i`
+/// switches to INSERT and the prompt line is unchanged; in NON-vim mode (or vim
+/// already-INSERT) the `i` is typed as text, so the prompt line gains a trailing
+/// `i`. Detecting the literal lets the caller Backspace exactly that one char
+/// before typing the real payload -- so an injected `[CLAUDE-WATCH] ...` /
+/// `/config ...` never arrives as `i[CLAUDE-WATCH]` / `i/config ...`.
+pub(crate) fn insert_key_landed_literal(before: Option<&str>, after: Option<&str>) -> bool {
+    let b = before.unwrap_or("");
+    let expected = format!("{b}i");
+    after == Some(expected.as_str())
+}
+
+/// Ensure the (vim-mode) input editor is in INSERT before typing a payload,
+/// leaving NO stray literal `i` on the prompt -- robust across Claude Code's
+/// `editorMode` (vim / normal) setting.
+///
+/// Historically the injectors blind-sent an `i` to enter vim INSERT mode. With
+/// `"editorMode": "vim"` that works ONLY from NORMAL mode, but the idle prompt
+/// is frequently ALREADY in INSERT (a prior inject left it there), so the `i`
+/// was typed as a LITERAL char -- the operator-reported `i[CLAUDE-WATCH] ...` /
+/// `i/config theme=...` (2026-08-17). In NON-vim mode there is no INSERT
+/// concept, so an `i` is ALWAYS literal.
+///
+/// Robust, setting-agnostic strategy:
+///   1. Already in INSERT (`-- INSERT --`) -> send nothing (vim, common idle).
+///   2. Else snapshot the prompt line, send exactly ONE `i`, then poll:
+///      a. now in INSERT -> the `i` was consumed as a vim NORMAL->INSERT switch.
+///      b. else the prompt line gained a trailing `i`
+///         (`insert_key_landed_literal`) -> it landed as LITERAL text (non-vim,
+///         or vim couldn't switch): Backspace exactly that one char.
+///      c. else ambiguous -> proceed (fail-open); the payload types either way.
+///   Only ONE `i` is ever sent, so a stuck probe can never accumulate `iii`.
+async fn ensure_insert_mode(pane: &str) {
+    // (1) Already INSERT -- never send a redundant `i`.
+    if is_insert_mode(pane).await {
+        return;
+    }
+    let before = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+    send_keys(pane, &["i"]).await;
+    // Poll for the mode switch (2a) or a literal `i` (2b); never send more `i`.
+    for _ in 0..3 {
+        sleep(Duration::from_millis(300)).await;
+        if is_insert_mode(pane).await {
+            return; // (2a) vim NORMAL->INSERT
+        }
+        let after = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+        if insert_key_landed_literal(before.as_deref(), after.as_deref()) {
+            // (2b) literal `i` on the prompt -- erase exactly that one char.
+            send_keys(pane, &["BSpace"]).await;
+            sleep(Duration::from_millis(150)).await;
+            return;
+        }
+        // (2c) neither signal yet -- re-poll (redraw lag).
+    }
+    debug!(
+        pane = %pane,
+        "ensure_insert_mode: INSERT mode ambiguous after `i`; proceeding (fail-open)"
+    );
+}
+
 /// NON-CANCELLING inject: type `text` and submit it as a QUEUED message
 /// WITHOUT seizing the in-flight turn.
 ///
@@ -893,6 +1334,23 @@ pub async fn inject_text(pane: &str, text: &str) {
 /// that genuinely must seize the turn (context-critical, wedged, auto-update,
 /// prolonged-thinking) keep using `inject_text` + `interrupt_and_wait`.
 pub async fn inject_text_queued(pane: &str, text: &str) {
+    type_text_non_cancelling(pane, text).await;
+
+    // Submit with a bare Enter from INSERT. A message typed-and-Entered while a
+    // turn is generating is QUEUED by Claude Code, not injected mid-generation
+    // — so the active turn keeps running.
+    send_keys(pane, &["Enter"]).await;
+    sleep(Duration::from_millis(300)).await;
+}
+
+/// The TYPE-ONLY half of the non-cancelling choreography: focus-return, enter
+/// INSERT without leaving a stray literal `i`, type the payload. Sends NO
+/// submit keystroke and — the load-bearing property — NO Escape.
+///
+/// Factored out of `inject_text_queued` so the non-cancelling `--no-submit`
+/// path (`inject_and_verify` without `--escape`) shares exactly one copy of it
+/// rather than falling back to the Escape-leading `inject_text_no_submit`.
+pub(crate) async fn type_text_non_cancelling(pane: &str, text: &str) {
     // Return FleetView selection to `main` FIRST (before entering INSERT and
     // typing), so a queued nudge lands on the main conversation and not on a
     // background agent selected in the FleetView (Andrew #270/#288/#291).
@@ -902,35 +1360,17 @@ pub async fn inject_text_queued(pane: &str, text: &str) {
     // preserved.
     send_focus_main_keys(pane).await;
 
-    // Enter INSERT mode (idempotent — `i` in INSERT just inserts an 'i' that
-    // the line-clear-free submit tolerates; verify-and-retry up to 3x mirrors
-    // inject_text_no_submit Step 3 so a NORMAL-mode pane still ends up typing
-    // into the input editor, NOT issuing motion commands). NO leading Escape:
-    // that is the whole point — we must not cancel the active turn.
-    let mut entered_insert = false;
-    for _ in 0..3 {
-        send_keys(pane, &["i"]).await;
-        sleep(Duration::from_millis(400)).await;
-        if is_insert_mode(pane).await {
-            entered_insert = true;
-            break;
-        }
-    }
+    // Enter INSERT mode WITHOUT leaving a stray literal `i` (Andrew 2026-08-17).
+    // The idle vim-mode prompt is frequently ALREADY in INSERT, so the old
+    // blind `i` was typed as text (`i[CLAUDE-WATCH] ...` / `i/config theme=...`).
+    // `ensure_insert_mode` sends `i` only when needed and Backspaces it if it
+    // lands literally. NO leading Escape -- the non-cancelling contract of this
+    // path (never seize the active turn) is preserved.
+    ensure_insert_mode(pane).await;
     sleep(Duration::from_millis(300)).await;
-    if !entered_insert {
-        debug!(
-            pane = %pane,
-            "inject_text_queued: INSERT mode not confirmed after 3 `i` attempts; proceeding anyway"
-        );
-    }
 
-    // Type the payload, then submit with a bare Enter from INSERT. A message
-    // typed-and-Entered while a turn is generating is QUEUED by Claude Code,
-    // not injected mid-generation — so the active turn keeps running.
     send_literal(pane, text).await;
     sleep(Duration::from_millis(500)).await;
-    send_keys(pane, &["Enter"]).await;
-    sleep(Duration::from_millis(300)).await;
 }
 
 /// The ordered keystroke sequence used by `inject_text` Step 5 to submit
@@ -966,6 +1406,157 @@ pub enum InjectOutcome {
     /// Submit keystrokes were sent but the payload was still visible on the
     /// prompt line after the verify window — submission likely did NOT land.
     SubmitUnverified,
+    /// REFUSED: after typing, the prompt line held more than our payload, so
+    /// we retracted what we typed and submitted NOTHING.
+    ///
+    /// Either the line was already dirty (residue from an operator's
+    /// half-typed input, or from a previous inject whose submit did not land)
+    /// or it acquired foreign text while we typed. Submitting such a line
+    /// splices two payloads into one string that is neither — and the old
+    /// "the payload cleared from the prompt line" check calls that a success.
+    /// See `inject_and_verify` for the autopsy.
+    PromptDirty,
+}
+
+/// How long to let a dirty prompt line clear before typing anyway.
+///
+/// Short on purpose. The inject lock already serialises us against other
+/// injectors, so a line still dirty here is residue nobody is actively
+/// clearing — most likely an operator's half-typed input. Waiting longer does
+/// not make it go away.
+const PROMPT_CLEAR_WAIT: Duration = Duration::from_secs(5);
+
+/// How long to let the typed payload settle before deciding the line is
+/// contaminated. Covers TUI redraw lag, not a competing writer.
+const TYPED_SETTLE_WAIT: Duration = Duration::from_millis(1500);
+
+const PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Pure: is the prompt line empty (or absent)?
+///
+/// `None` (no `❯` rendered at all) counts as NOT empty: we cannot see the
+/// input line, so we cannot assert anything about it.
+pub(crate) fn prompt_line_is_empty(prompt: Option<&str>) -> bool {
+    matches!(prompt, Some(p) if p.is_empty())
+}
+
+/// Pure: after typing `text`, is the prompt line EXACTLY our payload and
+/// nothing else?
+///
+/// The load-bearing check. `inject_and_verify`'s historical success criterion
+/// was "the payload prefix disappeared from the prompt line after Enter" —
+/// which is just as true when a SPLICED line gets submitted, because a splice
+/// submits and clears exactly like the real thing. On 2026-08-19 that reported
+/// `(verified)` for a `/config theme=light` that had been glued into the
+/// middle of a `WATCHER DOWN` banner; Claude Code answered
+/// `Expected key=value, got "theme=light[CLAUDE-WATCH] WATCHER DO…"` and the
+/// theme never changed.
+///
+/// tmux truncates the prompt line at pane width, so we can only see a PREFIX
+/// of a long payload. We therefore assert the strongest property the capture
+/// can support: everything visible on the line must be a prefix of what we
+/// typed. That rejects text PREPENDED to our payload
+/// (`WATCHER DOWN…/config theme=light`) and text APPENDED to it
+/// (`/config theme=light[CLAUDE-WATCH] WATCHER DOWN…`) as long as the extra
+/// characters fall inside the visible row — exactly the regime the observed
+/// failures live in, since the theme payload is 19 characters and the pane is
+/// 66 wide.
+pub(crate) fn typed_line_is_exclusively_payload(prompt: Option<&str>, text: &str) -> bool {
+    let Some(prompt) = prompt else {
+        return false;
+    };
+    let want: Vec<char> = text.trim().chars().collect();
+    let got: Vec<char> = prompt.chars().collect();
+    if want.is_empty() {
+        return got.is_empty();
+    }
+    // Nothing on the line (or it was cleared under us) is not "clean" — it
+    // means our payload is not on the line we are about to submit.
+    if got.is_empty() {
+        return false;
+    }
+    // More characters on the line than we typed => something else is there.
+    if got.len() > want.len() {
+        return false;
+    }
+    got[..] == want[..got.len()]
+}
+
+/// Give a dirty prompt line a bounded chance to clear before we type.
+///
+/// ADVISORY ONLY — it never blocks the inject. The authoritative gate is the
+/// post-type [`wait_for_clean_payload`] check. Refusing here would be the
+/// wrong shape of guard: `prompt_line_text` cannot distinguish an empty input
+/// from an empty input the TUI has painted a placeholder hint into (a virgin
+/// session renders `❯ Try "edit …"` with nothing actually typed), so a
+/// blocking pre-check could refuse forever on a perfectly clean pane — and a
+/// guard that can suppress a WATCHER DOWN alert indefinitely is worse than the
+/// bug it fixes. Waiting costs nothing and usually lets a peer's in-flight
+/// submit land first.
+async fn settle_prompt_line(pane: &str) {
+    let deadline = tokio::time::Instant::now() + PROMPT_CLEAR_WAIT;
+    loop {
+        let prompt = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+        if prompt_line_is_empty(prompt.as_deref()) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            debug!(
+                pane = %pane,
+                residue = ?prompt,
+                "inject: prompt line still not empty after settle window; typing anyway \
+                 (the post-type exclusivity check decides whether we submit)"
+            );
+            return;
+        }
+        sleep(PROMPT_POLL_INTERVAL).await;
+    }
+}
+
+/// Wait (bounded) for the prompt line to settle to EXACTLY our payload.
+async fn wait_for_clean_payload(pane: &str, text: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + TYPED_SETTLE_WAIT;
+    loop {
+        let prompt = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+        if typed_line_is_exclusively_payload(prompt.as_deref(), text) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            debug!(
+                pane = %pane,
+                on_line = ?prompt,
+                "inject: prompt line is not exclusively our payload; refusing to submit"
+            );
+            return false;
+        }
+        sleep(PROMPT_POLL_INTERVAL).await;
+    }
+}
+
+/// Send `count` presses of `key` in a single tmux call (`send-keys -N`).
+async fn send_key_repeated(pane: &str, key: &str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let n = count.to_string();
+    let _ = run_cmd(&["tmux", "send-keys", "-t", pane, "-N", &n, key], 5).await;
+}
+
+/// Undo our own typing after the exclusivity check failed, leaving the prompt
+/// line exactly as we found it.
+///
+/// Backspace removes the characters immediately BEFORE the caret, and the
+/// caret is sitting at the end of what we just typed — so this retracts our
+/// payload and nothing else, even when it landed spliced into the MIDDLE of
+/// someone else's text (the 2026-08-19 shape). Non-cancelling: no Escape, no
+/// `dd`, so an in-flight turn and any operator input are untouched.
+///
+/// Without this, every refused attempt would leave its payload behind for the
+/// next one to glue onto — which is how five and six fragments came to pile up
+/// in a single line.
+async fn retract_typed_payload(pane: &str, text: &str) {
+    send_key_repeated(pane, "BSpace", text.chars().count()).await;
+    sleep(Duration::from_millis(200)).await;
 }
 
 /// Pure helper: extract the text after the LAST `❯` prompt char in the
@@ -1003,6 +1594,23 @@ pub(crate) fn prompt_line_text(pane_output: &str) -> Option<String> {
 ///     commands MUST submit from INSERT — Escape→NORMAL then Enter does
 ///     NOT submit a slash command (the documented self-clear `/clear` bug).
 ///
+/// `escape` selects the choreography, and it DEFAULTS OFF (Andrew, 2026-08-18:
+/// make `claude-watch inject` not use Escape by default, and put it behind a
+/// flag):
+///   - `escape = false` (DEFAULT) — NON-CANCELLING. Never sends an Escape, so
+///     an in-flight turn is not interrupted AND a modal standing on the pane
+///     is not cancelled. Enters INSERT with an idempotent `i`, types, and
+///     (when `submit`) commits with a bare Enter from INSERT — which Claude
+///     Code QUEUES behind an active turn. `slash_command` makes no difference
+///     here: bare-Enter-from-INSERT already IS the slash-command contract.
+///     Trade-off: no `dd` line-clear, so half-typed operator input on the
+///     prompt line glues onto the payload.
+///   - `escape = true` — CANCELLING. The historical choreography:
+///     Escape→NORMAL coercion, `dd` line-clear, `i`, type, then
+///     Tab→Escape→Enter (or a bare Enter for `slash_command`). Opt in when the
+///     caller genuinely needs the turn seized and the prompt line wiped
+///     (self-clear's `/clear`, mcp-reconnect's `/mcp`).
+///
 /// Returns:
 ///   - `InjectOutcome::Typed` when `submit == false`.
 ///   - `InjectOutcome::Submitted` when submission was verified (payload
@@ -1015,15 +1623,72 @@ pub async fn inject_and_verify(
     text: &str,
     submit: bool,
     slash_command: bool,
+    escape: bool,
 ) -> InjectOutcome {
-    // Reuse inject_text's proven type-and-(maybe-)submit choreography for
-    // the regular-text submit path so there is exactly ONE copy of the
-    // Escape/dd/i/type + Tab→Escape→Enter sequence. For the no-submit and
-    // slash-command paths we drive the shared low-level helpers directly
-    // (inject_text always submits with the regular-text sequence).
-    if submit && !slash_command {
+    // DEFAULT PATH (`escape == false`): NEVER send a leading Escape.
+    // `inject_text` / `inject_text_no_submit` both open with an Escape→NORMAL
+    // coercion loop, and — as inject_dispatch.rs and docs/two-channel-design.md
+    // document — *that Escape is what CANCELS the in-flight turn*. It also
+    // cancels any MODAL standing on the pane, which is why the login flow could
+    // not use this subcommand at all until the default flipped. So the
+    // un-flagged behaviour is now the safe one: enter INSERT via an idempotent
+    // `i` (NO Escape, NO `dd` line-clear), type the payload, and — when
+    // submitting — commit with a bare Enter from INSERT, which is both the
+    // slash-command submit contract AND queued behind an active turn rather
+    // than interrupting it. Trade-off: no `dd` line-clear, so half-typed
+    // operator input glues onto the payload. Callers that need the turn seized
+    // and the prompt line wiped pass `--escape`. Then fall through to the
+    // shared verify window below.
+    if !escape {
+        // This path has no `dd` line-clear (that needs NORMAL mode, reached by
+        // an Escape that would cancel the in-flight turn), so whatever is
+        // already on the input line gets our payload glued onto it. The inject
+        // LOCK does not prevent that: it serialises injectors, but residue
+        // OUTLIVES the lock — a previous injector whose submit did not land,
+        // or an operator who half-typed something and walked away, leaves the
+        // line dirty long after every lock is released.
+        //
+        // Give it a bounded chance to clear (advisory — see
+        // `settle_prompt_line` for why this must not be a hard gate), then
+        // type, then decide.
+        settle_prompt_line(pane).await;
+        type_text_non_cancelling(pane, text).await;
+        // AUTHORITATIVE GATE: the line must be EXCLUSIVELY our payload before
+        // we press Enter.
+        //
+        // This is the check whose absence is the whole bug. The historical
+        // success criterion — "the payload cleared from the prompt line after
+        // Enter" — is satisfied just as well by a SPLICED line, because a
+        // splice submits and clears exactly like the real thing. So a
+        // `/config theme=light` glued into a WATCHER DOWN banner submitted,
+        // cleared, and reported `(verified)`, while Claude Code answered
+        // `Expected key=value, got "theme=light[CLAUDE-WATCH] WATCHER DO…"`
+        // and the theme never changed. Checking BEFORE Enter is what makes the
+        // difference: a submitted splice is unrecoverable, an un-submitted one
+        // we can simply take back.
+        //
+        // Deliberately not applied to `--no-submit`, whose entire contract is
+        // to leave text sitting on the prompt line.
+        if submit && !wait_for_clean_payload(pane, text).await {
+            retract_typed_payload(pane, text).await;
+            return InjectOutcome::PromptDirty;
+        }
+        if submit {
+            // Bare Enter from INSERT — the same submit `inject_text_queued`
+            // uses, and the same one slash commands require, so
+            // `slash_command` makes no difference on this path.
+            send_keys(pane, &["Enter"]).await;
+            sleep(Duration::from_millis(300)).await;
+        }
+    } else if submit && !slash_command {
+        // Reuse inject_text's proven type-and-submit choreography for the
+        // regular-text submit path so there is exactly ONE copy of the
+        // Escape/dd/i/type + Tab→Escape→Enter sequence.
         inject_text(pane, text).await;
     } else {
+        // No-submit (any), or the CANCELLING slash-command path: drive the
+        // shared low-level helpers directly (inject_text always submits with
+        // the regular-text sequence).
         inject_text_no_submit(pane, text).await;
         if submit && slash_command {
             // Slash commands submit with a bare Enter from INSERT mode.
@@ -1141,25 +1806,17 @@ pub(crate) async fn inject_text_no_submit(pane: &str, text: &str) {
     // that jump the cursor around before INSERT finally engages. Symmetric
     // fix: verify INSERT is active (mirror of the Step 1 Escape→NORMAL
     // verify loop), retry up to 3 times.
-    let mut entered_insert = false;
-    for _ in 0..3 {
-        send_keys(pane, &["i"]).await;
-        sleep(Duration::from_millis(500)).await;
-        if is_insert_mode(pane).await {
-            entered_insert = true;
-            break;
-        }
-    }
+    // Enter INSERT robustly and without leaving a stray literal `i` (Andrew
+    // 2026-08-17): after the Step 1 Escape->NORMAL coercion + Step 2 `dd` the
+    // pane is normally in NORMAL mode with an empty line, so `ensure_insert_mode`
+    // sends one `i` to switch to INSERT; if the pane was actually already in
+    // INSERT (Escape didn't take) or is non-vim, it sends no `i` / Backspaces a
+    // literal one -- so `send_literal` below always types onto a clean INSERT
+    // buffer instead of issuing motion commands or gluing an `i` prefix.
+    ensure_insert_mode(pane).await;
     // Final settle even on success — Claude Code may render `-- INSERT --`
     // before the input editor has fully accepted typed characters.
     sleep(Duration::from_millis(500)).await;
-    if !entered_insert {
-        debug!(
-            pane = pane,
-            "inject_text_no_submit: INSERT mode not confirmed after 3 `i` attempts; \
-             proceeding anyway (fall-through to legacy behavior)"
-        );
-    }
 
     // Step 4: Type the text
     send_literal(pane, text).await;
@@ -1688,21 +2345,17 @@ pub async fn wait_for_idle_prompt(pane: &str, timeout_secs: u64) -> bool {
 /// ("Browser didn't open?", OAuth URL, "Paste code here"), so the absence of
 /// TUI indicators is the reliable signal. This is a single-phase check: if the
 /// TUI is gone AND login-screen patterns are present, reauth is needed.
+///
+/// The 401 banner Claude Code prints INSIDE a live TUI ("Please run /login ·
+/// API Error: 401 OAuth access token has expired") is deliberately NOT this
+/// function's business — it is text, and text on a live pane is conversation
+/// until something off-screen says otherwise. `check_lines_for_401_banner`
+/// detects that banner and the caller corroborates it against the credential
+/// store before acting.
 pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
     let lower = pane_output.to_lowercase();
 
-    // Unified TUI guard: any TUI indicator means we're looking at live conversation,
-    // not a login screen. Conversation content can legitimately contain any
-    // auth-error text without triggering reauth.
-    let tui_visible = lower.contains("tokens")
-        || lower.contains("bashes")
-        || lower.contains(" shells")
-        || lower.contains(" agents")
-        || lower.contains(" background tasks")
-        || lower.contains("\u{276f}")
-        || lower.contains("bypass permissi");
-
-    if tui_visible {
+    if tui_visible(&lower) {
         return false;
     }
 
@@ -1711,7 +2364,9 @@ pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
     // "Paste code here", and a claude.ai/oauth/authorize URL.
     lower.contains("browser didn't open")
         || lower.contains("paste code here")
-        || lower.contains("claude.ai/oauth/authorize")
+        || LOGIN_URL_PREFIXES
+            .iter()
+            .any(|p| lower.contains(&p.to_lowercase()))
         || lower.contains("open this url") && lower.contains("login")
         || lower.contains("session expired")
         || lower.contains("login required")
@@ -1721,19 +2376,102 @@ pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
         || lower.contains("api key expired")
 }
 
+/// Unified TUI guard: any TUI indicator (tokens counter, background-task
+/// counters, the idle prompt glyph, the permission-mode banner) means we are
+/// looking at a live Claude Code session with conversation content. Takes the
+/// already-lowercased capture.
+fn tui_visible(lower: &str) -> bool {
+    lower.contains("tokens")
+        || lower.contains("bashes")
+        || lower.contains(" shells")
+        || lower.contains(" agents")
+        || lower.contains(" background tasks")
+        || lower.contains("\u{276f}")
+        || lower.contains("bypass permissi")
+}
+
+/// Pure function: is Claude Code's "access token has expired" banner on a
+/// LIVE pane?
+///
+/// This is the hole between the other two detectors. When the OAuth access
+/// token lapses and the silent refresh does not happen, Claude Code does not
+/// replace the TUI with a login screen — it keeps the TUI up (tokens footer,
+/// permission-mode banner, `❯` prompt all intact) and prints one inline line:
+///
+/// ```text
+/// ● Please run /login · API Error: 401 OAuth access token has expired. Re-authenticate to continue.
+/// ```
+///
+/// `check_lines_for_reauth` refuses to look at anything while the TUI is up
+/// (correctly — that is the conversation-text false positive), and the
+/// proactive expiry detector keys on a different warning about the REFRESH
+/// token, which can be weeks from lapsing while the access token is already
+/// dead. So nothing reacted, and the session sat on the banner until a human
+/// typed `/login`.
+///
+/// This detector requires the TUI to be VISIBLE (the banner is an in-TUI
+/// render; with the TUI gone the login-screen detector owns the pane) and
+/// requires the COMBINATION of the `/login` instruction and the 401 / expired
+/// phrasing, not any one phrase alone. It is still only text. The caller MUST
+/// corroborate against the credential store (`credentials::read_access_token`)
+/// before acting — a session reading this file, its tests, or the diff that
+/// added them has this exact sentence on the pane while perfectly well
+/// authenticated, and that case has to stay silent.
+///
+/// Matching is whitespace-insensitive for the same reason
+/// `detect_login_expiry_warning` is: a tmux pane hard-wraps a line this long
+/// at any column with no separator.
+pub(crate) fn check_lines_for_401_banner(pane_output: &str) -> bool {
+    let lower = pane_output.to_lowercase();
+    if !tui_visible(&lower) {
+        return false;
+    }
+    let squashed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    squashed.contains("pleaserun/login")
+        && (squashed.contains("apierror:401") || squashed.contains("oauthaccesstokenhasexpired"))
+}
+
+/// Every OAuth authorize-URL prefix a Claude Code login screen can print.
+///
+/// Claude Code MOVED its subscription authorize endpoint: current builds use
+/// `https://claude.com/cai/oauth/authorize` (the `CLAUDE_AI_AUTHORIZE_URL`
+/// constant in the shipped bundle), and the Console login path uses
+/// `https://platform.claude.com/oauth/authorize`. The original
+/// `https://claude.ai/oauth/authorize` this parser was written against no
+/// longer appears anywhere in a current build — matching only that string
+/// meant the login screen was detected but the URL came back EMPTY, so the
+/// operator got an alert with no link in it. Keep the legacy prefix for older
+/// Claude Code versions; match whichever appears FIRST in the pane.
+pub(crate) const LOGIN_URL_PREFIXES: &[&str] = &[
+    "https://claude.com/cai/oauth/authorize",
+    "https://platform.claude.com/oauth/authorize",
+    "https://claude.ai/oauth/authorize",
+];
+
 /// Extract the login URL from pane output, handling possible line wrapping.
-/// Looks for URLs starting with `https://claude.ai/oauth/authorize`.
+/// Looks for URLs starting with any prefix in `LOGIN_URL_PREFIXES`.
 /// tmux line wrapping splits a URL across lines with NO separator, so we
 /// reassemble by joining consecutive lines that look like URL continuations
 /// (no whitespace at start, valid URL chars).
 pub(crate) fn extract_login_url(pane_output: &str) -> Option<String> {
     let lines: Vec<&str> = pane_output.lines().collect();
 
-    // Find the line containing the URL start
+    // Find the line containing the URL start. Scan line-by-line so the
+    // EARLIEST line wins, and within a line take the leftmost prefix match,
+    // regardless of which prefix matched.
     let mut url_line_idx = None;
     let mut url_start_col = 0;
     for (i, line) in lines.iter().enumerate() {
-        if let Some(pos) = line.find("https://claude.ai/oauth/authorize") {
+        let mut best: Option<usize> = None;
+        for prefix in LOGIN_URL_PREFIXES {
+            if let Some(pos) = line.find(prefix) {
+                best = Some(match best {
+                    Some(b) if b <= pos => b,
+                    _ => pos,
+                });
+            }
+        }
+        if let Some(pos) = best {
             url_line_idx = Some(i);
             url_start_col = pos;
             break;
@@ -1770,15 +2508,105 @@ pub(crate) fn extract_login_url(pane_output: &str) -> Option<String> {
     Some(url)
 }
 
-/// Check if the pane is showing a reauth/login prompt.
-/// Returns the login URL if reauth is needed (or empty string if needed but URL not found).
-pub async fn needs_reauth(pane: &str) -> Option<String> {
-    if let Some(out) = capture_pane(pane).await {
-        if check_lines_for_reauth(&out) {
-            return Some(extract_login_url(&out).unwrap_or_default());
-        }
+/// Claude Code's PROACTIVE "your login is about to expire" warning.
+///
+/// This is a different signal from `check_lines_for_reauth`, and the two must
+/// not be confused. `check_lines_for_reauth` fires when the credentials are
+/// ALREADY dead: the TUI has been replaced by a login screen and the session
+/// can no longer do anything. This one fires while the session is perfectly
+/// healthy — the TUI is up, work is happening, and Claude Code has merely
+/// started warning that the OAuth refresh token lapses soon.
+///
+/// The exact wording was read out of the shipped Claude Code bundle rather
+/// than guessed, the same way `LOGIN_URL_PREFIXES` was. Two independent call
+/// sites render it and both compose the identical visible text:
+///
+/// ```text
+/// Your login expires in 2 days · run /login to renew
+/// ```
+///
+/// One is a startup banner that renders whenever the refresh token is inside
+/// its warning window; the other is a transient notice that renders only when
+/// the window is down to a single day. Because the notice is transient, a
+/// poller can legitimately MISS it — which is why the daemon corroborates
+/// with, and can fall back to, the on-disk credential expiry.
+///
+/// Matching strategy: strip ALL whitespace and lowercase before matching. A
+/// tmux pane hard-wraps with no separator and no hyphenation, so a phrase this
+/// long can be split at any column; a whitespace-insensitive match is wrap
+/// proof by construction, where a literal `"your login expires in"` is not.
+///
+/// Returns the number of days Claude Code claims are left.
+pub(crate) fn detect_login_expiry_warning(pane_output: &str) -> Option<u32> {
+    // No cheap literal pre-filter here, deliberately. The obvious one —
+    // "does the pane contain `login expires in`?" — is exactly the literal
+    // this function refuses to match on, and it silently defeats the whole
+    // point: a pane that wrapped mid-word would fail the pre-filter and
+    // return None while the squashed form matches perfectly. Squashing a
+    // pane capture is a few microseconds; a wrap-blind fast path is a bug.
+    static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex_lite::Regex::new(r"yourloginexpiresin(\d{1,4})day")
+            .expect("static login-expiry pattern is valid")
+    });
+    let squashed: String = pane_output
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    let caps = re.captures(&squashed)?;
+    caps.get(1)?.as_str().parse::<u32>().ok()
+}
+
+/// Capture the pane and report Claude Code's proactive login-expiry warning.
+///
+/// Companion to `reauth_signal`, deliberately a separate capture: the two
+/// signals are mutually exclusive (one needs the TUI gone, the other needs it
+/// present) so neither can mask the other.
+pub async fn login_expiry_warning(pane: &str) -> Option<u32> {
+    let out = capture_pane(pane).await?;
+    detect_login_expiry_warning(&out)
+}
+
+/// What the reactive reauth path can see on the pane this cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReauthSignal {
+    /// Nothing auth-related on the pane.
+    None,
+    /// The TUI is gone and a login screen is up. Carries the OAuth URL if one
+    /// is on the pane, or an empty string if the screen is up but the URL has
+    /// not been reassembled yet.
+    LoginScreen { url: String },
+    /// The TUI is UP and Claude Code's "Please run /login · API Error: 401
+    /// OAuth access token has expired" banner is on it. Text only — the
+    /// caller corroborates against the credential store before acting.
+    Banner401,
+}
+
+/// Pure function: classify ONE pane frame for the reactive reauth path.
+///
+/// One frame rather than two captures so the two detectors can never disagree
+/// about what they are looking at: the login-screen check runs first because
+/// it is the stronger claim (the TUI is gone), and the banner check only runs
+/// on a frame the TUI was still on.
+pub(crate) fn classify_reauth_frame(pane_output: &str) -> ReauthSignal {
+    if check_lines_for_reauth(pane_output) {
+        return ReauthSignal::LoginScreen {
+            url: extract_login_url(pane_output).unwrap_or_default(),
+        };
     }
-    None
+    if check_lines_for_401_banner(pane_output) {
+        return ReauthSignal::Banner401;
+    }
+    ReauthSignal::None
+}
+
+/// Capture the pane and classify it for the reactive reauth path.
+pub async fn reauth_signal(pane: &str) -> ReauthSignal {
+    match capture_pane(pane).await {
+        Some(out) => classify_reauth_frame(&out),
+        None => ReauthSignal::None,
+    }
 }
 
 /// Reason a Claude Code session is considered wedged (unable to recover on its own).
@@ -2234,6 +3062,18 @@ pub async fn detect_malformed_tool_call(pane: &str, override_marker: &str) -> Op
 ///      / "API Error: 429" / "Overloaded" / "overloaded_error" marker so we
 ///      know the retry is upstream-API driven.
 ///
+/// ALTERNATIVE (self-contained) signature: the spinner line states the retry
+/// itself, with no separate API-error line to pair with —
+///
+///   ✳ Waiting for API response · will retry in 1m 14s · check your network
+///
+/// That banner is only ever painted by the client's retry loop, and it carries
+/// its own countdown, so "waiting for API response" + a "retry in <duration>"
+/// countdown is accepted on its own. Without this, a session parked on a
+/// flaky endpoint (no 5xx line, no "attempt N/M") read as normal activity and
+/// the daemon happily interrupted it — the exact livelock this guard exists to
+/// prevent.
+///
 /// We intentionally scope the inspection to the LAST ~25 lines so the cue must
 /// be currently visible (not just somewhere in scrollback chat history).
 pub(crate) fn check_lines_for_api_retry(pane_output: &str) -> bool {
@@ -2245,6 +3085,18 @@ pub(crate) fn check_lines_for_api_retry(pane_output: &str) -> bool {
     };
     let tail = &lines[start..];
     let lower: String = tail.join("\n").to_lowercase();
+
+    // Self-contained banner: "Waiting for API response · will retry in <dur>".
+    // The countdown is what makes it a retry state rather than a plain
+    // in-flight request, and the phrase pair is painted only by the retry
+    // loop, so no separate error marker is required.
+    let waiting_for_api = lower.contains("waiting for api response");
+    let retry_countdown = regex_lite::Regex::new(r"retry in\s+\d+\s*(h|m|s)")
+        .ok()
+        .is_some_and(|re| re.is_match(&lower));
+    if waiting_for_api && retry_countdown {
+        return true;
+    }
 
     // Cue 1: "Retrying in Ns" or "attempt N/M" must be present in the live
     // tail. Both phrases are emitted directly by Claude Code's retry loop
@@ -2382,6 +3234,112 @@ pub async fn healthcheck_brief(config: &crate::config::TmuxConfig) -> String {
 mod tests {
     use super::*;
 
+    // ---- Proactive login-expiry warning ----
+
+    /// The literal string Claude Code renders, verbatim. Both of its render
+    /// sites compose this same text.
+    #[test]
+    fn login_expiry_warning_is_read_off_a_normal_pane() {
+        let pane = "\
+  Some tool output here
+  ⚠ Your login expires in 2 days · run /login to renew
+
+╭──────────────────────────────────────────────────────────╮
+│ > ";
+        assert_eq!(detect_login_expiry_warning(pane), Some(2));
+    }
+
+    /// Singular vs plural: Claude Code pluralizes the unit, so "1 day" has to
+    /// match as surely as "3 days".
+    #[test]
+    fn both_the_singular_and_plural_forms_match() {
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 1 day · run /login to renew"),
+            Some(1)
+        );
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 3 days · run /login to renew"),
+            Some(3)
+        );
+    }
+
+    /// The reason the matcher strips whitespace instead of matching a literal:
+    /// a tmux pane hard-wraps with NO separator and no hyphenation, so the
+    /// phrase can be cut at any column — including mid-word.
+    #[test]
+    fn a_hard_wrapped_warning_still_matches() {
+        // Wrapped between words.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires\nin 2 days · run /login to renew"),
+            Some(2)
+        );
+        // Wrapped MID-WORD, which is what tmux actually does at a narrow width.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expi\nres in 2 days · run /log\nin to renew"),
+            Some(2)
+        );
+        // And with the trailing half of the line missing entirely, because a
+        // narrow pane truncates the notice with an ellipsis.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 2 days ·…"),
+            Some(2)
+        );
+    }
+
+    /// A live session with no warning must report nothing — including one
+    /// whose conversation is full of auth vocabulary.
+    #[test]
+    fn an_ordinary_pane_reports_no_warning() {
+        assert_eq!(detect_login_expiry_warning(""), None);
+        assert_eq!(
+            detect_login_expiry_warning(
+                "⏵⏵ bypass permissions on · 3 shells · esc to interrupt\n337594 tokens"
+            ),
+            None
+        );
+        // Near-misses that are NOT the warning.
+        assert_eq!(
+            detect_login_expiry_warning("your session expires in 2 days"),
+            None
+        );
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in a couple of days"),
+            None
+        );
+        assert_eq!(
+            detect_login_expiry_warning("OAuth token has expired. Re-authenticate to continue."),
+            None
+        );
+    }
+
+    /// Documented, deliberately: the detector CANNOT tell Claude Code's banner
+    /// from the same sentence sitting in conversation text, and this test pins
+    /// that as a known property rather than leaving it as a surprise. It is
+    /// why `decide_expiry_action` refuses to act on a pane sighting the
+    /// credential store contradicts.
+    #[test]
+    fn conversation_text_matches_too_which_is_why_corroboration_exists() {
+        let quoting_the_docs =
+            "  I'm reading the detector docs, which quote \"Your login expires in 2 days\".";
+        assert_eq!(detect_login_expiry_warning(quoting_the_docs), Some(2));
+    }
+
+    /// The reactive login SCREEN and the proactive warning are different
+    /// states and must not be confused: the warning fires while the TUI is up,
+    /// the login screen fires only once it is gone.
+    #[test]
+    fn the_expiry_warning_and_the_login_screen_are_disjoint_signals() {
+        let warning = "Your login expires in 1 day · run /login to renew\n337594 tokens";
+        assert_eq!(detect_login_expiry_warning(warning), Some(1));
+        // TUI is visible, so the reactive path correctly stands down.
+        assert!(!check_lines_for_reauth(warning));
+
+        let login_screen = "Browser didn't open? Use the url below to sign in\n\n\
+                            https://claude.com/cai/oauth/authorize?code=true";
+        assert!(check_lines_for_reauth(login_screen));
+        assert_eq!(detect_login_expiry_warning(login_screen), None);
+    }
+
     // ---- Interrupt-only-hits-main-loop (Andrew #1803/#1804) ----
 
     /// `parse_pane_selected`: both `#{pane_active}` and `#{window_active}`
@@ -2499,6 +3457,81 @@ mod tests {
         // An older `❯` in scrollback must not shadow the live input line.
         let output = "\u{276f} old typed text\nstuff\n\u{276f} new text";
         assert_eq!(prompt_line_text(output).as_deref(), Some("new text"));
+    }
+
+    // ---- prompt-line exclusivity guards (the 2026-08-19 splice) ----
+
+    #[test]
+    fn empty_prompt_line_is_the_only_empty_state() {
+        assert!(prompt_line_is_empty(Some("")));
+        assert!(!prompt_line_is_empty(Some("half-typed operator input")));
+        // No `❯` rendered at all: we cannot SEE the input line, so we must not
+        // claim anything about it. A missing prompt is UNKNOWN, never empty.
+        assert!(!prompt_line_is_empty(None));
+    }
+
+    #[test]
+    fn clean_payload_accepts_exactly_what_we_typed() {
+        assert!(typed_line_is_exclusively_payload(
+            Some("/config theme=light"),
+            "/config theme=light"
+        ));
+    }
+
+    #[test]
+    fn clean_payload_accepts_a_width_truncated_prefix() {
+        // tmux truncates the prompt line at pane width, so a long banner is
+        // only visible as a prefix. That prefix must still be OURS.
+        let banner = "[CLAUDE-WATCH] WATCHER DOWN: 3 event(s) unconsumed >6min - dead";
+        assert!(typed_line_is_exclusively_payload(
+            Some("[CLAUDE-WATCH] WATCHER DOWN: 3 event(s)"),
+            banner
+        ));
+    }
+
+    #[test]
+    fn clean_payload_rejects_appended_foreign_text() {
+        // Reproduced 2026-08-19: cw-theme-sync typed first, the WATCHER DOWN
+        // banner landed after it, and Claude Code answered
+        // `Expected key=value, got "theme=light[CLAUDE-WATCH] WATCHER DO…"`.
+        assert!(!typed_line_is_exclusively_payload(
+            Some("/config theme=light[CLAUDE-WATCH] WATCHER DOWN: 3 event(s)"),
+            "/config theme=light"
+        ));
+    }
+
+    #[test]
+    fn clean_payload_rejects_prepended_foreign_text() {
+        // The 2026-08-19T10:08:47 shape: the theme payload spliced INTO the
+        // middle of the banner, so the line does not even start with ours.
+        assert!(!typed_line_is_exclusively_payload(
+            Some("unconsumed >6mi/config theme=lightn - the event watcher is dead"),
+            "/config theme=light"
+        ));
+    }
+
+    #[test]
+    fn clean_payload_rejects_an_empty_or_absent_line() {
+        // Our payload is not on the line we are about to submit.
+        assert!(!typed_line_is_exclusively_payload(
+            Some(""),
+            "/config theme=light"
+        ));
+        assert!(!typed_line_is_exclusively_payload(
+            None,
+            "/config theme=light"
+        ));
+    }
+
+    #[test]
+    fn prompt_dirty_is_a_distinct_outcome() {
+        // Must not collapse into SubmitUnverified: they mean different things
+        // to a caller. SubmitUnverified => keystrokes were sent and the
+        // payload may yet land. PromptDirty => NOTHING was submitted, and the
+        // pane still holds someone else's text.
+        assert_ne!(InjectOutcome::PromptDirty, InjectOutcome::SubmitUnverified);
+        assert_ne!(InjectOutcome::PromptDirty, InjectOutcome::Submitted);
+        assert_ne!(InjectOutcome::PromptDirty, InjectOutcome::Typed);
     }
 
     #[test]
@@ -2818,6 +3851,101 @@ mod tests {
     fn background_work_exit_dialog_not_fired_on_idle() {
         let output = "Claude Code is running\nTokens: 50000\n\u{276f} ";
         assert!(!background_work_exit_dialog_visible(output));
+    }
+
+    // bypass_permissions_dialog_visible — the launch-time consent dialog
+    // Claude Code renders under `--dangerously-skip-permissions` when the
+    // acceptance is not persisted in settings. Verbatim capture of the pane
+    // the daemon injected into on 2026-08-29 (Claude Code 2.1.251), which
+    // exited Claude because the default selection is "No, exit".
+    const BYPASS_DIALOG_PANE: &str = include_str!("../tests/fixtures/bypass_permissions_dialog.txt");
+
+    #[test]
+    fn bypass_permissions_dialog_matches_the_captured_pane() {
+        assert!(bypass_permissions_dialog_visible(BYPASS_DIALOG_PANE));
+    }
+
+    #[test]
+    fn bypass_permissions_dialog_not_fired_on_a_live_bypass_session() {
+        // The running TUI renders a PERSISTENT bypass-permissions status line
+        // on essentially every frame. That must never read as the dialog, or
+        // the daemon would think a modal is up for the whole session.
+        let output = "\u{25cf} Brewed for 12s\n\
+                      ─────────────\n\
+                      \u{276f}\n\
+                      ─────────────\n\
+                      \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        assert!(!bypass_permissions_dialog_visible(output));
+    }
+
+    #[test]
+    fn bypass_permissions_dialog_needs_both_markers() {
+        // Title without the confirm label (e.g. the warning scrolled past in
+        // conversation text) is not the dialog.
+        let title_only = "WARNING: Claude Code running in Bypass Permissions mode\n\u{276f}";
+        assert!(!bypass_permissions_dialog_visible(title_only));
+        // Confirm label without the mode wording is some other dialog.
+        let label_only = "  Do the thing?\n\u{276f} No, exit\n  Yes, I accept";
+        assert!(!bypass_permissions_dialog_visible(label_only));
+    }
+
+    #[test]
+    fn bypass_permissions_dialog_ignores_old_scrollback() {
+        // The dialog text 40 lines up (a transcript, this doc read into the
+        // pane) is history, not a live modal.
+        let mut lines = vec!["scrollback".to_string(); 40];
+        lines.insert(0, BYPASS_DIALOG_PANE.to_string());
+        assert!(!bypass_permissions_dialog_visible(&lines.join("\n")));
+    }
+
+    #[test]
+    fn bypass_permissions_dialog_reads_as_an_interactive_prompt() {
+        // The whole bug: the dialog's `❯ No, exit` row satisfies the bare-`❯`
+        // idle check, so every inject guard must see it as a live prompt.
+        assert!(check_lines_for_idle_prompt(BYPASS_DIALOG_PANE));
+        assert!(interactive_prompt_visible(BYPASS_DIALOG_PANE));
+        assert!(!idle_prompt_without_bypass_dialog(BYPASS_DIALOG_PANE));
+    }
+
+    #[test]
+    fn idle_prompt_without_bypass_dialog_still_matches_a_real_prompt() {
+        let output = "\u{25cf} Done\n\u{276f} \n\
+                      \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+        assert!(idle_prompt_without_bypass_dialog(output));
+    }
+
+    #[test]
+    fn bypass_permissions_accept_keys_move_off_the_default_then_confirm() {
+        // The dialog is rendered cancel-first with the cancel row focused
+        // ("❯ No, exit" above "Yes, I accept"), and hides option indexes — so
+        // a bare Enter picks "No, exit" (which is what exited Claude) and
+        // there is no number-key shortcut. Exactly one Down, then Enter.
+        assert_eq!(BYPASS_PERMISSIONS_ACCEPT_KEYS, ["Down", "Enter"]);
+
+        // Assert that against the rendered option order rather than trusting
+        // the constant: count the rows between the cursor and the confirm
+        // label in the captured pane.
+        let rows: Vec<&str> = BYPASS_DIALOG_PANE
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.ends_with("No, exit") || *l == "Yes, I accept")
+            .collect();
+        assert_eq!(rows, vec!["\u{276f} No, exit", "Yes, I accept"]);
+        let cursor_row = rows
+            .iter()
+            .position(|l| l.starts_with('\u{276f}'))
+            .expect("cursor row");
+        let confirm_row = rows
+            .iter()
+            .position(|l| l.contains("Yes, I accept"))
+            .expect("confirm row");
+        let downs = confirm_row - cursor_row;
+        assert_eq!(downs, 1, "one Down moves from the default to the confirm row");
+        assert_eq!(
+            BYPASS_PERMISSIONS_ACCEPT_KEYS.iter().filter(|k| **k == "Down").count(),
+            downs
+        );
+        assert_eq!(*BYPASS_PERMISSIONS_ACCEPT_KEYS.last().unwrap(), "Enter");
     }
 
     #[test]
@@ -3471,6 +4599,146 @@ mod tests {
         assert!(!check_lines_for_reauth(output));
     }
 
+    // --- check_lines_for_401_banner: the in-TUI access-token-expired banner ---
+    //
+    // The real thing, as observed: the TUI fully intact (tokens footer,
+    // "bypass permissions on", ❯ prompt) with ONE inline line from Claude
+    // Code. `check_lines_for_reauth` must keep saying no to this frame (the
+    // TUI guard above is load-bearing), and this detector must say yes — the
+    // decision to ACT is then the caller's, made against the credential store.
+    const BANNER_401_WITH_TUI: &str = concat!(
+        "● Please run /login · API Error: 401 OAuth access token has expired. ",
+        "Re-authenticate to continue.\n",
+        "\n",
+        "❯ \n",
+        "  bypass permissions on · 871,864 tokens\n"
+    );
+
+    #[test]
+    fn test_401_banner_detected_with_tui_up() {
+        assert!(check_lines_for_401_banner(BANNER_401_WITH_TUI));
+        // ...and the login-screen detector still leaves this frame alone.
+        assert!(!check_lines_for_reauth(BANNER_401_WITH_TUI));
+    }
+
+    #[test]
+    fn test_401_banner_detected_on_the_older_json_form() {
+        // The older render: banner line plus the raw error JSON underneath.
+        // Same frame `test_reauth_not_detected_401_text_with_tui` holds for.
+        let output = concat!(
+            "Please run /login · API Error: 401\n",
+            "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",",
+            "\"message\":\"Invalid authentication credentials\"}}\n",
+            "❯ \n",
+            "-- INSERT --  871864 tokens"
+        );
+        assert!(check_lines_for_401_banner(output));
+    }
+
+    #[test]
+    fn test_401_banner_survives_tmux_hard_wrap() {
+        // A narrow pane wraps the banner mid-phrase with no separator.
+        let output = concat!(
+            "● Please run /login · API Err\n",
+            "or: 401 OAuth access token has exp\n",
+            "ired. Re-authenticate to continue.\n",
+            "❯ \n",
+            "  12,345 tokens\n"
+        );
+        assert!(check_lines_for_401_banner(output));
+    }
+
+    #[test]
+    fn test_401_banner_not_detected_when_tui_gone() {
+        // With the TUI gone this is a login-screen frame, not a banner frame —
+        // the other detector owns it and this one must not double-claim.
+        let output = "Please run /login · API Error: 401 OAuth access token has expired.\n";
+        assert!(!check_lines_for_401_banner(output));
+        // (and the other detector does pick it up via "re-authenticate")
+        let output = "API Error: 401 OAuth access token has expired. Re-authenticate to continue.";
+        assert!(check_lines_for_reauth(output));
+    }
+
+    #[test]
+    fn test_401_banner_requires_the_combination_not_one_phrase() {
+        // "/login" alone (the proactive expiry warning, say) is not a 401.
+        assert!(!check_lines_for_401_banner(
+            "Your login expires in 2 days · run /login to renew\n❯ \n 1,234 tokens"
+        ));
+        assert!(!check_lines_for_401_banner("Please run /login\n❯ \n 1,234 tokens"));
+        // A 401 alone (a curl in the conversation) is not the banner.
+        assert!(!check_lines_for_401_banner(
+            "curl: HTTP/1.1 401 Unauthorized\nAPI Error: 401\n❯ \n 1,234 tokens"
+        ));
+        assert!(!check_lines_for_401_banner(
+            "the OAuth access token has expired on the other host\n❯ \n 1,234 tokens"
+        ));
+        assert!(!check_lines_for_401_banner(""));
+    }
+
+    // --- classify_reauth_frame: one frame, one verdict ---
+
+    #[test]
+    fn test_reauth_frame_login_screen_wins_and_carries_the_url() {
+        // TUI gone, login screen up with the authorize URL: phase 2, with URL.
+        let frame = concat!(
+            "Browser didn't open? Use the url below to sign in:\n",
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=abc\n",
+            "Paste code here if prompted >\n"
+        );
+        match classify_reauth_frame(frame) {
+            ReauthSignal::LoginScreen { url } => {
+                assert!(url.starts_with("https://claude.com/cai/oauth/authorize"), "{url}")
+            }
+            other => panic!("expected LoginScreen, got {other:?}"),
+        }
+        // TUI gone, login-ish text but no URL yet: phase 2 with an empty URL,
+        // which is what tells the caller to inject `/login` and wait.
+        assert_eq!(
+            classify_reauth_frame("Session expired. Login required.\n"),
+            ReauthSignal::LoginScreen { url: String::new() }
+        );
+    }
+
+    #[test]
+    fn test_reauth_frame_banner_with_tui_is_banner401() {
+        assert_eq!(
+            classify_reauth_frame(BANNER_401_WITH_TUI),
+            ReauthSignal::Banner401
+        );
+    }
+
+    #[test]
+    fn test_reauth_frame_normal_tui_is_none() {
+        assert_eq!(
+            classify_reauth_frame("● Done.\n\n❯ \n  bypass permissions on · 57,129 tokens\n"),
+            ReauthSignal::None
+        );
+        assert_eq!(classify_reauth_frame(""), ReauthSignal::None);
+        // The proactive warning is NOT this path's business.
+        assert_eq!(
+            classify_reauth_frame(
+                "Your login expires in 2 days · run /login to renew\n❯ \n 1,234 tokens"
+            ),
+            ReauthSignal::None
+        );
+    }
+
+    #[test]
+    fn test_401_banner_text_in_conversation_is_still_detected_as_text() {
+        // Somebody reading THIS file has the banner on the pane. The detector
+        // says "banner present" — it is text, and it cannot know better. The
+        // false-positive guard lives one layer up, in the credential
+        // corroboration (policy::decide_banner_action), and that is where the
+        // healthy-credentials case is asserted silent.
+        let output = concat!(
+            "    /// ● Please run /login · API Error: 401 OAuth access token has expired.\n",
+            "❯ \n",
+            "  bypass permissions on · 55,000 tokens\n"
+        );
+        assert!(check_lines_for_401_banner(output));
+    }
+
     #[test]
     fn test_reauth_not_detected_api_error_401_in_conversation() {
         let output = "API Error: 401\n57,129 tokens  9 bashes\n❯ ";
@@ -3555,6 +4823,43 @@ mod tests {
     fn test_extract_login_url_none() {
         let output = "Session expired\nPlease re-login";
         assert_eq!(extract_login_url(output), None);
+    }
+
+    #[test]
+    fn test_extract_login_url_current_claude_com_endpoint() {
+        // The endpoint CURRENT Claude Code builds actually print. Matching only
+        // the legacy claude.ai host produced an empty URL in the reauth alert.
+        let output = "Browser didn't open? Use the url below to sign in\n\nhttps://claude.com/cai/oauth/authorize?code=true&client_id=abc123\n\nPaste code here if prompted > ";
+        assert_eq!(
+            extract_login_url(output),
+            Some("https://claude.com/cai/oauth/authorize?code=true&client_id=abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_login_url_console_endpoint() {
+        let output = "https://platform.claude.com/oauth/authorize?code=true&client_id=xyz\n";
+        assert_eq!(
+            extract_login_url(output),
+            Some("https://platform.claude.com/oauth/authorize?code=true&client_id=xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_login_url_current_endpoint_wrapped() {
+        // Same hard-wrap reassembly, on the current host.
+        let output = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc123&code_chall\nenge=xyz789&code_challenge_method=S256";
+        assert_eq!(
+            extract_login_url(output),
+            Some("https://claude.com/cai/oauth/authorize?code=true&client_id=abc123&code_challenge=xyz789&code_challenge_method=S256".to_string())
+        );
+    }
+
+    #[test]
+    fn test_reauth_detected_on_current_authorize_host() {
+        // TUI gone + the current authorize URL => reauth screen.
+        let output = "Login\n\nBrowser didn't open? Use the url below to sign in\n\nhttps://claude.com/cai/oauth/authorize?code=true\n";
+        assert!(check_lines_for_reauth(output));
     }
 
     #[test]
@@ -4125,6 +5430,45 @@ Retrying in 32s\n\
     }
 
     #[test]
+    fn test_api_retry_waiting_for_api_response_banner() {
+        // The self-contained spinner banner: no 5xx line, no "attempt N/M",
+        // just the client's own countdown. Seen on a flaky endpoint, where it
+        // previously read as normal activity.
+        let output = "\
+\u{276f} run the deploy\n\
+\u{2731} Waiting for API response\u{2026} (836k tokens \u{00b7} will retry in 1m 14s \u{00b7} check your network)\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_waiting_banner_seconds_only() {
+        let output = "\
+\u{2731} Waiting for API response \u{00b7} will retry in 45s \u{00b7} check your network\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_waiting_without_countdown() {
+        // A plain in-flight request is NOT a retry state — the countdown is
+        // the load-bearing half of the banner.
+        let output = "\
+\u{2731} Waiting for API response\u{2026} (12s \u{00b7} esc to interrupt)\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_countdown_without_waiting_banner() {
+        // "retry in" prose in chat history, with no banner and no error cue.
+        let output = "\
+\u{276f} the workload will retry in 30s if the lock is held\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
     fn test_api_retry_isolated_overloaded_word() {
         // Bare "Overloaded" without any retrying-in cue must NOT trip —
         // we require both a retry marker AND an upstream-API error cue.
@@ -4205,5 +5549,126 @@ Retrying in 32s\n\
 
         // Restore for downstream tests.
         set_focus_main_keys(original);
+    }
+}
+
+#[cfg(test)]
+mod inject_and_selfclear_coord_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn insert_key_literal_detected_when_i_appended() {
+        assert!(insert_key_landed_literal(Some(""), Some("i")));
+        assert!(insert_key_landed_literal(None, Some("i")));
+        assert!(insert_key_landed_literal(Some("hello"), Some("helloi")));
+    }
+
+    #[test]
+    fn insert_key_not_literal_on_mode_switch() {
+        assert!(!insert_key_landed_literal(Some(""), Some("")));
+        assert!(!insert_key_landed_literal(Some("hello"), Some("hello")));
+        assert!(!insert_key_landed_literal(Some("hello"), Some("helloX")));
+        assert!(!insert_key_landed_literal(Some("hello"), Some("helloii")));
+        assert!(!insert_key_landed_literal(Some("hello"), None));
+        assert!(!insert_key_landed_literal(None, None));
+    }
+
+    #[test]
+    fn self_clear_lock_path_prefers_env_then_xdg_then_default() {
+        assert_eq!(
+            resolve_self_clear_lock_path(Some("/tmp/custom.lock"), Some("/run/user/1000")),
+            "/tmp/custom.lock"
+        );
+        assert_eq!(
+            resolve_self_clear_lock_path(Some("   "), Some("/run/user/1000")),
+            "/run/user/1000/claude-self-clear.lock"
+        );
+        assert_eq!(
+            resolve_self_clear_lock_path(None, Some("/run/user/1000/")),
+            "/run/user/1000/claude-self-clear.lock"
+        );
+        assert_eq!(
+            resolve_self_clear_lock_path(None, None),
+            "/var/run/claude/claude-self-clear.lock"
+        );
+        assert_eq!(
+            resolve_self_clear_lock_path(None, Some("  ")),
+            "/var/run/claude/claude-self-clear.lock"
+        );
+    }
+
+    #[test]
+    fn self_clear_handoff_path_prefers_env_then_xdg_then_default() {
+        // Mirrors the lockfile resolution EXACTLY (must agree with
+        // container/bin/self-clear's _default_handoff_file()).
+        assert_eq!(
+            resolve_self_clear_handoff_path(Some("/tmp/custom.handoff"), Some("/run/user/1000")),
+            "/tmp/custom.handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(Some("   "), Some("/run/user/1000")),
+            "/run/user/1000/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, Some("/run/user/1000/")),
+            "/run/user/1000/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, None),
+            "/var/run/claude/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, Some("  ")),
+            "/var/run/claude/claude-self-clear-handoff"
+        );
+    }
+
+    #[test]
+    fn handoff_is_recent_window_semantics() {
+        let now = 1_000_000.0;
+        // Absent marker => never recent.
+        assert!(!handoff_is_recent(None, now, 120));
+        // Just stamped => recent.
+        assert!(handoff_is_recent(Some(now), now, 120));
+        // Within the window => recent.
+        assert!(handoff_is_recent(Some(now - 119.0), now, 120));
+        // Exactly at the window edge => recent (inclusive).
+        assert!(handoff_is_recent(Some(now - 120.0), now, 120));
+        // Older than the window => NOT recent.
+        assert!(!handoff_is_recent(Some(now - 120.1), now, 120));
+        // Small clock-skew future mtime => still recent.
+        assert!(handoff_is_recent(Some(now + 5.0), now, 120));
+        // grace 0 disables at the caller layer, but the pure fn with a 0 window
+        // only treats an exactly-now (or future) marker as recent.
+        assert!(!handoff_is_recent(Some(now - 1.0), now, 0));
+    }
+
+    #[test]
+    fn lockfile_held_false_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.lock");
+        assert!(!lockfile_held(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn lockfile_held_true_while_locked_false_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("self-clear.lock");
+        let path_s = path.to_str().unwrap().to_string();
+        // Hold an exclusive flock via a SEPARATE open file description; flock
+        // treats independent opens (even same-process) as conflicting.
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let hfd = holder.as_raw_fd();
+        assert_eq!(unsafe { libc::flock(hfd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        assert!(lockfile_held(&path_s), "held lock must be detected");
+        assert_eq!(unsafe { libc::flock(hfd, libc::LOCK_UN) }, 0);
+        assert!(!lockfile_held(&path_s), "released lock must read as free");
+        drop(holder);
     }
 }

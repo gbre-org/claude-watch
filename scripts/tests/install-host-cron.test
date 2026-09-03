@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""Tests for cron.d/cw-host and scripts/install-host-cron.sh.
+
+Background: this repo ships cron entries for two deployment surfaces.
+
+  - `container/cron.d/cw-default` — baked into the image. It can hard-code
+    every path because the image fixes them (/usr/local/bin/claude-watch,
+    /var/lib/claude-watch).
+  - `cron.d/cw-host` — the HOST/systemd equivalent. A host deployment has no
+    fixed install prefix: the binary lives wherever the operator cloned the
+    repo, under whatever account runs the daemon. So the host fragment ships
+    @PLACEHOLDER@s and `scripts/install-host-cron.sh` substitutes them at
+    install time.
+
+Two properties make that parameterization load-bearing rather than cosmetic:
+
+  1. THIS REPO IS PUBLIC. A fragment with one operator's home path baked in
+     leaks it. Tests 1-3 pin that the shipped file names no concrete user,
+     home, or checkout path.
+  2. REUSE. A second deployment must be able to consume the same fragment
+     unmodified. That only holds if every placeholder the fragment uses is one
+     the installer actually knows how to fill (test 4) and rendering leaves
+     none behind (test 6).
+
+And one property the fragment depends on but cannot enforce itself:
+
+  3. SINGLE BINARY IDENTITY. `claude_watch_build_info` is emitted from
+     compile-time constants, so it describes whichever binary CRON execs. A
+     host deploy has two claude-watch binaries — the service's ExecStart
+     (target/release/) and the on-PATH $BIN_DIR copy that `install` places —
+     and if `deploy-systemd` refreshes only the first, the second silently goes
+     stale and anything running it reports the wrong commit. Test 10 pins that
+     `deploy-systemd` depends on `install`, which is what keeps them in step.
+
+What's covered:
+
+  1. `cron.d/cw-host` exists, is non-empty, and has no private-path sentinels.
+  2. It names no concrete username / home dir — every such slot is a
+     placeholder.
+  3. Every claude-watch invocation in it goes through @CW_BIN@ (never a
+     hard-coded binary path, which would defeat the whole point).
+  4. Every @CW_*@ placeholder it uses is one the installer substitutes.
+  5. Active (uncommented) rows carry the /etc/cron.d USER column.
+  6. `--dry-run` renders every placeholder and writes nothing.
+  7. A real install writes a regular root-readable 0644 file, byte-identical
+     to the dry-run render.
+  8. It is idempotent.
+  9. Guards: missing binary without --force, dotted destination basename,
+     unknown flag, missing template.
+ 10. Makefile wiring: `install-cron` invokes the script, `deploy-systemd`
+     depends on `install` (single-binary identity), and both new targets are
+     .PHONY.
+ 11. The three in-tree sources that each name a daemon binary path — the
+     shipped systemd unit's ExecStart, the installer's default @CW_BIN@, and
+     the Makefile `install` recipe — agree with each other. See the long
+     comment on that section for exactly what this does and does NOT prove.
+
+Run:  ./scripts/tests/install-host-cron.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FRAGMENT = REPO_ROOT / "cron.d" / "cw-host"
+INSTALLER = REPO_ROOT / "scripts" / "install-host-cron.sh"
+MAKEFILE = REPO_ROOT / "Makefile"
+SERVICE_UNIT = REPO_ROOT / "claude-watch.service"
+
+# Substrings that must never appear in a file shipped from this PUBLIC repo.
+PRIVATE_SENTINELS = [
+    "/mnt/Raiden",
+    "/mnt/Scorpion",
+    "ADHPrivate",
+    "~/repos/claude-config",
+    "~/repos/server-config",
+    "~/repos/pr-watch",
+]
+
+# The placeholders the installer knows how to substitute.
+SUPPORTED_PLACEHOLDERS = {"@CW_USER@", "@CW_HOME@", "@CW_BIN@", "@CW_STATE_DIR@"}
+
+failures: list[str] = []
+
+
+def check(cond: bool, msg: str) -> None:
+    if cond:
+        print(f"  ok: {msg}")
+    else:
+        print(f"  FAIL: {msg}")
+        failures.append(msg)
+
+
+def run(args: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args, capture_output=True, text=True, cwd=str(REPO_ROOT), **kw
+    )
+
+
+# -----------------------------------------------------------------------------
+print("1. Fragment exists and is public-repo clean")
+# -----------------------------------------------------------------------------
+check(FRAGMENT.is_file(), "cron.d/cw-host exists")
+check(INSTALLER.is_file(), "scripts/install-host-cron.sh exists")
+check(os.access(INSTALLER, os.X_OK), "install-host-cron.sh is executable")
+
+text = FRAGMENT.read_text() if FRAGMENT.is_file() else ""
+check(len(text.strip()) > 0, "cron.d/cw-host is non-empty")
+
+for sentinel in PRIVATE_SENTINELS:
+    check(sentinel not in text, f"cron.d/cw-host free of private sentinel {sentinel!r}")
+
+# -----------------------------------------------------------------------------
+print("2. No concrete user / home path baked in")
+# -----------------------------------------------------------------------------
+# Any /home/<something> must be the placeholder, not a real account.
+concrete_homes = [
+    m for m in re.findall(r"/home/[A-Za-z0-9._-]+", text) if "@CW_" not in m
+]
+check(not concrete_homes, f"no concrete /home/<user> paths (found {concrete_homes})")
+
+# The USER column of every active row must be the placeholder.
+active_rows = [
+    ln
+    for ln in text.splitlines()
+    if ln.strip() and not ln.lstrip().startswith("#") and not ln.startswith("PATH=")
+]
+check(len(active_rows) >= 2, f"fragment ships at least 2 active rows (got {len(active_rows)})")
+
+# -----------------------------------------------------------------------------
+print("3. Every claude-watch invocation goes through @CW_BIN@")
+# -----------------------------------------------------------------------------
+# Cron rows only — including the commented-out optional ones, which must be
+# ready to enable in place. Prose in the header legitimately discusses
+# $BIN_DIR/claude-watch and target/release/ as the thing NOT to point at.
+CRON_ROW_RE = re.compile(r"^[\*\d/,-]+(?:\s+\S+){4}\s+\S+\s+\S")
+
+
+def cron_rows(body: str) -> list[str]:
+    out = []
+    for ln in body.splitlines():
+        s = ln.lstrip()
+        s = s[1:].lstrip() if s.startswith("#") else s
+        if CRON_ROW_RE.match(s):
+            out.append(s)
+    return out
+
+
+rows = cron_rows(text)
+check(len(rows) >= 2, f"fragment has parseable cron rows (got {len(rows)})")
+bad = [
+    inv
+    for row in rows
+    for inv in re.findall(r"\S*claude-watch(?=\s)", row)
+    if "/" in inv  # a path-qualified claude-watch that isn't the placeholder
+]
+check(
+    not bad,
+    f"no hard-coded claude-watch binary paths in cron rows (found {bad})",
+)
+check("@CW_BIN@" in text, "fragment uses @CW_BIN@ for the daemon path")
+
+# -----------------------------------------------------------------------------
+print("4. Placeholders used are placeholders the installer substitutes")
+# -----------------------------------------------------------------------------
+used = set(re.findall(r"@CW_[A-Z_]+@", text))
+unknown = used - SUPPORTED_PLACEHOLDERS
+check(not unknown, f"no placeholder the installer cannot fill (unknown: {sorted(unknown)})")
+
+installer_text = INSTALLER.read_text() if INSTALLER.is_file() else ""
+for ph in sorted(SUPPORTED_PLACEHOLDERS):
+    if ph in used:
+        check(ph in installer_text, f"installer substitutes {ph}")
+
+# -----------------------------------------------------------------------------
+print("5. Active rows carry the /etc/cron.d USER column")
+# -----------------------------------------------------------------------------
+# schedule (5 fields) + user + command
+for row in active_rows:
+    fields = row.split()
+    check(
+        len(fields) > 6 and fields[5] == "@CW_USER@",
+        f"row has a USER column: {row[:60]!r}",
+    )
+
+# -----------------------------------------------------------------------------
+print("6. --dry-run renders every placeholder and writes nothing")
+# -----------------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    fake_bin = tmp / "claude-watch"
+    fake_bin.write_text("#!/bin/sh\n")
+    fake_bin.chmod(0o755)
+    dest = tmp / "cron.d" / "cw-host"
+
+    common = [
+        "--user", "alice",
+        "--home", "/home/alice",
+        "--bin", str(fake_bin),
+        "--state-dir", str(tmp / "state"),
+        "--dest", str(dest),
+    ]
+
+    r = run([str(INSTALLER), "-n", *common])
+    check(r.returncode == 0, f"--dry-run exits 0 (got {r.returncode}: {r.stderr[-300:]})")
+    rendered = r.stdout
+    check("@CW_" not in rendered, "dry-run output has no leftover placeholders")
+    check("alice" in rendered, "dry-run output substituted @CW_USER@")
+    check(str(fake_bin) in rendered, "dry-run output substituted @CW_BIN@")
+    check(not dest.exists(), "dry-run wrote nothing to the destination")
+
+    # -------------------------------------------------------------------------
+    print("7. Real install writes a regular 0644 file matching the render")
+    # -------------------------------------------------------------------------
+    r = run([str(INSTALLER), *common])
+    check(r.returncode == 0, f"install exits 0 (got {r.returncode}: {r.stderr[-300:]})")
+    check(dest.is_file() and not dest.is_symlink(), "destination is a regular file, not a symlink")
+    if dest.is_file():
+        mode = dest.stat().st_mode & 0o777
+        check(mode == 0o644, f"destination mode is 0644 (got {oct(mode)})")
+        check(dest.read_text() == rendered, "installed content == dry-run render")
+
+    # -------------------------------------------------------------------------
+    print("8. Idempotent")
+    # -------------------------------------------------------------------------
+    first = dest.read_text() if dest.is_file() else ""
+    r = run([str(INSTALLER), *common])
+    check(r.returncode == 0, "second install exits 0")
+    check(dest.read_text() == first, "second install produces identical content")
+
+    # -------------------------------------------------------------------------
+    print("9. Guards")
+    # -------------------------------------------------------------------------
+    r = run([str(INSTALLER), "-n", "--user", "alice", "--bin", str(tmp / "nope"),
+             "--dest", str(dest)])
+    check(r.returncode == 2, f"missing binary without --force exits 2 (got {r.returncode})")
+
+    r = run([str(INSTALLER), "-n", "--force", "--user", "alice",
+             "--bin", str(tmp / "nope"), "--dest", str(dest)])
+    check(r.returncode == 0, "--force allows a not-yet-built binary")
+
+    r = run([str(INSTALLER), "-n", *common[:-2], "--dest", str(tmp / "cw.host")])
+    check(r.returncode == 2, "dotted destination basename is refused (cron ignores it)")
+
+    r = run([str(INSTALLER), "--bogus-flag"])
+    check(r.returncode == 2, "unknown flag exits 2")
+
+    r = run([str(INSTALLER), "-n", "--source", str(tmp / "missing"), *common])
+    check(r.returncode == 2, "missing template exits 2")
+
+    r = run([str(INSTALLER), "--help"])
+    check(r.returncode == 0 and "install-host-cron.sh" in r.stdout, "--help exits 0 with usage")
+
+# -----------------------------------------------------------------------------
+print("10. Makefile wiring")
+# -----------------------------------------------------------------------------
+mk = MAKEFILE.read_text()
+
+install_cron = re.search(r"^install-cron:.*?\n((?:\t.*\n|\n(?=\t))*)", mk, re.MULTILINE)
+check(install_cron is not None, "Makefile defines an `install-cron` target")
+if install_cron:
+    check(
+        "scripts/install-host-cron.sh" in install_cron.group(1),
+        "install-cron runs scripts/install-host-cron.sh",
+    )
+
+# The single-binary-identity guarantee the cron fragment relies on.
+deploy = re.search(r"^deploy-systemd:(.*)$", mk, re.MULTILINE)
+check(deploy is not None, "Makefile defines `deploy-systemd`")
+if deploy:
+    deps = deploy.group(1).split("##")[0]
+    check(
+        re.search(r"\binstall\b", deps) is not None,
+        "deploy-systemd depends on `install` ($BIN_DIR copy cannot go stale)",
+    )
+    check(
+        "install-skills" in deps,
+        "deploy-systemd still depends on install-skills",
+    )
+
+# `install` must keep copying the daemon (a symlink into target/ dangles on
+# `cargo clean`), and `deploy-systemd` depending on `install` is what keeps
+# that copy fresh.
+install_target = re.search(r"^install:.*?\n((?:\t.*\n|\n(?=\t))*)", mk, re.MULTILINE)
+check(install_target is not None, "Makefile defines an `install` target")
+if install_target:
+    check(
+        "install -m 0755 target/release/claude-watch" in install_target.group(1),
+        "install copies the daemon from target/release (not a symlink)",
+    )
+
+for target in ("install-cron", "test-install-host-cron"):
+    check(
+        re.search(rf"^\.PHONY:.*\b{target}\b", mk, re.MULTILINE) is not None,
+        f"{target} is declared .PHONY",
+    )
+
+# -----------------------------------------------------------------------------
+print("11. Shipped unit, installer default, and Makefile agree on the binary")
+# -----------------------------------------------------------------------------
+# WHAT THIS SECTION PROVES — AND, MORE IMPORTANTLY, WHAT IT DOES NOT
+#
+# The failure this guards against: cron and the systemd service exec DIFFERENT
+# claude-watch binaries. `claude_watch_build_info` is emitted from compile-time
+# constants, so the gauge describes whichever binary cron execs — not "the
+# running daemon". When the two drift, the metric keeps updating every minute,
+# nothing errors, and a dashboard confidently displays a build that is not the
+# one serving. That happened for two days in Aug 2026 and showed a 35-commit-
+# stale build; the only symptom was the number being wrong.
+#
+# THIS TEST RUNS IN CI, WHERE THERE IS NO DEPLOYMENT. There is no
+# /etc/cron.d/cw-host, no installed systemd unit, no running daemon, and no
+# built binary. So the ONLY thing assertable here is that the artifacts this
+# repo SHIPS are internally consistent — i.e. that a from-scratch install using
+# the shipped unit plus the shipped installer defaults would land both cron and
+# the service on one binary.
+#
+# It therefore does NOT prove, and must not be read as proving:
+#   - that any particular host's /etc/cron.d/cw-host matches that host's unit;
+#   - that the installed unit matches the in-tree claude-watch.service (an
+#     operator can edit ExecStart= in /etc/systemd/system and never re-run
+#     anything in this repo);
+#   - that the running daemon execs either path;
+#   - that claude_watch_build_info currently reports the truth anywhere.
+#
+# Post-install hand edits on a live host remain uncovered by anything in-repo.
+# The closest thing to coverage there is install-host-cron.sh's own runtime
+# cross-check of the resolved binary against `systemctl show -p ExecStart`,
+# which only fires when someone actually re-runs the installer. Detecting drift
+# that appears AFTER install needs something running on the host (compare the
+# unit's ExecStart to the cron row, or have the daemon and the metrics emitter
+# each report their own build id and alert on disagreement) — deliberately out
+# of scope for a repo-local test, because a repo-local test cannot see a host.
+#
+# What it does catch is the template-level version of the same mistake: someone
+# repointing ExecStart= at the $BIN_DIR copy, or changing the installer's
+# @CW_BIN@ default, and shipping a repo whose two halves disagree by
+# construction.
+
+check(SERVICE_UNIT.is_file(), "claude-watch.service exists in-tree")
+unit_text = SERVICE_UNIT.read_text() if SERVICE_UNIT.is_file() else ""
+
+# --- source A: the shipped unit's ExecStart -----------------------------------
+exec_match = re.search(r"^\s*ExecStart\s*=\s*(\S+)", unit_text, re.MULTILINE)
+check(exec_match is not None, "claude-watch.service defines ExecStart=")
+unit_exec = exec_match.group(1) if exec_match else ""
+
+# --- source B: what the installer's OWN DEFAULT resolves @CW_BIN@ to ----------
+# No --bin here on purpose: overriding it would make this test assert only that
+# sed works. --force so an unbuilt tree (the CI case) still renders, and --dest
+# into a tmpdir so nothing can point at the real /etc/cron.d even by accident;
+# -n writes nothing regardless.
+cron_bin = ""
+with tempfile.TemporaryDirectory() as td:
+    r = run([str(INSTALLER), "-n", "--force", "--dest", str(Path(td) / "cw-host")])
+    check(r.returncode == 0, f"default-render exits 0 (got {r.returncode}: {r.stderr[-300:]})")
+    default_rows = cron_rows(r.stdout)
+    check(len(default_rows) >= 2, "default render produced cron rows")
+
+    # Field layout of an /etc/cron.d row: 5 schedule fields, USER, then command.
+    # cron_rows() is intentionally loose (section 3 wants commented rows too),
+    # so it also picks up prose from the header; narrow to rows whose command
+    # is an absolute path to a file named claude-watch. If a future edit made
+    # the rendered path relative, or stopped naming the daemon, no row would
+    # survive this filter and the count check below fails loudly rather than
+    # passing vacuously on an empty set.
+    daemon_rows = [
+        f
+        for f in (row.split() for row in default_rows)
+        if len(f) > 6 and f[6].startswith("/") and Path(f[6]).name == "claude-watch"
+    ]
+    check(
+        len(daemon_rows) >= 2,
+        f"default render has absolute claude-watch cron rows (got {len(daemon_rows)})",
+    )
+    bins = {f[6] for f in daemon_rows}
+    check(len(bins) == 1, f"every cron row execs ONE binary (got {sorted(bins)})")
+    cron_bin = next(iter(bins)) if len(bins) == 1 else ""
+
+# The installer must resolve the binary inside the checkout it was run from.
+# If this fails, the default was changed to something outside the repo (~/bin,
+# /usr/local/bin, ...) — which is precisely the drift being guarded against.
+cron_rel = ""
+if cron_bin:
+    try:
+        cron_rel = str(Path(cron_bin).resolve().relative_to(REPO_ROOT.resolve()))
+    except ValueError:
+        cron_rel = ""
+    check(
+        bool(cron_rel),
+        f"installer's default @CW_BIN@ resolves inside the checkout (got {cron_bin})",
+    )
+
+# --- A vs B ------------------------------------------------------------------
+# Both sides are derived live, so this is a real comparison rather than each
+# being matched against the same hard-coded literal. The unit's path carries a
+# checkout prefix (systemd's %h + the conventional clone location) that CI
+# cannot know, so agreement is asserted on the checkout-relative tail.
+if cron_rel and unit_exec:
+    check(
+        unit_exec.endswith("/" + cron_rel),
+        f"unit ExecStart and cron template name the same checkout-relative "
+        f"binary (unit={unit_exec}, cron={cron_rel})",
+    )
+
+# --- C: the Makefile's install recipe ----------------------------------------
+# `install` copies FROM target/release/ TO $(BIN_DIR). Both cron and the unit
+# must name the copied-FROM path; naming the copied-TO path is the exact bug
+# (that copy is refreshed on its own schedule and is what went stale).
+copy = re.search(
+    r"^\s*@?install\s+-m\s+0755\s+(\S+)\s+(\S+)\s*$", mk, re.MULTILINE
+)
+check(copy is not None, "Makefile install recipe copies the daemon binary")
+if copy and cron_rel:
+    copied_from, copied_to = copy.group(1), copy.group(2)
+    check(
+        cron_rel == copied_from,
+        f"cron template names the build output `install` copies FROM "
+        f"({cron_rel} vs {copied_from})",
+    )
+    # $(BIN_DIR)/claude-watch with BIN_DIR ?= $(HOME)/bin is the on-PATH copy;
+    # expressed home-relative it is bin/claude-watch. The unit uses systemd's
+    # %h for the same home, so the two are comparable after stripping.
+    bin_dir = re.search(r"^BIN_DIR\s*\?=\s*(\S+)", mk, re.MULTILINE)
+    check(bin_dir is not None, "Makefile defines a BIN_DIR default")
+    if bin_dir and unit_exec.startswith("%h/"):
+        on_path_copy = copied_to.replace("$(BIN_DIR)", bin_dir.group(1))
+        on_path_rel = on_path_copy.replace("$(HOME)/", "")
+        check(
+            unit_exec[len("%h/"):] != on_path_rel,
+            f"unit ExecStart is NOT the on-PATH $BIN_DIR copy (both are "
+            f"{on_path_rel})",
+        )
+
+# -----------------------------------------------------------------------------
+print("12. Optional job enabling (--enable / CW_HOST_CRON_ENABLE / --list-optional)")
+# -----------------------------------------------------------------------------
+# Optional rows in cron.d/cw-host (a watchdog pair, session-store rotation,
+# the cw-agent-stats producer) ship commented out. Before --enable existed,
+# turning one on meant hand-editing the tracked template -- impossible on a
+# host that deploys from a read-only checkout of this repo (botchat
+# #3176-#3179). Each optional row is tagged with a `# optional: <job>` marker
+# on the line directly above it; --enable / $CW_HOST_CRON_ENABLE match against
+# that marker, not the command text, so they keep working even if a row's
+# command changes.
+
+MARKER_RE = re.compile(r"^# optional: (\S+)\s*$")
+markers = [m.group(1) for ln in text.splitlines() if (m := MARKER_RE.match(ln))]
+check(len(markers) >= 2, f"cron.d/cw-host has at least 2 `# optional:` markers (got {markers})")
+check(len(markers) == len(set(markers)), f"optional job names are unique (got {markers})")
+
+# Every marker must sit directly above a commented cron row -- that's the only
+# line the installer's uncomment step looks at.
+frag_lines = text.splitlines()
+for i, ln in enumerate(frag_lines):
+    m = MARKER_RE.match(ln)
+    if m and i + 1 < len(frag_lines):
+        nxt = frag_lines[i + 1].lstrip()
+        check(
+            nxt.startswith("#") and CRON_ROW_RE.match(nxt[1:].lstrip()) is not None,
+            f"marker {m.group(1)!r} is immediately followed by a commented cron row",
+        )
+
+
+def optional_row_commented(rendered: str, job: str) -> bool | None:
+    """True/False if `job`'s row is commented/uncommented in `rendered`;
+    None if the marker isn't present at all (a real test failure elsewhere)."""
+    lns = rendered.splitlines()
+    for i, ln in enumerate(lns):
+        if ln.strip() == f"# optional: {job}" and i + 1 < len(lns):
+            return lns[i + 1].lstrip().startswith("#")
+    return None
+
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    fake_bin = tmp / "claude-watch"
+    fake_bin.write_text("#!/bin/sh\n")
+    fake_bin.chmod(0o755)
+    dest = tmp / "cron.d" / "cw-host"
+    common = [
+        "--user", "alice",
+        "--home", "/home/alice",
+        "--bin", str(fake_bin),
+        "--state-dir", str(tmp / "state"),
+        "--dest", str(dest),
+    ]
+
+    # --list-optional: prints exactly the template's marker names, no install.
+    r = run([str(INSTALLER), "--list-optional"])
+    check(r.returncode == 0, f"--list-optional exits 0 (got {r.returncode})")
+    listed = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    check(
+        set(listed) == set(markers),
+        f"--list-optional lists exactly the template's markers (got {listed}, want {markers})",
+    )
+    check(not dest.exists(), "--list-optional installs nothing")
+
+    # Default: nothing enabled, every optional row stays commented.
+    r = run([str(INSTALLER), "-n", *common])
+    check(r.returncode == 0, "default dry-run exits 0")
+    for job in markers:
+        check(
+            optional_row_commented(r.stdout, job) is True,
+            f"default leaves {job!r} commented",
+        )
+
+    job_a = markers[0]
+    job_b = markers[1]
+
+    # Enable one job: its row uncomments, every other stays commented.
+    r = run([str(INSTALLER), "-n", *common, "--enable", job_a])
+    check(r.returncode == 0, f"--enable {job_a} exits 0")
+    check(optional_row_commented(r.stdout, job_a) is False, f"--enable {job_a} uncomments its row")
+    for job in markers:
+        if job != job_a:
+            check(optional_row_commented(r.stdout, job) is True, f"--enable {job_a} leaves {job!r} commented")
+
+    # Enable two jobs: repeated --enable and one comma-joined --enable agree.
+    r_repeat = run([str(INSTALLER), "-n", *common, "--enable", job_a, "--enable", job_b])
+    check(r_repeat.returncode == 0, "enabling two jobs via repeated --enable exits 0")
+    check(optional_row_commented(r_repeat.stdout, job_a) is False, f"repeated --enable uncomments {job_a!r}")
+    check(optional_row_commented(r_repeat.stdout, job_b) is False, f"repeated --enable uncomments {job_b!r}")
+
+    r_comma = run([str(INSTALLER), "-n", *common, "--enable", f"{job_a},{job_b}"])
+    check(r_comma.returncode == 0, "enabling two jobs via one comma-joined --enable exits 0")
+    check(r_comma.stdout == r_repeat.stdout, "comma-joined --enable matches repeated --enable")
+
+    # CW_HOST_CRON_ENABLE env var does the same as --enable.
+    env = dict(os.environ)
+    env["CW_HOST_CRON_ENABLE"] = job_a
+    r = run([str(INSTALLER), "-n", *common], env=env)
+    check(r.returncode == 0, "CW_HOST_CRON_ENABLE exits 0")
+    check(optional_row_commented(r.stdout, job_a) is False, "CW_HOST_CRON_ENABLE uncomments its job")
+
+    # Unknown job name: hard error listing the known optional jobs.
+    r = run([str(INSTALLER), "-n", *common, "--enable", "not-a-real-job"])
+    check(r.returncode == 2, f"unknown --enable job exits 2 (got {r.returncode})")
+    check("not-a-real-job" in r.stderr, "unknown job error names the bad job")
+    for job in markers:
+        check(job in r.stderr, f"unknown job error lists known job {job!r}")
+    check(not dest.exists(), "unknown --enable job installs nothing")
+
+    # A real (non-dry-run) install with --enable writes the uncommented row.
+    r = run([str(INSTALLER), *common, "--enable", job_a])
+    check(r.returncode == 0, f"real install with --enable {job_a} exits 0")
+    check(dest.is_file(), "real install with --enable still writes the destination")
+    if dest.is_file():
+        check(
+            optional_row_commented(dest.read_text(), job_a) is False,
+            "installed file has the enabled job's row uncommented",
+        )
+        for job in markers:
+            if job != job_a:
+                check(
+                    optional_row_commented(dest.read_text(), job) is True,
+                    f"installed file leaves {job!r} commented",
+                )
+
+# -----------------------------------------------------------------------------
+print()
+if failures:
+    print(f"{len(failures)} FAILURE(S):")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+print("All host-cron installer tests passed.")

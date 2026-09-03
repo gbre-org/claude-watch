@@ -42,6 +42,9 @@ class ClassifyOwnerStampTests(unittest.TestCase):
         os.environ["AGENTS_JSONL_ROOT"] = str(Path(cls.tmp) / "no-jsonl")
         os.environ["QUEUE_LOG_ARCHIVE_DIR"] = str(Path(cls.tmp) / "no-archive")
         os.environ["WORKLOAD_LOG_DIR"] = str(Path(cls.tmp) / "no-workloads")
+        os.environ["AGENT_QUEUE_BINDINGS_JSON"] = str(
+            Path(cls.tmp) / "no-bindings.json"
+        )
         sys.path.insert(0, str(HERE))
         import app as appmod  # noqa: E402
 
@@ -95,6 +98,60 @@ class ClassifyOwnerStampTests(unittest.TestCase):
         """No stamp and no record: the existing 'owner unknown' path."""
         item = {"id": "q-2026-08-11-e8cd"}
         owner = self.app._classify_owner(item, self.now, {})
+        self.assertEqual(owner["mode"], "unknown")
+        self.assertEqual(owner["agent_id"], "")
+
+    def test_binding_resolves_owner_when_state_misses(self):
+        """No qid record and no register-time stamp, but the arm-hook
+        binding (queue_id -> agent_id) attributes the owner. Liveness is
+        recovered from the agent's record keyed under its ORIGINAL qid."""
+        item = {"id": "q-2026-08-11-b0b0"}
+        agent_by_qid = {
+            "q-2026-08-11-orig": {
+                "agent_id": "abound0000000000",
+                "alive": True,
+                "jsonl_age_seconds": 9,
+            }
+        }
+        owner = self.app._classify_owner(
+            item, self.now, agent_by_qid,
+            {"q-2026-08-11-b0b0": "abound0000000000"},
+        )
+        self.assertEqual(owner["mode"], "agent")
+        self.assertEqual(owner["agent_id"], "abound0000000000")
+        self.assertTrue(owner["alive"])
+        self.assertEqual(owner["jsonl_age_seconds"], 9)
+        self.assertFalse(owner["is_starting"])
+
+    def test_binding_owner_absent_from_state_shows_owner_alive_none(self):
+        """Bound owner not (yet) in active-agents: surface the KNOWN owner
+        with alive=None (owner attributed, liveness ambiguous -- no orphan
+        badge), never the spurious 'owner unknown'."""
+        item = {"id": "q-2026-08-11-b0b0"}
+        owner = self.app._classify_owner(
+            item, self.now, {}, {"q-2026-08-11-b0b0": "aonlybind0000000"}
+        )
+        self.assertEqual(owner["mode"], "agent")
+        self.assertEqual(owner["agent_id"], "aonlybind0000000")
+        self.assertIsNone(owner["alive"])
+        self.assertFalse(owner["is_starting"])
+
+    def test_register_stamp_wins_over_binding(self):
+        """The register-time stamp is the more precise owner signal; when
+        both a stamp and a binding are present the stamp path wins (the
+        binding is only consulted as a later fallback)."""
+        item = {"id": "q-2026-08-11-e8cd", "agent_id": "astamped00000000"}
+        owner = self.app._classify_owner(
+            item, self.now, {}, {"q-2026-08-11-e8cd": "aotherbind000000"}
+        )
+        self.assertEqual(owner["mode"], "agent")
+        self.assertEqual(owner["agent_id"], "astamped00000000")
+
+    def test_no_binding_no_stamp_no_record_is_unknown(self):
+        """No record, no stamp, empty bindings -> the honest owner-unknown
+        (alertable-orphan) path is preserved."""
+        item = {"id": "q-2026-08-11-e8cd"}
+        owner = self.app._classify_owner(item, self.now, {}, {})
         self.assertEqual(owner["mode"], "unknown")
         self.assertEqual(owner["agent_id"], "")
 

@@ -21,7 +21,7 @@
 //! with up to TOP_N ids in the message body and the full id list in
 //! `data.all_ids`.
 //!
-//! Design parity with the gomorrah-host cron script
+//! Design parity with the reference-host cron script
 //! (`cron-queue-stale-ready`) so that consumers (main loop event
 //! routing, obligation registration) see the same shape regardless of
 //! emitter. Tag: `queue-stale-ready`. Source: `claude-watch`.

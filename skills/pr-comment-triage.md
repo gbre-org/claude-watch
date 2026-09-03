@@ -23,7 +23,7 @@ pr-watch surfaces PR issue-comments (comments on the PR conversation, not just r
    `env GH_CONFIG_DIR=<dir> gh api repos/<owner>/<repo>/issues/<n>/comments --paginate`.
    (Review/diff comments if in scope: `.../pulls/<n>/comments`.) Capture each comment's author, body, and node id (the node id is what `minimizeComment` needs).
 
-2. **Classify each comment by CONTENT — never hardcode an author as always-noise** (not even `sonarqube-as-a-service` or `sfci-gec-github-app`). Decision tree:
+2. **Classify each comment by CONTENT — never hardcode an author as always-noise** (not even `sonarqube-as-a-service` or a CI status-check bot app). Decision tree:
 
    - **Bare-status bot noise** → COLLAPSE. Pure "Quality Gate passed", build-status pings, superseded/duplicate status posts, consumed retrigger acks. No content beyond the status.
    - **Real signal — KEEP VISIBLE (and maybe act):**

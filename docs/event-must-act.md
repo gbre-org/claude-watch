@@ -14,9 +14,72 @@ entrypoint run; the evaluator script and CLIs live in `container/bin/`.
 ## Four-tier event-response model
 
 When `claude-event-watch` delivers events, each event is classified into
-one of four tiers based on its `source` and `tag` (see the mapping in
-`event-classify`'s `CLASSIFICATIONS` table; inspect with
-`event-classify --list-rules`).
+one of four tiers. **The producer is the source of truth**: an event
+source ships its own tier in the event's `data.tier`, and that decision is
+NOT duplicated in `event-classify`'s `CLASSIFICATIONS` table or in local
+config. The table is the FALLBACK for producers that ship nothing, plus a
+place for genuine consumer policy.
+
+### Classification precedence
+
+| # | Rung | Where it lives |
+|---|------|----------------|
+| 0 | EXCLUDED consumer policy — **absolute** | `CLASSIFICATIONS` (`signal/*` only) |
+| 1 | **User-side override** | `~/.config/claude-events/tier-overrides.json` |
+| 2 | **Producer-shipped tier** | the event's own `data.tier` |
+| 3 | `CLASSIFICATIONS` table — fallback | `event-classify` |
+| 4 | fail-LOUD default (`actionable`, marked `UNCLASSIFIED`) | `event-classify` |
+
+Inspect every rung with `event-classify --list-rules`.
+
+**Adding a new event source?** Prefer rung 2 — stamp `data.tier` on the
+event in the producer. Only add a `CLASSIFICATIONS` row when you do not
+control the producer. Duplicating a producer's decision in the table is a
+two-sources-of-truth bug.
+
+#### Producer-shipped tier (rung 2)
+
+A producer sets `data.tier` to `actionable` / `ambient` / `excluded`:
+
+```bash
+claude-event "PR #637: CI still RED" --tag pr-ci-red --source cron \
+    --data tier=actionable
+```
+
+`claude-event-watch` reads `data.tier` off the event and passes it to
+`event-ack ingest --tier`, which hands it to `event-classify`. An invalid
+value (a typo, or a severity word like `high` — that is the separate
+top-level `priority` field) is IGNORED, and the event falls through to the
+table rather than being mis-routed.
+
+#### User-side overrides (rung 1)
+
+The operator can re-tier any event **without editing the producer and
+without editing `event-classify`**. Overrides outrank the producer.
+
+The file is OPTIONAL and never auto-created; absent means no overrides.
+Path: `$EVENT_CLASSIFY_OVERRIDES`, else
+`~/.config/claude-events/tier-overrides.json`.
+
+```json
+{"overrides": [
+  {"source": "cron", "tag": "pr-ci-red", "tier": "ambient",
+   "reason": "I watch PRs myself; the nudge is noise"},
+  {"source": "*", "tag": "pr-status-change", "contains": "merged",
+   "tier": "ambient"}
+]}
+```
+
+- `source` / `tag` — exact, `*`, or `prefix*`. Default `*`.
+- `contains` — OPTIONAL message substring narrowing the rule. Data, not
+  code: operator config never executes a predicate.
+- `tier` — `actionable` | `ambient` | `excluded` (required).
+- First match wins. A malformed file is ignored **wholesale** (default-open
+  — a typo must never break routing or half-apply); `--list-rules` prints
+  the parse error.
+
+An override can move anything **to** `excluded`, but cannot pull a
+`signal/*` event **out** of it: rung 0 stays absolute.
 
 ### Tier 1 — Ambient (info-only, context-inject only)
 
@@ -67,13 +130,45 @@ inbound is acked via `signal-ack`.
 
 ### Tier 4 — Unknown (defaults to ACTIONABLE — fail-LOUD)
 
-Any event whose `(source, tag)` pair doesn't match a rule in the
-`event-classify` table falls through to the default tier, which is now
-**actionable** (flipped from ambient). Fail-LOUD posture — a genuinely
-unknown event must be handled or get a classifier rule, never silently
-swallowed as context. Every deliberately-ambient pair already has an
-explicit rule above the catch-alls, so only TRULY-unmatched pairs hit
-this default.
+An event whose `(source, tag)` pair matches no rule in the
+`event-classify` table **and** whose producer shipped no `data.tier`
+falls through to the default tier, which is **actionable**. Fail-LOUD
+posture — a genuinely unknown event must be handled or get a
+classification, never silently swallowed as context. Every
+deliberately-ambient pair already has an explicit rule above the
+catch-alls, so only TRULY-unmatched pairs hit this default.
+
+#### The "add a rule" signal
+
+A fall-through is a **missing classification**, not a mystery gate, so it
+is surfaced as one. Such an event is marked `unclassified` in
+`pending-actions.json` and the `event-must-act` deny banner renders it
+distinctly:
+
+```
+Pending events:
+  - torrent-completed:Some.Release.mkv
+  - novel-tag:something new  [UNCLASSIFIED]
+
+NOTE: 1 of the above are [UNCLASSIFIED] -- they matched no rule in
+event-classify's CLASSIFICATIONS table AND their producer shipped no
+`data.tier`, so they hit the fail-loud ACTIONABLE default. Acking clears
+the event, NOT the cause -- the next one lands here too. Fix the
+classification (in preference order):
+  1. PREFERRED - have the PRODUCER stamp `data.tier=actionable|ambient`
+     on the event. Classification belongs with the source, not here.
+  2. Add a rule to CLASSIFICATIONS in tools/event-must-act/event-classify.
+  3. Add a user-side override (outranks the producer):
+     ~/.config/claude-events/tier-overrides.json
+
+  Inspect the current rules: event-classify --list-rules
+  Unclassified (source/tag): novel-source/novel-tag
+```
+
+This is **observability only** — the fail-loud ACTIONABLE default is
+deliberate and unchanged. Acking an unclassified event clears that event
+but not the cause; the next one lands in the same place until the
+classification is fixed.
 
 ## Workflow
 
@@ -157,6 +252,87 @@ container image:
   Dockerfile.
 - `tools/event-must-act/user-prompt-ambient-inject-hook` drains the ambient
   queue on every `UserPromptSubmit`.
+
+### Non-container (systemd host) install
+
+The four scripts above are deployment-agnostic — all their state lives
+under `~/.config/claude-events/` (override with `$CLAUDE_EVENT_STATE_DIR`)
+— so a host deployment uses the exact same copies rather than a fork.
+`make install` symlinks them (plus `obligations-init`) into `$BIN_DIR`
+(default `~/bin`).
+
+Two things differ from the container and both are easy to get silently
+wrong:
+
+1. **The evaluator path.** The seeded row stores an absolute `cmd`. On a
+   host that is `$BIN_DIR/eval-event-must-act`, not the baked
+   `/usr/local/bin/...`. Export `CW_EVAL_BIN_DIR` before seeding.
+   Getting this wrong fails **open and silently**: the `evaluator`
+   predicate allows on spawn error, so the row exists, `obligations list`
+   shows it, and it enforces nothing.
+2. **Seed one row, not all of them.** Bare `obligations-init` seeds every
+   default row — right for a fresh container, wrong for switching on one
+   gate on a host that is already running, where the other rows become
+   live gates on the next tool call. Use `--only`.
+
+```sh
+make install                                   # symlinks into ~/bin
+export CW_EVAL_BIN_DIR="$HOME/bin"
+obligations-init --only event_must_act -n      # inspect the exact add
+obligations-init --only event_must_act -v      # then seed it
+```
+
+Verify the row actually points somewhere real, rather than trusting that
+it was seeded:
+
+```sh
+obligations list --json \
+  | python3 -c 'import json,sys,os;
+rows=[o for o in json.load(sys.stdin)["obligations"]
+      if o.get("deny_message")=="[default-seed] event_must_act"]
+print(rows and os.access(
+    rows[0]["predicate_params"]["predicates"][1]["params"]["cmd"], os.X_OK))'
+```
+
+`claude-event-watch` auto-ingests every delivered event through
+`event-ack ingest` (disable with `CLAUDE_EVENT_WATCH_AUTO_INGEST=0`), and
+it resolves the CLI by `command -v` at startup — so ingestion begins on
+the first watcher run after `event-ack` lands on `PATH`, which is
+typically **before** you seed the row. Check `event-ack list` (and
+`event-ack clear` if a backlog accumulated) immediately before seeding,
+or the gate denies on its very first evaluation.
+
+Note that `keepalive` is classified **actionable**, so on a host that emits
+it the gate is what forces the loop to clear the pending entry. The
+clear-path is the same one used for every batch:
+
+```sh
+event-ack ack-batch --override-reason "<why>"
+```
+
+`--override-reason` is **mandatory** (mirrors `obligations override`'s
+mandatory-reason escape hatch): a bare batch-ack was being used to
+reflexively bypass the per-event actionable-gate instead of reading each
+event, so `ack-batch` now REFUSES (exit 2, nothing acked) without a
+non-empty reason. It is audited to `<state-dir>/ack-batch-audit.log`
+(timestamp, pid, reason, acked keys) every time it fires. Given a reason,
+it acks every pending entry, resets the N-counter, and stamps
+`last-ack-timestamp` -- whose age is claude-watch's liveness signal (`[ack]
+stale_minutes`). `event-ack` is exempt in this evaluator (and in
+`pre-tool-dispatch-gate-hook`), and `event-ack ack-batch` specifically is
+hardcoded-ALLOWed in `pre-tool-obligations-gate-hook` regardless of its
+flags -- the AST matcher only cares that `ack-batch` is the sole non-flag
+operand, so `--override-reason "<why>"` (a flag+value, same as the
+pre-existing `--action`) doesn't affect that exemption -- so the command
+that discharges the event can never be the command a gate denies.
+
+Two things this replaced, both retired: a `heartbeat-ack` wrapper (gone
+2026-08-21, once a plain ack was enough) and a `touch
+/var/run/claude/heartbeat` fallback (gone 2026-08-22 with the file itself).
+The per-key `event-ack ack "<key>" --action "..."` still exists for the case
+where you handled part of a batch and want the rest left pending.
+
+### Container redeploy
 
 To pick up changes to any of the above on workbot, rebuild and
 redeploy the container:

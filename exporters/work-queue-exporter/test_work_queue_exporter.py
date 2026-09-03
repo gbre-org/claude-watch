@@ -21,12 +21,54 @@ Scenarios covered:
       jsonl_age_seconds).
   (7) ready_age + status counts still emit normally regardless of
       agent state.
+  (23) container-spawned agent: no pid, owner named only by the
+      register-time `agent_id` stamp, active-agents record keyed under
+      a DIFFERENT qid -> has_live_owner=1 with agent_id populated;
+      stale stamped owner -> 0; unresolved stamp -> presumed alive;
+      the stamp outranks a disagreeing arm-hook binding.
+  (24) in-flight tool call (alive=true with a 443s transcript, the
+      post-#690 shape) -> has_live_owner=1; liveness is read from
+      `alive`, never re-derived from the transcript age and never
+      from a pid.
+  (25) BOTH owner inputs unreadable (a container missing its bind
+      mounts) -> loud warning naming each path + env var,
+      worktask_queue_owner_input_available=0 for each, and
+      has_live_owner ABSENT rather than 0 for every running item.
+      One readable input is enough to keep the orphan fallback live.
+  (27) owner-unknown: a running item nobody can be attributed to
+      emits worktask_queue_item_owner_unknown_age_seconds even with a
+      FRESH heartbeat (the case has_live_owner's staleness gate
+      misses); an active-agents record, a register/assign `agent_id`
+      stamp, a `workload:`/`hostjob:` scope token, an explicit pid,
+      and blocked status all exempt it; suppressed with no readable
+      owner input; the count series is always emitted and resets
+      between scrapes.
+  (28) agent runs lost to upstream API errors, read from the per-item
+      transcript archives: a three-death archive reads 3 with
+      model="unknown" (the run never produced a real assistant turn, so
+      the model is genuinely unrecoverable and is NOT guessed); a
+      one-death archive whose run did produce turns has its model
+      recovered, in either file order; a clean archive is absent
+      entirely; transient (529 / mid-response server error) and
+      non-transient (over-long prompt) deaths land in separate counter
+      series; re-scraping does not double-count and a GROWN archive adds
+      only its new death; the scan window excludes old archives and a
+      wider window brings them back; an unreadable archive dir reads
+      input_available=0 with archives_scanned=0 and NO per-item series
+      rather than a confident zero; quarantined items get an age gauge
+      that clears when they leave quarantine.
+  (26) build identity: worktask_exporter_build_info carries the
+      env-provided commit/version/source, falls back to
+      commit="unknown"/version="0.0.0"/source="host" when nothing
+      stamps the build, is stamped at IMPORT (present before any
+      collect()), and never emits more than one series.
 
 Run:  python3 test_work_queue_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
 """
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -38,12 +80,34 @@ from importlib.util import spec_from_file_location, module_from_spec
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+# Build-identity vars are handled differently from the path vars below: a
+# scenario that omits them is ASSERTING they are unset (the "unknown"
+# fallback case is exactly that), so they must be actively removed rather
+# than inherited from whatever the developer's shell or the CI runner
+# happens to export. The path vars keep their existing set-only behaviour.
+BUILD_ENV_KEYS = (
+    "WORKTASK_EXPORTER_COMMIT",
+    "WORKTASK_EXPORTER_VERSION",
+    "WORKTASK_EXPORTER_SOURCE",
+)
+
+
 def load_exporter(env):
     """Reload the exporter module under a fresh env so module-level
     config constants pick up our overrides."""
     saved = {}
-    for k in ("PORT", "QUEUE_JSON", "AGENT_STATE_JSON"):
+    for k in (
+        "PORT",
+        "QUEUE_JSON",
+        "AGENT_STATE_JSON",
+        "AGENT_QUEUE_BINDINGS_JSON",
+        "QUEUE_LOG_ARCHIVE_DIR",
+        "API_DEATH_WINDOW_DAYS",
+    ) + BUILD_ENV_KEYS:
         saved[k] = os.environ.get(k)
+    for k in BUILD_ENV_KEYS:
+        if k not in env:
+            os.environ.pop(k, None)
     for k, v in env.items():
         os.environ[k] = v
     try:
@@ -81,6 +145,85 @@ def write_agent_state(path, agents, *, subagents=None, workloads=None):
         json.dump(payload, f)
 
 
+def write_bindings(path, qid_to_aid):
+    """Write an arm-hook agent-queue-bindings.json (agent_id -> record).
+
+    Input is a queue_id -> agent_id map (the owner relation); we emit the
+    on-disk shape post-tool-agent-arm-hook writes, keyed by agent_id with a
+    monotonically-increasing registered_at so newest-wins is deterministic.
+    """
+    bindings = {}
+    for i, (qid, aid) in enumerate(qid_to_aid.items()):
+        bindings[aid] = {"queue_id": qid, "registered_at": 1000 + i}
+    with open(path, "w") as f:
+        json.dump({"bindings": bindings}, f)
+
+
+def api_error_line(status, *, error="server_error", ts="2026-09-03T14:09:01.710Z"):
+    """One archived transcript line for a run killed by an upstream API error.
+
+    Mirrors the real shape: the message is composed CLIENT-side when the API
+    call fails, so its `model` reads `<synthetic>` and carries no information
+    about which model the dead run was using. Tests that assert model
+    attribution depend on that being true here.
+    """
+    rec = {
+        "type": "assistant",
+        "isSidechain": True,
+        "timestamp": ts,
+        "isApiErrorMessage": True,
+        "error": error,
+        "message": {
+            "role": "assistant",
+            "model": "<synthetic>",
+            "content": [{"type": "text", "text": f"API Error: {status}"}],
+        },
+    }
+    if status is not None:
+        rec["apiErrorStatus"] = status
+    return rec
+
+
+def assistant_line(model, ts="2026-09-03T14:08:00.000Z"):
+    """An ordinary assistant turn — the ONLY place a real model name appears."""
+    return {
+        "type": "assistant",
+        "isSidechain": True,
+        "timestamp": ts,
+        "message": {
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": "working"}],
+        },
+    }
+
+
+def user_line(text="continue", ts="2026-09-03T14:08:30.000Z"):
+    return {
+        "type": "user",
+        "isSidechain": True,
+        "timestamp": ts,
+        "message": {"role": "user", "content": text},
+    }
+
+
+def write_archive(archive_dir, qid, records, *, age_days=0):
+    """Write `<archive_dir>/<qid>.jsonl` from a list of record dicts.
+
+    `age_days` backdates the file mtime, which is what the exporter's scan
+    window filters on.
+    """
+    os.makedirs(archive_dir, exist_ok=True)
+    path = os.path.join(archive_dir, f"{qid}.jsonl")
+    with open(path, "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    if age_days:
+        old = time.time() - age_days * 86400
+        os.utime(path, (old, old))
+    return path
+
+
 def find_sample(mod, metric_name, label_filters):
     for fam in mod.REG.collect():
         if fam.name != metric_name:
@@ -94,6 +237,26 @@ def find_sample(mod, metric_name, label_filters):
                     ok = False
                     break
             if ok:
+                return sample.value
+    return None
+
+
+def find_counter(mod, family_name, label_filters):
+    """Return a Counter's `_total` sample value, else None.
+
+    `find_sample` cannot do this: prometheus_client names a counter FAMILY
+    without the suffix (`worktask_queue_agent_api_deaths`) while the sample
+    it exposes carries it (`..._total`), so the family==sample equality
+    that helper relies on never holds for a counter.
+    """
+    want = family_name + "_total"
+    for fam in mod.REG.collect():
+        if fam.name != family_name:
+            continue
+        for sample in fam.samples:
+            if sample.name != want:
+                continue
+            if all(sample.labels.get(k) == v for k, v in label_filters.items()):
                 return sample.value
     return None
 
@@ -170,9 +333,18 @@ def run_scenarios():
     qjson = os.path.join(tmpdir, "queue.json")
     astate = os.path.join(tmpdir, "active-agents.json")
 
+    # Every scenario gets an EMPTY archive dir by default. Left unset, the
+    # exporter would derive it from QUEUE_JSON's directory, find nothing, and
+    # log the unreadable-input warning through scenarios that are about
+    # something else entirely — so point it at a real, empty directory and let
+    # scenario 28 populate its own.
+    archives = os.path.join(tmpdir, "queue-logs")
+    os.makedirs(archives, exist_ok=True)
+
     env = {
         "QUEUE_JSON": qjson,
         "AGENT_STATE_JSON": astate,
+        "QUEUE_LOG_ARCHIVE_DIR": archives,
         "PORT": "9099",
     }
 
@@ -845,6 +1017,823 @@ def run_scenarios():
         v is None,
         "expected None, got " + repr(v),
     )
+
+    # ---- Scenario 20: arm-hook binding + live agent under a DIFFERENT qid.
+    # A running item whose owning Agent is bound (arm-hook wrote a
+    # queue_id -> agent_id binding) but whose active-agents record is keyed
+    # under the agent's ORIGINAL spawn qid (not this item's qid) -- e.g. a
+    # SendMessage-rotated qid, or active-agents lag. Without the binding
+    # consult this item has NO record for its qid + a stale heartbeat, so it
+    # would false-orphan (has_live_owner=0). The binding resolves the owner
+    # by agent_id and reflects its LIVE flag: has_live_owner=1, no orphan.
+    print("\nScenario 20: bound owner (live) under a different qid -> owned, no orphan")
+    bpath = os.path.join(tmpdir, "bindings-s20.json")
+    stale_iso = (datetime.now(timezone.utc) - timedelta(seconds=1200)).isoformat()
+    item = make_running_item("q-bind20", "bound live different qid")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-b20", "queue_id": "q-orig20",
+        "alive": True, "jsonl_age_seconds": 7,
+    }])
+    write_bindings(bpath, {"q-bind20": "agent-b20"})
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": bpath})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind20", "agent_id": "agent-b20"},
+    )
+    check("S20 bound live owner has_live_owner == 1", v == 1.0, "got " + repr(v))
+    age = find_sample(
+        mod, "worktask_queue_item_agent_jsonl_age_seconds",
+        {"id": "q-bind20", "agent_id": "agent-b20"},
+    )
+    check("S20 bound owner jsonl_age emitted", age == 7.0, "got " + repr(age))
+    v_empty = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind20", "agent_id": ""},
+    )
+    check("S20 no false empty-agent orphan series", v_empty is None,
+          "expected None, got " + repr(v_empty))
+
+    # ---- Scenario 21: bound owner whose transcript went STALE (died).
+    # Binding resolves to an agent_id whose active-agents record is alive=0:
+    # a genuine died-after-spawn orphan -> has_live_owner=0 WITH the agent_id.
+    print("\nScenario 21: bound owner (dead transcript) -> orphan with agent_id")
+    bpath = os.path.join(tmpdir, "bindings-s21.json")
+    item = make_running_item("q-bind21", "bound dead")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-b21", "queue_id": "q-orig21",
+        "alive": False, "jsonl_age_seconds": 900,
+    }])
+    write_bindings(bpath, {"q-bind21": "agent-b21"})
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": bpath})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind21", "agent_id": "agent-b21"},
+    )
+    check("S21 bound dead owner has_live_owner == 0", v == 0.0, "got " + repr(v))
+
+    # ---- Scenario 22: bound owner NOT resolvable in active-agents.
+    # A binding proves an agent was spawned, but no active-agents record
+    # carries that agent_id yet (poll lag / between transcript writes). Even
+    # with a stale heartbeat we presume alive (emit 1) rather than
+    # false-orphan -- the honest "owner known, liveness ambiguous" posture.
+    # Contrast S19a (NO binding + stale -> 0).
+    print("\nScenario 22: bound owner unresolved in active-agents -> presume alive")
+    bpath = os.path.join(tmpdir, "bindings-s22.json")
+    item = make_running_item("q-bind22", "bound unresolved")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    write_bindings(bpath, {"q-bind22": "agent-b22"})
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": bpath})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind22", "agent_id": "agent-b22"},
+    )
+    check("S22 bound-unresolved presume alive has_live_owner == 1", v == 1.0,
+          "got " + repr(v))
+    v_empty = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind22", "agent_id": ""},
+    )
+    check("S22 no false empty-agent orphan series", v_empty is None,
+          "expected None, got " + repr(v_empty))
+
+    # ---- Scenario 23: container-spawned agent -- register-time agent_id
+    # stamp, NO pid on the item, active-agents record keyed under a
+    # DIFFERENT qid. This is the shape that produced the reported bug:
+    # has_live_owner=0 with agent_id="" for an agent the minisite showed
+    # alive. The stamp is the minisite's step-2 owner signal and the
+    # exporter now honours it too.
+    print("\nScenario 23: register-time agent_id stamp -> owned (container agent)")
+
+    # 23a: stamped owner, live record under another qid -> 1 with agent_id.
+    stale_iso = (datetime.now(timezone.utc) - timedelta(seconds=1200)).isoformat()
+    item = make_running_item("q-stamp23", "container agent, stamped owner")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    item["pid"] = None  # container-spawned: no resolvable pid, by design
+    item["agent_id"] = "agent-c23"
+    item["agent_id_source"] = "register"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-c23", "queue_id": "q-orig23",
+        "alive": True, "jsonl_age_seconds": 12,
+    }])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23", "agent_id": "agent-c23"},
+    )
+    check("S23a stamped live owner has_live_owner == 1", v == 1.0, "got " + repr(v))
+    age = find_sample(
+        mod, "worktask_queue_item_agent_jsonl_age_seconds",
+        {"id": "q-stamp23", "agent_id": "agent-c23"},
+    )
+    check("S23a stamped owner jsonl_age emitted", age == 12.0, "got " + repr(age))
+    v_empty = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23", "agent_id": ""},
+    )
+    check("S23a no false empty-agent orphan series", v_empty is None,
+          "expected None, got " + repr(v_empty))
+
+    # 23b: stamped owner whose record went stale -> genuine orphan, WITH id.
+    item = make_running_item("q-stamp23b", "stamped owner died")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    item["agent_id"] = "agent-c23b"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-c23b", "queue_id": "q-orig23b",
+        "alive": False, "jsonl_age_seconds": 1500,
+    }])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23b", "agent_id": "agent-c23b"},
+    )
+    check("S23b stale stamped owner has_live_owner == 0", v == 0.0,
+          "got " + repr(v))
+
+    # 23c: stamped owner absent from active-agents -> presume alive (1).
+    item = make_running_item("q-stamp23c", "stamped owner unresolved")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    item["agent_id"] = "agent-c23c"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23c", "agent_id": "agent-c23c"},
+    )
+    check("S23c unresolved stamped owner presumed alive == 1", v == 1.0,
+          "got " + repr(v))
+
+    # 23d: stamp BEATS a disagreeing binding (minisite precedence order).
+    bpath = os.path.join(tmpdir, "bindings-s23d.json")
+    item = make_running_item("q-stamp23d", "stamp beats binding")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    item["agent_id"] = "agent-stamped23d"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [
+        {"agent_id": "agent-stamped23d", "queue_id": "q-o1",
+         "alive": True, "jsonl_age_seconds": 5},
+        {"agent_id": "agent-bound23d", "queue_id": "q-o2",
+         "alive": False, "jsonl_age_seconds": 1500},
+    ])
+    write_bindings(bpath, {"q-stamp23d": "agent-bound23d"})
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": bpath})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23d", "agent_id": "agent-stamped23d"},
+    )
+    check("S23d stamp wins over binding (== 1)", v == 1.0, "got " + repr(v))
+    v_bound = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23d", "agent_id": "agent-bound23d"},
+    )
+    check("S23d binding-derived series not emitted", v_bound is None,
+          "expected None, got " + repr(v_bound))
+
+    # ---- Scenario 24: liveness comes from `alive`, NOT transcript age.
+    # Post-#690 an agent inside one long foreground tool call publishes
+    # alive=true with a many-minute-old transcript (in_flight_tool_use).
+    # The exporter must mirror `alive` and never re-derive it from the age.
+    print("\nScenario 24: in-flight tool call (old transcript, alive=true) -> owned")
+    item = make_running_item("q-inflight24", "agent inside a long tool call")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-i24", "queue_id": "q-inflight24",
+        "alive": True, "jsonl_age_seconds": 443, "in_flight_tool_use": True,
+    }])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-inflight24", "agent_id": "agent-i24"},
+    )
+    check("S24 in-flight agent has_live_owner == 1", v == 1.0, "got " + repr(v))
+    age = find_sample(
+        mod, "worktask_queue_item_agent_jsonl_age_seconds",
+        {"id": "q-inflight24", "agent_id": "agent-i24"},
+    )
+    check("S24 stale transcript age still exported", age == 443.0,
+          "got " + repr(age))
+
+    # ---- Scenario 25: owner inputs ABSENT -> warning + metric absent, not 0.
+    # A container that never got its bind mounts sees neither input. Every
+    # running item then looks ownerless, and the old code flagged the whole
+    # queue orphaned. Now: has_live_owner is ABSENT, both
+    # owner_input_available series read 0, and a WARNING names each path.
+    print("\nScenario 25: both owner inputs missing -> warn + suppress orphan gauge")
+    missing_bindings = os.path.join(tmpdir, "no-such-bindings.json")
+    item = make_running_item("q-noinput25", "stale item, no owner inputs")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    if os.path.exists(astate):
+        os.remove(astate)
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": missing_bindings})
+    warnings = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                warnings.append(record.getMessage())
+
+    mod.log.addHandler(_Capture())
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-noinput25")
+    check(
+        "S25 has_live_owner ABSENT (not 0) with no owner inputs",
+        v is None,
+        "expected None, got " + repr(v),
+    )
+    st = find_sample(
+        mod, "worktask_queue_owner_input_available", {"input": "agent_state"},
+    )
+    check("S25 owner_input_available{agent_state} == 0", st == 0.0,
+          "got " + repr(st))
+    bd = find_sample(
+        mod, "worktask_queue_owner_input_available",
+        {"input": "agent_queue_bindings"},
+    )
+    check("S25 owner_input_available{agent_queue_bindings} == 0", bd == 0.0,
+          "got " + repr(bd))
+    check(
+        "S25 loud warning names both inputs",
+        sum("OWNER-ATTRIBUTION INPUT" in w for w in warnings) == 2,
+        "warnings=" + repr(warnings),
+    )
+    check(
+        "S25 warning names the state path",
+        any(astate in w for w in warnings),
+        "warnings=" + repr(warnings),
+    )
+    # Repeat scrape: state unchanged -> no NEW warnings (loud once, not spam).
+    before = len(warnings)
+    mod.collect()
+    check("S25 repeat scrape does not re-warn", len(warnings) == before,
+          "warnings grew to " + repr(warnings))
+
+    # 25b: ONE input readable is enough -- the orphan fallback still works.
+    print("\nScenario 25b: agent-state readable, bindings missing -> orphan still fires")
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": missing_bindings})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-noinput25", "agent_id": ""},
+    )
+    check("S25b orphan still detected with one readable input", v == 0.0,
+          "got " + repr(v))
+    st = find_sample(
+        mod, "worktask_queue_owner_input_available", {"input": "agent_state"},
+    )
+    check("S25b owner_input_available{agent_state} == 1", st == 1.0,
+          "got " + repr(st))
+
+    # 25c: MALFORMED agent state + missing bindings -> same suppression.
+    print("\nScenario 25c: malformed agent state -> treated as no signal")
+    with open(astate, "w") as f:
+        f.write("{not json at all")
+    write_queue(qjson, [item])
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": missing_bindings})
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-noinput25")
+    check("S25c malformed state -> has_live_owner absent", v is None,
+          "expected None, got " + repr(v))
+    st = find_sample(
+        mod, "worktask_queue_owner_input_available", {"input": "agent_state"},
+    )
+    check("S25c owner_input_available{agent_state} == 0 on malformed", st == 0.0,
+          "got " + repr(st))
+    # Restore a good state file for anything appended after this point.
+    write_agent_state(astate, [])
+
+    # ---- Scenario 26: exporter build identity.
+    #
+    # The metric answers "is the exporter I am scraping the commit I think it
+    # is", so the two cases that matter are (a) a stamped build reports
+    # exactly what it was stamped with, and (b) an UNstamped build still
+    # publishes a series -- absence has to keep meaning "exporter too old to
+    # have this metric" and nothing else.
+    print("\nScenario 26: build identity gauge")
+    write_queue(qjson, [])
+    write_agent_state(astate, [])
+
+    mod = load_exporter({
+        **env,
+        "WORKTASK_EXPORTER_COMMIT": "deadbee",
+        "WORKTASK_EXPORTER_VERSION": "1.2.3",
+        "WORKTASK_EXPORTER_SOURCE": "image",
+    })
+    # Deliberately BEFORE collect(): build identity is stamped at import, so
+    # the deploy question stays answerable on a scrape whose collect() bails.
+    v = find_sample(
+        mod, "worktask_exporter_build_info",
+        {"commit": "deadbee", "version": "1.2.3", "source": "image"},
+    )
+    check("S26 build_info == 1 with env-provided labels (pre-collect)",
+          v == 1.0, "got " + repr(v))
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_exporter_build_info",
+        {"commit": "deadbee", "version": "1.2.3", "source": "image"},
+    )
+    check("S26 build_info survives a collect()", v == 1.0, "got " + repr(v))
+    n = sum(
+        1
+        for fam in mod.REG.collect()
+        if fam.name == "worktask_exporter_build_info"
+        for sample in fam.samples
+        if sample.name == "worktask_exporter_build_info"
+    )
+    check("S26 exactly one build_info series", n == 1, "got " + repr(n))
+
+    # 26b: nothing stamped -> the series is STILL emitted, carrying the
+    # unambiguous sentinel rather than being dropped.
+    print("\nScenario 26b: unstamped build -> commit=unknown, series present")
+    mod = load_exporter(env)
+    v = find_sample(
+        mod, "worktask_exporter_build_info",
+        {"commit": "unknown", "version": "0.0.0", "source": "host"},
+    )
+    check("S26b build_info == 1 with unknown/0.0.0/host fallback",
+          v == 1.0, "got " + repr(v))
+    got = (mod.EXPORTER_COMMIT, mod.EXPORTER_VERSION, mod.EXPORTER_SOURCE)
+    check("S26b module constants match the fallback",
+          got == ("unknown", "0.0.0", "host"), "got " + repr(got))
+
+    # 26c: an EMPTY build arg reaches the container as an empty ENV, not an
+    # absent one. It must fall through to the sentinel exactly like an unset
+    # var -- otherwise a host-side commit lookup that came back empty would
+    # ship an image advertising commit="" as though that were an identity.
+    print("\nScenario 26c: empty build args -> same sentinel fallback")
+    mod = load_exporter({
+        **env,
+        "WORKTASK_EXPORTER_COMMIT": "",
+        "WORKTASK_EXPORTER_VERSION": "   ",
+        "WORKTASK_EXPORTER_SOURCE": "",
+    })
+    v = find_sample(
+        mod, "worktask_exporter_build_info",
+        {"commit": "unknown", "version": "0.0.0", "source": "host"},
+    )
+    check("S26c empty/whitespace env falls back to the sentinel",
+          v == 1.0, "got " + repr(v))
+
+    # ---- Scenario 27: owner-unknown gauges.
+    #
+    # OWNER-UNKNOWN is a different failure from ORPHANED and needs its own
+    # signal. Orphaned = a KNOWN owner is gone (has_live_owner=0 on a named
+    # or once-named agent). Owner-unknown = the item is running and NOBODY
+    # can be named for it -- the "queue entry meant for an agent that never
+    # got one assigned" case, and the resumed-agent case where the owner
+    # stamp was never retrofitted.
+    #
+    # The load-bearing difference from the never-spawned-orphan branch
+    # (Scenario 19) is the ABSENCE of a staleness precondition: that branch
+    # requires a heartbeat older than ORPHAN_HEARTBEAT_STALE_SECONDS, so an
+    # item heartbeating happily while belonging to nobody never trips it.
+    # 27a is exactly that item.
+    print("\nScenario 27: owner-unknown gauges")
+
+    ou_stale_iso = (
+        datetime.now(timezone.utc) - timedelta(seconds=1200)
+    ).isoformat()
+    ou_fresh_iso = datetime.now(timezone.utc).isoformat()
+
+    # 27a: running, no owner, registered long ago, heartbeat FRESH.
+    # has_live_owner stays silent (correctly -- the heartbeat is fresh);
+    # owner_unknown_age fires anyway, which is the whole point.
+    item = make_running_item("q-s27a", "live but ownerless")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    item["last_heartbeat_at"] = ou_fresh_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27a",
+    )
+    check(
+        "S27a owner_unknown_age emitted despite a FRESH heartbeat",
+        age is not None and age > 1100,
+        "got " + repr(age),
+    )
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-s27a")
+    check(
+        "S27a has_live_owner still absent (fresh heartbeat) -- the gap this closes",
+        v is None,
+        "expected None, got " + repr(v),
+    )
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27a owner_unknown_items == 1", n == 1.0, "got " + repr(n))
+
+    # 27b: an item with an active-agents record has an owner -> silent.
+    item = make_running_item("q-s27b", "owned by a live agent")
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "aowner0000000000",
+        "queue_id": "q-s27b",
+        "alive": True,
+        "jsonl_age_seconds": 3,
+    }])
+    mod = load_exporter(env)
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27b",
+    )
+    check("S27b owned item emits no owner_unknown_age", age is None,
+          "expected None, got " + repr(age))
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27b owner_unknown_items == 0", n == 0.0, "got " + repr(n))
+
+    # 27c: the register-time / assign-time `agent_id` stamp names an owner
+    # even with NO active-agents record -- so `session-task queue assign`
+    # is what clears this alert for a resumed agent.
+    item = make_running_item("q-s27c", "owner retrofitted by assign")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    item["agent_id"] = "aassigned0000000"
+    item["agent_id_source"] = "assign"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27c",
+    )
+    check("S27c an assigned agent_id clears owner-unknown", age is None,
+          "expected None, got " + repr(age))
+
+    # 27d: system jobs are exempt -- a `workload:` / `hostjob:` scoped item
+    # is owned by a PROCESS in the tasks session, and an explicit `pid`
+    # names its owning process directly. Neither has an agent owner that
+    # could be missing.
+    ou_workload = make_running_item("q-s27d-workload", "exempt workload")
+    ou_workload["scope"] = ["workload:stv-promote"]
+    ou_hostjob = make_running_item("q-s27d-hostjob", "exempt hostjob")
+    ou_hostjob["scope"] = ["hostjob:nightly-sync"]
+    ou_pid = make_running_item("q-s27d-pid", "exempt pid-stamped")
+    ou_pid["pid"] = 4242
+    exempt_items = [ou_workload, ou_hostjob, ou_pid]
+    for it_ in exempt_items:
+        it_["registered_at"] = ou_stale_iso
+        it_["started_at"] = ou_stale_iso
+    write_queue(qjson, exempt_items)
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    for iid in ("q-s27d-workload", "q-s27d-hostjob", "q-s27d-pid"):
+        age = find_any_sample(
+            mod, "worktask_queue_item_owner_unknown_age_seconds", iid,
+        )
+        check("S27d " + iid + " exempt from owner-unknown", age is None,
+              "expected None, got " + repr(age))
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27d owner_unknown_items == 0 (all exempt)", n == 0.0,
+          "got " + repr(n))
+
+    # 27e: blocked items are exempt -- parked on an external blocker, no
+    # live agent expected by design (same posture as has_live_owner).
+    item = make_blocked_item("q-s27e", "blocked, ownerless by design")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27e",
+    )
+    check("S27e blocked item emits no owner_unknown_age", age is None,
+          "expected None, got " + repr(age))
+
+    # 27f: with NO readable owner input every running item looks ownerless.
+    # That is a deployment fault, not a queue fact -- stay silent and let
+    # worktask_queue_owner_input_available carry the alarm (same gate the
+    # never-spawned-orphan branch uses).
+    ou_missing_bindings = os.path.join(tmpdir, "no-such-bindings-27.json")
+    item = make_running_item("q-s27f", "no owner inputs at all")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    write_queue(qjson, [item])
+    if os.path.exists(astate):
+        os.remove(astate)
+    mod = load_exporter(
+        {**env, "AGENT_QUEUE_BINDINGS_JSON": ou_missing_bindings}
+    )
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27f",
+    )
+    check(
+        "S27f owner_unknown_age suppressed when no owner input is readable",
+        age is None,
+        "expected None, got " + repr(age),
+    )
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27f owner_unknown_items == 0 while suppressed", n == 0.0,
+          "got " + repr(n))
+    write_agent_state(astate, [])
+
+    # 27g: the count series is ALWAYS emitted, so its absence can only mean
+    # "exporter predating this metric" -- never a healthy queue.
+    write_queue(qjson, [])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27g owner_unknown_items present (0) on an empty queue",
+          n == 0.0, "got " + repr(n))
+
+    # 27h: the gauge is reset between scrapes -- an item that gains an owner
+    # must not leave a stale series behind.
+    item = make_running_item("q-s27h", "gains an owner")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    check(
+        "S27h owner_unknown_age present before assignment",
+        find_any_sample(
+            mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27h",
+        ) is not None,
+        "expected a value",
+    )
+    item["agent_id"] = "alater0000000000"
+    item["agent_id_source"] = "assign"
+    write_queue(qjson, [item])
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27h",
+    )
+    check("S27h series cleared once an owner is assigned", age is None,
+          "expected None, got " + repr(age))
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27h owner_unknown_items back to 0", n == 0.0, "got " + repr(n))
+
+    # ---- Scenario 28: agent runs lost to upstream API errors.
+    #
+    # Grounded in a real incident. One queue item was spawned, killed by
+    # `529 Overloaded`, respawned with continuation context, killed again,
+    # respawned, killed a third time, and then quarantined and abandoned —
+    # three agent runs bought nothing. A second, unrelated item lost exactly
+    # one run to the same storm and then completed. The retry of the first
+    # item succeeded on its first try. Nothing in the queue's own fields
+    # records any of that: the free-text abandon reason mentions it, and
+    # nothing else does. The archived transcripts DO, machine-readably, and
+    # 28a/28b/28c reproduce those three items in that order.
+    print("\nScenario 28: agent runs lost to upstream API errors")
+    api_dir = os.path.join(tmpdir, "api-archives")
+    os.makedirs(api_dir, exist_ok=True)
+    api_env = dict(env)
+    api_env["QUEUE_LOG_ARCHIVE_DIR"] = api_dir
+
+    # 28a: three deaths in one archive, and NOT ONE real assistant turn --
+    # every reply the run ever got was an error. This is the worst case for
+    # model attribution and the one that matters most: the model must read
+    # `unknown` rather than be inferred from anything else.
+    write_archive(api_dir, "q-s28a", [
+        user_line("Queue item: q-s28a"),
+        api_error_line(529, ts="2026-09-03T14:09:01.710Z"),
+        user_line("continue", ts="2026-09-03T14:09:13.822Z"),
+        api_error_line(529, ts="2026-09-03T14:12:54.209Z"),
+        user_line("continue", ts="2026-09-03T14:28:15.717Z"),
+        api_error_line(529, ts="2026-09-03T14:31:39.652Z"),
+    ])
+    # 28b: one death, but the run had produced real assistant turns first,
+    # so its model IS recoverable.
+    write_archive(api_dir, "q-s28b", [
+        user_line("Queue item: q-s28b"),
+        assistant_line("claude-opus-5"),
+        api_error_line(529, ts="2026-09-03T15:45:04.853Z"),
+    ])
+    # 28c: a clean run. Must not appear in the per-item gauge at all.
+    write_archive(api_dir, "q-s28c", [
+        user_line("Queue item: q-s28c"),
+        assistant_line("claude-opus-5"),
+    ])
+    items = [
+        {**make_running_item("q-s28a", "burned three runs"), "status": "abandoned"},
+        {**make_running_item("q-s28b", "burned one run"), "status": "done"},
+        {**make_running_item("q-s28c", "succeeded first try"), "status": "done"},
+    ]
+    write_queue(qjson, items)
+    write_agent_state(astate, [])
+    mod = load_exporter(api_env)
+    mod.collect()
+
+    v = find_any_sample(mod, "worktask_queue_item_api_deaths", "q-s28a")
+    check("S28a item that burned three runs reads 3", v == 3.0, f"got {v!r}")
+    v = find_sample(mod, "worktask_queue_item_api_deaths",
+                    {"id": "q-s28a", "model": "unknown"})
+    check(
+        "S28a model is `unknown`, not guessed, when no real turn ever ran",
+        v == 3.0, f"got {v!r}",
+    )
+    v = find_sample(mod, "worktask_queue_item_api_deaths",
+                    {"id": "q-s28b", "model": "claude-opus-5"})
+    check("S28b model recovered from a real assistant turn", v == 1.0,
+          f"got {v!r}")
+    v = find_any_sample(mod, "worktask_queue_item_api_deaths", "q-s28c")
+    check("S28c clean item absent from the per-item gauge", v is None,
+          f"got {v!r}")
+    n = find_sample(mod, "worktask_queue_items_with_api_deaths", {})
+    check("S28 items_with_api_deaths counts only the two offenders",
+          n == 2.0, f"got {n!r}")
+    n = find_sample(mod, "worktask_queue_api_death_archives_scanned", {})
+    check("S28 archives_scanned counts every archive, not just the bad ones",
+          n == 3.0, f"got {n!r}")
+    n = find_sample(mod, "worktask_queue_api_death_input_available", {})
+    check("S28 input_available == 1 with a readable archive dir", n == 1.0,
+          f"got {n!r}")
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "529", "error_class": "transient",
+                     "model": "unknown"})
+    check("S28 counter: 3 transient 529 deaths at model=unknown", n == 3.0,
+          f"got {n!r}")
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "529", "error_class": "transient",
+                     "model": "claude-opus-5"})
+    check("S28 counter: 1 transient 529 death at model=claude-opus-5",
+          n == 1.0, f"got {n!r}")
+
+    # 28d: the transient/non-transient split. A run lost to 529 is a capacity
+    # cost; a run lost to an over-long prompt is a briefing bug that would
+    # fail identically on respawn. Counting them under one label would answer
+    # neither question, so they must land in different series.
+    write_archive(api_dir, "q-s28d", [
+        user_line("Queue item: q-s28d"),
+        assistant_line("claude-sonnet-5"),
+        api_error_line(None, error="invalid_request",
+                       ts="2026-06-18T07:45:32.351Z"),
+    ])
+    write_archive(api_dir, "q-s28d2", [
+        user_line("Queue item: q-s28d2"),
+        assistant_line("claude-sonnet-5"),
+        api_error_line(None, error="server_error",
+                       ts="2026-08-21T00:31:41.477Z"),
+    ])
+    mod = load_exporter(api_env)
+    mod.collect()
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "none", "error_class": "non_transient",
+                     "model": "claude-sonnet-5"})
+    check("S28d over-long prompt (no status) classed non_transient",
+          n == 1.0, f"got {n!r}")
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "none", "error_class": "transient",
+                     "model": "claude-sonnet-5"})
+    check("S28d mid-response server error (no status) classed transient",
+          n == 1.0, f"got {n!r}")
+
+    # 28e: an archive GROWS while its item keeps churning -- each respawn
+    # appends another error line. The counter must pick up only the NEW
+    # death, and repeated scrapes of an unchanged archive must add nothing.
+    mod.collect()
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "529", "error_class": "transient",
+                     "model": "unknown"})
+    check("S28e re-scraping an unchanged archive does not double-count",
+          n == 3.0, f"got {n!r}")
+    write_archive(api_dir, "q-s28a", [
+        user_line("Queue item: q-s28a"),
+        api_error_line(529, ts="2026-09-03T14:09:01.710Z"),
+        user_line("continue", ts="2026-09-03T14:09:13.822Z"),
+        api_error_line(529, ts="2026-09-03T14:12:54.209Z"),
+        user_line("continue", ts="2026-09-03T14:28:15.717Z"),
+        api_error_line(529, ts="2026-09-03T14:31:39.652Z"),
+        user_line("continue", ts="2026-09-03T14:35:00.000Z"),
+        api_error_line(529, ts="2026-09-03T14:38:12.000Z"),
+    ])
+    mod.collect()
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "529", "error_class": "transient",
+                     "model": "unknown"})
+    check("S28e a grown archive adds exactly its new death", n == 4.0,
+          f"got {n!r}")
+    v = find_any_sample(mod, "worktask_queue_item_api_deaths", "q-s28a")
+    check("S28e per-item gauge tracks the grown total", v == 4.0, f"got {v!r}")
+
+    # 28f: archives older than the window are not scanned. The window bounds
+    # the work AND defines what the counters describe.
+    write_archive(api_dir, "q-s28f", [
+        user_line("Queue item: q-s28f"),
+        assistant_line("claude-opus-4-8"),
+        api_error_line(529, ts="2026-01-01T00:00:00.000Z"),
+    ], age_days=90)
+    mod = load_exporter(api_env)
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_api_deaths", "q-s28f")
+    check("S28f archive outside the window is not counted", v is None,
+          f"got {v!r}")
+    # ...and widening the window brings it back, proving the omission was the
+    # window rather than a parse failure.
+    wide_env = dict(api_env)
+    wide_env["API_DEATH_WINDOW_DAYS"] = "365"
+    mod = load_exporter(wide_env)
+    mod.collect()
+    v = find_sample(mod, "worktask_queue_item_api_deaths",
+                    {"id": "q-s28f", "model": "claude-opus-4-8"})
+    check("S28f a wider window does count it", v == 1.0, f"got {v!r}")
+
+    # 28g: an unreadable archive dir is a DEPLOYMENT fault, and must not be
+    # published as a confident "no task ever lost a run". The per-item series
+    # go absent and archives_scanned reads 0 so the zero is explicable.
+    missing_env = dict(env)
+    missing_env["QUEUE_LOG_ARCHIVE_DIR"] = os.path.join(tmpdir, "not-mounted")
+    mod = load_exporter(missing_env)
+    mod.collect()
+    n = find_sample(mod, "worktask_queue_api_death_input_available", {})
+    check("S28g input_available == 0 on an unreadable archive dir", n == 0.0,
+          f"got {n!r}")
+    n = find_sample(mod, "worktask_queue_api_death_archives_scanned", {})
+    check("S28g archives_scanned == 0 explains the zero death count",
+          n == 0.0, f"got {n!r}")
+    got = [
+        s for fam in mod.REG.collect() if fam.name == "worktask_queue_item_api_deaths"
+        for s in fam.samples
+    ]
+    check("S28g per-item death series absent, not zeroed", got == [],
+          f"got {got!r}")
+
+    # 28h: quarantine — where an item lands when its runs kept dying and the
+    # main loop stopped respawning. Not terminal, and it still holds its
+    # scope lock, so the age is what makes a forgotten one alertable.
+    q_item = make_running_item("q-s28h", "quarantined after a retry storm")
+    q_item["status"] = "quarantined"
+    q_item["quarantined_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=900)
+    ).isoformat()
+    write_queue(qjson, [q_item])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_any_sample(
+        mod, "worktask_queue_item_quarantined_age_seconds", "q-s28h",
+    )
+    check("S28h quarantined_age emitted for a quarantined item",
+          v is not None and 890 <= v <= 960, f"got {v!r}")
+    n = find_sample(mod, "worktask_queue_items_total", {"status": "quarantined"})
+    check("S28h status count still reports the quarantined item", n == 1.0,
+          f"got {n!r}")
+    q_item["status"] = "running"
+    write_queue(qjson, [q_item])
+    mod.collect()
+    v = find_any_sample(
+        mod, "worktask_queue_item_quarantined_age_seconds", "q-s28h",
+    )
+    check("S28h series cleared once the item leaves quarantine", v is None,
+          f"got {v!r}")
+
+    # 28i: a run whose only real assistant turn came AFTER the death line
+    # (the death was a retried early call). One archive holds one agent run,
+    # so that turn still identifies the model — attribution must not depend
+    # on file order.
+    write_archive(api_dir, "q-s28i", [
+        user_line("Queue item: q-s28i"),
+        api_error_line(500, ts="2026-05-16T18:13:58.448Z"),
+        assistant_line("claude-opus-4-7", ts="2026-05-16T18:15:00.000Z"),
+    ])
+    mod = load_exporter(api_env)
+    mod.collect()
+    v = find_sample(mod, "worktask_queue_item_api_deaths",
+                    {"id": "q-s28i", "model": "claude-opus-4-7"})
+    check("S28i model recovered from a turn AFTER the death", v == 1.0,
+          f"got {v!r}")
 
     print()
     if failures:

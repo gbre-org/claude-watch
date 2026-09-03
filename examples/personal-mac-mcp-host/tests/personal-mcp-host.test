@@ -22,6 +22,22 @@ Coverage:
   - Tunnel-only mode (--tunnel-only / PERSONAL_MCP_TUNNEL_ONLY=1):
     --print-cmd emits ONLY the SSH: block, NOT the MCP_HOST_BASH_BIN:
     launch block, and the ssh argv is otherwise unchanged.
+  - restart subcommand:
+      * documented in --help.
+      * `restart --print-cmd` emits a RESTART: plan block (reap +
+        restart + verify targets, launchd labels) alongside the
+        MCP_HOST_BASH_BIN: / SSH: blocks; the `--restart` alias is
+        equivalent.
+      * unmanaged (no launchd) end-to-end: a WEDGED server still
+        holding MCP_LOCAL_PORT plus a stale ssh carrying the
+        reverse-forward spec are BOTH reaped, both pieces come back,
+        and the new pids differ from the old ones.
+      * exit 4 naming the MCP host when the server never binds.
+      * exit 4 naming the reverse SSH tunnel when ssh exits immediately
+        (the ExitOnForwardFailure shape) — and it must NOT report
+        success just because a restart was issued.
+      * launchd-managed: bootstrapped units are kickstarted with
+        `kickstart -k` rather than hand-launched.
   - Bad flag exits 2.
   - --help exits 0 with the usage block + documents --enable.
   - PERSONAL_MCP_DISABLED=1 (without --print-cmd) exits 0 immediately.
@@ -31,6 +47,12 @@ Coverage:
   - Default status gate, GREEN: a listener on MCP_LOCAL_PORT → detects
     the service is up, proceeds to start the reverse tunnel (fake ssh
     stand-in), then SIGTERM actively tears the tunnel down.
+  - SIGTERM teardown is not racy: the TERM/INT handler is a bare
+    function name (bash re-parses a handler string on every signal, so
+    a multi-statement or interpolated one can fail to parse and swallow
+    the signal), nothing between the ssh spawn and the steady-state wait
+    uses a command substitution, and a repeated randomized-offset
+    SIGTERM tears the tunnel down cleanly every time.
   - --enable --print-cmd emits the MCP_HOST_BASH_BIN: launch block.
 
 Run:  ./personal-mcp-host.test
@@ -39,6 +61,9 @@ Run:  ./personal-mcp-host.test
 from __future__ import annotations
 
 import os
+import random
+import re
+import signal
 import socket
 import subprocess
 import sys
@@ -253,8 +278,8 @@ def test_mcp_host_bash_bin_block_contains_port() -> None:
         )
         if len(mcp) >= 3:
             expect(
-                mcp[0].endswith("/mcp-host-bash"),
-                f"MCP_HOST_BASH_BIN[0] should end in /mcp-host-bash; got {mcp[0]!r}",
+                mcp[0].endswith("/mcp-host-bash-server"),
+                f"MCP_HOST_BASH_BIN[0] should end in /mcp-host-bash-server; got {mcp[0]!r}",
             )
             expect(
                 mcp[1] == "--port",
@@ -706,6 +731,172 @@ def test_default_green_path_detects_service_up() -> None:
             subprocess.run(["pkill", "-f", "sleep 600"], check=False)
 
 
+
+def test_sigterm_handler_is_a_bare_function_call() -> None:
+    """The TERM/INT handler string must be a single bare function name.
+
+    bash re-parses a handler string at signal-delivery time, in whatever
+    parser state the shell happens to be in. A handler built out of
+    several statements — or worse, one with a value interpolated into it
+    — is parser work done at the least predictable moment there is, and
+    when that parse fails bash prints
+
+        ...personal-mcp-host.sh: trap: line 2: unexpected EOF while
+        looking for matching `)\'
+
+    and KEEPS GOING: the signal is swallowed, the teardown never runs and
+    the reverse tunnel stays open. Keep the string to one word and read
+    every value from variables inside the function."""
+    body = SCRIPT.read_text()
+    handlers = re.findall(r"^\s*trap\s+(.+?)\s+TERM\s+INT\s*$", body, re.M)
+    expect(
+        len(handlers) == 1,
+        f"expected exactly one `trap ... TERM INT` registration, got {handlers}",
+    )
+    if not handlers:
+        return
+    handler = handlers[0].strip().strip("'\"")
+    expect(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", handler) is not None,
+        f"the TERM/INT handler must be a bare function name, not a command "
+        f"string bash has to parse at signal time; got: {handlers[0]}",
+    )
+    for bad in ("$(", "${", "`", ";"):
+        expect(
+            bad not in handlers[0],
+            f"the TERM/INT handler string must not contain {bad!r} — it is "
+            f"re-parsed on every signal; got: {handlers[0]}",
+        )
+    expect(
+        re.search(rf"^{re.escape(handler)}\(\)\s*{{", body, re.M) is not None,
+        f"the TERM/INT handler `{handler}` should be defined as a function",
+    )
+
+
+def test_no_command_substitution_between_tunnel_spawn_and_wait() -> None:
+    """Nothing between spawning ssh and entering the steady-state wait may
+    use a command substitution.
+
+    That stretch is the window in which a SIGTERM has real teardown work
+    to do, and a `$( )` there makes the shell re-enter its own parser
+    mid-expansion. A signal landing inside that re-entry gets its handler
+    parsed with the substitution's still-open `(` on the parser's
+    delimiter stack, bash aborts the handler with `unexpected EOF while
+    looking for matching `)\'`, and the teardown silently never runs.
+    Log-file/dir preparation belongs BEFORE the spawn; parameter
+    expansion (`${path%/*}`) replaces `$(dirname ...)`."""
+    body = SCRIPT.read_text()
+    fn = re.search(
+        r"^run_tunnel_and_tail\(\)\s*{(.*?)^}", body, re.M | re.S
+    )
+    expect(fn is not None, "could not locate run_tunnel_and_tail() in the script")
+    if fn is None:
+        return
+    inner = fn.group(1)
+    spawn = inner.find('"${ssh_argv[@]}" &')
+    wait = inner.find("while kill -0")
+    expect(spawn != -1, "run_tunnel_and_tail should spawn the ssh argv")
+    expect(wait != -1, "run_tunnel_and_tail should hold in a `while kill -0` wait")
+    if spawn == -1 or wait == -1:
+        return
+    window = inner[spawn:wait]
+    code = "\n".join(
+        line for line in window.splitlines() if not line.lstrip().startswith("#")
+    )
+    for bad in ("$(", "`"):
+        expect(
+            bad not in code,
+            f"no command substitution ({bad!r}) is allowed between the ssh "
+            f"spawn and the steady-state wait — it can swallow a SIGTERM. "
+            f"Window:\n{code}",
+        )
+
+
+def test_green_path_sigterm_teardown_is_race_free() -> None:
+    """Repeat the GREEN-path SIGTERM several times, signalling at a
+    randomized sub-millisecond offset after the tunnel-started line, and
+    require a clean teardown every time.
+
+    This is the regression guard for the intermittent flake where the
+    SIGTERM landed while the shell was expanding
+    `mkdir -p "$(dirname "$MCP_HOST_BASH_LOG")"` — bash failed to parse
+    the handler string, printed `trap: line 2: unexpected EOF while
+    looking for matching `)\'` and carried on running with the tunnel
+    still up."""
+    rounds = 5
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        env_path = tdp / ".env"
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        port = _free_port()
+        write_env(env_path, mcp_local_port=str(port), ssh_key_path=str(key_path))
+        bindir = _make_fake_ssh(tdp)
+
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen(64)
+        env = {
+            "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PERSONAL_MCP_ENV_FILE": str(env_path),
+            "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+        }
+        try:
+            for i in range(rounds):
+                proc = subprocess.Popen(
+                    [str(SCRIPT)],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                )
+                seen = ""
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    seen += line
+                    if "reverse SSH tunnel started" in line:
+                        break
+                # Signal somewhere inside the spawn -> steady-state window.
+                time.sleep(random.uniform(0, 0.003))
+                proc.terminate()
+                # Give the handler a bounded window, then take the whole
+                # process group down before draining. A child the wrapper
+                # failed to tear down still holds the stdout pipe, and
+                # reading it would block forever instead of failing.
+                exit_by = time.time() + 10
+                while time.time() < exit_by and proc.poll() is None:
+                    time.sleep(0.02)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    seen += proc.communicate(timeout=10)[0] or ""
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    seen += proc.communicate(timeout=10)[0] or ""
+                expect(
+                    ": trap:" not in seen,
+                    f"round {i}: bash failed to parse the signal handler — the "
+                    f"SIGTERM was swallowed; got:\n{seen}",
+                )
+                expect(
+                    "tearing down reverse SSH tunnel" in seen
+                    and "reverse SSH tunnel torn down" in seen,
+                    f"round {i}: SIGTERM should always tear the tunnel down and "
+                    f"confirm it is gone; got:\n{seen}",
+                )
+        finally:
+            listener.close()
+            subprocess.run(["pkill", "-f", "sleep 600"], check=False)
+
+
 def test_enable_print_cmd_emits_mcp_block() -> None:
     """--enable --print-cmd emits the MCP_HOST_BASH_BIN: launch block
     (the --enable path brings the server up), plus the SSH: block."""
@@ -884,9 +1075,25 @@ def test_enable_ctrlc_leaves_host_service_running() -> None:
             # pressing Ctrl-C in their terminal.
             os.write(master, b"\x03")
 
-            try:
-                proc.wait(timeout=12)
-            except subprocess.TimeoutExpired:
+            # Drain the PTY WHILE waiting for the wrapper to exit. The
+            # wrapper writes its teardown banner to the slave PTY on the
+            # way out; if we block in proc.wait() without reading the
+            # master, a full PTY output buffer stalls those writes and the
+            # wrapper never reaches its `exit` — a write-deadlock that
+            # bites on macOS, whose PTY buffer is smaller than Linux's.
+            exit_deadline = time.time() + 12
+            while time.time() < exit_deadline:
+                r, _, _ = select.select([master], [], [], 0.3)
+                if r:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        chunk = b""
+                    if chunk:
+                        buf += chunk
+                if proc.poll() is not None:
+                    break
+            if proc.poll() is None:
                 os.killpg(os.getpgid(proc.pid), 9)
                 proc.wait(timeout=5)
                 failures.append("--enable: wrapper did not exit after Ctrl-C")
@@ -971,6 +1178,582 @@ def test_script_uses_ssh_minus_capital_R_not_lowercase() -> None:
 
 
 # ---------------------------------------------------------------------------
+# restart subcommand
+# ---------------------------------------------------------------------------
+
+
+def _write_exec(path: Path, body: str) -> Path:
+    path.write_text(body)
+    path.chmod(0o755)
+    return path
+
+
+def _make_recording_ssh(bindir: Path, pidfile: Path, *, lifetime: int = 900) -> Path:
+    """Fake `ssh` that records its pid and then holds.
+
+    `exec -a "ssh $*"` keeps the reverse-forward spec in the surviving
+    process's argv — that argv IS how the wrapper finds the tunnel
+    (`pgrep -f <spec>`), so a fake that exec'd a bare `sleep` would be
+    invisible to it and the test would assert nothing real."""
+    return _write_exec(
+        bindir / "ssh",
+        "#!/usr/bin/env bash\n"
+        f'echo $$ > "{pidfile}"\n'
+        f'exec -a "ssh $*" sleep {lifetime}\n',
+    )
+
+
+def _make_dying_ssh(bindir: Path, pidfile: Path, *, lifetime: int = 1) -> Path:
+    """Fake `ssh` that comes up, is visible for a moment, then exits
+    non-zero — the ExitOnForwardFailure shape (remote port already
+    bound). The wrapper must NOT count this as a restored tunnel."""
+    return _write_exec(
+        bindir / "ssh",
+        "#!/usr/bin/env bash\n"
+        f'echo $$ > "{pidfile}"\n'
+        f"sleep {lifetime}\n"
+        "exit 255\n",
+    )
+
+
+def _make_dead_mcp_host(bindir: Path) -> Path:
+    """Fake `mcp-host-bash` that exits immediately without binding."""
+    return _write_exec(
+        bindir / "mcp-host-bash",
+        "#!/usr/bin/env bash\necho 'fake-mcp-host-bash: boom' >&2\nexit 1\n",
+    )
+
+
+def _make_fake_launchctl(
+    bindir: Path,
+    calls: Path,
+    *,
+    registered: list[str],
+    starts: dict[str, str],
+) -> Path:
+    """Fake `launchctl`: `print` reports which labels are bootstrapped,
+    `kickstart` records the call and runs the label's stand-in command
+    detached (so it outlives this launchctl, exactly as launchd's job
+    would). Lets the launchd-managed path be exercised on Linux CI."""
+    reg = "|".join(registered) if registered else "__none__"
+    start_cases = "\n".join(
+        f'        {label}) sh -c {cmd!r} >/dev/null 2>&1 & ;;'
+        for label, cmd in starts.items()
+    )
+    return _write_exec(
+        bindir / "launchctl",
+        "#!/usr/bin/env bash\n"
+        f'echo "$*" >> "{calls}"\n'
+        'case "$1" in\n'
+        "  print)\n"
+        '    label="${2##*/}"\n'
+        '    case "$label" in\n'
+        f"      {reg}) exit 0 ;;\n"
+        "      *) exit 113 ;;\n"
+        "    esac\n"
+        "    ;;\n"
+        "  kickstart)\n"
+        '    target="$3"\n'
+        '    if [ "$2" != "-k" ]; then target="$2"; fi\n'
+        '    label="${target##*/}"\n'
+        '    case "$label" in\n'
+        f"{start_cases}\n"
+        "    esac\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 0\n",
+    )
+
+
+def _detach_prefix() -> str:
+    """`setsid` when available so a stand-in survives the fake
+    launchctl's exit; plain nohup otherwise."""
+    import shutil
+
+    return "setsid " if shutil.which("setsid") else "nohup "
+
+
+def _can_find_port_owner() -> bool:
+    """The wrapper reaps the MCP port's owner via lsof, falling back to
+    ss. With neither, it says so and skips the reap — so the reap
+    assertions below only make sense when one of them exists."""
+    import shutil
+
+    return bool(shutil.which("lsof") or shutil.which("ss"))
+
+
+def test_restart_in_help() -> None:
+    """--help documents the restart subcommand and what it covers."""
+    lines, _, _, rc = run_script(["--help"])
+    expect(rc == 0, f"--help: rc should be 0, got {rc}")
+    body = "\n".join(lines)
+    expect("restart" in body, "--help should document the restart subcommand")
+    expect(
+        "personal-mcp-host.sh restart" in body,
+        "--help usage block should show `personal-mcp-host.sh restart`",
+    )
+
+
+def test_restart_print_cmd_emits_plan_block() -> None:
+    """`restart --print-cmd` emits a RESTART: plan block naming what it
+    reaps / restarts / verifies plus the launchd labels it consults,
+    alongside the MCP_HOST_BASH_BIN: and SSH: blocks (restart may end up
+    launching either piece itself)."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path, remote_port="20001", mcp_local_port="20002")
+        lines, _, _, _ = run_script(["restart", "--print-cmd"], env_file=env_path)
+        blocks = parse_blocks(lines)
+        expect(
+            "RESTART" in blocks,
+            f"restart --print-cmd: should emit a RESTART: block; got {sorted(blocks)}",
+        )
+        expect(
+            "SSH" in blocks and "MCP_HOST_BASH_BIN" in blocks,
+            f"restart --print-cmd: should still emit SSH: + MCP_HOST_BASH_BIN: "
+            f"blocks; got {sorted(blocks)}",
+        )
+        plan = blocks.get("RESTART", [])
+        for token in (
+            "reap-tunnel",
+            "reap-mcp-port",
+            "restart-mcp-host",
+            "restart-tunnel",
+            "verify-mcp-host",
+            "verify-tunnel",
+        ):
+            expect(token in plan, f"RESTART plan should list {token!r}; got {plan}")
+        expect(
+            "20001:127.0.0.1:20002" in plan,
+            f"RESTART plan should name the reverse-forward spec; got {plan}",
+        )
+        expect(
+            "org.claude-watch.personal-mcp.tunnel" in plan
+            and "org.claude-watch.mcp-host-bash" in plan,
+            f"RESTART plan should name the launchd labels it consults; got {plan}",
+        )
+
+
+def test_restart_flag_alias_equivalent() -> None:
+    """`--restart` is an alias for the bare `restart` verb."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        verb, _, _, _ = run_script(["restart", "--print-cmd"], env_file=env_path)
+        flag, _, _, _ = run_script(["--restart", "--print-cmd"], env_file=env_path)
+        expect(
+            verb == flag,
+            "restart and --restart should produce identical plans;\n"
+            f"verb:\n{verb}\nflag:\n{flag}",
+        )
+
+
+def test_restart_reaps_wedged_stack_and_brings_both_back() -> None:
+    """THE MOTIVATING CASE. A WEDGED MCP host still holding
+    MCP_LOCAL_PORT (its stdio child died on a broken pipe; the parent
+    keeps the socket bound, so a status probe calls it GREEN) plus a
+    stale ssh carrying the reverse-forward spec.
+
+    `restart` with no launchd in play must:
+      - reap BOTH corpses (not skip them because the port answers),
+      - bring the MCP host back (new pid, port answering),
+      - bring the tunnel back (new pid, spec in argv),
+      - exit 0.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        bindir = tdp / "fakebin"
+        bindir.mkdir()
+        port = _free_port()
+        remote_port = _free_port()
+        spec = f"{remote_port}:127.0.0.1:{port}"
+
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        env_path = tdp / ".env"
+        write_env(
+            env_path,
+            remote_port=str(remote_port),
+            mcp_local_port=str(port),
+            ssh_key_path=str(key_path),
+        )
+
+        # The wedged server: binds the port and sits there. Built in its
+        # OWN directory — _make_fake_mcp_host always writes
+        # <dir>/fakebin/mcp-host-bash, so sharing a directory with the
+        # replacement below would truncate this script out from under
+        # the interpreter that is still starting up.
+        wedge_dir = tdp / "wedge"
+        wedge_dir.mkdir()
+        wedged_pidfile = tdp / "wedged.pid"
+        wedged_bin = _make_fake_mcp_host(wedge_dir, port, wedged_pidfile)
+        wedged = subprocess.Popen(
+            [str(wedged_bin)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        # The stale tunnel: a process whose argv carries our spec.
+        stale_ssh = subprocess.Popen(
+            ["bash", "-c", f'exec -a "ssh -N -R {spec} bob@remote" sleep 900'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # The replacements the wrapper will launch (separate directory —
+        # see the note above).
+        fresh_dir = tdp / "fresh"
+        fresh_dir.mkdir()
+        fresh_pidfile = tdp / "fresh-host.pid"
+        fresh_host = _make_fake_mcp_host(fresh_dir, port, fresh_pidfile)
+        ssh_pidfile = tdp / "ssh.pid"
+        _make_recording_ssh(bindir, ssh_pidfile)
+
+        env = {
+            "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PERSONAL_MCP_ENV_FILE": str(env_path),
+            "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+            "MCP_HOST_BASH_BIN": str(fresh_host),
+            "PERSONAL_MCP_RESTART_TIMEOUT": "20",
+            "PERSONAL_MCP_TUNNEL_SETTLE": "1",
+        }
+        new_ssh_pid = None
+        try:
+            time.sleep(0.8)  # let the corpses settle / bind
+            expect(
+                wedged_pidfile.exists(),
+                "setup: the wedged MCP host should have bound the port",
+            )
+            result = subprocess.run(
+                [str(SCRIPT), "restart"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            out = result.stdout + result.stderr
+            expect(result.returncode == 0, f"restart: rc should be 0, got {result.returncode}\n{out}")
+
+            wedged_pid = int(wedged_pidfile.read_text().strip())
+            # .wait() rather than _pid_alive(): these corpses are OUR
+            # children, so until this process reaps them they linger as
+            # zombies that `kill -0` still answers for.
+            for corpse in (wedged, stale_ssh):
+                try:
+                    corpse.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if _can_find_port_owner():
+                expect(
+                    wedged.poll() is not None,
+                    f"restart: the wedged MCP host (pid {wedged_pid}) MUST be "
+                    f"reaped even though its port still answered.\n{out}",
+                )
+                expect(
+                    "reaping MCP host" in out,
+                    f"restart: should announce reaping the stale MCP host.\n{out}",
+                )
+            expect(
+                stale_ssh.poll() is not None,
+                f"restart: the stale ssh (pid {stale_ssh.pid}) carrying {spec} "
+                f"MUST be reaped.\n{out}",
+            )
+            expect(
+                "reaping reverse SSH tunnel" in out,
+                f"restart: should announce reaping the stale tunnel.\n{out}",
+            )
+
+            # Both pieces back, and demonstrably NEW processes.
+            expect(
+                fresh_pidfile.exists(),
+                f"restart: a fresh MCP host should have been launched.\n{out}",
+            )
+            if fresh_pidfile.exists():
+                fresh_pid = int(fresh_pidfile.read_text().strip())
+                expect(
+                    fresh_pid != wedged_pid and _pid_alive(fresh_pid),
+                    f"restart: the MCP host should be a NEW live pid "
+                    f"(old {wedged_pid}, new {fresh_pid}).\n{out}",
+                )
+            expect(
+                ssh_pidfile.exists(),
+                f"restart: a fresh reverse SSH tunnel should have been "
+                f"launched.\n{out}",
+            )
+            if ssh_pidfile.exists():
+                new_ssh_pid = int(ssh_pidfile.read_text().strip())
+                expect(
+                    new_ssh_pid != stale_ssh.pid and _pid_alive(new_ssh_pid),
+                    f"restart: the tunnel should be a NEW live pid "
+                    f"(old {stale_ssh.pid}, new {new_ssh_pid}).\n{out}",
+                )
+            expect(
+                "MCP host is answering" in out and "reverse SSH tunnel is up" in out,
+                f"restart: should report BOTH pieces verified, not just "
+                f"'restart issued'.\n{out}",
+            )
+            expect(
+                "full stack restarted and VERIFIED" in out,
+                f"restart: should print the verified-summary banner.\n{out}",
+            )
+        finally:
+            for p in (wedged, stale_ssh):
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=5)
+            for pid in (new_ssh_pid,):
+                if pid and _pid_alive(pid):
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        pass
+            for pidfile in (fresh_pidfile,):
+                if pidfile.exists():
+                    pid = int(pidfile.read_text().strip())
+                    if _pid_alive(pid):
+                        try:
+                            os.kill(pid, 9)
+                        except OSError:
+                            pass
+            subprocess.run(["pkill", "-f", "--", spec], check=False)
+
+
+def test_restart_exit_four_when_mcp_host_does_not_come_back() -> None:
+    """MCP host that never binds → exit 4, message NAMES the MCP host,
+    and the tunnel is deliberately NOT started (a tunnel to a dead
+    server looks healthy from the remote while failing every call)."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        bindir = tdp / "fakebin"
+        bindir.mkdir()
+        port = _free_port()
+        remote_port = _free_port()
+        spec = f"{remote_port}:127.0.0.1:{port}"
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        env_path = tdp / ".env"
+        write_env(
+            env_path,
+            remote_port=str(remote_port),
+            mcp_local_port=str(port),
+            ssh_key_path=str(key_path),
+        )
+        dead_host = _make_dead_mcp_host(bindir)
+        ssh_pidfile = tdp / "ssh.pid"
+        _make_recording_ssh(bindir, ssh_pidfile)
+
+        env = {
+            "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PERSONAL_MCP_ENV_FILE": str(env_path),
+            "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+            "MCP_HOST_BASH_BIN": str(dead_host),
+            "PERSONAL_MCP_RESTART_TIMEOUT": "3",
+        }
+        try:
+            result = subprocess.run(
+                [str(SCRIPT), "restart"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            out = result.stdout + result.stderr
+            expect(
+                result.returncode == 4,
+                f"restart with a dead MCP host: rc should be 4, got "
+                f"{result.returncode}\n{out}",
+            )
+            expect(
+                "MCP host did NOT come back" in out,
+                f"restart failure should NAME the MCP host as the failing "
+                f"piece.\n{out}",
+            )
+            expect(
+                not ssh_pidfile.exists(),
+                "restart must NOT start the tunnel when the MCP host never "
+                "came back",
+            )
+        finally:
+            subprocess.run(["pkill", "-f", "--", spec], check=False)
+
+
+def test_restart_exit_four_when_tunnel_dies_on_forward_failure() -> None:
+    """Tunnel that comes up and then exits (ExitOnForwardFailure: the
+    remote port was still bound) → exit 4 naming the tunnel. Guards the
+    'issued a restart' vs 'the thing is answering' distinction: an ssh
+    that merely EXISTED for a moment must not count."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        bindir = tdp / "fakebin"
+        bindir.mkdir()
+        port = _free_port()
+        remote_port = _free_port()
+        spec = f"{remote_port}:127.0.0.1:{port}"
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        env_path = tdp / ".env"
+        write_env(
+            env_path,
+            remote_port=str(remote_port),
+            mcp_local_port=str(port),
+            ssh_key_path=str(key_path),
+        )
+        host_pidfile = tdp / "host.pid"
+        fake_host = _make_fake_mcp_host(tdp, port, host_pidfile)
+        ssh_pidfile = tdp / "ssh.pid"
+        _make_dying_ssh(bindir, ssh_pidfile, lifetime=1)
+
+        env = {
+            "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PERSONAL_MCP_ENV_FILE": str(env_path),
+            "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+            "MCP_HOST_BASH_BIN": str(fake_host),
+            "PERSONAL_MCP_RESTART_TIMEOUT": "6",
+            "PERSONAL_MCP_TUNNEL_SETTLE": "3",
+        }
+        try:
+            result = subprocess.run(
+                [str(SCRIPT), "restart"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            out = result.stdout + result.stderr
+            expect(
+                result.returncode == 4,
+                f"restart with a dying tunnel: rc should be 4, got "
+                f"{result.returncode}\n{out}",
+            )
+            expect(
+                "reverse SSH tunnel did NOT come back" in out,
+                f"restart failure should NAME the reverse SSH tunnel as the "
+                f"failing piece.\n{out}",
+            )
+            expect(
+                "full stack restarted and VERIFIED" not in out,
+                f"restart must NOT claim success when the tunnel died.\n{out}",
+            )
+            expect(
+                "MCP host is answering" in out,
+                f"restart should still report the MCP host came back (only the "
+                f"tunnel failed).\n{out}",
+            )
+        finally:
+            if host_pidfile.exists():
+                pid = int(host_pidfile.read_text().strip())
+                if _pid_alive(pid):
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        pass
+            subprocess.run(["pkill", "-f", "--", spec], check=False)
+
+
+def test_restart_kickstarts_bootstrapped_launchd_units() -> None:
+    """When launchd units own the pieces, restart drives THEM
+    (`launchctl kickstart -k`, which kills a running instance and starts
+    it — idempotent whether the piece was up or down) instead of
+    hand-launching processes launchd would fight over."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        bindir = tdp / "fakebin"
+        bindir.mkdir()
+        port = _free_port()
+        remote_port = _free_port()
+        spec = f"{remote_port}:127.0.0.1:{port}"
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        env_path = tdp / ".env"
+        write_env(
+            env_path,
+            remote_port=str(remote_port),
+            mcp_local_port=str(port),
+            ssh_key_path=str(key_path),
+        )
+
+        host_pidfile = tdp / "host.pid"
+        fake_host = _make_fake_mcp_host(tdp, port, host_pidfile)
+        ssh_pidfile = tdp / "ssh.pid"
+        fake_ssh = _make_recording_ssh(bindir, ssh_pidfile)
+        calls = tdp / "launchctl-calls.txt"
+        d = _detach_prefix()
+        _make_fake_launchctl(
+            bindir,
+            calls,
+            registered=[
+                "org.claude-watch.mcp-host-bash",
+                "org.claude-watch.personal-mcp.tunnel",
+            ],
+            starts={
+                "org.claude-watch.mcp-host-bash": f"{d}{fake_host}",
+                "org.claude-watch.personal-mcp.tunnel": (
+                    f"{d}{fake_ssh} -N -R {spec} bob@remote"
+                ),
+            },
+        )
+
+        env = {
+            "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PERSONAL_MCP_ENV_FILE": str(env_path),
+            "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+            "MCP_HOST_BASH_BIN": str(fake_host),
+            "PERSONAL_MCP_RESTART_TIMEOUT": "20",
+            "PERSONAL_MCP_TUNNEL_SETTLE": "1",
+        }
+        try:
+            result = subprocess.run(
+                [str(SCRIPT), "restart"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            out = result.stdout + result.stderr
+            expect(
+                result.returncode == 0,
+                f"restart under launchd: rc should be 0, got "
+                f"{result.returncode}\n{out}\ncalls:\n"
+                f"{calls.read_text() if calls.exists() else '<none>'}",
+            )
+            body = calls.read_text() if calls.exists() else ""
+            uid = os.getuid()
+            expect(
+                f"kickstart -k gui/{uid}/org.claude-watch.mcp-host-bash" in body,
+                f"restart should kickstart -k the bootstrapped MCP server "
+                f"unit; calls:\n{body}",
+            )
+            expect(
+                f"kickstart -k gui/{uid}/org.claude-watch.personal-mcp.tunnel" in body,
+                f"restart should kickstart -k the bootstrapped tunnel unit; "
+                f"calls:\n{body}",
+            )
+            expect(
+                "launched MCP host directly" not in out,
+                f"restart must NOT hand-launch the MCP host when a launchd "
+                f"unit owns it.\n{out}",
+            )
+            expect(
+                "launched reverse SSH tunnel directly" not in out,
+                f"restart must NOT hand-launch the tunnel when a launchd unit "
+                f"owns it.\n{out}",
+            )
+        finally:
+            for pidfile in (host_pidfile, ssh_pidfile):
+                if pidfile.exists():
+                    pid = int(pidfile.read_text().strip())
+                    if _pid_alive(pid):
+                        try:
+                            os.kill(pid, 9)
+                        except OSError:
+                            pass
+            subprocess.run(["pkill", "-f", "--", spec], check=False)
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -995,11 +1778,21 @@ tests = [
     test_enable_flag_in_help,
     test_default_red_path_service_down_exits_three,
     test_default_green_path_detects_service_up,
+    test_sigterm_handler_is_a_bare_function_call,
+    test_no_command_substitution_between_tunnel_spawn_and_wait,
+    test_green_path_sigterm_teardown_is_race_free,
     test_enable_print_cmd_emits_mcp_block,
     test_enable_ctrlc_leaves_host_service_running,
     test_env_example_exists_and_has_required_keys,
     test_gitignore_excludes_env,
     test_script_uses_ssh_minus_capital_R_not_lowercase,
+    test_restart_in_help,
+    test_restart_print_cmd_emits_plan_block,
+    test_restart_flag_alias_equivalent,
+    test_restart_reaps_wedged_stack_and_brings_both_back,
+    test_restart_exit_four_when_mcp_host_does_not_come_back,
+    test_restart_exit_four_when_tunnel_dies_on_forward_failure,
+    test_restart_kickstarts_bootstrapped_launchd_units,
 ]
 
 for t in tests:

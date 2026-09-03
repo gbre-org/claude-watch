@@ -1,6 +1,6 @@
 # container/watchers/
 
-Watcher source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each watcher is a background task the in-container session launches via the `/start-watchers` skill (defined in [`container/skills/start-watchers.md`](../skills/start-watchers.md)).
+Watcher source files baked into the [claude-container](https://github.com/gbre-org/claude-watch/tree/main/container) image. Each watcher is a background task the in-container session launches via the `/start-watchers` skill (defined in [`container/skills/start-watchers.md`](../skills/start-watchers.md)).
 
 > **Authoring a new watcher?** Read [`docs/adding-watchers.md`](../../docs/adding-watchers.md) — covers the block-print-exit lifecycle contract, the metadata schema below, and a fully-worked example.
 
@@ -15,7 +15,27 @@ Watchers are **session-scoped `run_in_background` Bash tasks**. They are NOT lon
 5. Claude Code delivers the stdout back to the session as a task-completion notification.
 6. The session **immediately restarts** the watcher before processing the events.
 
-This "block-print-exit" contract is fundamental. A watcher that runs forever in a loop cannot deliver results to the session — Claude Code only surfaces `run_in_background` output when the task completes (exits). The reference implementation is `tools/watchers/claude-event-watch`.
+This "block-print-exit" contract is fundamental **for a watcher launched as a background Bash task**: Claude Code only surfaces `run_in_background` output when the task completes (exits), so a watcher that loops forever under that launcher delivers nothing. The reference implementation is `tools/watchers/claude-event-watch`.
+
+### Opt-in alternative: monitor mode (line-streaming launcher)
+
+A watcher can instead be declared `mode=monitor` in its `watchers.conf` entry. Such a watcher is **armed once** by the session through a launcher that turns **each stdout line into its own notification** (Claude Code's `Monitor` tool with `persistent: true`) and stays alive across batches — one notification per batch and no restart call. Everything else is identical: same `EVENT[<source>/<tag>]` prefix (the monitor line additionally carries a per-tag lead plus the full message, since that line is the whole notification — see `tools/watchers/README.md`, *Monitor line format*), same file consumption/deletion, same no-ack contract (the watcher never consumes on the loop's behalf; every `EVENT[...]` line must still be read and acted on).
+
+What changes for the operator:
+
+- `watcher-ctl run <name>` for a monitor-mode watcher does **not** exec the one-shot (a block-print-exit supervisor above a monitor would capture its stdout until an exit that never comes). It prints the exact command to arm — `<monitor_cmd> 2>&1` (default `<start_cmd> --mode monitor`), the description, `persistent: true` — plus a one-line reminder to read every line, records the request in `<pid_dir>/<name>.monitor-intent`, and exits 0. If a live instance is already recorded it says so (idempotent).
+- `watcher-ctl status` judges liveness the same way in both modes (the pid the watcher records in `<name>.lock`), so a live monitor is `ok (1/1)`; its row carries a trailing `[monitor]` tag and the DOWN footer says to re-arm rather than re-run. `watcher-restart` kills it like any other watcher; the reference watcher treats SIGTERM as a clean exit 0 (one `[monitor-mode] … STOPPED` line, no restart banner).
+- The reference watcher in monitor mode merges stderr into stdout, prints a `[monitor-mode] EVENT-WATCH MONITOR MODE ACTIVE …` banner at startup and an `EVENT-WATCH ALIVE …` line after a configurable silence (`--liveness-interval`, default 900s) so idle, wedged and dead are distinguishable.
+
+Flipping between modes is one config line (see below) plus a re-arm — no rebuild, no revert, no session restart.
+
+### Layered `watchers.conf` (base + user-dir override) — also in the container
+
+The watcher list is read in two layers: the committed/baked **base** file and an optional **override** file in the user's config dir. An override line naming an existing watcher changes only the fields it sets (`name|mode=monitor`, `name|enabled=false`, or positional with blanks meaning "inherit"); unknown names are appended. `watcher-ctl list` shows the effective values with a `SOURCE` column (`base`, `override`, `base+override(mode,…)`) and names both files in its `layers:` footer, in the container exactly as on a host.
+
+- **Paths are `$HOME` / `$XDG_CONFIG_HOME`-relative, never host-absolute.** On a host the override defaults to `$XDG_CONFIG_HOME/watchmen/watchers.override.conf`. In this container the user config dir that is bind-mounted is `~/.config/claude-container/`, so the entrypoint exports `WATCHERS_CONFIG_EXTRA=$HOME/.config/claude-container/watchers/watchers.conf` (and propagates it to cron), and the baked daemon config's `[watcher_monitor].watchers_config_extra` names the same file — CLI and daemon agree.
+- **The committed default still loads when the override is absent**: a missing or unreadable override is a silent no-op (`watcher-ctl list` reports `override = … (absent — base only)`).
+- **Symlinked overrides** (a file linked in from a git checkout) work — the file is read through the symlink — **provided the link's target is also inside the mounted tree** (e.g. under the mounted `~/repos/…` or inside `~/.config/claude-container/` itself). A symlink whose target lives outside the bind mount dangles inside the container and is treated as absent.
 
 ## Session lifecycle
 

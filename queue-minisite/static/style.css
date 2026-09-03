@@ -22,10 +22,15 @@
   --starting:  #cb4b16; /* orange — queue-running but no agent yet */
   --pending:   #b58900; /* yellow */
   --blocked:   #d33682; /* magenta — parked on external blocker */
+  --wedged:    #cb4b16; /* orange — in-flight but stuck; still holds scope */
+  --quarantined: #dc322f; /* red — scope held, liveness unknown, needs a human */
+  --other:     #268bd2; /* blue — status this UI has no section for */
+  --info:      #268bd2; /* blue — the agent-activity pill while agents are live */
   --done:      #859900; /* green */
   --abandoned: #93a1a1; /* base1 */
   --orphan:    #dc322f; /* red */
   --ready:     #6c71c4; /* violet */
+  --locked:    #268bd2; /* blue — pending but parked by an operator scope lock */
   --ok:        #859900;
   --critical:  #dc322f;
   --shadow:    0 1px 0 rgba(0,0,0,0.06);
@@ -44,10 +49,15 @@
     --starting:  #cb4b16;
     --pending:   #b58900;
     --blocked:   #d33682;
+    --wedged:    #cb4b16;
+    --quarantined: #dc322f;
+    --other:     #268bd2;
+    --info:      #268bd2;
     --done:      #859900;
     --abandoned: #586e75;
     --orphan:    #dc322f;
     --ready:     #6c71c4;
+    --locked:    #268bd2;
     --ok:        #859900;
     --critical:  #dc322f;
     --shadow:    0 1px 0 rgba(0,0,0,0.4);
@@ -205,17 +215,220 @@ html.header-collapsed .topbar .density-control { display: none; }
 .count-running  { color: var(--running);  border-color: var(--running); }
 .count-starting { color: var(--starting); border-color: var(--starting); }
 .count-blocked  { color: var(--blocked);  border-color: var(--blocked); }
+.count-wedged   { color: var(--wedged);   border-color: var(--wedged); }
+.count-quarantined { color: var(--quarantined); border-color: var(--quarantined); }
+.count-other    { color: var(--other);    border-color: var(--other); }
 .count-pending  { color: var(--pending);  border-color: var(--pending); }
 .count-orphan   { color: var(--orphan);   border-color: var(--orphan); }
 
-.dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  display: inline-block;
+/* ------- stacked count pills (botchat #2983, reordered #3090) -------
+   The count pills live in TWO stacked half-height rows inside the header:
+   TOP (.count-row-agents) = the agent-activity pill (`● N agents · C calls
+   · K tok`), RIGHT-aligned within the stack (align-self: flex-end — the
+   stack itself stays flex-start so the status row keeps its left edge);
+   BOTTOM (.count-row-status) = running / blocked / pending / …. Each pill is
+   roughly HALF its old size (font + padding) so the stack is about as tall
+   as the single old row was, and the header keeps its height. Both rows are
+   hard-nowrap at EVERY width — flex-wrap nowrap + white-space nowrap, the
+   stack can shrink (min-width: 0) and a pill clips with an ellipsis before
+   anything breaks onto a third line. The controls to the right (density,
+   source filter, dot, info) are unchanged. */
+.count-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+  flex: 0 1 auto;
 }
-.dot-ok  { background: var(--ok); }
-.dot-err { background: var(--critical); }
+.count-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+/* The agent pill's row hugs the RIGHT edge of the stack (botchat #3090:
+   "make the agent line the top one, and make it right aligned") — the stack
+   is as wide as its widest row (normally the status row), so the pill's
+   right edge lines up with the last status pill's. */
+.count-row-agents {
+  align-self: flex-end;
+  justify-content: flex-end;
+}
+.count-row .count {
+  display: block;            /* (not inline-flex) so text-overflow applies */
+  font-size: 0.68rem;
+  line-height: 1.25;
+  padding: 1px 7px;
+  min-height: 0;
+  min-width: 0;
+  flex: 0 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ------- agent-activity bar (botchat #2967 / #2983, botchat-look #3066, top-right #3090) -------
+   The TOP half-row (right-aligned) is ONE outlined rounded pill — "● N
+   agents · C calls · K tok" — ported from botchat's topbar badge: a live dot + tabular numerals
+   on a 999px-radius outline. States: .active (≥1 live agent: info-blue text,
+   border, dot; the dot pulses), .idle (0 agents: muted), .stale (snapshot
+   past the fresh window: dashed border, amber dot, "n/a" numerals — withheld,
+   never frozen), .open (popover pinned: tinted). It is a <button> (the
+   popover toggle) but sized to the half-row, NOT botchat's 28px chip, so the
+   header keeps its two-row height. Under 480px the long units (" agents" /
+   " calls" / " tok") collapse to a / c / t so the pill still fits one line —
+   the same degradation botchat's chip had on its phone topbar. */
+.agent-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 8px;
+  min-height: 0;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--fg-mute);
+  font: inherit;
+  font-size: 0.68rem;
+  line-height: 1.25;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.agent-bar:focus-visible { outline: 2px solid var(--info); outline-offset: 1px; }
+.agent-bar .agent-bar-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-mute);
+  flex: 0 0 auto;
+  margin-right: 1px;
+}
+.agent-bar .agent-bar-num { color: var(--fg-emph); }
+/* Qualifier in front of the token numeral ("main") when the pill is showing
+   the main loop's context because no agent is live. Muted so the numeral
+   still reads first. */
+.agent-bar .agent-bar-pre { color: var(--fg-mute); }
+.agent-bar .agent-bar-sep { opacity: 0.6; margin: 0 1px; }
+.agent-bar .agent-bar-unit-short { display: none; }
+.agent-bar.active { color: var(--info); border-color: var(--info); }
+.agent-bar.active .agent-bar-dot { background: var(--info); animation: agent-bar-pulse 2.4s ease-in-out infinite; }
+.agent-bar.active .agent-bar-num { color: var(--info); }
+.agent-bar.stale { border-style: dashed; color: var(--fg-mute); }
+.agent-bar.stale .agent-bar-num { color: var(--fg-mute); }
+.agent-bar.stale .agent-bar-dot { background: var(--pending); }
+.agent-bar:hover, .agent-bar.open { background: var(--bg-alt); }
+@keyframes agent-bar-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-bar.active .agent-bar-dot { animation: none; }
+}
+
+/* The per-agent breakdown popover behind the pill (agent-bar.js). Absolute
+   inside the sticky topbar, OUTSIDE #topbar-meta so the 5s morph never
+   touches it. Its RIGHT edge is anchored to the pill's right edge
+   (`--abp-right`, set by agent-bar.js from the pill's box each time it
+   opens / repaints / the window resizes, clamped so the popover never
+   leaves the viewport on either side; the 12px fallback = the old fixed
+   top-right anchor, used until the script measures). Layout/typography as
+   botchat's: bold head (count — totals), a right-aligned numeric table with
+   the description column left-aligned + wrapping, a muted footer (main loop
+   ctx · updated · host). Phones: pinned edge-to-edge (the ≤480px rule below
+   overrides right/left, so the measured anchor is ignored there). */
+.agent-bar-pop {
+  position: absolute;
+  top: 100%;
+  right: var(--abp-right, 12px);
+  margin-top: 4px;
+  z-index: 20;
+  min-width: 300px;
+  max-width: min(560px, calc(100vw - 24px));
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  padding: 10px 12px;
+  font-size: 0.82rem;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+.agent-bar-pop[hidden] { display: none; }
+.agent-bar-pop .abp-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 600;
+  color: var(--fg-emph);
+  margin-bottom: 6px;
+}
+.agent-bar-pop table { border-collapse: collapse; width: 100%; }
+.agent-bar-pop th, .agent-bar-pop td {
+  text-align: right;
+  padding: 3px 6px;
+  white-space: nowrap;
+  vertical-align: top;
+}
+.agent-bar-pop th { color: var(--fg-mute); font-weight: 500; border-bottom: 1px solid var(--line); }
+.agent-bar-pop th:first-child, .agent-bar-pop td:first-child {
+  text-align: left;
+  white-space: normal;
+  max-width: 260px;
+  overflow-wrap: anywhere;
+}
+.agent-bar-pop td.abp-desc .abp-type { color: var(--fg-mute); font-size: 0.75rem; }
+.agent-bar-pop .abp-empty { color: var(--fg-mute); padding: 4px 0; }
+/* "last 15m" line: the window totals (finished agents included) under the
+   live-only head. */
+.agent-bar-pop .abp-window {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--fg-mute);
+  margin-bottom: 6px;
+}
+.agent-bar-pop .abp-foot {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  color: var(--fg-mute);
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.agent-bar-pop .abp-stale { color: var(--pending); font-weight: 600; }
+
+/* Liveness badge: was a 10px dot; now a small outlined `live` / `error`
+   pill — the look of botchat's connection-state chip (#3066). Same element
+   + classes (refresh.js rebuilds it every tick; header-collapse hides it). */
+.dot {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  font-size: 0.68rem;
+  line-height: 1.25;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.dot-ok  { color: var(--ok); border-color: var(--ok); }
+.dot-err { color: var(--critical); border-color: var(--critical); }
 
 /* ------- source filter dropdown (topbar) ------- */
 .source-filter-label {
@@ -357,8 +570,20 @@ html.header-collapsed .topbar .density-control { display: none; }
 .item.state-running   { border-left-color: var(--running); }
 .item.state-starting  { border-left-color: var(--starting); background: color-mix(in srgb, var(--starting) 6%, var(--bg-alt)); }
 .item.state-blocked   { border-left-color: var(--blocked); background: color-mix(in srgb, var(--blocked) 6%, var(--bg-alt)); }
+/* Scope-holding attention states. Both are tinted (not faded like the
+   terminal states) because the work is NOT over: the item still owns its
+   scope, so a pending peer in the same scope cannot start until it ends. */
+.item.state-wedged      { border-left-color: var(--wedged); background: color-mix(in srgb, var(--wedged) 7%, var(--bg-alt)); }
+.item.state-quarantined { border-left-color: var(--quarantined); background: color-mix(in srgb, var(--quarantined) 7%, var(--bg-alt)); }
+/* Unrecognised status — visible and clearly flagged, deliberately plain. */
+.item.state-other       { border-left-color: var(--other); background: color-mix(in srgb, var(--other) 6%, var(--bg-alt)); }
 .item.state-pending   { border-left-color: var(--pending); }
 .item.state-pending.ready { border-left-color: var(--ready); }
+/* Locked: pending item parked by an operator scope lock. Tinted (not faded)
+   like the other scope-relevant states — the item is not terminal, it is held
+   until the operator unlocks the scope. Wins over the ready tint (a locked
+   item is never ready, but be defensive about class combination). */
+.item.state-pending.locked { border-left-color: var(--locked); background: color-mix(in srgb, var(--locked) 7%, var(--bg-alt)); }
 .item.state-done      { border-left-color: var(--done); opacity: 0.75; }
 .item.state-abandoned { border-left-color: var(--abandoned); opacity: 0.6; }
 /* Errored hostjob (non-zero exit). Reuses the orphan red and overrides the
@@ -414,6 +639,18 @@ html.header-collapsed .topbar .density-control { display: none; }
 .badge.state-abandoned { background: var(--abandoned); }
 .badge.state-errored   { background: var(--orphan); }
 .badge.state-orphan    { background: var(--orphan); }
+.badge.state-wedged      { background: var(--wedged); }
+.badge.state-quarantined { background: var(--quarantined); }
+.badge.state-locked      { background: var(--locked); }
+.badge.state-other       { background: var(--other); }
+/* "from running" / "from wedged" — the status the item held when it was
+   quarantined. Outlined rather than filled so it reads as a qualifier on the
+   quarantined badge next to it, not a second state. */
+.badge.quarantined-from {
+  background: transparent;
+  color: var(--quarantined);
+  border: 1px solid var(--quarantined);
+}
 .badge.ghead {
   background: transparent;
   color: var(--ready);
@@ -447,6 +684,107 @@ html.header-collapsed .topbar .density-control { display: none; }
 }
 
 .description.abandon-reason > strong { font-style: normal; }
+
+/* "scope still held" line on a quarantined card. This is the consequence the
+   operator most needs and the one the old UI never showed at all: no agent is
+   working the item, and nothing else can start in its scope either. */
+.description.scope-held {
+  font-style: normal;
+  color: var(--quarantined);
+}
+
+/* "scope locked" line on a LOCKED pending card — the consequence the operator
+   needs: an operator scope lock is parking this item; the dispatcher will not
+   spawn it until the scope is unlocked. */
+.description.scope-locked {
+  font-style: normal;
+  color: var(--locked);
+}
+
+/* ------- exit commands (wedged / quarantined cards) -------
+   The ways OUT of a scope-holding state, rendered as copyable commands with a
+   one-line note on what each one asserts. Showing the state without the exits
+   leaves the operator knowing something is stuck but not what to do about it,
+   which is most of the problem these sections were added to solve. */
+.exits {
+  margin: 8px 0 4px 0;
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+}
+
+.exits-label {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-mute);
+  margin-bottom: 6px;
+}
+
+.exit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.exit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.exit-cmd {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  color: var(--fg-emph);
+  background: var(--bg-alt);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 2px 6px;
+  word-break: break-all;
+}
+
+.exit-note {
+  font-size: 0.8rem;
+  color: var(--fg-mute);
+}
+
+.copy-cmd-btn {
+  font: inherit;
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  background: var(--bg-alt);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.copy-cmd-btn:hover { color: var(--fg-emph); border-color: var(--fg-mute); }
+
+/* Explainer at the top of the OTHER (unrecognised status) section. */
+.section-note {
+  margin: 0 0 10px 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--other);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--other) 6%, var(--bg-alt));
+  color: var(--fg);
+  font-size: 0.85rem;
+}
+
+.section-note code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
 
 .age {
   font-size: 0.82rem;
@@ -615,6 +953,16 @@ html.header-collapsed .topbar .density-control { display: none; }
   .topbar { padding: 10px 12px; }
   .topbar .title { font-size: 0.95rem; }
   .topbar .meta { font-size: 0.78rem; }
+  /* Stacked count pills (botchat #2983): shrink a notch more on phones —
+     still two nowrap rows, abbreviation + ellipsis, never a third line. */
+  .count-stack { gap: 2px; }
+  .count-row { gap: 3px; }
+  .count-row .count { font-size: 0.62rem; padding: 1px 5px; }
+  .agent-bar { font-size: 0.62rem; padding: 1px 6px; gap: 2px; }
+  .agent-bar .agent-bar-unit-long { display: none; }
+  .agent-bar .agent-bar-unit-short { display: inline; opacity: 0.75; }
+  .agent-bar-pop { right: 6px; left: 6px; min-width: 0; max-width: none; }
+  .dot { font-size: 0.62rem; padding: 1px 5px; }
   .info-dropdown { min-width: 180px; font-size: 0.78rem; }
 }
 
@@ -688,6 +1036,24 @@ html.header-collapsed .topbar .density-control { display: none; }
 
 .force-start-btn:focus-visible {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--pending) 35%, transparent);
+}
+
+/* Demoted force-start on a LOCKED pending item: force-starting bypasses the
+   operator's scope lock, so it must not read as the primary action. Muted
+   outline + reduced weight; the copyable `queue unlock` command in the card
+   body is the intended way out. Still fully clickable (the override is kept
+   available on purpose), just visually secondary. */
+.force-start-btn.force-start-locked {
+  border-color: var(--fg-mute);
+  color: var(--fg-mute);
+  opacity: 0.75;
+}
+
+.force-start-btn.force-start-locked:hover,
+.force-start-btn.force-start-locked:focus-visible {
+  background: var(--fg-mute);
+  color: var(--bg);
+  opacity: 1;
 }
 
 /* ------- modal ------- */
@@ -792,6 +1158,30 @@ body.modal-open { overflow: hidden; }
   color: var(--fg-mute);
   text-transform: uppercase;
   letter-spacing: 0.06em;
+}
+
+.modal-checkbox-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 0 4px 0;
+  padding: 8px 10px;
+  border-radius: 4px;
+  border-left: 3px solid var(--pending);
+  background: color-mix(in srgb, var(--pending) 8%, var(--bg-alt));
+  color: var(--fg-emph);
+  font-size: 0.84rem;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.modal-checkbox-label input[type="checkbox"] {
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+
+.modal-checkbox-label code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
 #action-modal-reason {
@@ -1201,6 +1591,48 @@ body.modal-open { overflow: hidden; }
   max-height: 320px;
   overflow: auto;
   font-size: 0.85rem;
+}
+
+/* BLOCK REASON (botchat #2413) — the headline datum for a blocked item.
+ * Same integrated-disclosure treatment as the agent-return block, with a
+ * warning-toned left rule so it reads as "this is why the item is parked"
+ * rather than as more metadata. Reasons routinely run to several hundred
+ * words, so the body SCROLLS (max-height + overflow) instead of growing
+ * the modal past the panel's 90vh cap and clipping the tail. */
+.log-modal-meta-summary .log-modal-blocker {
+  margin-top: 0;
+  border-top: none;
+  padding-top: 0;
+  padding-left: 8px;
+  border-left: 3px solid var(--pending);
+}
+
+.log-modal-meta-summary .log-modal-blocker > .prompt-summary {
+  color: var(--pending);
+  font-weight: 700;
+}
+
+.log-modal-meta-summary .log-modal-blocker .prompt-body {
+  max-height: 320px;
+  overflow: auto;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* DETAILS-ONLY MODE (data-mode="meta", botchat #2413). Blocked rows open
+ * the modal with no transcript to tail, so the stream pane and every
+ * stream-only control are hidden. With the flex:1 stream gone the panel
+ * itself becomes the scroll container, so a long block reason can never
+ * overflow past the 90vh cap. */
+.log-modal[data-mode="meta"] .log-stream,
+.log-modal[data-mode="meta"] .log-jump-btn,
+.log-modal[data-mode="meta"] #log-modal-expand {
+  display: none;
+}
+
+.log-modal[data-mode="meta"] .log-modal-panel {
+  overflow-y: auto;
 }
 
 .log-status {
@@ -1891,6 +2323,27 @@ html.density-compact .summary {
   white-space: nowrap;
 }
 
+/* Agent activity cell (botchat #2967): `11 calls · 82K tok` in the item
+   head of a RUNNING row. Sits in the HEAD (not the elided .scope/.description)
+   so compact density keeps it — see the html.density-compact override below
+   which swaps the full label for the short `11·82Kt` form. */
+.agent-stats {
+  font-size: 0.72rem;
+  color: var(--fg-mute);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.agent-stats-short { display: none; }
+/* Compact: shortest form, NEVER hidden. */
+html.density-compact .agent-stats { font-size: 0.68rem; }
+/* Header count pills (botchat #2983) in compact: same two nowrap half-rows,
+   one notch smaller so the stack tracks the denser page. */
+html.density-compact .count-stack { gap: 2px; }
+html.density-compact .count-row .count { font-size: 0.64rem; padding: 1px 6px; }
+html.density-compact .agent-bar { font-size: 0.64rem; padding: 1px 7px; }
+html.density-compact .agent-stats-full { display: none; }
+html.density-compact .agent-stats-short { display: inline; }
+
 /* Age line: keep (it carries the live running/agent signal) but shrink + tighten. */
 html.density-compact .age {
   font-size: 0.7rem;
@@ -1913,6 +2366,13 @@ html.density-compact .item > .prompt-toggle:not(.subagent-tree) { display: none;
    this die?" from the page. Higher specificity than the blanket hide above,
    and ordered after it. */
 html.density-compact .item > .description.abandon-reason { display: block; }
+
+/* Same exception for the quarantine consequence line. A quarantined item is
+   waiting on a human decision; a compact view that hides "scope still held"
+   reproduces the original bug in miniature — the row is present but says
+   nothing you can act on. (The .exits block is not covered by the blanket
+   hide above, so the ways out survive compact density as-is.) */
+html.density-compact .item > .description.scope-held { display: block; }
 
 /* Pending-item drag affordances: keep functional but shrink the handle + dep
    badges so a pending row matches the running-row height. */

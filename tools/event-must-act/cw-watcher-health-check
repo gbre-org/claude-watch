@@ -15,9 +15,9 @@
 # are accumulating, the event consumption path is broken).
 #
 # This is the CRON-DRIVEN RECOVERY injector. It is distinct from, and
-# complementary to, the claude-watch DAEMON's own heartbeat-stale inject:
-#   - The daemon fires when the *host heartbeat file* mtime goes stale (the
-#     main loop stopped touching it). PREVENTION/liveness path.
+# complementary to, the claude-watch DAEMON's own ack-stale inject:
+#   - The daemon fires when the *last-ack timestamp* goes stale (the main loop
+#     stopped acking events). PREVENTION/liveness path.
 #   - This script fires when *event files* go unconsumed (the event WATCHER
 #     is dead, even if the loop is otherwise alive). RECOVERY path for the
 #     watcher itself.
@@ -31,7 +31,16 @@
 #
 # Environment:
 #   CLAUDE_EVENT_QUEUE  — event spool directory (default ~/claude-events)
-#   CW_WATCHER_HEALTH_STALE_MIN — age threshold in minutes (default 2)
+#   CW_WATCHER_HEALTH_STALE_MIN — age threshold in minutes. If set in the
+#       environment it PINS the value (explicit escape hatch). If UNSET, the
+#       threshold is read from `[watcher_health] stale_minutes` in the runtime
+#       override TOML ($CLAUDE_WATCH_RUNTIME_CONFIG — the bind-mounted,
+#       operator-editable ~/.config/claude-container/claude-watch.override.toml,
+#       #613's live-tune layer; picked up on the next cron tick, no rebuild),
+#       then the baked config ($CLAUDE_WATCH_CONFIG), then defaults to 6.
+#       Default 6 is >= 2x the event watcher's ~3min debounce
+#       ($EVENT_WATCH_DEBOUNCE_SECONDS = 180), so a normal debounce window never
+#       false-fires "WATCHER DOWN" before the batch surfaces.
 #   CW_WATCHER_HEALTH_PANE — tmux pane target. When UNSET/empty (the
 #       default), `--pane` is omitted entirely and `claude-watch inject`
 #       resolves the pane itself ($CW_WATCHER_HEALTH_PANE -> $CLAUDE_WATCH_PANE
@@ -102,7 +111,49 @@
 set -euo pipefail
 
 QUEUE="${CLAUDE_EVENT_QUEUE:-$HOME/claude-events}"
-STALE_MIN="${CW_WATCHER_HEALTH_STALE_MIN:-2}"
+# Staleness threshold (minutes). Resolution order, highest precedence first:
+#   1. CW_WATCHER_HEALTH_STALE_MIN env var, if explicitly set (cron/systemd pin).
+#   2. [watcher_health] stale_minutes in the runtime override TOML
+#      ($CLAUDE_WATCH_RUNTIME_CONFIG) -- the bind-mounted, operator-editable
+#      ~/.config/claude-container/claude-watch.override.toml (#613's live-tune
+#      layer; the next cron tick picks up an edit, no rebuild/redeploy).
+#   3. [watcher_health] stale_minutes in the baked config ($CLAUDE_WATCH_CONFIG).
+#   4. Hardcoded default 6 (>= 2x the event watcher's ~3min debounce, so a
+#      normal debounce window never false-fires "WATCHER DOWN").
+# (cw-cron-run sources /etc/cron.d/00-env, seeded by the entrypoint with
+# CLAUDE_WATCH_CONFIG + CLAUDE_WATCH_RUNTIME_CONFIG, so this script sees both
+# under cron. Absent them, resolution just falls through to the default 6.)
+_watcher_health_toml_int() {
+    # $1=file $2=section $3=key -> prints first matching non-negative int, if any.
+    local file="$1" section="$2" key="$3"
+    [ -n "$file" ] && [ -r "$file" ] || return 1
+    awk -v want_section="$section" -v want_key="$key" '
+        { line = $0; sub(/#.*/, "", line) }                  # strip comments
+        line ~ /^[[:space:]]*\[/ {                           # [section] header
+            hdr = line; gsub(/[][[:space:]]/, "", hdr); cur = hdr; next
+        }
+        cur == want_section && line ~ ("^[[:space:]]*" want_key "[[:space:]]*=") {
+            val = line; sub(/^[^=]*=[[:space:]]*/, "", val); gsub(/[[:space:]]/, "", val)
+            if (val ~ /^[0-9]+$/) { print val; exit }
+        }
+    ' "$file" 2>/dev/null
+}
+
+if [ -n "${CW_WATCHER_HEALTH_STALE_MIN+set}" ]; then
+    STALE_MIN="$CW_WATCHER_HEALTH_STALE_MIN"
+else
+    STALE_MIN="$(_watcher_health_toml_int "${CLAUDE_WATCH_RUNTIME_CONFIG:-}" watcher_health stale_minutes || true)"
+    [ -n "$STALE_MIN" ] || STALE_MIN="$(_watcher_health_toml_int "${CLAUDE_WATCH_CONFIG:-}" watcher_health stale_minutes || true)"
+    [ -n "$STALE_MIN" ] || STALE_MIN=6
+fi
+# `find -mmin +N` needs a non-negative integer -- a bad explicit env / TOML value
+# falls back to the safe default rather than breaking the staleness scan.
+case "$STALE_MIN" in
+    ''|*[!0-9]*)
+        printf 'cw-watcher-health-check: invalid stale-minutes %s; using default 6\n' "$STALE_MIN" >&2
+        STALE_MIN=6
+        ;;
+esac
 PANE="${CW_WATCHER_HEALTH_PANE:-}"
 RESTART_HINT="${CW_WATCHER_HEALTH_RESTART_HINT:-Start the event watcher NOW: run \`watcher-ctl run claude-event-watch\` as a background task. (\`watcher-restart\` will NOT do it — it only STOPS all watchers.)}"
 COOLDOWN_SECS="${CW_WATCHER_HEALTH_COOLDOWN_SECS:-600}"
@@ -121,8 +172,28 @@ if [ ! -d "$QUEUE" ]; then
     exit 0
 fi
 
-# Count .json files older than the threshold.
-STALE=$(find "$QUEUE" -name '*.json' -mmin +"$STALE_MIN" 2>/dev/null | wc -l)
+# Count unconsumed EVENTS older than the threshold.
+#
+# The three predicates below are each load-bearing, and the first two were
+# missing until 2026-08-22:
+#
+#   -maxdepth 1   The queue dir's TOP LEVEL is the queue. A recursive find
+#                 descends into any subdirectory and counts what it finds as
+#                 unconsumed events. #681 put a `.state/last-heartbeat.json`
+#                 marker one level down, and this check fired
+#                 "WATCHER DOWN: 1 event(s) unconsumed >6min" twice in one day
+#                 off it — exactly 6 minutes after the directory's mtime,
+#                 which is what a real stale event looks like. The marker is
+#                 gone now, but the guard stays: a scan that counts state as
+#                 events will make that mistake again the next time anything
+#                 writes beside the queue.
+#   ! -name '.*'  Dotfiles are never events. `claude-event` writes each event
+#                 to a dot-prefixed temp file and renames it into place, so a
+#                 leftover temp from an interrupted write would otherwise
+#                 register as an unconsumed event forever.
+#   -type f       A directory named `*.json` is not an event either.
+STALE=$(find "$QUEUE" -maxdepth 1 -type f -name '*.json' ! -name '.*' \
+    -mmin +"$STALE_MIN" 2>/dev/null | wc -l)
 
 if [ "$STALE" -le 0 ]; then
     # Bus is healthy (nothing stale) — clear the escalation counter so a
@@ -153,11 +224,19 @@ fi
 # daemon uses for its alerts, triggering the "STOP EVERYTHING" protocol.
 #
 # The type-and-submit choreography is CENTRALIZED in `claude-watch inject`
-# (src/tmux.rs) — the ONE verified copy of the Escape->NORMAL / dd / `i`
-# INSERT verify-and-retry / type / Tab->Escape->Enter sequence. Shelling out
-# to it (instead of hand-rolling send-keys) carries the proven keystroke
-# order AND verifies the submission landed (payload cleared from the prompt
-# line), exiting non-zero if it didn't.
+# (src/tmux.rs) — the ONE verified copy of the type-and-submit sequence.
+# Shelling out to it (instead of hand-rolling send-keys) carries the proven
+# keystroke order AND verifies the submission landed (payload cleared from the
+# prompt line), exiting non-zero if it didn't.
+#
+# Deliberately NO `--escape`. Since 2026-08-18 inject only fires the
+# Escape->NORMAL blast when asked, and this alert must NOT ask: the daemon's
+# own watcher-down alert is the ROUTINE tier (src/alert.rs, KNOB #4) precisely
+# because seizing the turn to deliver a can-wait recovery nudge aborts the
+# loop's in-flight turn and kills mid-flight background agents. This script is
+# the cron-driven twin of that same alert, so it now delivers the same way:
+# queued, arriving by the next turn boundary. Adding `--escape` here would
+# re-introduce the cancellation the daemon side deliberately gave up.
 ALERT="[CLAUDE-WATCH] WATCHER DOWN: $STALE event(s) unconsumed >${STALE_MIN}min — the event watcher is dead or stuck. $RESTART_HINT"
 
 inject_rc=0

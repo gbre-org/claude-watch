@@ -14,6 +14,7 @@ use crate::reminders::{seconds_since_fire, should_defer_to_hook, ReminderType};
 use crate::state::{FailureDetail, State, StatusSnapshot, WatcherState};
 use crate::status;
 use crate::tmux;
+use crate::token_usage;
 
 /// Parse elapsed seconds since an ISO datetime string.
 pub(crate) fn elapsed_since(dt_str: &str) -> Option<f64> {
@@ -161,60 +162,119 @@ pub(crate) fn apply_thinking_token_progress(
     }
 }
 
-/// Age in whole seconds of the host heartbeat file's mtime relative to
-/// `now` (pure). Returns `None` when the mtime is unavailable (file
-/// missing/unreadable) or in the FUTURE relative to `now`
-/// (`duration_since` fails on clock skew / corrupt stamp). The
-/// heartbeat-freshness gate FAILS OPEN on `None` — the fire is allowed —
-/// deliberately unlike the workload-heartbeat suppressor (which treats a
-/// future mtime as fresh): a corrupt or skewed host heartbeat must never
-/// mask a real wedge.
-pub(crate) fn heartbeat_age_secs(mtime: Option<SystemTime>, now: SystemTime) -> Option<u64> {
+/// Bound on `carry_forward_token_misparse`: how many CONSECUTIVE zero-token
+/// polls a large, same-pane context reading may be carried forward before the
+/// zero is finally trusted. Small so a genuine `/clear` or crashed process
+/// still registers within a couple of extra cycles; large enough to bridge the
+/// 1-2-poll transient misparse (an overlay panel or a mid-redraw scrolls the
+/// bare context total out of the capture window) that the 2026-08 status-parser
+/// hardening now surfaces as a bare 0 instead of a small bogus count.
+pub(crate) const MISPARSE_CARRY_MAX: u32 = 3;
+
+/// Smooth a transient status-bar token MISPARSE so a live session is not
+/// misread as dead/cleared.
+///
+/// Context: the status parser was hardened (2026-08) to NEVER adopt the
+/// thinking-indicator (`\u{2193} N tokens`, the current turn's own output) or
+/// an agent-roster row's per-subagent count as the session context total --
+/// those numbers fooled the fresh-/clear and dead-process detectors into
+/// phantom "context clear" injects. The hardened parser instead returns `None`
+/// (-> `0`) when only those lines are on screen and the bare context total has
+/// momentarily scrolled out of the capture window. But a bare `0` itself feeds
+/// two liveness paths that the old small-bogus count did not: the
+/// `tokens == 0 && bashes == 0` dead-check accumulator and the
+/// fresh-external-session gate. A long, intact session that is merely thinking
+/// mid-turn -- or quiet-holding while subagent roster rows are on screen --
+/// would then be misread as a fresh/dead session and get a bogus resume prompt.
+///
+/// This carries the last known reading forward across a BOUNDED run of
+/// consecutive zero polls, but ONLY when the prior reading was clearly LARGE
+/// (`last_known >= carry_floor`, set by the caller to the fresh-/clear window's
+/// upper bound):
+///
+///   * A genuinely fresh/low session (`last_known < carry_floor`) is never
+///     carried, so fresh-/clear detection in the low-token window is untouched.
+///   * A large context that momentarily reads 0 is held at its last value, so a
+///     transient misparse cannot manufacture a phantom clear.
+///   * The carry is bounded (`max_carry`), so a REAL `/clear` or crashed
+///     process -- which holds 0 for many consecutive polls -- still registers
+///     once the bound is exhausted.
+///
+/// The caller additionally gates this on pane continuity (only smooth within
+/// the SAME pane), so a genuine new session (pane change) is never carried.
+///
+/// Returns `(effective_tokens, new_carry_count)`.
+pub(crate) fn carry_forward_token_misparse(
+    current: u64,
+    last_known: u64,
+    carry_count: u32,
+    carry_floor: u64,
+    max_carry: u32,
+) -> (u64, u32) {
+    if current > 0 {
+        // Real reading this poll -- trust it and reset the carry run.
+        return (current, 0);
+    }
+    if last_known >= carry_floor && carry_count < max_carry {
+        // Transient misparse of a large same-pane context -- hold the last
+        // value and advance the bounded run.
+        return (last_known, carry_count + 1);
+    }
+    // Nothing large to carry, or the carry bound is exhausted: trust the 0.
+    (0, carry_count)
+}
+
+/// Age in whole seconds of a liveness stamp relative to `now` (pure).
+/// Returns `None` when the stamp is unavailable (file missing/unreadable) or
+/// in the FUTURE relative to `now` (`duration_since` fails on clock skew /
+/// corrupt stamp). The ack-freshness gate FAILS OPEN on `None` — the fire is
+/// allowed — deliberately unlike the workload-heartbeat suppressor (which
+/// treats a future mtime as fresh): a corrupt or skewed stamp must never mask
+/// a real wedge.
+pub(crate) fn ack_age_secs(mtime: Option<SystemTime>, now: SystemTime) -> Option<u64> {
     now.duration_since(mtime?).ok().map(|d| d.as_secs())
 }
 
-/// Heartbeat-freshness gate for the prolonged-thinking fire path (v3,
-/// 2026-06-11). In deployments where the supervised session touches the
-/// host heartbeat file (`[claude].heartbeat_file`) on a periodic cadence
-/// event, a FRESH mtime at fire time is proof the session is alive and
-/// merely parked in an open turn — the residual v2 false positive, where
-/// an ultra-quiet stretch drips fewer context tokens than
-/// `min_tokens_delta` per backoff window so the token-progress guard
-/// never re-arms. A STALE mtime means a possible real wedge (a wedged
-/// session stops touching the file by design), so the fire proceeds —
-/// and the daemon's separate heartbeat-stale detection escalates that
-/// case independently.
+/// Ack-freshness gate for the prolonged-thinking fire path (v3, 2026-06-11;
+/// re-sourced from the last-ack timestamp 2026-08-22). A RECENT ack at fire
+/// time is proof the session is alive and merely parked in an open turn — the
+/// residual v2 false positive, where an ultra-quiet stretch drips fewer
+/// context tokens than `min_tokens_delta` per backoff window so the
+/// token-progress guard never re-arms. A STALE ack means a possible real
+/// wedge (a wedged session stops acking by design), so the fire proceeds —
+/// and the daemon's separate ack-stale detection escalates that case
+/// independently.
 ///
 /// Returns `true` (suppress the fire) iff the gate is enabled
-/// (`heartbeat_fresh_secs > 0`) AND the heartbeat age is known AND
-/// `age < heartbeat_fresh_secs` — in which case it RE-ARMS the thinking
+/// (`ack_fresh_secs > 0`) AND the ack age is known AND
+/// `age < ack_fresh_secs` — in which case it RE-ARMS the thinking
 /// timer exactly like the v2 token-progress re-arm: `thinking_start` and
 /// the token baseline slide forward to `now`, so the timer only resumes
 /// accumulating from this check. Returns `false` (allow the fire,
-/// touch nothing) when the gate is disabled, the heartbeat file is
+/// touch nothing) when the gate is disabled, the ack stamp is
 /// missing/unreadable, its mtime is in the future (both surface here as
-/// `heartbeat_age_secs == None` — fail-open), or the age is at/over the
+/// `ack_age_secs == None` — fail-open), or the age is at/over the
 /// threshold. Split out from `check_foreground_inner` so the behavior is
 /// unit-testable without tmux (same pattern as
 /// `apply_thinking_token_progress`).
-pub(crate) fn apply_heartbeat_fresh_rearm(
+pub(crate) fn apply_ack_fresh_rearm(
     thinking_start: &mut Option<String>,
     episode_start_tokens: &mut Option<u64>,
-    heartbeat_age_secs: Option<u64>,
-    heartbeat_fresh_secs: u64,
+    ack_age_secs: Option<u64>,
+    ack_fresh_secs: u64,
     current_tokens: u64,
     now: &str,
 ) -> bool {
-    if heartbeat_fresh_secs == 0 {
+    if ack_fresh_secs == 0 {
         // Gate disabled.
         return false;
     }
-    let Some(age) = heartbeat_age_secs else {
-        // Missing/unreadable file or future mtime — fail open.
+    let Some(age) = ack_age_secs else {
+        // Missing/unreadable stamp or future mtime — fail open.
         return false;
     };
-    if age >= heartbeat_fresh_secs {
-        // Stale heartbeat — possible real wedge, allow the fire.
+    if age >= ack_fresh_secs {
+        // Stale ack — possible real wedge, allow the fire.
         return false;
     }
     *thinking_start = Some(now.to_string());
@@ -358,7 +418,7 @@ pub(crate) fn obligation_escalation_decision(
 /// one. Context-low is the rung whose whole job is to rescue a loop that is
 /// about to run out of context, and on a dispatcher that keeps subagents in
 /// flight the count is essentially never zero — so the obligation arms once
-/// and then HOLDS forever, re-emitting the same "auto-clear pending" alert
+/// and then HOLDS forever, re-emitting the same "SELF-CLEAR NOW" alert
 /// every cycle while the context keeps climbing into the hard wall. Waiting
 /// for a quiet moment is not a recovery strategy when the thing being waited
 /// on is the very loop that is stuck.
@@ -622,6 +682,61 @@ pub(crate) fn fresh_clear_inject_suppressed(
     suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
 }
 
+/// Pure predicate: is the main loop provably alive per THE liveness signal —
+/// the age of the last event-ack (`last_ack_timestamp_age`)?
+///
+/// The fresh-/clear fast path infers a `/clear` from a low context-token
+/// reading (`[min_tokens, max_tokens)`) plus `bashes == 0` and an idle pane.
+/// That inference is fooled whenever the token reading is a MISPARSE rather
+/// than a real context reset: the status-bar total can drop out of the capture
+/// window and the parser falls back to the thinking-indicator's `↓ N tokens`
+/// (current-turn output, typically a few thousand) or an agent-roster row's
+/// count — both of which land squarely inside `[min_tokens, max_tokens)`
+/// (see `status::parse_status_bar`). A long, intact session that is thinking
+/// mid-turn or quiet-holding while acking keepalives then reads as a "fresh
+/// /clear" and gets a resume prompt injected on top of live, uncleared work
+/// (false-fire incident 2026-08-24: looped for hours at tokens=2100..4900).
+///
+/// The one signal that cannot be spoofed by a token misparse is whether the
+/// loop is still handling events: `event-ack` stamps `last-ack-timestamp` on
+/// every ack, and the main loop's per-batch reflex is `event-ack ack-batch`.
+/// If that stamp is younger than the stale threshold the loop demonstrably
+/// handled something recently, so it CANNOT have been cleared/stranded — any
+/// low-token reading this cycle is noise. Gate the inject on it.
+///
+/// Returns true iff we HAVE an ack stamp AND it is younger than `stale_secs`.
+/// `None` (no ack data yet — fresh boot, host without event-ack) => false:
+/// we never claim a liveness we can't prove, so the genuine fresh-/clear case
+/// keeps its existing behaviour. Symmetrically, a genuinely stranded post-clear
+/// loop stops acking, so its stamp ages past `stale_secs` and the gate opens
+/// again — this defers to, rather than disables, wedge detection (the same
+/// single-liveness-signal principle the 2026-08-22 ack redesign consolidated
+/// on).
+pub(crate) fn ack_liveness_fresh(liveness_age: Option<u64>, stale_secs: u64) -> bool {
+    liveness_age.is_some_and(|age| age < stale_secs)
+}
+
+/// Pure predicate: should `ack_liveness_fresh` suppress a fresh-/clear or
+/// post-clear-resume inject THIS cycle?
+///
+/// `ack_liveness_fresh` exists to catch a status-bar MISPARSE — a live,
+/// intact session whose low-token reading is actually a thinking-indicator
+/// or agent-roster count leaking through, not a real clear. It must defer
+/// to a genuine context-limit/rate-limit wedge (`wedged_now`, from
+/// `tmux::detect_wedged` on the *current* banner text — independent,
+/// stronger evidence than a token-count reading). Without this carve-out, a
+/// session that hit "Context limit reached" moments after its last
+/// event-ack reads as "alive" for the whole `ack.stale_minutes` window,
+/// and the ack gate's early `return` in `check_cycle` never lets control
+/// reach `handle_wedged_pane` — silently swallowing the autoclear-on-
+/// context-limit recovery (2026-08-26 incident: "Context limit reached"
+/// then "Context low (0% remaining)", autoclear never fired).
+///
+/// Returns true iff `ack_alive && !wedged_now`.
+pub(crate) fn ack_liveness_suppresses_clear_inject(ack_alive: bool, wedged_now: bool) -> bool {
+    ack_alive && !wedged_now
+}
+
 /// Pure predicate: should the dead-process restart be suppressed because
 /// the main loop is actively turning? Mirrors the decision we make at
 /// the fire site so unit tests don't have to mock tmux pane reads.
@@ -776,6 +891,75 @@ pub(crate) fn workload_heartbeat_suppresses_stuck(config: &Config) -> bool {
 /// computes the two inputs.
 pub(crate) fn stuck_suppressed_by_activity(workload_fresh: bool, active_subagents: u32) -> bool {
     workload_fresh || active_subagents > 0
+}
+
+/// Pure predicate: given the heartbeat-stale proof-of-life inputs, return the
+/// reason to SUPPRESS the stuck flag this cycle, or `None` to let it fire.
+///
+/// Extends [`stuck_suppressed_by_activity`] with two INDEPENDENT liveness
+/// signals the daemon already tracks, decoupling host-heartbeat freshness from
+/// event-bus tick DELIVERY. The host heartbeat file is refreshed by the main
+/// loop only when it PROCESSES a `heartbeat-tick` claude-event (acks it via
+/// `event-ack ack`, which refreshes the liveness timestamp per #649's
+/// ack-driven redesign) -- which needs (a) the event bus to deliver the tick
+/// AND (b) the loop to reach a tool-call boundary. Both premises fail while the
+/// loop is ALIVE: a long single turn (prolonged thinking, no tool calls) or a
+/// stalled bus (claude-event-watch itself down) starves the heartbeat even
+/// though nothing is wedged, firing a FALSE "heartbeat stale" alert (incident
+/// 2026-08-21: 25min + 40min false stale while the loop was thinking).
+///
+/// So when the daemon has its OWN evidence the loop is alive -- an active
+/// thinking episode (`loop_thinking`) or a tool call running / run within the
+/// active window (`actively_turning`) -- a stale heartbeat file is NOT a wedge
+/// and the stuck flag is suppressed. A genuinely wedged session shows NEITHER
+/// signal (idle pane, no thinking, no tool activity, no live subagents, no
+/// fresh workload heartbeat), so real wedge detection is preserved. The
+/// "thinking forever" case is independently covered by prolonged-thinking
+/// detection + its own token-progress rearm, so deferring to it here loses no
+/// coverage. Kept pure (no /proc, no Config) so it is unit-testable.
+pub(crate) fn heartbeat_stale_liveness_reason(
+    workload_fresh: bool,
+    active_subagents: u32,
+    loop_thinking: bool,
+    actively_turning: bool,
+) -> Option<&'static str> {
+    if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
+        return Some(if workload_fresh {
+            "workload_heartbeat_fresh"
+        } else {
+            "active_subagents"
+        });
+    }
+    if loop_thinking {
+        return Some("loop_thinking");
+    }
+    if actively_turning {
+        return Some("loop_actively_turning");
+    }
+    None
+}
+
+/// Age in seconds of the last ack of ANY claude-event — THE liveness signal.
+///
+/// `event-ack` stamps `<state-dir>/last-ack-timestamp` on every ack, and the
+/// main loop's per-batch reflex is `event-ack ack-batch`, so this timestamp
+/// answers exactly one question: how long since the loop last handled
+/// anything. It is the only liveness input the daemon has (the host heartbeat
+/// FILE and its `touch` ritual were retired 2026-08-22 — two signals for one
+/// fact was the complexity Andrew asked to remove).
+///
+/// Default-open: missing/unreadable file => `None` (treat as "no ack data
+/// yet", not an error). A `None` NEVER reads as stale — a fresh host with no
+/// ack state must not alert; the first ack starts the clock.
+pub(crate) fn last_ack_timestamp_age(state_dir: &str) -> Option<u64> {
+    use std::fs;
+    use std::time::SystemTime;
+
+    let path = std::path::Path::new(state_dir).join(crate::config::LAST_ACK_FILE);
+    let meta = fs::metadata(&path).ok()?;
+    // Age via the pure helper so the fail-open rule for a future/skewed stamp
+    // is defined in exactly one place (and stays unit-testable without I/O).
+    ack_age_secs(meta.modified().ok(), SystemTime::now())
 }
 
 /// Reason a force-inject escalation should fire.
@@ -1054,6 +1238,15 @@ async fn emit_watcher_down_event(
     let watcher_kv = format!("watcher={}", watcher);
     let consec_kv = format!("consecutive_missing={}", consecutive_missing);
     let pid_kv = format!("recorded_pid={}", pid_str);
+    // Producer-stamped routing tier (rung 2 in the classifier precedence): a
+    // down watcher DEMANDS a relaunch, so route it to the ACTIONABLE pending
+    // list + N-call gate rather than ambient context. Without this the event
+    // fell through the classifier's `claude-watch/* -> ambient` catch-all and a
+    // busy main loop never relaunched the watcher (comms watcher down ~4h,
+    // incident 2026-08-21). claude-event-watch forwards data.tier to
+    // `event-ack ingest --tier`, so this producer stamp wins over the
+    // consumer-side table.
+    let tier_kv = "tier=actionable";
     let args: Vec<&str> = vec![
         cli,
         &message,
@@ -1071,6 +1264,8 @@ async fn emit_watcher_down_event(
         &consec_kv,
         "--data",
         &pid_kv,
+        "--data",
+        tier_kv,
     ];
 
     // 5s timeout — claude-event is a tiny Python script that should complete
@@ -1122,6 +1317,14 @@ fn record_reminder_latency_if_recent(kind: ReminderType, state: &mut State, shor
 /// Restart Claude Code by writing a relaunch script and injecting it.
 async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::ClaudeConfig) {
     let now = Local::now().to_rfc3339();
+
+    // The launch argv below carries `--dangerously-skip-permissions`, so
+    // Claude Code renders its Bypass-Permissions consent dialog at startup
+    // unless the acceptance is persisted in settings. Record it now;
+    // the post-restart resume-inject block also refuses to inject while that
+    // dialog is up (and accepts it), so this is an optimisation, not the
+    // safety belt.
+    pre_accept_bypass_permissions(config);
 
     // Try to find session ID from pane history
     let mut session_id: Option<String> = None;
@@ -1204,7 +1407,14 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
     // included; only the shell-safe `claude` argv is.)
     let inline_launch = format!("cd $HOME && {}", launch);
     let inject_cmd = build_relaunch_inject_cmd(&config.relaunch_script, &inline_launch);
-    tmux::inject_shell(pane, &inject_cmd).await;
+    // Serialize with every other injector (see `inject_lock`). The pane shows a
+    // SHELL prompt here, but cw-theme-sync's idle gate keys on the prompt-cursor
+    // glyph, which a zsh prompt can also render — so a theme inject can and does
+    // aim at this pane mid-relaunch. Same interleave hazard, same lock.
+    {
+        let _guard = crate::inject_lock::InjectLock::acquire("relaunch-shell").await;
+        tmux::inject_shell(pane, &inject_cmd).await;
+    }
 
     state.last_restart = Some(now);
     state.restart_count += 1;
@@ -1276,6 +1486,38 @@ pub(crate) fn evaluate_api_retry_state(
     (new_consecutive, new_first_seen, true)
 }
 
+/// Pure decision: given the current observation and the PREVIOUS episode's
+/// consecutive count, return the `(new_last_seen, episodes_delta)` pair for
+/// the retry-storm OBSERVABILITY state (`api_retry_last_seen`,
+/// `api_retry_episodes_total`).
+///
+/// Deliberately independent of `evaluate_api_retry_state`'s suppression
+/// decision. Suppression is a policy choice that switches OFF mid-storm once
+/// `max_stuck_secs` elapses, and it never runs at all when the guard is
+/// configured off — so a metric derived from suppression under-reports the
+/// exact incident it exists to describe (a 17-minute 529 storm on
+/// 2026-09-03 was invisible on the stall panels for precisely this reason).
+/// What we want exported is the raw observation: the pane showed a retry
+/// banner on this cycle, yes or no.
+///
+/// Semantics:
+///   - `is_retrying=false` clears the stamp (a resolved storm reads resolved
+///     on the very next cycle) and counts no episode.
+///   - `is_retrying=true` stamps `now`. It counts a NEW episode only on the
+///     0 -> 1 edge of the consecutive counter, so one long storm increments
+///     `api_retry_episodes_total` exactly once.
+pub(crate) fn evaluate_api_retry_observation(
+    is_retrying: bool,
+    prev_consecutive: u32,
+    now: &str,
+) -> (Option<String>, u64) {
+    if !is_retrying {
+        return (None, 0);
+    }
+    let episodes_delta = u64::from(prev_consecutive == 0);
+    (Some(now.to_string()), episodes_delta)
+}
+
 /// Detect whether the pane is currently in an upstream-API retry-backoff and
 /// update the daemon's tracking state accordingly. Returns true when the
 /// caller should SUPPRESS interrupt fires for this cycle.
@@ -1293,6 +1535,21 @@ async fn update_api_retry_state(config: &Config, state: &mut State, pane: &str) 
 
     let is_retrying = tmux::detect_api_retry(pane).await;
     let was_suppressing = is_api_retry_suppressing(config, state);
+
+    // Observability first, and from the RAW detection — see
+    // `evaluate_api_retry_observation` for why this must not be derived from
+    // the suppression decision below. Read `api_retry_consecutive` before
+    // `evaluate_api_retry_state` overwrites it so the 0 -> 1 episode edge is
+    // still visible.
+    let (new_last_seen, episodes_delta) = evaluate_api_retry_observation(
+        is_retrying,
+        state.api_retry_consecutive,
+        &Local::now().to_rfc3339(),
+    );
+    state.api_retry_last_seen = new_last_seen;
+    state.api_retry_episodes_total = state
+        .api_retry_episodes_total
+        .saturating_add(episodes_delta);
 
     let (new_consec, new_first, suppress) = evaluate_api_retry_state(
         is_retrying,
@@ -1542,31 +1799,25 @@ async fn check_foreground_inner(
                         );
                         return;
                     }
-                    // Host-heartbeat freshness gate (v3, 2026-06-11): if the
-                    // supervised session touched the host heartbeat file
-                    // (`[claude].heartbeat_file` — the same path the
-                    // heartbeat-stale detector watches) within
-                    // `heartbeat_fresh_secs`, the session is demonstrably
-                    // alive and this is an idle parked-open turn, not a
-                    // wedge — suppress and RE-ARM (slide thinking_start +
+                    // Ack-freshness gate (v3, 2026-06-11; re-sourced from the
+                    // last-ack timestamp 2026-08-22): if the supervised
+                    // session acked an event — the SAME signal the ack-stale
+                    // detector watches — within `ack_fresh_secs`, it is
+                    // demonstrably alive and this is an idle parked-open turn,
+                    // not a wedge: suppress and RE-ARM (slide thinking_start +
                     // token baseline, same as the v2 token-progress re-arm).
-                    // Stale/missing/unreadable/future-mtime heartbeat allows
-                    // the fire (fail-open); 0 disables the gate. Checked
-                    // BEFORE the global-gate claim so a suppressed cycle
-                    // does not consume a claim. The age is also reused in
-                    // the fire-time observability fields below.
-                    let hb_age_secs = heartbeat_age_secs(
-                        std::fs::metadata(&config.claude.heartbeat_file)
-                            .ok()
-                            .and_then(|m| m.modified().ok()),
-                        SystemTime::now(),
-                    );
+                    // A stale/missing/unreadable/future stamp allows the fire
+                    // (fail-open); 0 disables the gate. Checked BEFORE the
+                    // global-gate claim so a suppressed cycle does not consume
+                    // a claim. The age is also reused in the fire-time
+                    // observability fields below.
+                    let hb_age_secs = last_ack_timestamp_age(&config.ack.resolve_state_dir());
                     let pre_rearm_baseline = state.thinking_episode_start_tokens;
-                    if apply_heartbeat_fresh_rearm(
+                    if apply_ack_fresh_rearm(
                         &mut state.thinking_start,
                         &mut state.thinking_episode_start_tokens,
                         hb_age_secs,
-                        config.foreground_monitor.heartbeat_fresh_secs,
+                        config.foreground_monitor.ack_fresh_secs,
                         tokens,
                         &now,
                     ) {
@@ -1574,12 +1825,12 @@ async fn check_foreground_inner(
                         info!(
                             elapsed_secs = elapsed,
                             threshold = next_threshold,
-                            heartbeat_age_secs = hb_age_secs,
-                            heartbeat_fresh_secs = config.foreground_monitor.heartbeat_fresh_secs,
+                            ack_age_secs = hb_age_secs,
+                            ack_fresh_secs = config.foreground_monitor.ack_fresh_secs,
                             start_tokens,
                             tokens,
                             tokens_delta = tokens.saturating_sub(start_tokens),
-                            "prolonged thinking suppressed: host heartbeat fresh — \
+                            "prolonged thinking suppressed: recent event ack — \
                              session alive, idle parked-open turn; re-arming"
                         );
                         write_jsonl_log(
@@ -1588,10 +1839,10 @@ async fn check_foreground_inner(
                             serde_json::json!({
                                 "elapsed_secs": elapsed,
                                 "threshold_secs": next_threshold,
-                                "reason": "heartbeat_fresh",
-                                "heartbeat_age_secs": hb_age_secs,
-                                "heartbeat_fresh_secs": config.foreground_monitor.heartbeat_fresh_secs,
-                                "heartbeat_file": &config.claude.heartbeat_file,
+                                "reason": "ack_fresh",
+                                "ack_age_secs": hb_age_secs,
+                                "ack_fresh_secs": config.foreground_monitor.ack_fresh_secs,
+                                "ack_state_dir": config.ack.resolve_state_dir(),
                                 "start_tokens": start_tokens,
                                 "tokens": tokens,
                                 "tokens_delta": tokens.saturating_sub(start_tokens),
@@ -1703,7 +1954,7 @@ async fn check_foreground_inner(
                         tokens_delta = tokens.saturating_sub(start_tokens.unwrap_or(0)),
                         baseline_recorded = start_tokens.is_some(),
                         min_tokens_delta = config.foreground_monitor.min_tokens_delta,
-                        heartbeat_age_secs = hb_age_secs,
+                        ack_age_secs = hb_age_secs,
                         "prolonged thinking detected — interrupting (backoff)"
                     );
                     write_jsonl_log(
@@ -1717,8 +1968,8 @@ async fn check_foreground_inner(
                             "tokens_delta": tokens.saturating_sub(start_tokens.unwrap_or(0)),
                             "baseline_recorded": start_tokens.is_some(),
                             "min_tokens_delta": config.foreground_monitor.min_tokens_delta,
-                            "heartbeat_age_secs": hb_age_secs,
-                            "heartbeat_fresh_secs": config.foreground_monitor.heartbeat_fresh_secs,
+                            "ack_age_secs": hb_age_secs,
+                            "ack_fresh_secs": config.foreground_monitor.ack_fresh_secs,
                             "interrupt_count": state.thinking_interrupt_count,
                             "next_threshold_secs": next_threshold,
                             "action": if config.foreground_monitor.interrupt_enabled { "interrupt" } else { "log-only" },
@@ -2463,10 +2714,96 @@ pub(crate) const CONTEXT_FRESH_TOKEN_THRESHOLD: u64 = 30000;
 /// is just starting up (no prior high reading).
 const PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG: u64 = 30000;
 
-/// Reset `state.context_clear_triggered` when tokens drop below the fresh
-/// threshold, regardless of whether the inner trigger gate (`tokens > 0`)
-/// runs this cycle. Also handles the external-clear bookkeeping path so the
-/// "Since Last Clear" dashboard metric stays accurate.
+/// Fraction of the PREVIOUS token sample the counter must FALL BY for the new
+/// sample to read as a context reset, even when the new sample is still above
+/// `CONTEXT_FRESH_TOKEN_THRESHOLD`.
+///
+/// Why a ratio and not just the fresh threshold: within one context the token
+/// counter only ever climbs. A halving is not something a live context does —
+/// it means the context was thrown away and rebuilt (a `/clear`, a `self-clear`,
+/// or an auto-compaction). The fresh threshold alone MISSES that event whenever
+/// the replacement context boots above 30K, which is the normal case for any
+/// session with a large always-loaded preamble.
+pub(crate) const CONTEXT_RESET_DROP_RATIO: f64 = 0.5;
+
+/// How a check sample was recognised as "the context was just reset".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextResetSignal {
+    /// The sample itself is below `CONTEXT_FRESH_TOKEN_THRESHOLD` — the pane
+    /// is showing a near-empty context (classically `0 tokens` in the seconds
+    /// between `/clear` landing and the first turn of the new context).
+    FreshSample,
+    /// The sample is still above the fresh threshold, but the counter FELL by
+    /// at least `CONTEXT_RESET_DROP_RATIO` of the previous sample — a context
+    /// that was replaced, observed only after the replacement had already
+    /// loaded its preamble.
+    TokenDrop,
+}
+
+/// Pure predicate: does this token sample mean the context was reset since the
+/// previous sample?
+///
+/// THE BUG THIS EXISTS FOR (observed 2026-08-22): the daemon recognised a
+/// context reset ONLY by sampling a token count below
+/// `CONTEXT_FRESH_TOKEN_THRESHOLD` (30K). That works only if the daemon happens
+/// to land a poll inside the few seconds a cleared pane reads near-zero. On a
+/// session whose fresh context boots at ~77K tokens (large always-loaded
+/// preamble) the window is not just narrow — the pane may NEVER read below 30K
+/// at all. The real samples across that day's auto-clear were:
+///
+///   21:08:13  tokens=907979
+///   21:08:46  tokens=77185      <- the clear happened in this 33s gap
+///
+/// Neither sample is under 30K, so nothing stamped `last_context_clear`, the
+/// dashboard's "Since Clear" tile kept counting from the PREVIOUS day's clear
+/// (1.07 days at 17:57 ET, 50 minutes after the clear it should have shown),
+/// and `context_clear_triggered` was left at the mercy of a later low sample.
+///
+/// Keying on the DROP instead makes detection independent of how big a fresh
+/// context is, and covers every path that resets a context: the daemon's own
+/// deferred auto-clear, a wedged-pane recovery self-clear, an agent- or
+/// operator-run `self-clear`, a hand-typed `/clear`, and an auto-compaction.
+/// All of them manifest the same way — the counter collapses between two polls.
+///
+/// Returns `None` for a live context (growth, or the ordinary small jitter of a
+/// re-rendered status bar), so a normal turn never reads as a clear.
+pub(crate) fn context_reset_signal(
+    prev_tokens: Option<u64>,
+    tokens: u64,
+) -> Option<ContextResetSignal> {
+    if tokens < CONTEXT_FRESH_TOKEN_THRESHOLD {
+        return Some(ContextResetSignal::FreshSample);
+    }
+    // A drop is only meaningful against a previous sample that was itself high
+    // enough to be a real context (the same "previously high" notion the
+    // external-clear log uses) — during boot there is nothing to compare to.
+    let prev = prev_tokens?;
+    if prev < PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG {
+        return None;
+    }
+    let dropped = prev.saturating_sub(tokens);
+    if (dropped as f64) >= (prev as f64) * CONTEXT_RESET_DROP_RATIO {
+        return Some(ContextResetSignal::TokenDrop);
+    }
+    None
+}
+
+/// Reset `state.context_clear_triggered` when a check sample shows the context
+/// was reset (see `context_reset_signal`), regardless of whether the inner
+/// trigger gate (`tokens > 0`) runs this cycle. Also handles the external-clear
+/// bookkeeping path so the "Since Clear" dashboard metric stays accurate.
+///
+/// STAMP SEMANTICS: `last_context_clear` is stamped with `now` — the check
+/// cycle on which the reset was OBSERVED, not the instant the context was
+/// actually thrown away, which the daemon cannot see. The two differ by at most
+/// one `check_interval` plus the status read (order of seconds; ~33s in the
+/// 2026-08-22 incident, where the clear fell inside a poll gap). The dashboard
+/// tile renders this in minutes/hours/days, so the observation lag is not
+/// material — and it is far closer than the alternative anchors: the deferred
+/// auto-clear's TRIGGER stamp runs up to a full `grace_period` (300s) EARLY,
+/// and `self-clear`'s handoff marker is touched only after the resume prompt
+/// has been delivered, LATER. Whichever of those fired, this landing
+/// observation re-stamps with the closest available reading.
 ///
 /// Why this lives outside the `tokens > 0` guard in `check_cycle`:
 /// when `self-clear` succeeds, the pane briefly shows tokens=0. The inner
@@ -2483,14 +2820,21 @@ pub(crate) fn maybe_reset_context_clear(
     tokens: u64,
     now: &str,
 ) {
-    if tokens >= CONTEXT_FRESH_TOKEN_THRESHOLD {
+    // The previous sample, captured BEFORE `check_cycle` slides
+    // `last_seen_tokens` forward — a reset is a relation between two samples.
+    let prev_tokens = state.last_seen_tokens;
+    let Some(signal) = context_reset_signal(prev_tokens, tokens) else {
         return;
-    }
+    };
+    let detected_by = match signal {
+        ContextResetSignal::FreshSample => "fresh_sample",
+        ContextResetSignal::TokenDrop => "token_drop",
+    };
 
-    // Context-low condition has cleared (tokens below the fresh threshold) —
-    // disarm the two-phase obligation so the next crossing re-arms, and end
-    // the threshold episode so the hook-deferral ceiling restarts from the
-    // NEXT crossing rather than staying permanently expired.
+    // Context-low condition has cleared (the context was reset) — disarm the
+    // two-phase obligation so the next crossing re-arms, and end the threshold
+    // episode so the hook-deferral ceiling restarts from the NEXT crossing
+    // rather than staying permanently expired.
     state.context_obligation_armed_at = None;
     state.context_threshold_first_seen_at = None;
 
@@ -2498,12 +2842,17 @@ pub(crate) fn maybe_reset_context_clear(
     // the in-flight flag + child-pid bookkeeping so the next threshold
     // crossing can fire.
     if state.context_clear_triggered {
-        info!(tokens, "context clear detected — resetting trigger");
+        info!(
+            tokens,
+            prev_tokens, detected_by, "context clear detected — resetting trigger"
+        );
         write_jsonl_log(
             &config.general.log_file,
             "context_clear_reset",
             serde_json::json!({
                 "tokens": tokens,
+                "prev_tokens": prev_tokens,
+                "detected_by": detected_by,
             }),
         );
         record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
@@ -2521,23 +2870,108 @@ pub(crate) fn maybe_reset_context_clear(
     // Path 2: external clear (user `/clear`, fresh-clear path, or any other
     // off-path reset). Only emit the log when we previously saw a high
     // sample, to avoid logging on every check during boot.
-    if state.last_seen_tokens.unwrap_or(0) >= PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG {
+    // (A `TokenDrop` signal implies this — it is measured against a
+    // previously-high sample. The check is what suppresses the boot case,
+    // where a `FreshSample` is just an empty pane and not a clear at all.)
+    if prev_tokens.unwrap_or(0) >= PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG {
         info!(
             tokens,
-            prev_tokens = state.last_seen_tokens,
-            "external context clear detected"
+            prev_tokens, detected_by, "external context clear detected"
         );
         write_jsonl_log(
             &config.general.log_file,
             "context_clear_reset",
             serde_json::json!({
                 "tokens": tokens,
+                "prev_tokens": prev_tokens,
+                "detected_by": detected_by,
                 "external": true,
             }),
         );
         record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
         state.last_context_clear = Some(now.to_string());
     }
+}
+
+/// Stamp `last_context_clear` from a `self-clear` handoff marker when the
+/// token-drop detector (`maybe_reset_context_clear` / `context_reset_signal`)
+/// missed the clear.
+///
+/// `context_reset_signal` can only recognise a clear it SEES as a token drop
+/// between two consecutive polls. A `self-clear` (`/clear` + an
+/// immediately-injected resume prompt) re-inflates the context within seconds,
+/// so the brief low-token window can fall ENTIRELY between two polls -- no drop
+/// sample is ever taken and `last_context_clear` is never stamped, leaving the
+/// dashboard's "Since Clear" tile counting from the PREVIOUS clear. This is the
+/// self-clear analogue of the 2026-08-22 poll-gap incident; PR #732 fixed the
+/// continue/recreate boundary, not the self-clear `/clear` path.
+///
+/// The `self-clear` tool touches `tmux::self_clear_handoff_path()` the moment
+/// it finishes delivering the resume prompt (the same marker the post-clear
+/// resume gate consults via `tmux::self_clear_handoff_recent`). That marker is
+/// an out-of-band signal, immune to the poll gap, that a clear DID happen, so
+/// we stamp `last_context_clear` from it whenever the drop path missed it.
+///
+/// Idempotent: `state.self_clear_handoff_stamped_mtime` records the marker
+/// mtime already accounted for, so the stamp fires ONCE per self-clear -- not
+/// on every poll while the marker stays inside its grace window (the mtime is
+/// stable until the next self-clear touches it anew).
+///
+/// STAMP SEMANTICS mirror `maybe_reset_context_clear`: `last_context_clear` is
+/// stamped with `now` (the observation cycle), not the marker mtime; the two
+/// differ by at most `self_clear_handoff_grace_secs`, immaterial to a tile
+/// rendered in minutes/hours/days.
+pub(crate) fn maybe_stamp_self_clear_handoff(
+    config: &Config,
+    state: &mut State,
+    handoff_mtime: Option<f64>,
+    now_epoch: f64,
+    now: &str,
+) {
+    let grace = config.fresh_clear.self_clear_handoff_grace_secs;
+    if grace == 0 {
+        return;
+    }
+    let Some(mtime) = handoff_mtime else {
+        return;
+    };
+    if !tmux::handoff_is_recent(Some(mtime), now_epoch, grace) {
+        return;
+    }
+    // Already stamped for this exact self-clear (marker mtime unchanged) -- do
+    // not re-stamp on every subsequent poll inside the grace window.
+    if state.self_clear_handoff_stamped_mtime == Some(mtime) {
+        return;
+    }
+
+    info!(
+        mtime, now_epoch,
+        "self-clear handoff marker observed — stamping last_context_clear (token-drop path missed it)"
+    );
+    write_jsonl_log(
+        &config.general.log_file,
+        "context_clear_reset",
+        serde_json::json!({
+            "detected_by": "self_clear_handoff",
+            "handoff_mtime": mtime,
+            "external": true,
+        }),
+    );
+    record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
+
+    state.self_clear_handoff_stamped_mtime = Some(mtime);
+    state.last_context_clear = Some(now.to_string());
+    // The self-clear delivered its OWN resume prompt, so latch the post-clear
+    // resume gate closed for this clear (mirror Path 1 of
+    // `maybe_reset_context_clear`).
+    state.post_clear_resume_injected_for = Some(now.to_string());
+    // The context-low condition has been resolved by the clear: reset the
+    // in-flight trigger + episode/obligation bookkeeping so the next crossing
+    // can fire, exactly as the token-drop path does.
+    state.context_clear_triggered = false;
+    state.context_clear_child_pid = None;
+    state.context_obligation_armed_at = None;
+    state.context_threshold_first_seen_at = None;
 }
 
 /// Seconds after a detected /clear (or compaction) boundary during which the
@@ -2554,7 +2988,23 @@ pub(crate) const MALFORMED_POST_CLEAR_GRACE_SECS: f64 = 60.0;
 /// captured pane tail is necessarily PRE-clear scrollback residue rather than a
 /// live malform from the current (freshly-reset) context?
 ///
-/// Either signal suffices:
+/// `active_ui` is checked FIRST and short-circuits to `false` (never
+/// suppress): it is the same positive-liveness signal
+/// (`status::pane_shows_active_ui`) the fresh-session-inject gate uses
+/// (operator #5620) — a thinking indicator, agent-roster row, or
+/// background-work marker on screen is proof the low/zero `tokens` reading is
+/// a PARSE MISS (the bare context total scrolled behind the marker), not a
+/// genuinely fresh/near-empty context. Without this check, a long, busy,
+/// many-agent session — exactly the shape most likely to emit a malformed
+/// tool-call, and the most costly to miss — reads `tokens == 0` on
+/// essentially every poll (2026-06-17 / 2026-08-25 incidents) and this
+/// predicate returned `true` (suppress) for the ENTIRE session, silently
+/// neutering the detector (2026-08-27 regression: the detector went silent
+/// for a whole session while a `court`-prefixed malformed-invoke block sat
+/// unrecovered in the transcript).
+///
+/// Absent that positive signal, either of the original signals still
+/// suffices:
 ///   * `tokens < CONTEXT_FRESH_TOKEN_THRESHOLD` — the context is freshly
 ///     cleared / near-empty (the same low-token threshold used elsewhere to
 ///     mean "just cleared / boot state"). A near-empty context cannot have
@@ -2572,7 +3022,10 @@ pub(crate) const MALFORMED_POST_CLEAR_GRACE_SECS: f64 = 60.0;
 /// `/clear` was being classified MALFORMED purely because the pre-clear turn's
 /// `<invoke>` block was still in the captured scrollback. The freshly-reset
 /// context is exempt for the boundary window.
-pub(crate) fn malformed_detection_post_clear(state: &State, tokens: u64) -> bool {
+pub(crate) fn malformed_detection_post_clear(state: &State, tokens: u64, active_ui: bool) -> bool {
+    if active_ui {
+        return false;
+    }
     if tokens < CONTEXT_FRESH_TOKEN_THRESHOLD {
         return true;
     }
@@ -2607,10 +3060,30 @@ pub(crate) fn check_context_threshold_with_margin(
 ) -> Option<(f64, bool)> {
     let pct = (tokens as f64 / max_context_tokens as f64) * 100.0;
 
-    // Primary: compact_remaining is the most accurate signal when present.
-    if let Some(cr) = compact_remaining {
-        if cr <= compact_trigger_percent {
-            return Some((pct, true));
+    // Real-usage danger zone against the TRUE window — the same bar the
+    // fallback paths use below: a fixed token margin from max when
+    // `threshold_margin` is set, else a percentage of max. For the baked 1M
+    // window with `threshold_margin = 100000` this is 900K == ~90% used
+    // (~10% left) — the point at which a self-clear is wanted, and no earlier.
+    let in_danger_zone = match threshold_margin {
+        Some(margin) => max_context_tokens > margin && tokens >= max_context_tokens - margin,
+        None => pct >= threshold_percent as f64,
+    };
+
+    // Primary: `compact_remaining` is Claude Code's own "Context left until
+    // auto-compact: X%" — the most TIMELY signal, but only trustworthy once
+    // real usage confirms we are actually near full. On a large window (the
+    // 1M-token Claude Code window) Claude Code's auto-compact point is
+    // DECOUPLED from the true window: it reports a low auto-compact % at only
+    // ~48% real usage, so trusting it alone fired a destructive self-clear far
+    // too early (incident 2026-09-01: 484889/1000000 = 48.5%, compact_remaining
+    // = 5 <= compact_trigger_percent = 5). Gate it behind the real-usage danger
+    // zone so a clear never fires before ~10% of the true window remains.
+    if in_danger_zone {
+        if let Some(cr) = compact_remaining {
+            if cr <= compact_trigger_percent {
+                return Some((pct, true));
+            }
         }
     }
 
@@ -2634,26 +3107,106 @@ pub(crate) fn check_context_threshold_with_margin(
     None
 }
 
-/// Check if an auto-update should be triggered, and if so, spawn the update task.
-/// This is called from check_cycle() on each iteration.
-/// Check if Claude Code needs API reauth and send high-priority alert.
+/// Where the OAuth credential store lives for this deployment.
+fn credentials_path(config: &Config) -> std::path::PathBuf {
+    if config.reauth.credentials_file.is_empty() {
+        crate::credentials::default_path()
+    } else {
+        std::path::PathBuf::from(&config.reauth.credentials_file)
+    }
+}
+
+/// Check whether Claude Code needs API reauth, and drive the recovery.
 ///
-/// Two-phase flow:
-/// 1. **401 detected** (TUI visible, error JSON in pane) — inject `/login`, no alert yet.
-/// 2. **Login screen visible** (OAuth URL present) — send high-priority alert with URL.
+/// This is the REACTIVE half of `[reauth]` (the proactive half, which acts on
+/// the "login expires in N days" warning before anything breaks, is
+/// `check_login_expiry`). Two phases, keyed on what the pane shows:
+///
+/// 1. **401 banner, TUI still up.** When the OAuth access token lapses and the
+///    silent refresh does not happen, Claude Code keeps the TUI and prints one
+///    inline line: `Please run /login · API Error: 401 OAuth access token has
+///    expired. Re-authenticate to continue.` The session can no longer make an
+///    API call, but nothing about the screen says "dead" to the other
+///    detectors. Text alone is never acted on — any session reading this file
+///    has that sentence on its pane — so the sighting is corroborated against
+///    the credential store's ACCESS token (`expiresAt` in the past, or no token
+///    at all). Corroborated + `auth_error_auto_self_login` → `fire_self_login`,
+///    the SAME path the proactive check uses, under the same retry / attempt /
+///    abandon bounds and the same one-dialog-at-a-time latch. Auto off or
+///    bounds exhausted → the high-priority reauth alert, so it is never silent.
+///    Credential store says the token is VALID → the banner is conversation
+///    text, ignore it. Store unreadable → alert only, and say it stands alone.
+/// 2. **Login screen, TUI gone.** Inject `/login` once per reauth cycle so the
+///    OAuth URL appears (unless a self-login dialog already owns the pane),
+///    then, once the URL is on the pane, send the high-priority alert with it.
 ///
 /// Alerts are rate-limited to once per `alert_interval_seconds` (default 3 hours).
 async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
-    let reauth_result = tmux::needs_reauth(pane).await;
+    let signal = tmux::reauth_signal(pane).await;
 
-    if let Some(login_url) = reauth_result {
+    // Hand the pane back if an auto-fired login (either path) has been sitting
+    // unconsumed. `check_login_expiry` runs this too, but that check can be
+    // configured off while this one stays on, and the banner path opens
+    // dialogs that then need the same watchdog.
+    run_self_login_abandon_watchdog(config, state, pane).await;
+
+    if matches!(signal, tmux::ReauthSignal::Banner401) {
+        // Phase 1. Falls through to the phase-2 bookkeeping below on purpose:
+        // a banner on a live TUI also means any login screen is GONE (the
+        // dialog was answered, cancelled or abandoned), and that state must
+        // not leak into the next cycle.
+        check_reauth_banner(config, state, pane).await;
+    } else if state.reauth_banner_detected && matches!(signal, tmux::ReauthSignal::None) {
+        // The banner is gone from the pane and nothing replaced it: the
+        // session is back to normal. (A login screen replacing it is phase 2
+        // below, and the banner latch stays held through it so the dialog
+        // latch is not released underneath the dialog.)
+        let access = crate::credentials::read_access_token(&credentials_path(config));
+        info!(access_token = access.as_str(), "401 banner resolved");
+        write_jsonl_log(
+            &config.general.log_file,
+            "reauth_401_banner_resolved",
+            serde_json::json!({ "pane": pane, "access_token": access.as_str() }),
+        );
+        write_legacy_log(
+            &config.general.legacy_log_file,
+            &format!("Reauth: 401 banner resolved (access token {})", access.as_str()),
+        );
+        state.reauth_banner_detected = false;
+        if access == crate::credentials::AccessTokenState::Valid {
+            // A 401 that resolved into a valid access token is a login that
+            // went through (or a refresh that finally happened). Either way
+            // the window is over: give the next one a full attempt budget,
+            // and release the dialog latch so the reactive inject is not
+            // suppressed by a dialog that no longer exists. The proactive
+            // path does the same thing on credential renewal, but it can be
+            // configured off while this path stays on.
+            state.self_login_attempts_this_window = 0;
+            state.last_self_login_attempt = None;
+            state.self_login_dialog_opened_at = None;
+        }
+        crate::state::save_state(&config.general.state_file, state);
+    }
+
+    if let tmux::ReauthSignal::LoginScreen { url: login_url } = signal {
         if !state.reauth_detected {
             info!("reauth needed: first detection");
             state.reauth_detected = true;
         }
 
-        // Inject /login once per reauth cycle so the login screen appears
-        if !state.login_injected {
+        // Inject /login once per reauth cycle so the login screen appears.
+        //
+        // The `self_login_dialog_opened_at` half is not redundant with the
+        // `login_injected` latch. When the PROACTIVE path opens the dialog,
+        // this function's detector sees exactly what it sees after a real
+        // 401 — the TUI gone, a login screen up — and would inject `/login`
+        // straight into the modal. `inject_to_agent` opens with an Escape
+        // blast to reach vim NORMAL mode, and Escape in this modal CANCELS
+        // the login, so the two paths would take turns killing each other's
+        // dialog forever. The latch is cleared when the dialog is abandoned
+        // or the credentials are renewed, so this cannot wedge the reactive
+        // path shut.
+        if !state.login_injected && state.self_login_dialog_opened_at.is_none() {
             info!("injecting /login command into pane");
             inject_dispatch::inject_to_agent(pane, "/login").await;
             state.login_injected = true;
@@ -2720,12 +3273,17 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
             debug!("reauth detected (401) but no URL yet — waiting for login screen");
         }
     } else if state.reauth_detected {
-        // Reauth resolved
-        info!("reauth resolved");
+        // Login screen gone. With the 401 banner still up this is "the dialog
+        // went away", not "the session is healthy" — the banner path is still
+        // running and says so in its own events.
+        info!(
+            banner_still_up = state.reauth_banner_detected,
+            "reauth resolved (login screen gone)"
+        );
         write_jsonl_log(
             &config.general.log_file,
             "reauth_resolved",
-            serde_json::json!({}),
+            serde_json::json!({ "banner_still_up": state.reauth_banner_detected }),
         );
         write_legacy_log(&config.general.legacy_log_file, "Reauth resolved");
         state.reauth_detected = false;
@@ -2733,6 +3291,735 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
         state.login_injected = false;
         crate::state::save_state(&config.general.state_file, state);
     }
+}
+
+/// What the reactive 401-banner path decided to do this cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BannerAction {
+    /// The credential store contradicts the banner: the access token is
+    /// valid, so the text is conversation. Stay silent.
+    Ignore,
+    /// Say so, but do not touch the session. `reason` names which brake held.
+    AlertOnly {
+        corroborated: bool,
+        reason: &'static str,
+    },
+    /// Drive `self-login`.
+    AutoLogin,
+}
+
+/// Evidence available to the 401-banner decision on one cycle. The banner
+/// itself is a precondition (this is only evaluated when it is on the pane).
+pub(crate) struct BannerEvidence {
+    /// What the credential store says about the ACCESS token.
+    pub access_token: crate::credentials::AccessTokenState,
+    /// `auth_error_auto_self_login`.
+    pub auto_enabled: bool,
+    /// Seconds since the last auto-fire (either path), if there was one.
+    pub since_last_attempt: Option<f64>,
+    /// Minimum spacing between auto-fires.
+    pub retry_seconds: u64,
+    /// Attempts already spent in this window (shared with the proactive path).
+    pub attempts: u32,
+    /// Attempt ceiling for one window.
+    pub max_attempts: u32,
+    /// An auto-fired login is already up and waiting for a code.
+    pub login_pending: bool,
+}
+
+/// Decide what the reactive 401-banner path should do, given this cycle's
+/// evidence. Pure, for the same reason `decide_expiry_action` is.
+///
+/// The corroboration rule is the whole point. The banner is ONE LINE OF TEXT
+/// on a live TUI, and the reason the login-screen detector refuses to look at
+/// anything while the TUI is up is that a session reading this file, its
+/// tests, or the diff that introduced them has `API Error: 401` on its pane
+/// while being perfectly well authenticated. So:
+///
+///   * banner + access token VALID on disk  -> IGNORE. Conversation text.
+///   * banner + access token EXPIRED/MISSING -> act. This is the incident:
+///     Claude Code's silent refresh did not happen, `expiresAt` is in the past,
+///     and every request 401s until somebody runs `/login`.
+///   * banner + store UNREADABLE             -> alert, uncorroborated. Not
+///     enough to open a modal on, but an unreadable store is UNKNOWN, never
+///     a negative, and a deployment whose store lives elsewhere should hear
+///     about it rather than sit on a dead session.
+///
+/// The brakes below the corroboration are the proactive path's brakes, shared
+/// deliberately: one dialog at a time, one attempt budget, one retry spacing.
+pub(crate) fn decide_banner_action(ev: &BannerEvidence) -> BannerAction {
+    use crate::credentials::AccessTokenState;
+
+    if ev.access_token == AccessTokenState::Valid {
+        return BannerAction::Ignore;
+    }
+    if !ev.access_token.corroborates_401() {
+        // Unknown: the store could not be read. Not a negative, not evidence.
+        return BannerAction::AlertOnly {
+            corroborated: false,
+            reason: "credential store unreadable",
+        };
+    }
+    let held = |reason: &'static str| BannerAction::AlertOnly {
+        corroborated: true,
+        reason,
+    };
+    if !ev.auto_enabled {
+        return held("auto-login disabled");
+    }
+    // A login dialog we already opened is still waiting for its code. Firing
+    // a second one types `/login` into the first one's text field.
+    if ev.login_pending {
+        return held("login dialog already open");
+    }
+    if ev.attempts >= ev.max_attempts {
+        return held("attempt budget exhausted");
+    }
+    if let Some(elapsed) = ev.since_last_attempt {
+        if elapsed < ev.retry_seconds as f64 {
+            return held("retry spacing");
+        }
+    }
+    BannerAction::AutoLogin
+}
+
+/// Phase 1 of `check_reauth`: the 401 banner is on a live pane. Corroborate,
+/// decide, act.
+async fn check_reauth_banner(config: &Config, state: &mut State, pane: &str) {
+    let access = crate::credentials::read_access_token(&credentials_path(config));
+    let action = decide_banner_action(&BannerEvidence {
+        access_token: access,
+        auto_enabled: config.reauth.auth_error_auto_self_login,
+        since_last_attempt: state
+            .last_self_login_attempt
+            .as_deref()
+            .and_then(elapsed_since),
+        retry_seconds: config.reauth.self_login_retry_seconds,
+        attempts: state.self_login_attempts_this_window,
+        max_attempts: config.reauth.self_login_max_attempts,
+        login_pending: state.self_login_dialog_opened_at.is_some(),
+    });
+
+    if !state.reauth_banner_detected {
+        // First sighting of this banner: log it ONCE with everything the
+        // next incident's diagnosis will need — what the store said and
+        // what was decided. The decision is re-made every cycle (a brake can
+        // release, the store can change), so later cycles log only when they
+        // actually do something.
+        info!(
+            access_token = access.as_str(),
+            decision = ?action,
+            "401 banner on pane: first detection"
+        );
+        write_jsonl_log(
+            &config.general.log_file,
+            "reauth_401_banner",
+            serde_json::json!({
+                "pane": pane,
+                "access_token": access.as_str(),
+                "action": match &action {
+                    BannerAction::Ignore => "ignore",
+                    BannerAction::AlertOnly { .. } => "alert_only",
+                    BannerAction::AutoLogin => "auto_login",
+                },
+                "reason": match &action {
+                    BannerAction::AlertOnly { reason, .. } => *reason,
+                    BannerAction::Ignore => "access token valid on disk",
+                    BannerAction::AutoLogin => "access token expired on disk",
+                },
+            }),
+        );
+        write_legacy_log(
+            &config.general.legacy_log_file,
+            &format!(
+                "Reauth: 401 banner on pane (access token {}): {}",
+                access.as_str(),
+                match &action {
+                    BannerAction::Ignore => "ignored, credentials healthy".to_string(),
+                    BannerAction::AlertOnly { reason, .. } => format!("alert only ({reason})"),
+                    BannerAction::AutoLogin => "auto-firing self-login".to_string(),
+                }
+            ),
+        );
+        state.reauth_banner_detected = true;
+        crate::state::save_state(&config.general.state_file, state);
+    }
+
+    match action {
+        BannerAction::Ignore => {
+            debug!("401 banner on pane but the access token is valid on disk; conversation text");
+        }
+        BannerAction::AutoLogin => {
+            fire_self_login(config, state, pane, SelfLoginTrigger::Banner401).await;
+        }
+        BannerAction::AlertOnly {
+            corroborated,
+            reason,
+        } => {
+            // Same cooldown and same alert channel as phase 2, so a banner the
+            // daemon cannot or may not act on still reaches a human.
+            let should_alert = match &state.last_reauth_alert {
+                Some(last) => elapsed_since(last)
+                    .map(|e| e >= config.reauth.alert_interval_seconds as f64)
+                    .unwrap_or(true),
+                None => true,
+            };
+            if !should_alert {
+                debug!(reason, "401 banner still on pane, alert cooldown active");
+                return;
+            }
+            let qualifier = if corroborated {
+                ""
+            } else {
+                " (seen on the pane only — the credential store was not readable)"
+            };
+            let tail = if config.reauth.auth_error_auto_self_login {
+                format!(" Auto-login did not fire: {reason}.")
+            } else {
+                " Auto-login is disabled; run `self-login start` or `/login`.".to_string()
+            };
+            warn!(reason, "Claude Code hit a 401 (access token expired); alerting");
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "reauth-needed",
+                stuck_reason: "claude code 401, access token expired, login needed",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &format!(
+                    "Claude Code login needed: API Error 401, OAuth access token expired{qualifier}.{tail}"
+                ),
+            })
+            .await;
+            write_jsonl_log(
+                &config.general.log_file,
+                "reauth_alert",
+                serde_json::json!({
+                    "pane": pane,
+                    "url": "",
+                    "trigger": "401_banner",
+                    "corroborated": corroborated,
+                    "reason": reason,
+                }),
+            );
+            write_legacy_log(
+                &config.general.legacy_log_file,
+                &format!("Reauth needed (401 banner): sent high-priority alert ({reason})"),
+            );
+            state.last_reauth_alert = Some(Local::now().to_rfc3339());
+            crate::state::save_state(&config.general.state_file, state);
+        }
+    }
+}
+
+/// What the proactive expiry check decided to do this cycle.
+///
+/// Split out as a pure function so the whole decision — the corroboration
+/// rules, the retry spacing, the attempt budget — is testable without a tmux
+/// pane, a credential file, or a clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExpiryAction {
+    /// Nothing is expiring, or the evidence does not support acting.
+    Idle,
+    /// Warn the operator, but do not touch the session.
+    AlertOnly { days_left: u32, corroborated: bool },
+    /// Warn AND drive `self-login`.
+    AutoLogin { days_left: u32 },
+}
+
+/// Evidence available to the proactive expiry decision on one cycle.
+pub(crate) struct ExpiryEvidence {
+    /// Days-left parsed off Claude Code's own on-screen warning, if it was
+    /// on the pane this cycle.
+    pub pane_days_left: Option<u32>,
+    /// What the on-disk credential store says.
+    pub credentials: crate::credentials::CredentialExpiry,
+    /// Whether the credential store may TRIGGER on its own, or may only
+    /// corroborate a warning that was seen on the pane. See
+    /// `ReauthConfig::expiry_from_credentials` — a short-lived rolling refresh
+    /// token classifies as "expiring" permanently, so a store-driven trigger
+    /// is only safe where the token's lifetime is long relative to the
+    /// three-day warning window.
+    pub credentials_may_trigger: bool,
+    /// Auto-fire configured on.
+    pub auto_enabled: bool,
+    /// Auto-fire only at or below this many days left.
+    pub auto_days: u32,
+    /// Seconds since the last auto-fire, if there was one.
+    pub since_last_attempt: Option<f64>,
+    /// Minimum spacing between auto-fires.
+    pub retry_seconds: u64,
+    /// Attempts already spent in this expiry window.
+    pub attempts: u32,
+    /// Attempt ceiling for one window.
+    pub max_attempts: u32,
+    /// An auto-fired login is already up and waiting for a code.
+    pub login_pending: bool,
+}
+
+/// Decide what the proactive expiry path should do, given this cycle's evidence.
+///
+/// The corroboration rule is the important part. "Your login expires in 2
+/// days" is a sentence, and a session that is reading this file, its tests, or
+/// the diff that introduced them will have that sentence on the pane while
+/// being perfectly well authenticated. Auto-firing `/login` at it would park a
+/// healthy loop in a modal. So a pane sighting is believed only when the
+/// credential store either agrees or cannot be read at all:
+///
+///   * pane says expiring + credentials agree  -> act, corroborated
+///   * pane says expiring + credentials UNKNOWN -> act, uncorroborated (the
+///     store is not readable in every deployment, and an unreadable file is
+///     UNKNOWN, never a negative — but say so out loud)
+///   * pane says expiring + credentials healthy or already expired -> IGNORE.
+///     Healthy means the sentence was conversation text. Already-expired is
+///     the reactive path's territory, and racing it into the same modal helps
+///     nobody.
+///   * pane silent + credentials expiring -> act only when the store is
+///     allowed to trigger. The transient form of Claude Code's warning lives
+///     about fifteen seconds, so a poller missing it is not evidence of
+///     anything — but a short-lived rolling refresh token classifies as
+///     "expiring" every second of its healthy life, so this branch is opt-in
+///     rather than the default.
+pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
+    use crate::credentials::CredentialExpiry;
+
+    let (days_left, corroborated) = match (ev.pane_days_left, ev.credentials) {
+        // The reactive path owns a dead credential, whatever the pane says.
+        (_, CredentialExpiry::Expired) => return ExpiryAction::Idle,
+        (Some(_), CredentialExpiry::Healthy) => return ExpiryAction::Idle,
+        (Some(pane), CredentialExpiry::Expiring { days_left }) => {
+            // Trust the credential store's arithmetic over a scraped digit,
+            // but take whichever is more urgent so a stale banner cannot
+            // stretch the deadline.
+            (pane.min(days_left), true)
+        }
+        (Some(pane), CredentialExpiry::Unknown) => (pane, false),
+        (None, CredentialExpiry::Expiring { days_left }) if ev.credentials_may_trigger => {
+            (days_left, true)
+        }
+        (None, _) => return ExpiryAction::Idle,
+    };
+
+    let alert_only = ExpiryAction::AlertOnly {
+        days_left,
+        corroborated,
+    };
+
+    if !ev.auto_enabled || days_left > ev.auto_days {
+        return alert_only;
+    }
+    // A login dialog we already opened is still waiting for its code. Firing
+    // a second one types `/login` into the first one's text field.
+    if ev.login_pending {
+        return alert_only;
+    }
+    if ev.attempts >= ev.max_attempts {
+        return alert_only;
+    }
+    if let Some(elapsed) = ev.since_last_attempt {
+        if elapsed < ev.retry_seconds as f64 {
+            return alert_only;
+        }
+    }
+    ExpiryAction::AutoLogin { days_left }
+}
+
+/// Proactive counterpart to `check_reauth`: act on Claude Code's warning that
+/// the login is ABOUT to lapse, rather than waiting for it to actually lapse.
+///
+/// The reactive path only ever runs on a session that is already dead, which
+/// means the recovery always happens at the worst possible moment. This one
+/// runs while everything still works.
+async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
+    let pane_days_left = tmux::login_expiry_warning(pane).await;
+
+    let creds_path = credentials_path(config);
+    let credentials = crate::credentials::read(&creds_path);
+
+    // Renewal is the ONLY unambiguous "this is resolved" signal, and it is
+    // the value MOVING that says so, not where the value sits. A short-lived
+    // rolling refresh token never leaves the three-day warning window, so it
+    // would otherwise never resolve, the attempt budget would never reset,
+    // and the alert would stand forever on a session in no trouble at all.
+    let refresh_expiry = crate::credentials::read_refresh_expiry_ms(&creds_path);
+    if let (Some(now_val), Some(prev)) = (refresh_expiry, state.last_seen_refresh_expiry_ms) {
+        if now_val > prev {
+            info!("oauth credentials were renewed; resetting the expiry window");
+            write_jsonl_log(
+                &config.general.log_file,
+                "login_expiry_credentials_renewed",
+                serde_json::json!({ "previous": prev, "current": now_val }),
+            );
+            state.login_expiry_detected = false;
+            state.login_expiry_days_left = None;
+            state.last_login_expiry_alert = None;
+            state.last_self_login_attempt = None;
+            state.self_login_attempts_this_window = 0;
+            state.self_login_dialog_opened_at = None;
+        }
+    }
+    if state.last_seen_refresh_expiry_ms != refresh_expiry {
+        state.last_seen_refresh_expiry_ms = refresh_expiry;
+        crate::state::save_state(&config.general.state_file, state);
+    }
+
+    let action = decide_expiry_action(&ExpiryEvidence {
+        pane_days_left,
+        credentials,
+        credentials_may_trigger: config.reauth.expiry_from_credentials,
+        auto_enabled: config.reauth.expiry_auto_self_login,
+        auto_days: config.reauth.expiry_auto_days,
+        since_last_attempt: state
+            .last_self_login_attempt
+            .as_deref()
+            .and_then(elapsed_since),
+        retry_seconds: config.reauth.self_login_retry_seconds,
+        attempts: state.self_login_attempts_this_window,
+        max_attempts: config.reauth.self_login_max_attempts,
+        login_pending: state.self_login_dialog_opened_at.is_some(),
+    });
+
+    // Hand the pane back if an auto-fired login has been sitting unconsumed.
+    run_self_login_abandon_watchdog(config, state, pane).await;
+
+    if matches!(action, ExpiryAction::Idle) {
+        // A login screen or the 401 banner is on the pane: the reactive path
+        // owns the session right now. The pane warning this check keys on is
+        // NOT visible while a login dialog covers the TUI, so an Idle here
+        // says nothing about the expiry — it must neither "resolve" the
+        // window (resetting the attempt budget mid-flow) nor release the
+        // dialog latch, because that latch is what stops the reactive path
+        // from injecting `/login` into the dialog the daemon itself opened.
+        if state.reauth_detected || state.reauth_banner_detected {
+            return;
+        }
+        if state.login_expiry_detected {
+            info!("login expiry resolved");
+            write_jsonl_log(
+                &config.general.log_file,
+                "login_expiry_resolved",
+                serde_json::json!({ "pane": pane }),
+            );
+            write_legacy_log(
+                &config.general.legacy_log_file,
+                "Login expiry resolved (credentials renewed)",
+            );
+            state.login_expiry_detected = false;
+            state.login_expiry_days_left = None;
+            state.last_login_expiry_alert = None;
+            state.last_self_login_attempt = None;
+            state.self_login_attempts_this_window = 0;
+            crate::state::save_state(&config.general.state_file, state);
+        }
+        // Release the dialog latch OUTSIDE the `login_expiry_detected` guard,
+        // and on every idle cycle rather than only on the transition. The
+        // latch suppresses the reactive path's `/login` inject, so a stuck one
+        // is not a cosmetic leak — it is the reactive recovery quietly
+        // disabled. The abandon watchdog normally clears it, but a deployment
+        // that set `self_login_abandon_seconds = 0` has no watchdog, and a
+        // daemon restart can land here with the latch set and
+        // `login_expiry_detected` false. Nothing is expiring on this branch,
+        // so nothing needs the latch held.
+        if state.self_login_dialog_opened_at.is_some() {
+            state.self_login_dialog_opened_at = None;
+            crate::state::save_state(&config.general.state_file, state);
+        }
+        return;
+    }
+
+    let (days_left, corroborated, auto) = match action {
+        ExpiryAction::AlertOnly {
+            days_left,
+            corroborated,
+        } => (days_left, corroborated, false),
+        ExpiryAction::AutoLogin { days_left } => (days_left, true, true),
+        ExpiryAction::Idle => unreachable!(),
+    };
+
+    if !state.login_expiry_detected {
+        info!(days_left, "login expiry warning: first detection");
+        write_jsonl_log(
+            &config.general.log_file,
+            "login_expiry_detected",
+            serde_json::json!({
+                "pane": pane,
+                "days_left": days_left,
+                "corroborated": corroborated,
+                "from_pane": pane_days_left.is_some(),
+            }),
+        );
+        state.login_expiry_detected = true;
+    }
+    state.login_expiry_days_left = Some(days_left);
+
+    if auto {
+        fire_self_login(
+            config,
+            state,
+            pane,
+            SelfLoginTrigger::ExpiryWarning { days_left },
+        )
+        .await;
+    }
+
+    // Alert on the same cooldown the reactive path uses. The warning stands
+    // for days; without this it would page every ten seconds.
+    let should_alert = match &state.last_login_expiry_alert {
+        Some(last) => elapsed_since(last)
+            .map(|e| e >= config.reauth.alert_interval_seconds as f64)
+            .unwrap_or(true),
+        None => true,
+    };
+    if should_alert {
+        let qualifier = if corroborated {
+            ""
+        } else {
+            " (seen on the pane only — the credential store was not readable)"
+        };
+        let tail = if auto {
+            " Auto-login fired; watch for the OAuth URL."
+        } else if config.reauth.expiry_auto_self_login {
+            " Auto-login has not fired yet."
+        } else {
+            " Auto-login is disabled; run `self-login start` when convenient."
+        };
+        warn!(days_left, "Claude Code login is expiring");
+        alert::notify(crate::event_bus::ClaudeWatchAlert {
+            alert_type: "login-expiring",
+            stuck_reason: "claude code oauth credentials expiring soon",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: crate::event_bus::Severity::High,
+            message: &format!(
+                "Claude Code login expires in {days_left} day(s){qualifier}.{tail}"
+            ),
+        })
+        .await;
+        state.last_login_expiry_alert = Some(Local::now().to_rfc3339());
+    }
+
+    crate::state::save_state(&config.general.state_file, state);
+}
+
+/// Why `self-login` is being auto-fired. Both paths go through ONE
+/// `fire_self_login` — the same booking, the same latch, the same budget —
+/// and the trigger exists only so the logs and alerts say which one it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfLoginTrigger {
+    /// Proactive: Claude Code warned the login expires in `days_left` days.
+    ExpiryWarning { days_left: u32 },
+    /// Reactive: the in-TUI "API Error: 401 OAuth access token has expired"
+    /// banner, corroborated by the credential store.
+    Banner401,
+}
+
+impl SelfLoginTrigger {
+    /// Stable label for JSONL events and metrics.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SelfLoginTrigger::ExpiryWarning { .. } => "expiry_warning",
+            SelfLoginTrigger::Banner401 => "401_banner",
+        }
+    }
+
+    fn days_left(self) -> Option<u32> {
+        match self {
+            SelfLoginTrigger::ExpiryWarning { days_left } => Some(days_left),
+            SelfLoginTrigger::Banner401 => None,
+        }
+    }
+
+    /// The situation, phrased for a human alert.
+    fn situation(self) -> &'static str {
+        match self {
+            SelfLoginTrigger::ExpiryWarning { .. } => "Claude Code login is expiring",
+            SelfLoginTrigger::Banner401 => {
+                "Claude Code hit API Error 401 (OAuth access token expired)"
+            }
+        }
+    }
+}
+
+/// Drive `self-login start` out of process and publish whatever it produced.
+///
+/// Spawned rather than awaited: `start` interrupts the pane, injects `/login`,
+/// drives the method picker and then waits for the dialog to paint, which is
+/// far longer than a check cycle. Blocking the cycle on it would stall every
+/// other monitor the daemon runs.
+async fn fire_self_login(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    trigger: SelfLoginTrigger,
+) {
+    // Book the attempt BEFORE spawning. If the process crashes mid-run the
+    // budget is still spent, which is the safe direction: an unbooked attempt
+    // re-fires on the next cycle and every cycle after it.
+    state.last_self_login_attempt = Some(Local::now().to_rfc3339());
+    state.self_login_attempts_this_window = state.self_login_attempts_this_window.saturating_add(1);
+    state.self_login_autofire_total = state.self_login_autofire_total.saturating_add(1);
+    let attempt = state.self_login_attempts_this_window;
+    state.self_login_dialog_opened_at = Some(Local::now().to_rfc3339());
+    crate::state::save_state(&config.general.state_file, state);
+
+    info!(trigger = trigger.as_str(), days_left = ?trigger.days_left(), attempt, "auto-firing self-login");
+    write_jsonl_log(
+        &config.general.log_file,
+        "self_login_autofire",
+        serde_json::json!({
+            "pane": pane,
+            "trigger": trigger.as_str(),
+            "days_left": trigger.days_left(),
+            "attempt": attempt,
+        }),
+    );
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        &match trigger {
+            SelfLoginTrigger::ExpiryWarning { days_left } => format!(
+                "Login expiring in {days_left}d: auto-firing self-login (attempt {attempt})"
+            ),
+            SelfLoginTrigger::Banner401 => format!(
+                "401 banner, access token expired: auto-firing self-login (attempt {attempt})"
+            ),
+        },
+    );
+
+    let cmd = config.reauth.self_login_command.clone();
+    let pane = pane.to_string();
+    let log_file = config.general.log_file.clone();
+    let legacy_log_file = config.general.legacy_log_file.clone();
+    let situation = trigger.situation();
+    let stuck_reason: &'static str = match trigger {
+        SelfLoginTrigger::ExpiryWarning { .. } => "claude code login expiring, auto-login started",
+        SelfLoginTrigger::Banner401 => "claude code 401, auto-login started",
+    };
+    tokio::spawn(async move {
+        // `--foreground --json` is self-login's programmatic entry point: it
+        // blocks and emits exactly one JSON object.
+        let (out, ok) = crate::cmd::run_cmd_any(
+            &[
+                &cmd,
+                "--pane",
+                &pane,
+                "--json",
+                "start",
+                "--foreground",
+            ],
+            300,
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or(serde_json::json!({}));
+        let url = parsed.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        if ok && !url.is_empty() {
+            warn!("self-login produced an OAuth URL");
+            write_jsonl_log(
+                &log_file,
+                "self_login_url",
+                serde_json::json!({ "pane": pane, "url": url, "trigger": trigger.as_str() }),
+            );
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "reauth-needed",
+                stuck_reason,
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &format!(
+                    "{situation} and auto-login has opened the dialog. \
+                     Authorize at {url} then run: self-login code <CODE>"
+                ),
+            })
+            .await;
+        } else {
+            // FAIL LOUD. A self-login that produced no URL has usually left
+            // the pane somewhere unexpected, and a quiet failure here is a
+            // session that dies for real a day later.
+            let reason = parsed
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("self-login produced no URL and gave no reason");
+            warn!(reason, "self-login auto-fire failed");
+            write_jsonl_log(
+                &log_file,
+                "self_login_autofire_failed",
+                serde_json::json!({ "pane": pane, "reason": reason, "trigger": trigger.as_str() }),
+            );
+            write_legacy_log(
+                &legacy_log_file,
+                &format!("self-login auto-fire FAILED: {reason}"),
+            );
+            let advice = match trigger {
+                SelfLoginTrigger::ExpiryWarning { .. } => {
+                    "Log in by hand before the credentials lapse."
+                }
+                SelfLoginTrigger::Banner401 => {
+                    "The session cannot make API calls until somebody runs /login."
+                }
+            };
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "reauth-needed",
+                stuck_reason: "self-login auto-fire failed",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &format!("{situation} and auto-login FAILED: {reason}. {advice}"),
+            })
+            .await;
+        }
+    });
+}
+
+/// Hand the session back if an auto-fired login dialog was never consumed.
+///
+/// The failure this exists for: auto-fire runs at 3am, publishes a URL nobody
+/// is awake to open, and the login modal sits on the pane swallowing the
+/// loop's keystrokes until morning. The OAuth link has a short life of its
+/// own, so waiting it out buys nothing. `self-login cancel` escapes the dialog
+/// only if it is still up, so this is a no-op when the code was entered
+/// normally.
+async fn run_self_login_abandon_watchdog(config: &Config, state: &mut State, pane: &str) {
+    if config.reauth.self_login_abandon_seconds == 0 {
+        return;
+    }
+    let Some(published) = state.self_login_dialog_opened_at.clone() else {
+        return;
+    };
+    let Some(elapsed) = elapsed_since(&published) else {
+        // Unparseable timestamp: clear it rather than wedge the watchdog on it.
+        state.self_login_dialog_opened_at = None;
+        return;
+    };
+    if elapsed < config.reauth.self_login_abandon_seconds as f64 {
+        return;
+    }
+
+    info!(elapsed, "abandoning unconsumed self-login dialog");
+    let (out, ok) = crate::cmd::run_cmd_any(
+        &[
+            &config.reauth.self_login_command,
+            "--pane",
+            pane,
+            "--json",
+            "cancel",
+        ],
+        120,
+    )
+    .await;
+    write_jsonl_log(
+        &config.general.log_file,
+        "self_login_abandoned",
+        serde_json::json!({
+            "pane": pane,
+            "waited_seconds": elapsed.round(),
+            "cancel_ok": ok,
+            "cancel_output": out.trim(),
+        }),
+    );
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        "Unconsumed self-login dialog abandoned; pane handed back",
+    );
+    state.self_login_dialog_opened_at = None;
+    crate::state::save_state(&config.general.state_file, state);
 }
 
 /// Check for a manual update trigger file written by `claude-watch update`.
@@ -2762,9 +4049,11 @@ pub async fn check_update_trigger(config: &Config, state: &mut State, pane: &str
     }
 
     // Check version mismatch (or force)
-    let version_info = tokio::task::spawn_blocking(crate::status::get_version_info)
-        .await
-        .unwrap_or_default();
+    // Pane-scoped: resolve the RUNNING version from the main-loop pane's own
+    // PID, NOT the global `pgrep -af claude` first-match — which in a container
+    // can return a SIGKILL-orphaned OLDER versioned claude and manufacture a
+    // false `running != installed`, driving a self-sustaining relaunch loop.
+    let version_info = crate::status::get_version_info_for_pane(pane).await;
 
     let running = match version_info.running {
         Some(v) => v,
@@ -2822,7 +4111,44 @@ pub async fn check_update_trigger(config: &Config, state: &mut State, pane: &str
 }
 
 pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
-    if !config.auto_update.enabled || pane.is_empty() {
+    if !config.auto_update.enabled {
+        // Observability + latent-state hygiene for the config-disabled path.
+        //
+        // A hot-reload runtime override (claude-watch.override.toml) can turn
+        // this feature OFF live. When it does, the daemon otherwise returns
+        // here SILENTLY — no log, no jsonl event — so a stopgap disable is
+        // invisible and can outlive its cause indefinitely. That is exactly what
+        // happened after the version-detection flip-flop fix landed: auto-update
+        // stayed disabled for days while a running-behind-on-disk session never
+        // got the restart nudge, with nothing in the logs to explain why. Emit a
+        // ONE-TIME (per daemon lifetime) notice so `grep auto_update <log>`
+        // reveals the feature is off BY CONFIG, not silently broken.
+        static LOGGED_DISABLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED_DISABLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                "auto-update disabled by config (auto_update.enabled=false) — \
+                 restart nudge on running-behind-on-disk will NOT fire"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_update_disabled",
+                serde_json::json!({ "reason": "config auto_update.enabled=false" }),
+            );
+        }
+        // Clear a stale in-progress flag so it cannot persist forever while
+        // disabled. The staleness-timeout clear below runs ONLY on the enabled
+        // path, so a disable that lands mid-update pins update_in_progress=true
+        // (and its exported gauge) until the feature is re-enabled — observed
+        // stuck true for ~10 days. Clearing here keeps the flag honest.
+        if state.update_in_progress {
+            state.update_in_progress = false;
+            crate::state::save_state(&config.general.state_file, state);
+        }
+        return;
+    }
+
+    if pane.is_empty() {
         return;
     }
 
@@ -2875,9 +4201,11 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
     }
 
     // Check version mismatch
-    let version_info = tokio::task::spawn_blocking(crate::status::get_version_info)
-        .await
-        .unwrap_or_default();
+    // Pane-scoped: resolve the RUNNING version from the main-loop pane's own
+    // PID, NOT the global `pgrep -af claude` first-match — which in a container
+    // can return a SIGKILL-orphaned OLDER versioned claude and manufacture a
+    // false `running != installed`, driving a self-sustaining relaunch loop.
+    let version_info = crate::status::get_version_info_for_pane(pane).await;
 
     let running = match version_info.running {
         Some(v) => v,
@@ -3127,6 +4455,197 @@ fn build_relaunch_inject_cmd(script_path: &str, launch: &str) -> String {
     format!("[ -f {p} ] && bash {p} || {{ {launch}; }}", p = script_path, launch = launch)
 }
 
+/// Maximum times the daemon presses "Yes, I accept" on the
+/// Bypass-Permissions dialog during a single relaunch.
+///
+/// More than one press is only ever useful when a keystroke lands mid-render
+/// and is dropped. Beyond that, pressing again is not just noise: once the
+/// dialog is gone an extra `Enter` submits an empty prompt into the live TUI.
+/// So the presses are capped and the rest of the budget is spent WATCHING.
+const BYPASS_DIALOG_MAX_ACCEPT_ATTEMPTS: u32 = 3;
+
+/// Outcome of the post-relaunch Bypass-Permissions dialog gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BypassDialogGate {
+    /// Nothing is in the way — carry on with the resume inject exactly as
+    /// before this gate existed. Either handling is disabled, the pane
+    /// reached a genuine idle prompt, or the dialog never appeared.
+    Proceed,
+    /// The dialog appeared, was accepted, and Claude reached an idle prompt.
+    Accepted,
+    /// The dialog appeared but the pane never reached an idle prompt within
+    /// the budget. The caller must NOT inject: typing into a pane in this
+    /// state is exactly what caused the incident this gate exists for.
+    Stuck,
+}
+
+/// Pre-accept the Bypass-Permissions dialog by writing the acceptance key into
+/// the Claude Code settings file(s), so the relaunched process never renders
+/// the dialog in the first place.
+///
+/// Best-effort and idempotent: a settings tier we cannot see, or a settings
+/// file we refuse to edit, just means the dialog still appears and
+/// [`settle_bypass_permissions_dialog`] handles it on the pane. See
+/// `crate::bypass_consent` for the write discipline.
+fn pre_accept_bypass_permissions(claude_config: &crate::config::ClaudeConfig) {
+    if !claude_config.handle_bypass_dialog || !claude_config.pre_accept_bypass_dialog {
+        return;
+    }
+    for (path, outcome) in crate::bypass_consent::ensure_accepted_everywhere() {
+        match outcome {
+            crate::bypass_consent::ConsentWrite::AlreadySet => {
+                debug!(path = %path.display(), "bypass-consent: acceptance already recorded")
+            }
+            crate::bypass_consent::ConsentWrite::Inserted
+            | crate::bypass_consent::ConsentWrite::Created => {
+                info!(
+                    path = %path.display(),
+                    outcome = ?outcome,
+                    "bypass-consent: recorded the Bypass-Permissions acceptance in settings"
+                )
+            }
+            crate::bypass_consent::ConsentWrite::Skipped => {
+                debug!(
+                    path = %path.display(),
+                    "bypass-consent: left settings file untouched (will accept the dialog on the pane if it appears)"
+                )
+            }
+        }
+    }
+}
+
+/// Post-relaunch gate: get past Claude Code's Bypass-Permissions launch dialog
+/// BEFORE anything injects a resume prompt.
+///
+/// ## Why this exists
+///
+/// Claude Code renders a full-screen consent dialog at startup under
+/// `--dangerously-skip-permissions` when the acceptance is not persisted in
+/// settings — which is every relaunch this daemon performs on a host where the
+/// key has never been written. Its cancel row is `❯ No, exit`, and the bare
+/// `❯` is exactly what `wait_for_idle_prompt` treats as "ready for input". So
+/// the daemon's own idle detector reports READY while a modal is up, the
+/// resume prompt is typed into it, and the default selection ("No, exit")
+/// submits: Claude exits 0, the prompt text spills into the bare pane shell,
+/// and the pane is left half-attached needing a manual dashboard reinit
+/// (operator-observed on Claude Code 2.1.251, 2026-08-29).
+///
+/// ## Shape
+///
+/// Two bounded phases, each capped by `[claude] bypass_dialog_wait_secs`:
+///
+/// 1. **Appear.** Poll the pane. A dialog → phase 2. A genuine idle prompt
+///    (the `❯` WITHOUT the dialog markers) → `Proceed`, which is the fast path
+///    and costs one capture. Budget exhausted with neither → `Proceed`, i.e.
+///    behave exactly as before this gate existed and let the caller's own
+///    idle-prompt wait deal with a slow start.
+/// 2. **Accept + settle.** Press `Down`+`Enter` (at most
+///    `BYPASS_DIALOG_MAX_ACCEPT_ATTEMPTS` times) and watch for the dialog to
+///    go away and a real prompt to appear → `Accepted`. If it never does →
+///    `Stuck`: alert loudly and let the caller abandon the inject rather than
+///    type into an unknown pane.
+///
+/// Note the asymmetry that decides every ambiguous case here: NOT injecting
+/// costs one delayed resume (the operator, or the next check cycle, recovers
+/// it); injecting into the dialog EXITS Claude. So this gate never guesses in
+/// favour of injecting.
+async fn settle_bypass_permissions_dialog(pane: &str, config: &Config) -> BypassDialogGate {
+    if !config.claude.handle_bypass_dialog {
+        return BypassDialogGate::Proceed;
+    }
+    let budget = std::time::Duration::from_secs(config.claude.bypass_dialog_wait_secs);
+
+    // Phase 1: does the dialog show up at all?
+    let appear_deadline = tokio::time::Instant::now() + budget;
+    let mut saw_dialog = false;
+    while tokio::time::Instant::now() < appear_deadline {
+        if let Some(out) = tmux::capture_pane(pane).await {
+            if tmux::bypass_permissions_dialog_visible(&out) {
+                saw_dialog = true;
+                break;
+            }
+            if tmux::idle_prompt_without_bypass_dialog(&out) {
+                debug!("bypass-dialog: pane is at an idle prompt, no consent dialog");
+                return BypassDialogGate::Proceed;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if !saw_dialog {
+        debug!(
+            wait_secs = config.claude.bypass_dialog_wait_secs,
+            "bypass-dialog: no consent dialog observed after relaunch"
+        );
+        return BypassDialogGate::Proceed;
+    }
+
+    info!("bypass-dialog: Bypass-Permissions consent dialog detected — selecting 'Yes, I accept'");
+    write_jsonl_log(
+        &config.general.log_file,
+        "bypass_permissions_dialog_detected",
+        serde_json::json!({"pane": pane}),
+    );
+
+    // Phase 2: accept, then wait for a REAL prompt (not the dialog's cursor).
+    let settle_deadline = tokio::time::Instant::now() + budget;
+    let mut attempts: u32 = 0;
+    while tokio::time::Instant::now() < settle_deadline {
+        let Some(out) = tmux::capture_pane(pane).await else {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        };
+        if tmux::bypass_permissions_dialog_visible(&out) {
+            if attempts < BYPASS_DIALOG_MAX_ACCEPT_ATTEMPTS {
+                attempts += 1;
+                tmux::accept_bypass_permissions_dialog(pane).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            } else {
+                // Presses exhausted — keep watching, never keep typing.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            continue;
+        }
+        if tmux::idle_prompt_without_bypass_dialog(&out) {
+            info!(
+                attempts,
+                "bypass-dialog: accepted; Claude is at an idle prompt"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "bypass_permissions_dialog_accepted",
+                serde_json::json!({"attempts": attempts}),
+            );
+            return BypassDialogGate::Accepted;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    warn!(
+        attempts,
+        wait_secs = config.claude.bypass_dialog_wait_secs,
+        "bypass-dialog: Claude never reached an idle prompt after accepting the \
+         consent dialog -- ABORTING the resume inject (never type into an unknown pane)"
+    );
+    write_jsonl_log(
+        &config.general.log_file,
+        "bypass_permissions_dialog_stuck",
+        serde_json::json!({
+            "attempts": attempts,
+            "wait_secs": config.claude.bypass_dialog_wait_secs,
+        }),
+    );
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "bypass-dialog-stuck",
+        stuck_reason: "bypass-permissions consent dialog was accepted but Claude never reached an idle prompt; resume-inject aborted",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::High,
+        message: "claude-watch: Claude Code is sitting on (or just past) the Bypass Permissions consent dialog and never reached a prompt. The resume prompt was NOT injected. Operator must check the pane.",
+    })
+    .await;
+    BypassDialogGate::Stuck
+}
+
 /// Container auto-update relaunch path: clean `tmux respawn-pane -k` via the
 /// configured `[auto_update] relaunch_command` (default `["cwsr",
 /// "--no-upgrade"]`) INSTEAD of the interactive `/exit` + shell-inject flow.
@@ -3201,6 +4720,20 @@ async fn run_auto_update_clean_relaunch(
     }
     info!("auto-update: Claude binary is up (clean-relaunch)");
 
+    // Get past the Bypass-Permissions consent dialog before anything types
+    // into the pane. The relaunch argv carries `--dangerously-skip-permissions`,
+    // so Claude Code renders that dialog at startup unless the acceptance is
+    // persisted in settings — and its `❯ No, exit` row reads as an idle prompt
+    // to the wait below. See `settle_bypass_permissions_dialog`.
+    if settle_bypass_permissions_dialog(pane, config).await == BypassDialogGate::Stuck {
+        write_jsonl_log(
+            &config.general.log_file,
+            "auto_update_failed",
+            serde_json::json!({"reason": "bypass_dialog_stuck_after_clean_relaunch"}),
+        );
+        return;
+    }
+
     // Wait for the idle prompt (best-effort — binary is confirmed up).
     info!("auto-update: waiting for idle prompt (clean-relaunch)...");
     if !tmux::wait_for_idle_prompt(pane, 90).await {
@@ -3211,6 +4744,23 @@ async fn run_auto_update_clean_relaunch(
     // Inject the resume prompt (lands in the Claude TUI, never a raw shell).
     info!("auto-update: injecting resume prompt (clean-relaunch)...");
     inject_dispatch::inject_to_agent(pane, &config.auto_update.resume_prompt).await;
+
+    // Latch this clear as already handled (mirrors the daemon-driven-clear
+    // stamp at the Path-1 branch of `maybe_reset_context_clear`): the
+    // concurrent poll loop's own external-clear detection (Path 2 —
+    // `context_reset_signal` observing the respawned pane's near-zero token
+    // reading) typically stamps `last_context_clear` DURING this relaunch,
+    // independent of this function, since check_cycle keeps polling while
+    // this clean-relaunch sequence awaits the new binary/idle prompt. That
+    // stamp is never otherwise matched by `post_clear_resume_injected_for`
+    // (only the daemon-driven-clear path sets that), so the sibling
+    // "Post-clear resume detection" block's
+    // `post_clear_resume_injected_for != last_context_clear` guard reads
+    // true forever after and double-injects a SECOND resume ~40s later on
+    // top of the one just sent above. Sync the two fields to close that gap.
+    let mut st = crate::state::load_state(&config.general.state_file);
+    st.post_clear_resume_injected_for = st.last_context_clear.clone();
+    crate::state::save_state(&config.general.state_file, &st);
 
     write_jsonl_log(
         &config.general.log_file,
@@ -3242,6 +4792,12 @@ async fn run_auto_update_clean_relaunch(
 
 /// Execute the auto-update sequence: interrupt → /exit → wait → relaunch → resume.
 async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, config: &Config) {
+    // Before anything else: record the Bypass-Permissions acceptance in
+    // settings so the relaunched process (every relaunch path below passes
+    // `--dangerously-skip-permissions`) never renders the consent dialog.
+    // Best-effort — `settle_bypass_permissions_dialog` still watches for it.
+    pre_accept_bypass_permissions(&config.claude);
+
     info!("auto-update: interrupting Claude Code...");
     write_jsonl_log(
         &config.general.log_file,
@@ -3429,7 +4985,11 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     info!("auto-update: injecting relaunch command...");
     let inline_launch = format!("cd $HOME && {}", launch);
     let inject_cmd = build_relaunch_inject_cmd(&config.claude.relaunch_script, &inline_launch);
-    tmux::inject_shell(pane, &inject_cmd).await;
+    // Serialize with every other injector (see `inject_lock`), as above.
+    {
+        let _guard = crate::inject_lock::InjectLock::acquire("auto-update-shell").await;
+        tmux::inject_shell(pane, &inject_cmd).await;
+    }
 
     // Step 7: Wait for claude binary to appear in process tree.
     //
@@ -3519,6 +5079,25 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
             return;
         }
         info!("auto-update: clean-restart fallback brought Claude back up");
+    }
+
+    // Step 7b: Get past the Bypass-Permissions consent dialog.
+    //
+    // The relaunch argv carries `--dangerously-skip-permissions`, so Claude
+    // Code renders a full-screen consent dialog at startup unless the
+    // acceptance is persisted in settings. Its cancel row is `❯ No, exit` —
+    // the same `❯` Step 8's `wait_for_idle_prompt` reads as "ready", so
+    // without this gate Step 9 types the resume prompt INTO the dialog and
+    // the default selection exits Claude (operator-observed, 2026-08-29).
+    // `Stuck` means we could not get the pane to a real prompt: abort rather
+    // than inject blind.
+    if settle_bypass_permissions_dialog(pane, config).await == BypassDialogGate::Stuck {
+        write_jsonl_log(
+            &config.general.log_file,
+            "auto_update_failed",
+            serde_json::json!({"reason": "bypass_dialog_stuck_after_relaunch"}),
+        );
+        return;
     }
 
     // Step 8: Wait for the idle prompt (Claude Code is ready for input).
@@ -4077,6 +5656,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     let pane = &cs.pane;
     let tokens = cs.tokens;
     let bashes = cs.bashes;
+    let active_ui = cs.active_ui;
     let watchmen_count = status::check_watchmen_count().await;
 
     // --- Activity detection (Phase 1: logging only) ---
@@ -4093,6 +5673,27 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
+        }
+        // The restarted process was launched with
+        // `--dangerously-skip-permissions`, so Claude Code may be sitting on
+        // its Bypass-Permissions consent dialog. That dialog renders `❯ No,
+        // exit`, which the `is_idle` check below reads as a ready prompt —
+        // injecting there submits "No, exit" and Claude EXITS. Accept it and
+        // come back next cycle (the interactive-prompt guard below also
+        // matches the dialog, so a missed acceptance only delays the resume).
+        if let Some(out) = tmux::capture_pane(pane).await {
+            if tmux::bypass_permissions_dialog_visible(&out) {
+                info!(
+                    "post-restart: Bypass-Permissions consent dialog is up -- \
+                     selecting 'Yes, I accept' and deferring the resume inject"
+                );
+                if config.claude.handle_bypass_dialog {
+                    tmux::accept_bypass_permissions_dialog(pane).await;
+                }
+                state.last_check = Some(now);
+                crate::state::save_state(&config.general.state_file, state);
+                return;
+            }
         }
         // Don't inject while an interactive prompt (AskUserQuestion menu,
         // tool-permission confirmation, selection overlay) is awaiting the
@@ -4132,6 +5733,28 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         return;
     }
 
+    // Carry-forward guard against a transient status-bar token misparse (see
+    // `carry_forward_token_misparse`): if this poll reads 0 tokens for the SAME
+    // pane whose last known reading was a large, intact context, hold the prior
+    // value for a bounded run of polls rather than let the 0 trip the dead-check
+    // accumulator or the fresh-/clear detection below. A pane change (new
+    // session) or an exhausted carry run lets the 0 through. Applied only to the
+    // liveness/detection logic that follows -- the post-restart resume block
+    // above deliberately keeps the raw reading.
+    let same_pane = !cs.pane.is_empty() && cs.pane == state.last_known_pane;
+    let (tokens, token_carry_count) = if same_pane {
+        carry_forward_token_misparse(
+            tokens,
+            state.last_known_tokens,
+            state.token_carry_count,
+            config.fresh_clear.max_tokens,
+            MISPARSE_CARRY_MAX,
+        )
+    } else {
+        (tokens, 0)
+    };
+    state.token_carry_count = token_carry_count;
+
     // --- Find pane when claude-status can't (process crashed) ---
     let effective_pane: String = if pane.is_empty() && tokens == 0 && bashes == 0 {
         if let Some(p) = tmux::find_dashboard_pane(&config.tmux).await {
@@ -4165,8 +5788,17 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // Only update tokens/bashes when we got a valid parse (non-zero) to avoid
     // writing 0 to Prometheus during transient status bar parsing failures.
     state.last_known_pane = effective_pane.clone();
-    if tokens > 0 {
-        state.last_known_tokens = tokens;
+    // Prefer the JSONL-transcript-derived context size — read directly from
+    // the active session's own usage record, so it can't be clobbered by an
+    // overlay (auto-update banner, dialog) blanking the tmux status line the
+    // way `cs.tokens` can. Fall back to the tmux-scraped `tokens` when the
+    // JSONL read comes back empty/zero (no transcript yet, mid-write, races)
+    // rather than regress to 0/stale. See `token_usage::current_context_tokens`.
+    let context_tokens = token_usage::current_context_tokens()
+        .filter(|&t| t > 0)
+        .unwrap_or(tokens);
+    if context_tokens > 0 {
+        state.last_known_tokens = context_tokens;
     }
     if bashes > 0 || tokens > 0 {
         state.last_known_bashes = bashes;
@@ -4193,6 +5825,28 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     if api_retrying {
         debug!("check_cycle: api_retry active — suppressing wedged/watcher/context fires");
     }
+
+    // --- Wedged-pane pre-check (context limit / persistent rate limit) ---
+    //
+    // Computed once, early, so the ack-liveness suppression gates below (the
+    // fresh-/clear and post-clear-resume fixes from #707/#713, 2026-08-24/25)
+    // can tell a genuine context-wall wedge apart from the status-bar
+    // MISPARSE those gates were built to catch. A session that just hit
+    // "Context limit reached" / "Context low (N% remaining)" typically acked
+    // an event/keepalive moments before it wedged, so `ack_liveness_fresh`
+    // keeps reading "alive" for up to the whole stale window
+    // (`config.ack.stale_minutes`) — during which both ack-gated blocks below
+    // `return`ed BEFORE this function ever reached `handle_wedged_pane`,
+    // silently swallowing the autoclear-on-context-limit recovery (incident
+    // 2026-08-26: "Context limit reached" then "Context low (0% remaining)",
+    // autoclear never fired, operator had to `/clear` by hand). The
+    // ack-liveness gate must suppress spurious resume/restart injects on an
+    // intact session — it must never suppress the wedged-pane recovery,
+    // which rests on independent banner-text evidence (not a token-count
+    // misparse) and has its own consecutive-cycle + cooldown gating inside
+    // `handle_wedged_pane`.
+    let wedged_now =
+        !effective_pane.is_empty() && tmux::detect_wedged(&effective_pane).await.is_some();
 
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
@@ -4235,8 +5889,13 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     );
                     state.consecutive_dead_checks = 0;
                     state.last_known_pane = retry.pane.clone();
-                    if retry.tokens > 0 {
-                        state.last_known_tokens = retry.tokens;
+                    // Same JSONL-preferred / tmux-fallback policy as the
+                    // primary set site above.
+                    let recovered_context_tokens = token_usage::current_context_tokens()
+                        .filter(|&t| t > 0)
+                        .unwrap_or(retry.tokens);
+                    if recovered_context_tokens > 0 {
+                        state.last_known_tokens = recovered_context_tokens;
                     }
                     if retry.bashes > 0 || retry.tokens > 0 {
                         state.last_known_bashes = retry.bashes;
@@ -4288,7 +5947,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     info!("dead state reached after active session — resetting fresh_session_injected");
                     state.fresh_session_injected = false;
                     state.was_alive_since_inject = false;
-                } else if inject_expired {
+                } else if inject_expired
+                    // ONE-SHOT LATCH GUARD (operator #5620): only treat a
+                    // never-active session as "died during fresh startup" (and
+                    // thus re-arm the inject) when this pane was NOT hosting a
+                    // large context. A large last-known total is positive proof
+                    // the pane holds a live, intact session whose bare total is
+                    // merely a persistent parse miss — re-arming there is what
+                    // re-fired the bogus resume prompt every ~5 min.
+                    && state.last_known_tokens < config.fresh_clear.max_tokens
+                {
                     info!("dead state reached — inject expired (>5min, never active) — resetting fresh_session_injected");
                     state.fresh_session_injected = false;
                     state.was_alive_since_inject = false;
@@ -4402,7 +6070,33 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     state.alert_count = 0;
                     reset_suppression(state);
                 }
-            } else if {
+            } else if
+                // SELF-CLEAR HANDOFF GUARD (operator #4799, q-2026-08-18-e509):
+                // do NOT fire the generic fresh-session prompt while a
+                // `self-clear` is mid-handoff (lock held) OR has JUST delivered
+                // its own resume prompt (marker within the grace window). The
+                // lock-held check alone was insufficient: `self-clear` releases
+                // the lock the instant it submits the resume prompt, but the
+                // fresh session then reads idle+0-tokens for many more seconds
+                // while it bootstraps — the exact window in which this gate
+                // fired the generic "You are a fresh session ..." text and
+                // CLOBBERED the handoff. Checked BEFORE the pane captures so a
+                // recent handoff short-circuits without extra tmux work, and
+                // placed at the GATE (not just inside `inject_to_agent`) so the
+                // `fresh_session_injected` latch is not set on a deferred fire.
+                // ACTIVE-UI SUPPRESSION (operator #5620): a long, active
+                // session whose bare context total has scrolled behind the
+                // thinking indicator / agent-roster / background-tasks overlay
+                // reads tokens==0 — a parse MISS, not a fresh session. Those
+                // active-work markers never appear on a genuinely fresh idle
+                // pane, so their presence is positive proof this is NOT a fresh
+                // external session: never fire the resume-checklist inject.
+                !active_ui
+                && !tmux::self_clear_in_progress()
+                && !tmux::self_clear_handoff_recent(
+                    config.fresh_clear.self_clear_handoff_grace_secs,
+                )
+                && {
                 // Evaluate the pane reads ONCE into locals, then defer the
                 // FIRE/SUPPRESS decision to the pure `fresh_inject_due` gate
                 // (unit-tested, so the interactive-prompt suppression is
@@ -4501,6 +6195,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         check_reauth(config, state, &effective_pane).await;
     }
 
+    // --- Proactive login-expiry detection ---
+    //
+    // Runs alongside the reactive path, not inside it: that one only ever
+    // sees a session that is already dead, so its recovery always lands at
+    // the worst possible moment. This one acts on Claude Code's own warning
+    // while everything still works.
+    if config.reauth.enabled && config.reauth.expiry_watch_enabled && !effective_pane.is_empty() {
+        check_login_expiry(config, state, &effective_pane).await;
+    }
+
     // --- Post-clear resume detection ---
     //
     // Covers the blind spot BELOW the fresh-/clear token window. A pane that
@@ -4524,6 +6228,54 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         && state.last_context_clear.is_some()
         && state.post_clear_resume_injected_for != state.last_context_clear
     {
+        // Liveness gate (mirrors the 2026-08-24 fresh-/clear fix at the
+        // sibling fast path — #707/ack_liveness_fresh): THE single liveness
+        // signal is the age of the last event-ack. If the loop acked ANY
+        // event/keepalive within the stale window it is provably alive and
+        // therefore CANNOT be a genuinely stranded post-clear loop — the
+        // low-token reading that satisfied this block's guard is almost
+        // certainly the SAME status-bar misparse #707 fixed for the fresh-
+        // /clear fast path (`context_reset_signal` stamping `last_context_clear`
+        // from a sub-30K sample that is actually the thinking-indicator's
+        // current-turn count or an agent-roster row leaking through, not a
+        // real reset; see `status::parse_status_bar`). This is a hard
+        // suppression, checked before any idle-check bookkeeping or the
+        // `post_clear_resume_due` call so a fresh ack is never overridden. A
+        // genuinely stranded post-clear loop stops acking, so its stamp ages
+        // past the threshold and this gate opens again — deferring to, not
+        // disabling, wedge detection.
+        let ack_alive = ack_liveness_fresh(
+            last_ack_timestamp_age(&config.ack.resolve_state_dir()),
+            config.ack.stale_minutes * 60,
+        );
+        if ack_liveness_suppresses_clear_inject(ack_alive, wedged_now) {
+            info!(
+                tokens,
+                bashes,
+                "post-clear resume inject suppressed: fresh event-ack liveness (loop alive)"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "post_clear_inject_suppressed",
+                serde_json::json!({
+                    "tokens": tokens,
+                    "bashes": bashes,
+                    "reason": "ack_liveness_fresh",
+                    "stale_secs": config.ack.stale_minutes * 60,
+                }),
+            );
+            state.post_clear_idle_checks = 0;
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        } else if ack_alive {
+            debug!(
+                tokens,
+                bashes,
+                "post-clear resume suppression skipped: pane shows a genuine wedge banner — deferring to wedged-pane recovery"
+            );
+        }
+
         // A clear the DAEMON drove is already covered: the `self-clear` child
         // polls until the clear lands and then injects its own resume prompt.
         // Only operator-driven clears need this gate.
@@ -4534,7 +6286,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             .is_some_and(|e| e < config.fresh_clear.post_clear_window_secs as f64)
             || state
                 .context_clear_child_pid
-                .is_some_and(clear_child_is_running);
+                .is_some_and(clear_child_is_running)
+            // A self-clear (daemon-, operator-, or skill-driven) that JUST
+            // delivered its own resume prompt also counts as "daemon covered":
+            // its handoff marker is fresh, so this post-clear gate must NOT
+            // inject a second resume on top of it (operator #4799). Covers the
+            // operator/skill self-clears that `context_clear_child_pid` /
+            // `last_wedged_clear` do not, plus the post-lock-release window.
+            || tmux::self_clear_handoff_recent(
+                config.fresh_clear.self_clear_handoff_grace_secs,
+            );
         let idle = tmux::is_idle(&effective_pane).await;
         // Only consulted when idle already holds, to avoid a second pane
         // capture on the common not-idle path (same shape as the gates above).
@@ -4573,7 +6334,18 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 }),
             );
             tmux::dismiss_feedback_prompt(&effective_pane).await;
-            inject_dispatch::inject_to_agent(&effective_pane, &config.alerts.resume_prompt).await;
+            // NOT the generic `resume_prompt`: that one reports a stuck state
+            // with "no background tasks running" and asks for a watcher
+            // cleanup. This gate exists precisely BECAUSE background shells
+            // survive a /clear — the log line above records how many are live
+            // — so the generic wording states something the daemon has just
+            // measured to be false, and points the recovery at the wrong
+            // thing.
+            inject_dispatch::inject_to_agent(
+                &effective_pane,
+                &config.alerts.post_clear_resume_prompt,
+            )
+            .await;
             state.post_clear_resume_injected_for = state.last_context_clear.clone();
             state.post_clear_idle_checks = 0;
             state.fresh_clear_resume_inject_interrupts_total = state
@@ -4636,6 +6408,57 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         return;
                     }
                 }
+            }
+
+            // Liveness gate (2026-08-24 false-fire fix): THE single liveness
+            // signal is the age of the last event-ack. If the loop acked ANY
+            // event/keepalive within the stale window it is provably alive and
+            // therefore CANNOT have been /clear'd or stranded — the low token
+            // reading that landed us in this block is a misparse (the
+            // thinking-indicator's `↓ N tokens` current-turn count, or an
+            // agent-roster row, leaking through as the context total; see
+            // `status::parse_status_bar`), NOT a fresh /clear. This is a HARD
+            // suppression, deliberately checked BEFORE the escalation backstop:
+            // escalation exists to force through when the `actively_turning`
+            // heuristic might be wrong, but a fresh ack is direct proof of
+            // life, so it must never be overridden (that is exactly the
+            // false-inject the incident produced — hours of resume prompts on
+            // an intact, mid-turn/quiet-holding session at tokens=2100..4900).
+            // A genuinely stranded post-clear loop stops acking, so its stamp
+            // ages past the threshold and this gate opens again — deferring to,
+            // not disabling, wedge detection.
+            let ack_alive = ack_liveness_fresh(
+                last_ack_timestamp_age(&config.ack.resolve_state_dir()),
+                config.ack.stale_minutes * 60,
+            );
+            if ack_liveness_suppresses_clear_inject(ack_alive, wedged_now) {
+                info!(
+                    tokens,
+                    bashes,
+                    "fresh /clear inject suppressed: fresh event-ack liveness (loop alive)"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "fresh_clear_inject_suppressed",
+                    serde_json::json!({
+                        "tokens": tokens,
+                        "bashes": bashes,
+                        "reason": "ack_liveness_fresh",
+                        "stale_secs": config.ack.stale_minutes * 60,
+                    }),
+                );
+                // Rebuild detection from scratch once the (misparsed) reading
+                // clears, exactly as the actively-turning suppression does.
+                state.consecutive_fast_detections = 0;
+                state.last_check = Some(now);
+                crate::state::save_state(&config.general.state_file, state);
+                return;
+            } else if ack_alive {
+                debug!(
+                    tokens,
+                    bashes,
+                    "fresh /clear suppression skipped: pane shows a genuine wedge banner — deferring to wedged-pane recovery"
+                );
             }
 
             // Active-turn suppression (2026-04-27 false-positive fix):
@@ -4749,22 +6572,30 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.consecutive_fast_detections = 0;
     }
 
-    // --- Heartbeat stale detection ---
+    // --- Ack-stale detection (THE liveness check) ---
+    // Redesign (2026-08-22, botchat #3155-#3167): there is exactly ONE
+    // liveness signal — the age of the last ack of ANY claude-event. The main
+    // loop acks every batch it handles (`event-ack ack-batch`), which stamps
+    // `<state-dir>/last-ack-timestamp`; the daemon reads that stamp here. The
+    // host heartbeat FILE and its `touch` ritual are GONE: two signals for one
+    // fact was the complexity Andrew asked to remove, and the file had its own
+    // failure mode (the loop touching it while ignoring the events that told
+    // it to). The `keepalive` event exists only to give an IDLE loop something
+    // to ack before this threshold elapses.
     let mut stuck = false;
     let mut stuck_reason = String::new();
     // Captured for the claude-event sink so the main loop can parse
     // `stale_minutes` as a number rather than re-regex'ing the string.
     let mut stuck_stale_minutes: Option<u64> = None;
 
-    match std::fs::metadata(&config.claude.heartbeat_file) {
-        Ok(meta) => {
-            if let Ok(modified) = meta.modified() {
-                let age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default()
-                    .as_secs();
-                let stale_secs = config.heartbeat.stale_minutes * 60;
-                if age >= stale_secs {
+    // `[ack] state_dir`, else $CLAUDE_EVENT_STATE_DIR, else
+    // ~/.config/claude-events/ — the same ladder `event-ack` walks, so the
+    // writer and this reader cannot drift apart.
+    let liveness_age = last_ack_timestamp_age(&config.ack.resolve_state_dir());
+
+    if let Some(age) = liveness_age {
+        let stale_secs = config.ack.stale_minutes * 60;
+        if age >= stale_secs {
                     // Workload-heartbeat suppression: a long-running
                     // `workload run` (stv-promote, big rsync, ffmpeg)
                     // can pin the main loop in a fire-and-forget wait
@@ -4795,18 +6626,33 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     let workload_fresh = workload_heartbeat_suppresses_stuck(config);
                     let active_subagents =
                         crate::respawn::count_alive_subagents();
-                    if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
+                    // Independent proof-of-life signals the daemon already
+                    // tracks, so host-heartbeat freshness is decoupled from
+                    // event-bus tick DELIVERY (incident 2026-08-21): a live
+                    // loop in a long turn / with a stalled bus starves the
+                    // heartbeat without being wedged. `thinking_start` is set
+                    // by the foreground thinking detector (cleared when idle),
+                    // so `is_some()` ~= "the model is mid-generation now".
+                    let loop_thinking = state.thinking_start.is_some();
+                    let actively_turning = main_loop_actively_turning(
+                        state,
+                        bashes,
+                        config.watcher_monitor.active_window_secs,
+                    );
+                    if let Some(reason) = heartbeat_stale_liveness_reason(
+                        workload_fresh,
+                        active_subagents,
+                        loop_thinking,
+                        actively_turning,
+                    ) {
                         let age_min = age / 60;
-                        let reason = if workload_fresh {
-                            "workload_heartbeat_fresh"
-                        } else {
-                            "active_subagents"
-                        };
                         debug!(
                             stale_age_min = age_min,
-                            threshold_min = config.heartbeat.stale_minutes,
+                            threshold_min = config.ack.stale_minutes,
                             workload_fresh,
                             active_subagents,
+                            loop_thinking,
+                            actively_turning,
                             reason,
                             "heartbeat-stale suppressed (proof-of-life)"
                         );
@@ -4815,10 +6661,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             "heartbeat_stale_suppressed",
                             serde_json::json!({
                                 "stale_age_min": age_min,
-                                "threshold_min": config.heartbeat.stale_minutes,
+                                "threshold_min": config.ack.stale_minutes,
                                 "reason": reason,
                                 "workload_fresh": workload_fresh,
                                 "active_subagents": active_subagents,
+                                "loop_thinking": loop_thinking,
+                                "actively_turning": actively_turning,
                                 "dir": &config.stuck_detection.workload_heartbeat_dir,
                                 "max_age_secs": config.stuck_detection.workload_heartbeat_max_age_secs,
                             }),
@@ -4827,20 +6675,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         stuck = true;
                         let age_min = age / 60;
                         stuck_reason = format!(
-                            "heartbeat stale ({}min, threshold={}min, watchmen={})",
-                            age_min,
-                            config.heartbeat.stale_minutes,
-                            watchmen_count
+                            "no event ack for {}min (threshold={}min, watchmen={})",
+                            age_min, config.ack.stale_minutes, watchmen_count
                         );
                         stuck_stale_minutes = Some(age_min);
                         state.heartbeat_stale_count += 1;
                     }
-                }
-            }
         }
-        Err(_) => {
-            // No heartbeat file -- give it time
-        }
+        // No ack stamp at all -- give it time. Fresh boot / early daemon start
+        // / a host without event-must-act. Absence is NOT staleness: the clock
+        // starts at the first ack.
     }
 
     // --- AskUserQuestion stale detection (Phase 1: detect + alarm) ---
@@ -4874,12 +6718,53 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // Calling maybe_reset_context_clear() ahead of the trigger gate also means a
     // fresh fire can happen in the same cycle the reset lands, if tokens jump
     // straight from <30K to >threshold (boundary case, but cheap to handle).
+    //
+    // A reset is recognised from EITHER a below-threshold sample or a large
+    // drop against the previous sample (`context_reset_signal`). The drop arm
+    // is what covers a clear whose replacement context boots above 30K — on a
+    // session with a big always-loaded preamble the pane may never read low at
+    // all, so the below-threshold arm alone silently misses the clear (real
+    // incident 2026-08-22: 907979 -> 77185 across one poll gap, nothing
+    // stamped, "Since Clear" kept counting from the previous day).
     if config.context_monitor.enabled {
         // Reset path runs first so it can observe the pre-update last_seen_tokens.
-        maybe_reset_context_clear(config, state, tokens, &now);
+        //
+        // Use `context_tokens` (JSONL-preferred, tmux-fallback — see the
+        // `state.last_known_tokens` assignment above) rather than the raw
+        // tmux-scraped `tokens`. `context_reset_signal` detects a clear by
+        // comparing consecutive samples for a drop; if an overlay (auto-update
+        // banner, dialog) clobbers the status line right after a real clear,
+        // `tokens` can freeze at the stale PRE-clear reading for one or more
+        // cycles, so the comparison never sees a drop and the clear goes
+        // undetected — the dashboard's "Since Clear" tile then keeps counting
+        // from the previous clear (real incident 2026-08-22: a poll landed on
+        // a frozen 907979 sample instead of the JSONL-visible drop to 77185).
+        // `context_tokens` reads the session transcript directly and isn't
+        // subject to that overlay clobber.
+        maybe_reset_context_clear(config, state, context_tokens, &now);
         // Always record the latest token sample (even tokens=0) so the next
         // cycle's "previously high → now low" detector sees the right history.
-        state.last_seen_tokens = Some(tokens);
+        // Recorded on the SAME basis as the value just passed above — mixing
+        // a JSONL-derived current sample against a tmux-derived previous
+        // sample (or vice versa) would make the drop comparison meaningless.
+        state.last_seen_tokens = Some(context_tokens);
+        // Fallback for a self-clear that landed inside a poll gap: /clear +
+        // immediate resume re-inflates the context within one check interval,
+        // so `maybe_reset_context_clear` above never observes the drop. The
+        // self-clear handoff marker is an out-of-band, poll-gap-proof signal
+        // that a clear happened -- stamp `last_context_clear` from it so the
+        // "Since Clear" tile does not keep counting from the previous clear.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        maybe_stamp_self_clear_handoff(
+            config,
+            state,
+            tmux::self_clear_handoff_mtime(),
+            now_epoch,
+            &now,
+        );
     }
     if config.context_monitor.enabled && tokens > 0 {
         if let Some((pct, _by_compact)) = check_context_threshold_with_margin(
@@ -4982,9 +6867,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         // child remains the hard context backstop and is spawned
                         // only on Escalate below.
                         let ctx_msg = format!(
-                            "[CLAUDE-WATCH] Context at {:.0}% — auto-clear pending. \
-                            Commit/push in-flight work and save state NOW before compaction.",
-                            pct
+                            "[CLAUDE-WATCH] Context at {:.0}% — SELF-CLEAR NOW. \
+                            Run: (1) `session-task set '<state to resume>'`, \
+                            (2) commit + push in-flight repo work, (3) `self-clear`. \
+                            Auto-clear will be forced in {}s if you don't act.",
+                            pct, config.context_monitor.max_armed_secs
                         );
                         let _ = crate::obligation_arm::arm_alert_obligation(
                             &ctx_msg,
@@ -5095,7 +6982,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         }
 
-        // Reset paths (tokens < 30K) and last_seen_tokens bookkeeping run
+        // Reset paths (below-threshold sample or a halved token counter) and
+        // last_seen_tokens bookkeeping run
         // unconditionally above this block via maybe_reset_context_clear() —
         // keeping them outside the `tokens > 0` guard so a clean tokens=0
         // sample successfully resets `context_clear_triggered`.
@@ -5120,7 +7008,15 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // we require N consecutive cycles before firing. Shared with the
     // `cs.is_none()` early-return path so a wedge that hides the status bar
     // (and thus makes the session read as "not running") is still recovered.
-    handle_wedged_pane(config, state, &effective_pane, api_retrying, tokens, &now).await;
+    // Pass the same JSONL-preferred `context_tokens` used above (not the raw,
+    // overlay-fragile `tokens`) so the `wedged_clear`/`wedged_clear_retry`
+    // diagnostic log line records the true context size rather than a
+    // possibly-stale tmux scrape — consistent with the reset-detection fix
+    // just above. `detect_wedged` itself stays banner-text-only by design
+    // (see the `wedged_now` comment earlier in this function): the wedge
+    // determination and recovery confirmation never depended on either token
+    // source, so this only tightens what gets logged.
+    handle_wedged_pane(config, state, &effective_pane, api_retrying, context_tokens, &now).await;
 
     // --- Malformed-tool-call detection (non-namespaced invoke/parameter) ---
     //
@@ -5161,7 +7057,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // false-flags the very first post-clear turn (the reported bug). At such
         // a boundary skip detection this cycle — the resulting `None` falls
         // through to the reset arm below, ending any in-flight episode cleanly.
-        let malformed_fingerprint = if malformed_detection_post_clear(state, tokens) {
+        let malformed_fingerprint = if malformed_detection_post_clear(state, tokens, active_ui) {
             debug!(
                 tokens,
                 "malformed tool-call detection suppressed — fresh-/clear / \
@@ -5317,9 +7213,36 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 
     // --- Individual watcher health monitoring ---
     if config.watcher_monitor.enabled {
-        let mut entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
-        if let Some(ref extra) = config.watcher_monitor.watchers_config_extra {
-            entries.extend(status::parse_watchers_config(extra));
+        // Layered load — base file + the user-dir override layer — through
+        // the SAME loader `watcher-ctl` uses, so the daemon can never
+        // disagree with the CLI about what is enabled or which mode a
+        // watcher is in. `[watcher_monitor].watchers_config_extra` names the
+        // override file; when unset, the CLI's default resolution
+        // (`$WATCHERS_CONFIG_EXTRA`, else
+        // `$XDG_CONFIG_HOME/watchmen/watchers.override.conf`) applies.
+        let override_path = config
+            .watcher_monitor
+            .watchers_config_extra
+            .clone()
+            .or_else(crate::watcher::config_path_extra);
+        let entries = status::load_watchers_config(
+            &config.watcher_monitor.watchers_config,
+            override_path.as_deref(),
+        );
+        // Drop health for watchers the config no longer lists, and force
+        // `enabled: false` on the ones it disables. The loop below `continue`s
+        // past both shapes, so without this pass their entries would keep the
+        // `enabled: true` + climbing `consecutive_missing` they had at
+        // retirement forever. Re-run every cycle (not just at load) so editing
+        // the watchers config takes effect without a daemon restart.
+        let reconciled = crate::state::reconcile_watcher_health(state, &entries);
+        if reconciled.changed() {
+            info!(
+                removed = ?reconciled.removed,
+                disabled = ?reconciled.disabled,
+                re_enabled = ?reconciled.re_enabled,
+                "reconciled watcher_health against watcher config"
+            );
         }
         let mut any_critical_missing = false;
         let mut missing_names: Vec<String> = Vec::new();
@@ -5398,6 +7321,36 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // only the CURRENT outage, not a prior one.
                 health.down_since = None;
             } else {
+                // ARMING (monitor mode): `watcher-ctl run <name>` does not
+                // exec a `mode=monitor` watcher — it records
+                // `<name>.monitor-intent` and prints the Monitor-tool command
+                // for the main loop to arm. Between that print and the
+                // Monitor going live there is legitimately NO process, and
+                // this is exactly the window a WATCHER(S) DOWN inject (or the
+                // obligations gate, via `watcher-status --unhealthy-only`,
+                // which shares this helper) must not fire in. A fresh intent
+                // that no runtime file has superseded => healthy-pending, not
+                // a miss. A runtime file YOUNGER than the intent means the
+                // monitor went live and then died => falls through to the
+                // normal DOWN path at once. Same decision as `watcher-ctl
+                // status`, so CLI and daemon never disagree.
+                if entry.mode == status::WatcherMode::Monitor {
+                    let arming_grace = config.watcher_monitor.monitor_arming_grace_secs as f64;
+                    let intent_age =
+                        status::watcher_monitor_intent_age_secs_multi(&pid_dirs, &entry.name);
+                    let runtime_age =
+                        status::watcher_runtime_file_age_secs_multi(&pid_dirs, &entry.name);
+                    if status::watcher_is_arming(intent_age, runtime_age, arming_grace) {
+                        debug!(
+                            watcher = %entry.name,
+                            intent_age = ?intent_age,
+                            runtime_age = ?runtime_age,
+                            arming_grace,
+                            "monitor-mode watcher ARMING (arm intent fresh, Monitor not live yet) — not counting a miss"
+                        );
+                        continue;
+                    }
+                }
                 // Grace period: if the watcher was seen running within the
                 // configured grace_secs, don't count this as a miss. Short-
                 // lived watchers (e.g. an `*-wait` watcher that exits when
@@ -6237,28 +8190,27 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             stuck_reason = %stuck_reason,
                             dwell_secs = config.general.obligation_dwell_secs,
                             active_subagents = hb_active_subagents,
-                            "heartbeat-stale: obligation armed/held — deferring interrupt"
+                            "ack-stale: obligation armed/held — deferring interrupt"
                         );
                     }
                     ObligationDecision::Escalate => {
-                        // Inject the heartbeat-SPECIFIC recovery prompt, not the
-                        // generic `resume_prompt`. This is the heartbeat-stale
-                        // path (the only site that sets `stuck = true`), and the
-                        // recovery action is to touch the host heartbeat file to
-                        // restore liveness. The generic resume_prompt (a
-                        // "/cleanup" directive) never mentions the heartbeat
-                        // file, so prior to this the inject landed but the loop
-                        // never touched the file and it stayed stale even while
-                        // the loop was actively working (2026-06-19 incident:
-                        // ~85 min stale with a live loop).
+                        // Inject the ack-SPECIFIC recovery prompt, not the
+                        // generic `resume_prompt`. This is the ack-stale path
+                        // (the only site that sets `stuck = true`), and the
+                        // recovery action is to run the per-batch ack. The
+                        // generic resume_prompt (a "/cleanup" directive) never
+                        // mentions acking, so prior to this the inject landed
+                        // but liveness stayed stale even while the loop was
+                        // actively working (2026-06-19 incident: ~85 min stale
+                        // with a live loop).
                         alert::alert(
                             &msg,
                             &alert_pane,
-                            &config.alerts.heartbeat_stale_prompt,
+                            &config.alerts.ack_stale_prompt,
                             use_pingme,
                             event_alert,
-                            // KNOB #4 (2026-06-24): heartbeat-stale is a ROUTINE
-                            // tier — recovery is a `touch` of the heartbeat file,
+                            // KNOB #4 (2026-06-24): ack-stale is a ROUTINE tier
+                            // — recovery is one bare `event-ack ack-batch`,
                             // which can wait for the next turn boundary. Do NOT
                             // seize the turn / kill subagents: queue the nudge.
                             false,
@@ -6291,6 +8243,441 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::{AccessTokenState, CredentialExpiry};
+
+    // ---- Proactive login-expiry decision ----
+
+    fn evidence() -> ExpiryEvidence {
+        ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Unknown,
+            credentials_may_trigger: true,
+            auto_enabled: true,
+            auto_days: 1,
+            since_last_attempt: None,
+            retry_seconds: 3600,
+            attempts: 0,
+            max_attempts: 3,
+            login_pending: false,
+        }
+    }
+
+    /// Nothing on the pane and nothing on disk: the daemon stays out of it.
+    #[test]
+    fn no_evidence_is_idle() {
+        assert_eq!(decide_expiry_action(&evidence()), ExpiryAction::Idle);
+    }
+
+    /// THE false-positive guard, and the reason this function exists. A pane
+    /// sighting that the credential store contradicts is conversation text —
+    /// somebody reading this file, or its tests, or the diff that added them.
+    /// Acting on it would park a healthy session in a login modal.
+    #[test]
+    fn a_pane_sighting_a_healthy_credential_contradicts_is_ignored() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Healthy,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+    }
+
+    /// An already-dead credential belongs to the REACTIVE path. Racing it into
+    /// the same modal from two directions helps nobody.
+    #[test]
+    fn an_already_expired_credential_is_left_to_the_reactive_path() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(1),
+            credentials: CredentialExpiry::Expired,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+    }
+
+    /// An unreadable credential store is UNKNOWN, never a negative — the pane
+    /// still carries the decision, but the alert has to say it stands alone.
+    #[test]
+    fn an_unreadable_credential_store_still_acts_but_uncorroborated() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Unknown,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 2,
+                corroborated: false,
+            }
+        );
+    }
+
+    /// The transient form of Claude Code's warning lives about fifteen
+    /// seconds, so a poller MISSING it proves nothing. The credential store
+    /// alone is enough to act on.
+    #[test]
+    fn the_credential_store_alone_can_carry_the_decision() {
+        let ev = ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// The store is a VETO by default, not a trigger: a short-lived rolling
+    /// refresh token classifies as "expiring" for every second of its healthy
+    /// life, so a store-driven trigger would fire forever on a fine session.
+    #[test]
+    fn the_credential_store_does_not_trigger_on_its_own_unless_allowed() {
+        let ev = ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+
+        // ...but it still VETOES a pane sighting it contradicts, which is the
+        // half that is never optional.
+        let vetoed = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Healthy,
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&vetoed), ExpiryAction::Idle);
+
+        // ...and still corroborates one it agrees with.
+        let agreed = ExpiryEvidence {
+            pane_days_left: Some(1),
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&agreed), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Claude Code starts SHOWING the warning three days out but only starts
+    /// nagging inside one. Three days out is a heads-up, not a reason to
+    /// interrupt a working session.
+    #[test]
+    fn a_warning_outside_the_auto_window_only_alerts() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(3),
+            credentials: CredentialExpiry::Expiring { days_left: 3 },
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 3,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// When the two sources disagree, take the more urgent number: a banner
+    /// left over from an earlier render must not be able to stretch a deadline.
+    #[test]
+    fn disagreeing_sources_resolve_to_the_more_urgent_one() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(3),
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Debounce. The warning stands for DAYS; without spacing, a ten-second
+    /// poll re-fires the login flow ~8,600 times a day.
+    #[test]
+    fn a_recent_attempt_blocks_a_re_fire_and_an_old_one_does_not() {
+        let recent = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(60.0),
+            attempts: 1,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&recent),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+
+        let stale = ExpiryEvidence {
+            since_last_attempt: Some(3601.0),
+            ..recent
+        };
+        assert_eq!(decide_expiry_action(&stale), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Failing loudly is right; failing every hour forever is not. Once the
+    /// budget is spent the alert keeps going out and the session is left alone.
+    #[test]
+    fn the_attempt_budget_stops_auto_fire_but_not_the_alert() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(99999.0),
+            attempts: 3,
+            max_attempts: 3,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// A dialog we already opened is still waiting for its code. Firing a
+    /// second `/login` types the literal text into the first one's field.
+    #[test]
+    fn a_pending_login_dialog_blocks_a_second_fire() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(99999.0),
+            login_pending: true,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// Auto-fire off means alert only — the reactive path is untouched either
+    /// way, so turning this off degrades to "tell me, I'll handle it".
+    #[test]
+    fn auto_fire_disabled_degrades_to_alert_only() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            auto_enabled: false,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
+
+    // ---- Reactive 401-banner decision ----
+
+    fn banner_evidence() -> BannerEvidence {
+        BannerEvidence {
+            access_token: AccessTokenState::Expired,
+            auto_enabled: true,
+            since_last_attempt: None,
+            retry_seconds: 3600,
+            attempts: 0,
+            max_attempts: 3,
+            login_pending: false,
+        }
+    }
+
+    /// THE incident: the banner is on a live pane and the credential store
+    /// agrees the access token is dead. Fire.
+    #[test]
+    fn banner_with_expired_access_token_fires_self_login() {
+        assert_eq!(decide_banner_action(&banner_evidence()), BannerAction::AutoLogin);
+        let missing = BannerEvidence {
+            access_token: AccessTokenState::Missing,
+            ..banner_evidence()
+        };
+        assert_eq!(decide_banner_action(&missing), BannerAction::AutoLogin);
+    }
+
+    /// THE false-positive guard, and the reason the detector alone is not
+    /// trusted. The banner text on a pane whose credential store says the
+    /// access token is valid is conversation — a session reading this file,
+    /// its tests, or the diff that introduced them. Silence, not an alert.
+    #[test]
+    fn banner_with_a_valid_access_token_is_ignored_outright() {
+        let ev = BannerEvidence {
+            access_token: AccessTokenState::Valid,
+            ..banner_evidence()
+        };
+        assert_eq!(decide_banner_action(&ev), BannerAction::Ignore);
+        // ...even with every brake released and auto on.
+        let ev = BannerEvidence {
+            access_token: AccessTokenState::Valid,
+            since_last_attempt: Some(99999.0),
+            attempts: 0,
+            ..banner_evidence()
+        };
+        assert_eq!(decide_banner_action(&ev), BannerAction::Ignore);
+    }
+
+    /// An unreadable store is UNKNOWN, never a negative — but it is also not
+    /// enough evidence to open a modal on. Alert, and say it stands alone.
+    #[test]
+    fn banner_with_an_unreadable_store_alerts_uncorroborated_and_never_fires() {
+        let ev = BannerEvidence {
+            access_token: AccessTokenState::Unknown,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: false,
+                reason: "credential store unreadable",
+            }
+        );
+    }
+
+    /// Auto off degrades to the high-priority alert, never to silence.
+    #[test]
+    fn banner_auto_disabled_degrades_to_alert_only() {
+        let ev = BannerEvidence {
+            auto_enabled: false,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "auto-login disabled",
+            }
+        );
+    }
+
+    /// The fire is bounded by the SAME knobs as the proactive path: one
+    /// dialog at a time, retry spacing, and the per-window attempt budget.
+    /// Walk a window the way `fire_self_login` books it and check each brake
+    /// engages in turn — and that every held cycle still alerts.
+    #[test]
+    fn banner_fire_is_bounded_by_the_shared_self_login_knobs() {
+        let max_attempts = 3;
+        let retry_seconds = 3600;
+        let mut attempts = 0;
+
+        // Cycle 1: nothing booked yet -> fire. `fire_self_login` books the
+        // attempt and sets the dialog latch before the command runs.
+        let ev = BannerEvidence {
+            attempts,
+            max_attempts,
+            retry_seconds,
+            ..banner_evidence()
+        };
+        assert_eq!(decide_banner_action(&ev), BannerAction::AutoLogin);
+        attempts += 1;
+
+        // Cycle 2: the dialog is up and waiting for its code -> held, alert.
+        let ev = BannerEvidence {
+            attempts,
+            since_last_attempt: Some(10.0),
+            login_pending: true,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "login dialog already open",
+            }
+        );
+
+        // The watchdog abandoned the dialog (latch cleared) but the retry
+        // spacing has not elapsed -> held, alert.
+        let ev = BannerEvidence {
+            attempts,
+            since_last_attempt: Some(retry_seconds as f64 - 1.0),
+            login_pending: false,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "retry spacing",
+            }
+        );
+
+        // Spacing elapsed -> fire again, up to the budget.
+        while attempts < max_attempts {
+            let ev = BannerEvidence {
+                attempts,
+                since_last_attempt: Some(retry_seconds as f64),
+                ..banner_evidence()
+            };
+            assert_eq!(decide_banner_action(&ev), BannerAction::AutoLogin, "attempt {attempts}");
+            attempts += 1;
+        }
+
+        // Budget spent -> held forever (until the window resets), still alerting.
+        let ev = BannerEvidence {
+            attempts,
+            since_last_attempt: Some(99999.0),
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "attempt budget exhausted",
+            }
+        );
+    }
+
+    /// The proactive path's brakes and the banner path's brakes are the same
+    /// state: an attempt the proactive path booked counts against the banner
+    /// path's budget and spacing, because it is the same dialog on the same
+    /// pane.
+    #[test]
+    fn banner_and_expiry_paths_share_one_budget_and_one_latch() {
+        // Proactive fired a moment ago (latch set).
+        let proactive_pending = ExpiryEvidence {
+            pane_days_left: Some(1),
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(5.0),
+            attempts: 1,
+            login_pending: true,
+            ..evidence()
+        };
+        assert!(matches!(
+            decide_expiry_action(&proactive_pending),
+            ExpiryAction::AlertOnly { .. }
+        ));
+        let banner_same_state = BannerEvidence {
+            since_last_attempt: Some(5.0),
+            attempts: 1,
+            login_pending: true,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&banner_same_state),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "login dialog already open",
+            }
+        );
+    }
+
+    /// `SelfLoginTrigger` labels are what the JSONL events and alerts key on;
+    /// pin them so a log grep written today still works tomorrow.
+    #[test]
+    fn self_login_trigger_labels_are_stable() {
+        assert_eq!(
+            SelfLoginTrigger::ExpiryWarning { days_left: 2 }.as_str(),
+            "expiry_warning"
+        );
+        assert_eq!(SelfLoginTrigger::Banner401.as_str(), "401_banner");
+        assert_eq!(
+            SelfLoginTrigger::ExpiryWarning { days_left: 2 }.days_left(),
+            Some(2)
+        );
+        assert_eq!(SelfLoginTrigger::Banner401.days_left(), None);
+    }
 
     #[test]
     fn test_elapsed_since_valid() {
@@ -6628,6 +9015,35 @@ mod tests {
     }
 
     #[test]
+    fn test_context_threshold_compact_gated_below_danger_on_large_window() {
+        // Regression (incident 2026-09-01): 1M window, ~48% REAL usage, but
+        // Claude Code reported "Context left until auto-compact: 5%" — its
+        // auto-compact point is decoupled from the true 1M window. With
+        // compact_remaining = 5 <= compact_trigger_percent = 5 the old code
+        // fired a destructive self-clear at 48% used. The compact signal is
+        // now gated behind the real-usage danger zone (margin = 100000 => the
+        // 900K point), so this must NOT trigger.
+        let result =
+            check_context_threshold_with_margin(484889, 1_000_000, Some(5), 75, 5, Some(100_000));
+        assert!(
+            result.is_none(),
+            "compact_remaining must not fire at 48% real usage on a 1M window"
+        );
+    }
+
+    #[test]
+    fn test_context_threshold_compact_fires_in_danger_zone_large_window() {
+        // Same 1M window + margin, but now genuinely near full (91% used, i.e.
+        // within margin = max - 100000 = 900K). compact_remaining = 5 must
+        // still fire — the signal is honored once real usage confirms danger.
+        let result =
+            check_context_threshold_with_margin(910000, 1_000_000, Some(5), 75, 5, Some(100_000));
+        assert!(result.is_some(), "should fire at 91% used within margin");
+        let (_, by_compact) = result.unwrap();
+        assert!(by_compact, "should be BY_COMPACT in the danger zone");
+    }
+
+    #[test]
     fn test_context_threshold_fallback_token_percent_triggers() {
         // No compact_remaining, token pct = 80% >= 75% threshold
         let result = check_context_threshold_with_margin(160000, 200000, None, 75, 5, None);
@@ -6722,10 +9138,14 @@ mod tests {
     }
 
     #[test]
-    fn test_context_threshold_compact_wins_over_margin() {
-        // compact_remaining=Some(3) (triggers, <= 5) AND margin would not fire
-        // (tokens at 200K, far from max-margin=900K). compact_remaining takes
-        // precedence — BY_COMPACT path.
+    fn test_context_threshold_compact_gated_below_margin_zone() {
+        // Formerly `test_context_threshold_compact_wins_over_margin`, which
+        // asserted compact_remaining=3 FIRES at 200K/1M (20% real usage) even
+        // though tokens are far below the margin zone (max-margin=900K). That
+        // encoded the 2026-09-01 misfire: a destructive self-clear at 20% of a
+        // 1M window, driven by Claude Code's auto-compact % (decoupled from the
+        // true window). compact_remaining no longer "wins" below the real-usage
+        // danger zone — it is GATED behind it. Expect None here.
         let result = check_context_threshold_with_margin(
             200_000,
             1_000_000,
@@ -6734,9 +9154,10 @@ mod tests {
             5,
             Some(100_000),
         );
-        assert!(result.is_some());
-        let (_, by_compact) = result.unwrap();
-        assert!(by_compact, "compact_remaining=3 should win over margin");
+        assert!(
+            result.is_none(),
+            "compact_remaining must not fire at 20% real usage on a 1M window"
+        );
     }
 
     #[test]
@@ -6893,11 +9314,11 @@ cooldown = 300
         // episode, so it is exempt.
         let state = State::default();
         assert!(
-            malformed_detection_post_clear(&state, 4_200),
+            malformed_detection_post_clear(&state, 4_200, false),
             "low-token (freshly-cleared) context must be exempt from malformed detection"
         );
         assert!(
-            malformed_detection_post_clear(&state, 0),
+            malformed_detection_post_clear(&state, 0, false),
             "tokens=0 (just-landed clear) must be exempt"
         );
     }
@@ -6912,7 +9333,7 @@ cooldown = 300
         let mut state = State::default();
         state.last_context_clear = Some(Utc::now().to_rfc3339());
         assert!(
-            malformed_detection_post_clear(&state, 120_000),
+            malformed_detection_post_clear(&state, 120_000, false),
             "a clear within the grace window must exempt even a high-token boundary turn"
         );
     }
@@ -6923,7 +9344,7 @@ cooldown = 300
         // (high tokens, no recent clear) is fully subject to detection.
         let state = State::default();
         assert!(
-            !malformed_detection_post_clear(&state, 120_000),
+            !malformed_detection_post_clear(&state, 120_000, false),
             "a normal high-token turn with no recent clear must NOT be exempt — \
              genuine malforms still fire"
         );
@@ -6939,8 +9360,32 @@ cooldown = 300
             - chrono::Duration::seconds(MALFORMED_POST_CLEAR_GRACE_SECS as i64 + 120);
         state.last_context_clear = Some(stale.to_rfc3339());
         assert!(
-            !malformed_detection_post_clear(&state, 120_000),
+            !malformed_detection_post_clear(&state, 120_000, false),
             "a clear older than the grace window must not exempt a later malform"
+        );
+    }
+
+    #[test]
+    fn test_malformed_post_clear_active_ui_never_suppresses() {
+        // 2026-08-27 regression: a long, busy, many-agent session reads
+        // tokens==0 on essentially every poll (the bare context total is
+        // scrolled behind the thinking indicator / agent roster / background
+        // work markers), which used to make this predicate return `true`
+        // (suppress) for the WHOLE session -- silently neutering the
+        // malformed-tool-call detector exactly when it matters most. A
+        // positive active_ui signal must short-circuit to "not a boundary"
+        // regardless of how low `tokens` reads, and regardless of a recent
+        // `last_context_clear` timestamp.
+        let state = State::default();
+        assert!(
+            !malformed_detection_post_clear(&state, 0, true),
+            "active_ui must override the low-token fresh-boundary exemption"
+        );
+        let mut state_recent_clear = State::default();
+        state_recent_clear.last_context_clear = Some(Utc::now().to_rfc3339());
+        assert!(
+            !malformed_detection_post_clear(&state_recent_clear, 120_000, true),
+            "active_ui must override the recent-clear-grace-window exemption too"
         );
     }
 
@@ -7025,6 +9470,220 @@ cooldown = 300
         maybe_reset_context_clear(&config, &mut state, 5_300, &now);
         assert!(!state.context_clear_triggered);
         assert_eq!(state.last_context_clear, before);
+    }
+
+    // --- Context-reset DETECTION tests (regression guard for 2026-08-22) ---
+    //
+    // 2026-08-22 incident: the daemon recognised a context reset only from a
+    // token sample below 30K. The session's fresh context boots at ~77K
+    // (large always-loaded preamble), and the clear fell inside a poll gap:
+    //
+    //     21:08:13  tokens=907979
+    //     21:08:46  tokens=77185     <- the auto-clear landed in here
+    //
+    // Neither sample is under 30K, so `last_context_clear` was never stamped
+    // and the dashboard's "Since Clear" tile read 1.07 DAYS (the previous
+    // day's clear) 50 minutes after the clear it should have shown. These
+    // tests pin drop-based detection, one per path that resets a context.
+
+    #[test]
+    fn test_self_clear_in_poll_gap_stamps_from_handoff() {
+        // A self-clear (/clear + immediate resume) re-inflates the context
+        // within one poll gap, so `maybe_reset_context_clear` never sees a
+        // token drop and never stamps `last_context_clear` -- the same
+        // poll-gap miss as 2026-08-22, on the self-clear path PR #732 did not
+        // cover. The handoff marker must stamp it instead so "Since Clear"
+        // stops counting from the previous clear.
+        let config = config_for_reset_test();
+        let now_epoch = 1_000_000.0_f64;
+        let now = "2026-09-02T12:00:00-07:00";
+
+        // No prior clear; both token samples stay high (the low window fell
+        // entirely between polls), so the drop path is a no-op.
+        let mut state = State::default();
+        state.last_seen_tokens = Some(900_000);
+        maybe_reset_context_clear(&config, &mut state, 850_000, now);
+        assert_eq!(
+            state.last_context_clear, None,
+            "token-drop path must miss the poll-gap self-clear"
+        );
+
+        // A handoff marker touched 5s ago (well within the 120s grace) stamps.
+        let mtime = now_epoch - 5.0;
+        maybe_stamp_self_clear_handoff(&config, &mut state, Some(mtime), now_epoch, now);
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(now),
+            "handoff marker must stamp last_context_clear when the drop path missed it"
+        );
+        assert_eq!(state.self_clear_handoff_stamped_mtime, Some(mtime));
+        // The self-clear delivered its own resume -> post-clear gate latched.
+        assert_eq!(state.post_clear_resume_injected_for.as_deref(), Some(now));
+
+        // Idempotent: a later poll inside the grace window (same marker mtime)
+        // must NOT re-stamp.
+        let later = "2026-09-02T12:00:33-07:00";
+        maybe_stamp_self_clear_handoff(&config, &mut state, Some(mtime), now_epoch + 33.0, later);
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(now),
+            "same handoff marker must not re-stamp on a subsequent poll"
+        );
+
+        // A stale marker (older than grace) does not stamp.
+        let mut fresh = State::default();
+        let stale = now_epoch - (config.fresh_clear.self_clear_handoff_grace_secs as f64) - 10.0;
+        maybe_stamp_self_clear_handoff(&config, &mut fresh, Some(stale), now_epoch, now);
+        assert_eq!(fresh.last_context_clear, None, "a stale handoff marker must not stamp");
+
+        // Absent marker does not stamp.
+        let mut none_state = State::default();
+        maybe_stamp_self_clear_handoff(&config, &mut none_state, None, now_epoch, now);
+        assert_eq!(none_state.last_context_clear, None);
+    }
+
+    #[test]
+    fn test_context_reset_signal_fresh_sample() {
+        // The classic case still holds: a near-empty sample is a reset even
+        // with no previous sample to compare against (daemon just started).
+        assert_eq!(
+            context_reset_signal(None, 0),
+            Some(ContextResetSignal::FreshSample)
+        );
+        assert_eq!(
+            context_reset_signal(Some(900_000), 5_300),
+            Some(ContextResetSignal::FreshSample)
+        );
+    }
+
+    #[test]
+    fn test_context_reset_signal_token_drop() {
+        // The incident's exact samples.
+        assert_eq!(
+            context_reset_signal(Some(907_979), 77_185),
+            Some(ContextResetSignal::TokenDrop)
+        );
+    }
+
+    #[test]
+    fn test_context_reset_signal_ignores_growth_and_jitter() {
+        // A live context only climbs; a re-rendered status bar can jitter a
+        // little. Neither may read as a clear, or every turn would stamp one.
+        assert_eq!(context_reset_signal(Some(905_000), 950_000), None);
+        assert_eq!(context_reset_signal(Some(900_000), 880_000), None);
+        // Just short of the halving boundary.
+        assert_eq!(context_reset_signal(Some(900_000), 450_001), None);
+        // Exactly halved counts (>= ratio).
+        assert_eq!(
+            context_reset_signal(Some(900_000), 450_000),
+            Some(ContextResetSignal::TokenDrop)
+        );
+    }
+
+    #[test]
+    fn test_context_reset_signal_needs_previously_high_sample() {
+        // No previous sample, or a previous sample that was itself boot-level:
+        // there is no context to have been reset.
+        assert_eq!(context_reset_signal(None, 100_000), None);
+        assert_eq!(context_reset_signal(Some(29_000), 100_000), None);
+    }
+
+    #[test]
+    fn test_daemon_auto_clear_landing_above_fresh_threshold_stamps() {
+        // PATH: daemon-triggered deferred auto-clear (context-low ->
+        // self-clear). The clear lands, the replacement context boots at 77K,
+        // and the daemon's first post-clear sample is already above the fresh
+        // threshold. Must reset the in-flight flag AND stamp the clear.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = true;
+        state.context_clear_child_pid = Some(12345);
+        state.last_seen_tokens = Some(907_979);
+        state.last_context_clear = Some("2026-08-21T16:21:11-04:00".to_string());
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 77_185, &now);
+        assert!(
+            !state.context_clear_triggered,
+            "a clear landing above the fresh threshold must still reset the flag"
+        );
+        assert!(state.context_clear_child_pid.is_none());
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(now.as_str()),
+            "the auto-clear path must stamp last_context_clear at the observing cycle"
+        );
+        assert_eq!(
+            state.post_clear_resume_injected_for.as_deref(),
+            Some(now.as_str()),
+            "a daemon-driven clear injects its own resume — latch the gate"
+        );
+    }
+
+    #[test]
+    fn test_agent_self_clear_landing_above_fresh_threshold_stamps() {
+        // PATH: `self-clear` run by the agent / an operator / a skill. The
+        // daemon never triggered, so only the external-clear path can stamp.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = false;
+        state.last_seen_tokens = Some(903_905);
+        state.last_context_clear = Some("2026-08-21T16:21:11-04:00".to_string());
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 84_000, &now);
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(now.as_str()),
+            "an externally-driven self-clear must stamp last_context_clear"
+        );
+    }
+
+    #[test]
+    fn test_manual_clear_then_restart_stamps() {
+        // PATH: hand-typed /clear (or a `session-resume restart`, which brings
+        // up a brand-new process whose context starts from the preamble). Both
+        // present to the daemon as a collapsed token counter.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.last_seen_tokens = Some(640_000);
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 61_000, &now);
+        assert_eq!(state.last_context_clear.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_compaction_stamps() {
+        // PATH: auto-compaction. The context is rebuilt from a summary, so the
+        // counter collapses the same way a clear's does — and it IS a context
+        // reset, which is what the panel measures.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.last_seen_tokens = Some(950_000);
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 180_000, &now);
+        assert_eq!(state.last_context_clear.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_reset_stamps_exactly_once_per_clear() {
+        // The stamp must land on the observing cycle and NOT be refreshed by
+        // the subsequent cycles of the new (small, growing) context — the tile
+        // would otherwise sit pinned near zero forever.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.last_seen_tokens = Some(907_979);
+        let landing = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 77_185, &landing);
+        assert_eq!(state.last_context_clear.as_deref(), Some(landing.as_str()));
+
+        // check_cycle slides the sample forward after the reset path runs.
+        state.last_seen_tokens = Some(77_185);
+        let later = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 85_993, &later);
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(landing.as_str()),
+            "the growing new context must not re-stamp the clear"
+        );
     }
 
     // --- Thinking backoff threshold tests ---
@@ -7255,7 +9914,7 @@ cooldown = 300
         // identical state effect to the v2 token-progress re-arm.
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        let suppressed = apply_heartbeat_fresh_rearm(
+        let suppressed = apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(120),
@@ -7275,7 +9934,7 @@ cooldown = 300
         // baseline-refresh semantics.
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(apply_heartbeat_fresh_rearm(
+        assert!(apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(0),
@@ -7293,7 +9952,7 @@ cooldown = 300
         // the fire, touch nothing. Boundary (age == threshold) is stale.
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(900),
@@ -7301,7 +9960,7 @@ cooldown = 300
             290_000,
             "now"
         ));
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(600),
@@ -7314,13 +9973,13 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_missing_file_fails_open() {
-        // Missing/unreadable heartbeat file surfaces as age None: the gate
-        // must FAIL OPEN (allow the fire) and touch nothing.
-        assert_eq!(heartbeat_age_secs(None, SystemTime::now()), None);
+    fn test_ack_missing_stamp_fails_open() {
+        // Missing/unreadable ack stamp surfaces as age None: the gate must
+        // FAIL OPEN (allow the fire) and touch nothing.
+        assert_eq!(ack_age_secs(None, SystemTime::now()), None);
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             None,
@@ -7333,20 +9992,20 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_future_mtime_fails_open() {
+    fn test_ack_future_mtime_fails_open() {
         // mtime in the future relative to now: duration_since fails, age
         // is None, gate fails open. (Deliberately NOT treated as fresh,
         // unlike the workload-heartbeat suppressor — a corrupt or skewed
-        // host heartbeat must never mask a real wedge.)
+        // stamp must never mask a real wedge.)
         let now = SystemTime::now();
         let future = now + std::time::Duration::from_secs(60);
-        assert_eq!(heartbeat_age_secs(Some(future), now), None);
+        assert_eq!(ack_age_secs(Some(future), now), None);
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
-            heartbeat_age_secs(Some(future), now),
+            ack_age_secs(Some(future), now),
             600,
             290_000,
             "now"
@@ -7355,12 +10014,12 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_gate_zero_disables() {
-        // heartbeat_fresh_secs = 0 disables the gate entirely: even a
-        // just-touched heartbeat (age 0) never suppresses.
+    fn test_ack_gate_zero_disables() {
+        // ack_fresh_secs = 0 disables the gate entirely: even a just-stamped
+        // ack (age 0) never suppresses.
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(0),
@@ -7373,11 +10032,11 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_age_secs_past_mtime() {
+    fn test_ack_age_secs_past_mtime() {
         // Plain past mtime: age computes in whole seconds.
         let now = SystemTime::now();
         let past = now - std::time::Duration::from_secs(123);
-        assert_eq!(heartbeat_age_secs(Some(past), now), Some(123));
+        assert_eq!(ack_age_secs(Some(past), now), Some(123));
     }
 
     #[test]
@@ -8331,6 +10990,187 @@ cooldown = 300
         assert!(!fresh_clear_inject_suppressed(&state, 0, true, 0));
     }
 
+    // --- ack_liveness_fresh: the fresh-/clear liveness gate (2026-08-24) ---
+    // The fresh-/clear fast path was firing on a MISPARSED low token reading
+    // (thinking-indicator / agent-roster count leaking as the context total)
+    // while the session was alive and intact — looping resume injects for
+    // hours at tokens=2100..4900. The gate suppresses the inject whenever the
+    // last event-ack is fresh (the loop is provably alive), and stays out of
+    // the way when there is no proof of life so genuine fresh /clears still
+    // recover.
+
+    #[test]
+    fn test_ack_liveness_fresh_true_when_recent_ack() {
+        // Acked 60s ago, stale threshold 20min: the loop handled an event
+        // well within the window, so it is alive — suppress the inject.
+        assert!(ack_liveness_fresh(Some(60), 20 * 60));
+    }
+
+    #[test]
+    fn test_ack_liveness_fresh_false_when_ack_stale() {
+        // Last ack 25min ago, threshold 20min: no proof of life, so the gate
+        // opens and a genuine fresh /clear can still be resumed.
+        assert!(!ack_liveness_fresh(Some(25 * 60), 20 * 60));
+    }
+
+    #[test]
+    fn test_ack_liveness_fresh_false_when_no_ack_stamp() {
+        // No ack data at all (fresh boot / host without event-ack): we cannot
+        // prove liveness, so DON'T suppress — preserve fast-path behaviour.
+        assert!(!ack_liveness_fresh(None, 20 * 60));
+    }
+
+    // --- ack_liveness_suppresses_clear_inject: the wedged carve-out
+    // (2026-08-26 autoclear-swallowed-by-ack-gate fix) ---
+    //
+    // Regression coverage for the incident: a session hit "Context limit
+    // reached" / "Context low (0% remaining)" shortly after its last
+    // event-ack, so `ack_liveness_fresh` kept reading "alive" for the whole
+    // stale window and the fresh-/clear + post-clear-resume gates `return`ed
+    // before `check_cycle` ever reached `handle_wedged_pane`. Autoclear
+    // never fired; the operator had to `/clear` by hand.
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_normal_case() {
+        // Fresh ack, no wedge banner on screen: this IS the misparse case the
+        // gate was built for — suppress the spurious resume/fresh-clear inject.
+        assert!(ack_liveness_suppresses_clear_inject(true, false));
+    }
+
+    #[test]
+    fn test_ack_liveness_does_not_suppress_when_genuinely_wedged() {
+        // Fresh ack (acked moments before hitting the wall) BUT the pane is
+        // showing a genuine context-limit/rate-limit banner right now: do NOT
+        // suppress. Autoclear must be allowed to reach `handle_wedged_pane`
+        // regardless of how recently the loop last acked.
+        assert!(!ack_liveness_suppresses_clear_inject(true, true));
+    }
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_no_ack_no_wedge() {
+        // No proof of life and no wedge banner: gate stays out of the way
+        // (unrelated to the wedge carve-out — mirrors ack_liveness_fresh's
+        // own "no data => false" behaviour flowing through unchanged).
+        assert!(!ack_liveness_suppresses_clear_inject(false, false));
+    }
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_no_ack_but_wedged() {
+        // Stale/absent ack AND wedged: still don't suppress (wedge detection
+        // was already going to run regardless — this just confirms wedged
+        // never flips the result to "suppress").
+        assert!(!ack_liveness_suppresses_clear_inject(false, true));
+    }
+
+    #[test]
+    fn test_carry_forward_real_reading_resets_run() {
+        // A non-zero reading this poll is trusted verbatim and resets the
+        // carry run to 0, regardless of any prior carry.
+        assert_eq!(
+            carry_forward_token_misparse(180_000, 200_000, 2, 50_000, 3),
+            (180_000, 0)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_large_context_zero_is_carried() {
+        // A large same-pane context momentarily reads 0 -> hold the last value
+        // and advance the bounded run.
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 0, 50_000, 3),
+            (200_000, 1)
+        );
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 1, 50_000, 3),
+            (200_000, 2)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_bound_exhausted_lets_zero_through() {
+        // Once the run reaches max_carry the 0 is finally trusted, so a real
+        // /clear or crashed process still registers.
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 3, 50_000, 3),
+            (0, 3)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_below_floor_not_carried() {
+        // A genuinely small prior reading (below the fresh-/clear window's
+        // upper bound) is never carried: fresh-/clear detection in the
+        // low-token window must be untouched.
+        assert_eq!(
+            carry_forward_token_misparse(0, 4_000, 0, 50_000, 3),
+            (0, 0)
+        );
+    }
+
+    /// End-to-end MISPARSE PATTERN over consecutive polls (the real bug):
+    /// a large, intact context (408_000) momentarily reads 0 for a couple of
+    /// polls -- the 2026-08 status-parser hardening now yields a bare 0 for a
+    /// thinking/roster-only pane instead of the old tiny (~2600) count -- then
+    /// the real total returns. Every transient 0 must be carried forward (never
+    /// surfaced as the session total, so no phantom context-clear fires), and
+    /// the real reading resumes cleanly and resets the carry run.
+    #[test]
+    fn test_carry_forward_transient_misparse_sequence_is_smoothed() {
+        let floor = 50_000u64;
+        let max = MISPARSE_CARRY_MAX;
+        let mut last_known = 408_000u64;
+        let mut carry = 0u32;
+        // Two consecutive misparse polls must both be held at the last large
+        // value rather than collapsing the reported context to 0/tiny.
+        for _ in 0..2 {
+            let (eff, c) = carry_forward_token_misparse(0, last_known, carry, floor, max);
+            assert_eq!(eff, 408_000, "a transient 0 must be carried, not surfaced");
+            carry = c;
+            last_known = eff; // caller writes the effective value back (check_cycle)
+        }
+        // Real total returns -> trusted verbatim, carry run resets to 0.
+        let (eff, c) = carry_forward_token_misparse(410_000, last_known, carry, floor, max);
+        assert_eq!(eff, 410_000, "a real reading is always trusted");
+        assert_eq!(c, 0, "a real reading resets the carry run");
+    }
+
+    /// A GENUINE /clear (or crashed process) holds 0 for many consecutive
+    /// polls. The carry is BOUNDED, so after `MISPARSE_CARRY_MAX` held polls
+    /// the 0 is finally trusted and the clear registers: the guard DELAYS a
+    /// real clear by a couple of cycles, it never SUPPRESSES one.
+    #[test]
+    fn test_carry_forward_sustained_zero_eventually_registers_clear() {
+        let floor = 50_000u64;
+        let max = MISPARSE_CARRY_MAX;
+        let mut last_known = 408_000u64;
+        let mut carry = 0u32;
+        let mut effective = Vec::new();
+        for _ in 0..(max + 2) {
+            let (eff, c) = carry_forward_token_misparse(0, last_known, carry, floor, max);
+            effective.push(eff);
+            carry = c;
+            last_known = eff; // mirror check_cycle writing the effective value back
+        }
+        // The first `max` polls are held at the large value...
+        for e in effective.iter().take(max as usize) {
+            assert_eq!(*e, 408_000, "within the bound the large context is held");
+        }
+        // ...then the bound is exhausted and the 0 is trusted, so a real
+        // /clear finally registers downstream.
+        assert_eq!(
+            effective[max as usize], 0,
+            "past the carry bound a sustained 0 (real clear) must register"
+        );
+    }
+
+    #[test]
+    fn test_ack_liveness_fresh_boundary_is_exclusive() {
+        // age == stale_secs is NOT fresh (mirrors the ack-stale detector's
+        // `age >= stale_secs` staleness boundary — the two must agree).
+        assert!(!ack_liveness_fresh(Some(1200), 1200));
+        assert!(ack_liveness_fresh(Some(1199), 1200));
+    }
+
     #[test]
     fn test_dead_process_suppressed_when_actively_turning() {
         // bashes > 0 right now: the process is demonstrably alive.
@@ -9015,6 +11855,71 @@ cooldown = 300
             evaluate_api_retry_state(true, u32::MAX, Some(&now), 1, 1800);
         assert_eq!(consec, u32::MAX); // saturated
         assert!(suppress);
+    }
+
+    // --- evaluate_api_retry_observation tests (metrics-facing state) ---
+
+    #[test]
+    fn test_api_retry_observation_stamps_on_detection() {
+        let now = "2026-09-03T09:28:00-04:00";
+        let (last_seen, episodes) = evaluate_api_retry_observation(true, 0, now);
+        assert_eq!(last_seen.as_deref(), Some(now));
+        // 0 -> 1 edge: a new episode.
+        assert_eq!(episodes, 1);
+    }
+
+    #[test]
+    fn test_api_retry_observation_counts_one_episode_per_storm() {
+        // A multi-minute storm must increment the episode counter ONCE, not
+        // once per 10s cycle -- otherwise "episodes" would just be a slower
+        // spelling of "cycles" and storm frequency would be unreadable.
+        let now = "2026-09-03T09:30:00-04:00";
+        for prev in [1u32, 2, 50, 102] {
+            let (last_seen, episodes) = evaluate_api_retry_observation(true, prev, now);
+            assert_eq!(last_seen.as_deref(), Some(now));
+            assert_eq!(episodes, 0, "prev_consecutive={prev} must not re-count");
+        }
+    }
+
+    #[test]
+    fn test_api_retry_observation_clears_stamp_when_resolved() {
+        // The daemon itself reports resolution on the next cycle; the
+        // metrics-side freshness window is only a backstop for "stopped
+        // observing".
+        let (last_seen, episodes) =
+            evaluate_api_retry_observation(false, 102, "2026-09-03T09:45:00-04:00");
+        assert!(last_seen.is_none());
+        assert_eq!(episodes, 0);
+    }
+
+    #[test]
+    fn test_api_retry_observation_recounts_after_resolution() {
+        // Storm 1 ends (consecutive back to 0), storm 2 starts -> a second
+        // episode.
+        let now = "2026-09-03T10:00:00-04:00";
+        let (_, first) = evaluate_api_retry_observation(true, 0, now);
+        let (_, mid) = evaluate_api_retry_observation(true, 1, now);
+        let (_, resolved) = evaluate_api_retry_observation(false, 2, now);
+        let (_, second) = evaluate_api_retry_observation(true, 0, now);
+        assert_eq!((first, mid, resolved, second), (1, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_api_retry_observation_is_independent_of_suppression() {
+        // The whole point: past max_stuck_secs `evaluate_api_retry_state`
+        // stops suppressing, but the observation must keep being recorded --
+        // that is the window in which the old suppressions counter went flat
+        // while the storm raged on.
+        let started = (Utc::now() - chrono::Duration::seconds(2400)).to_rfc3339();
+        let (_, _, suppress) = evaluate_api_retry_state(true, 240, Some(&started), 1, 1800);
+        assert!(!suppress, "suppression should have been lifted by the cap");
+        let now = Utc::now().to_rfc3339();
+        let (last_seen, _) = evaluate_api_retry_observation(true, 240, &now);
+        assert_eq!(
+            last_seen.as_deref(),
+            Some(now.as_str()),
+            "observation must be stamped even with suppression lifted"
+        );
     }
 
     // --- is_api_retry_suppressing tests (read-only state derivation) ---
@@ -9932,6 +12837,94 @@ pane_unchanged_secs = 600
         assert!(
             stuck_suppressed_by_activity(true, 3),
             "both conditions must suppress"
+        );
+    }
+
+    #[test]
+    fn heartbeat_stale_liveness_reason_truth_table() {
+        // No proof-of-life at all -> None (stuck may fire = genuine wedge).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, false, false),
+            None,
+            "idle+not-thinking+no-activity must let the stuck flag fire"
+        );
+        // Pre-existing signals still win, with their original reason strings.
+        assert_eq!(
+            heartbeat_stale_liveness_reason(true, 0, false, false),
+            Some("workload_heartbeat_fresh")
+        );
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 2, false, false),
+            Some("active_subagents")
+        );
+        // NEW: an active thinking episode is independent proof-of-life ->
+        // suppress the false stale (the incident case: loop thinking in a
+        // long turn, heartbeat starved because no tool call processed a tick).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, true, false),
+            Some("loop_thinking")
+        );
+        // NEW: actively turning (tool call running / recent) also suppresses.
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, false, true),
+            Some("loop_actively_turning")
+        );
+        // Precedence: workload/subagents outrank the new signals (stable
+        // reason string for existing log consumers).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(true, 1, true, true),
+            Some("workload_heartbeat_fresh")
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_none_when_missing() {
+        // Missing file -> None (fresh boot / stripped deployment).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().to_str().unwrap();
+        assert_eq!(
+            last_ack_timestamp_age(state_dir),
+            None,
+            "missing last-ack timestamp must return None"
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_age_when_present() {
+        // Fresh file -> Some(age ~0).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path();
+        let ack_file = state_dir.join("last-ack-timestamp");
+        std::fs::write(&ack_file, "1234567890.0\n").expect("write ack file");
+        let age = last_ack_timestamp_age(state_dir.to_str().unwrap());
+        assert!(age.is_some(), "fresh ack file must return Some(age)");
+        // Age should be very small (file just written).
+        assert!(
+            age.unwrap() < 10,
+            "fresh ack file age must be near zero, got {:?}",
+            age
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_age_when_stale() {
+        // Stale file -> Some(age > threshold).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path();
+        let ack_file = state_dir.join("last-ack-timestamp");
+        std::fs::write(&ack_file, "1234567890.0\n").expect("write ack file");
+        // Backdate the file mtime by 700 seconds.
+        let now = std::time::SystemTime::now();
+        let old = now - std::time::Duration::from_secs(700);
+        filetime::set_file_mtime(&ack_file, filetime::FileTime::from_system_time(old))
+            .expect("backdate mtime");
+        let age = last_ack_timestamp_age(state_dir.to_str().unwrap());
+        assert!(age.is_some(), "stale ack file must return Some(age)");
+        let age_val = age.unwrap();
+        assert!(
+            age_val >= 690 && age_val <= 710,
+            "stale ack file age must be ~700s, got {}",
+            age_val
         );
     }
 

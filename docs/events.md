@@ -32,11 +32,19 @@ main loop reads stdout, dispatches per-tag, restarts the watcher.
 Each consumed event surfaces as exactly one line:
 
 ```
-EVENT[<source>/<tag>] <first-60-chars-of-message>…
+EVENT[<source>/<tag>] <first-60-chars-of-message>… [k=v …]
 ```
 
 The shape is intentionally narrow — the main loop's bash-task view stays
 small. To see details, use `claude-event-tail` against the ring buffer.
+
+In **monitor mode** (`--mode monitor`, where each stdout line is itself the
+notification) the same prefix is followed by a terse per-source/tag lead, the
+**full** message (newlines flattened to ` ⏎ `) and the data tags, capped at
+~400 chars — e.g. `EVENT[cron/pr-status-change] PR #652 CI failure — PR
+owner/repo#652: CI failure (was: pending) [field=ci_status …]`. The lead
+patterns and cap rules are documented in `tools/watchers/README.md`
+(*Monitor line format*).
 
 ## Debounce / cooloff
 
@@ -129,6 +137,17 @@ ring-buffer log (compact JSON).
 - **Consumed log**: `$CLAUDE_EVENT_LOG_DIR/consumed.jsonl` (default
   `~/.config/claude-events/`), rotated to `.1`/`.2`/`.3`.
 - **Ring buffer max lines**: `$CLAUDE_EVENT_LOG_MAX_LINES` (default 10000).
+- **Liveness stamp**: `$CLAUDE_EVENT_STATE_DIR/last-ack-timestamp` (default
+  `~/.config/claude-events/`). `event-ack` writes it on EVERY ack; the main
+  loop's per-batch reflex is `event-ack ack-batch --override-reason "<why>"`
+  (the reason is mandatory and audited). Its age is claude-watch's
+  liveness signal (`[ack] stale_minutes`), exported by `claude-watch metrics`
+  as `claude_mainloop_last_ack_timestamp_seconds`. Note where it does NOT
+  live: **nothing writes state under the queue dir**. A `.state/` subdir
+  there (#681's drain-time marker, removed 2026-08-22) is counted as an
+  unconsumed event by `cw-watcher-health-check`'s scan, and fired two false
+  "WATCHER DOWN: 1 event(s) unconsumed >6min" alerts in one day before it was
+  removed.
 
 ## Schema
 

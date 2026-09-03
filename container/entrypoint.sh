@@ -110,6 +110,58 @@ fi
 # claude-watch/src/config.rs `try_load_config`).
 export CLAUDE_WATCH_CONFIG="${CLAUDE_WATCH_CONFIG:-/etc/claude-watch/config.toml}"
 
+# Runtime-editable cadence / tunables override. The baked config above is
+# frozen into the image (changing it needs `make container-build` + a
+# redeploy). This runtime override lives in the bind-mounted, operator-editable
+# ~/.config/claude-container/ dir (NOT the config dir ~/.config/claude-watch —
+# overlaying THAT historically root-broke the config dir; this is a SEPARATE
+# file). The daemon layers it on TOP of the baked config (highest precedence)
+# and AUTO-RELOADS when its mtime changes, so editing it on the host retunes
+# e.g. the memory-reminder cadence LIVE — no rebuild, no redeploy.
+export CLAUDE_WATCH_RUNTIME_CONFIG="${CLAUDE_WATCH_RUNTIME_CONFIG:-${HOME:-/home/hndrewaall}/.config/claude-container/claude-watch.override.toml}"
+# Seed a fully-commented template on first boot so the override is
+# discoverable. All-commented => a pure no-op layer until the operator
+# uncomments a value. Never overwrites an existing (possibly operator-edited)
+# file. Best-effort: a missing/unwritable dir (bare `docker run` without the
+# ~/.config/claude-container mount) is fine — the daemon just finds no runtime
+# layer and uses the baked defaults.
+if [ ! -e "$CLAUDE_WATCH_RUNTIME_CONFIG" ]; then
+    mkdir -p "$(dirname "$CLAUDE_WATCH_RUNTIME_CONFIG")" 2>/dev/null || true
+    cat > "$CLAUDE_WATCH_RUNTIME_CONFIG" 2>/dev/null <<'CWRUNTIMEEOF' || true
+# claude-watch runtime override — operator-editable, takes effect LIVE.
+#
+# Layered on TOP of the baked /etc/claude-watch/config.toml (highest
+# precedence). The daemon watches this file's mtime and auto-reloads when it
+# changes, so edits here take effect within one daemon loop pass — NO image
+# rebuild, NO redeploy. This file lives under the bind-mounted
+# ~/.config/claude-container/ dir (NOT ~/.config/claude-watch, which must never
+# be overlay-mounted). Uncomment + edit a value, save, and the daemon picks it
+# up. (A manual `pkill -HUP claude-watch` also forces an immediate reload.)
+#
+# Example — retune the daemon-emitted cadence claude-events live:
+# [cadence]
+# memory_reminder_interval_secs = 3600   # 1h    (code default 1800 = 30min)
+# keepalive_interval_secs       = 300    # 5min  (code default 300)
+#
+# Example -- retune the event-watcher health-check staleness threshold live
+# (consumed by the cw-watcher-health-check cron, not the daemon):
+# [watcher_health]
+# stale_minutes = 6    # minutes unconsumed before "WATCHER DOWN" (default 6 =
+#                      # >= 2x the ~3min event-watcher debounce)
+CWRUNTIMEEOF
+fi
+
+# Watcher-list OVERRIDE layer (user-dir file, may be a symlink into a repo).
+# The baked base list is $WATCHERS_CONFIG (image ENV). The override lives in
+# the same bind-mounted, operator-editable ~/.config/claude-container/ dir as
+# the runtime config above — $HOME-relative, never a host-absolute path — and
+# is the SAME file the baked daemon config names in
+# [watcher_monitor].watchers_config_extra, so `watcher-ctl list/status/run`
+# and the daemon's watcher_monitor resolve one identical layered view. Absent
+# file = base only. A symlinked override works only if its target is inside a
+# mounted tree (otherwise it dangles in here and reads as absent).
+export WATCHERS_CONFIG_EXTRA="${WATCHERS_CONFIG_EXTRA:-${HOME:-/home/hndrewaall}/.config/claude-container/watchers/watchers.conf}"
+
 # Make sure the directories claude-watch wants to write to exist + are
 # writable by uid 1000. State dir is under ~/.cache; logs are in /tmp.
 mkdir -p "${HOME:-/home/hndrewaall}/.cache/claude-watch"
@@ -180,6 +232,12 @@ unset _local_bin
 # keeps the change surgical — no host-native binaries (falcon, slack, devbar)
 # get pulled onto the container PATH. Missing CLIs are skipped (the `-x` guard),
 # so this is a no-op when the botchat repo isn't mounted.
+#
+# pce-aws-creds (PCE/EKS AWS creds helper against envchain `sf-pce-aws`,
+# see claude-config/tools/pce-aws-creds and
+# memory/reference_pce_nemotron_aws_creds_envchain_sf_pce_aws.md) is linked
+# the same way: it's a plain bash script under the bind-mounted claude-config
+# repo, so a symlink into ~/.local/bin is enough — no fork needed.
 _user_bin="${HOME:-/home/hndrewaall}/.local/bin"
 for _script in \
     "${PINGME_SRC:-}" \
@@ -187,7 +245,8 @@ for _script in \
     "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-send" \
     "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-unread-check" \
     "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-show" \
-    "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-history"; do
+    "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-history" \
+    "${HOME:-/home/hndrewaall}/repos/claude-config/tools/pce-aws-creds"; do
     [ -n "$_script" ] || continue
     if [ -x "$_script" ] && [ ! -e "${_user_bin}/$(basename "$_script")" ]; then
         ln -sf "$_script" "${_user_bin}/$(basename "$_script")" 2>/dev/null || true
@@ -719,20 +778,46 @@ mkdir -p /var/log/claude-watch/watchers /var/run/claude 2>/dev/null || true
 # `emit_events` reads its fail-closed default (false) because the daemon
 # config loader can't find the baked config without $CLAUDE_WATCH_CONFIG
 # — so it detects stale/orphaned queue items but emits no
-# queue-stuck/queue-orphaned event. The file sorts first in /etc/cron.d/
-# so its env-var lines apply to all subsequent entries (cron processes
-# /etc/cron.d/ in sorted order and env-var lines apply to entries in the
-# same file + later files).
+# queue-stuck/queue-orphaned event. IMPORTANT: cron scopes env-var lines
+# PER cron.d FILE — 00-env's vars do NOT propagate to jobs defined in OTHER
+# files (e.g. the metrics/active-agents jobs in cw-default). So 00-env is the
+# canonical env SOURCE, and `cw-cron-run` — the wrapper EVERY cw-default job
+# runs through — SOURCES this file before exec'ing the real command; that is
+# what actually delivers these vars to cw-default jobs. (An earlier version of
+# this comment wrongly assumed cron applies env-var lines to later files in
+# sorted order — it does not.) See container/bin/cw-cron-run.
+#
+# The metrics-emit vars (CW_PROMETHEUS_URL, CLAUDE_WATCH_PROM_FILE,
+# CLAUDE_WATCH_STATE) are propagated the same way so the baked
+# `claude-watch metrics` cron (cron.d/cw-default) — which runs in the same
+# clean cron environment — actually (a) writes to the node-exporter-scraped
+# textfile the operator configured (CLAUDE_WATCH_PROM_FILE) rather than the
+# built-in hardcoded path, (b) reads the live daemon state file
+# (CLAUDE_WATCH_STATE, when the operator overrides the config default), and
+# (c) can reach Prometheus (CW_PROMETHEUS_URL) to rehydrate the operator
+# desk-streak. Set in the container env (compose) but INVISIBLE to cron
+# without this propagation — which is why the shipped Rust emitter never
+# reached the scraped dir and an out-of-tree Python textfile bridge had to
+# stand in. Emitted only when set so a bare deploy keeps built-in defaults.
 #
 # /etc/cron.d/ files must be root:root mode 0644 (cron rejects others).
 # The Dockerfile grants passwordless sudo for `tee /etc/cron.d/00-env`.
-if [ -n "${CLAUDE_EVENT_QUEUE:-}" ]; then
-    printf '# /etc/cron.d/00-env — generated by entrypoint from container env vars.\n# Do not edit; regenerated on every container start.\n%s\n%s\n%s\n%s\n' \
-        "CLAUDE_EVENT_QUEUE=${CLAUDE_EVENT_QUEUE}" \
-        "HOME=${HOME:-/home/hndrewaall}" \
-        "PATH=${PATH}" \
-        "CLAUDE_WATCH_CONFIG=${CLAUDE_WATCH_CONFIG:-/etc/claude-watch/config.toml}" \
-        | sudo -n tee /etc/cron.d/00-env > /dev/null 2>&1 \
+if [ -n "${CLAUDE_EVENT_QUEUE:-}" ] || [ -n "${CW_PROMETHEUS_URL:-}" ] \
+    || [ -n "${CLAUDE_WATCH_PROM_FILE:-}" ] || [ -n "${CLAUDE_WATCH_STATE:-}" ]; then
+    {
+        printf '# /etc/cron.d/00-env — generated by entrypoint from container env vars.\n'
+        printf '# Do not edit; regenerated on every container start.\n'
+        [ -n "${CLAUDE_EVENT_QUEUE:-}" ] && printf 'CLAUDE_EVENT_QUEUE=%s\n' "${CLAUDE_EVENT_QUEUE}"
+        printf 'HOME=%s\n' "${HOME:-/home/hndrewaall}"
+        printf 'PATH=%s\n' "${PATH}"
+        printf 'CLAUDE_WATCH_CONFIG=%s\n' "${CLAUDE_WATCH_CONFIG:-/etc/claude-watch/config.toml}"
+        [ -n "${CLAUDE_WATCH_RUNTIME_CONFIG:-}" ] && printf 'CLAUDE_WATCH_RUNTIME_CONFIG=%s\n' "${CLAUDE_WATCH_RUNTIME_CONFIG}"
+        [ -n "${WATCHERS_CONFIG:-}" ] && printf 'WATCHERS_CONFIG=%s\n' "${WATCHERS_CONFIG}"
+        [ -n "${WATCHERS_CONFIG_EXTRA:-}" ] && printf 'WATCHERS_CONFIG_EXTRA=%s\n' "${WATCHERS_CONFIG_EXTRA}"
+        [ -n "${CW_PROMETHEUS_URL:-}" ] && printf 'CW_PROMETHEUS_URL=%s\n' "${CW_PROMETHEUS_URL}"
+        [ -n "${CLAUDE_WATCH_PROM_FILE:-}" ] && printf 'CLAUDE_WATCH_PROM_FILE=%s\n' "${CLAUDE_WATCH_PROM_FILE}"
+        [ -n "${CLAUDE_WATCH_STATE:-}" ] && printf 'CLAUDE_WATCH_STATE=%s\n' "${CLAUDE_WATCH_STATE}"
+    } | sudo -n tee /etc/cron.d/00-env > /dev/null 2>&1 \
     && sudo -n chmod 0644 /etc/cron.d/00-env 2>/dev/null || true
 fi
 

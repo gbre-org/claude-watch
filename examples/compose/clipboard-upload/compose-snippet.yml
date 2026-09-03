@@ -17,8 +17,12 @@
 
 services:
   # ---------------------------------------------------------------------
-  # clipboard-upload — sideband endpoint for browser-paste → clipboard
-  # file. Listens on 9701 inside the container, default published only
+  # clipboard-upload — sideband endpoints for the browser-served
+  # terminal. Serves POST /clipboard-upload (browser-paste → clipboard
+  # file) AND POST /theme-report (browser prefers-color-scheme →
+  # /host-clipboard/theme, consumed by claude-container's cw-theme-sync
+  # daemon to drive the Claude Code TUI theme). Listens on 9701 inside
+  # the container, default published only
   # on localhost so an operator deploying via a reverse proxy can do
   # auth + TLS in front. The browser frontend (q-2026-05-20-5f6e) POSTs
   # to /clipboard-upload; this service materializes the PNG on the
@@ -42,6 +46,13 @@ services:
       # value here only matters for the file NAME under
       # /host-clipboard/. Default matches the shim contract.
       CLIPBOARD_DEST_PATH: /host-clipboard/clipboard.png
+      # Destination for the dynamic-theme feature: the ttyd frontend POSTs
+      # {"theme":"dark"|"light"} to this service's /theme-report route and
+      # we atomically write the value here on the shared volume. The
+      # sibling claude-container's cw-theme-sync daemon reads it and injects
+      # `/config theme=<x>` so the Claude Code TUI theme follows the
+      # browser. Same shared volume as the clipboard file.
+      THEME_DEST_PATH: /host-clipboard/theme
       LOG_LEVEL: INFO
     volumes:
       # Shared volume with the sibling claude-container. Both services

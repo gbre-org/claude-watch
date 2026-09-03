@@ -148,10 +148,10 @@ sets `CLAUDE_MCP_HTTP_BRIDGE` and even if `~/.claude.json` lists neither.
 
 BEARER-AUTH HEADER AUTO-INJECT (--bearer-env)
 
-When the host-side mcp-host-bash launcher is fronted by
-`mcp-proxy-auth-shim` (i.e. the operator set `MCP_HOST_BASH_BEARER`),
-in-container MCP clients must send `Authorization: Bearer <token>` on
-every request or the shim 401's them. Pre-PR, the operator had to
+When the host-side mcp-host-bash-server enforces bearer auth (i.e. the
+operator set `MCP_HOST_BASH_BEARER`), in-container MCP clients must send
+`Authorization: Bearer <token>` on every request or the server 401's
+them. Pre-PR, the operator had to
 hand-edit the generated `.mcp.json` to add a `headers` block on every
 http-bridged entry — friction the workbot v50 validation surfaced
 loud and clear.

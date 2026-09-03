@@ -1,46 +1,175 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-queue-minisite test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size test-install-host-skills build deploy deploy-systemd install install-hooks install-skills compose-up compose-down compose-build container-build bootstrap redeploy deploy-container sync-main-clone clean
+# claude-watch Makefile.
+#
+# `make help` prints an index of every public target, grouped by the ##@
+# section banners below. Run it first — this header only explains WHICH
+# targets apply to WHICH machine.
+#
+# ---------------------------------------------------------------------------
+# TWO DEPLOYMENT SHAPES. Both are first-class; neither set is dead code.
+# ---------------------------------------------------------------------------
+#
+# (a) LINUX HOST + systemd — the daemon runs directly on the host, usually
+#     deployed from a detached build worktree.
+#
+#       make deploy-systemd   build + install + install-skills + restart the
+#                             systemd unit.   (`make deploy` = deprecated alias)
+#       make install          daemon COPY + tool-script symlinks into $BIN_DIR
+#       make install-skills   skills/*.md  -> host /cw-<name> slash commands
+#       make install-cron     render cron.d/cw-host -> /etc/cron.d (root; run
+#                             once at setup, deliberately NOT a deploy dep)
+#
+# (b) CONTAINER (the "workbot" shape) — claude-watch runs inside
+#     claude-container, orchestrated by examples/compose/ on a macOS host with
+#     Docker Desktop. process-compose is PID 1 inside the image; the host side
+#     is driven by launchd + the examples/compose/bin/ shims (cw, hostjob,
+#     mcp-host-bash-server).
+#
+#       make deploy-container force-recreate claude-container, then up -d the
+#                             rest of the stack.  (`make redeploy` = alias, and
+#                             MUST keep working — the baked image self-redeploys
+#                             through that name)
+#       make container-build  build just claude-container:dev
+#       make compose-build    build every image in the stack
+#       make bootstrap        one-time prereq check + seed examples/compose/.env
+#       make sync-main-clone  ff-only sync the BIND-MOUNTED source clone; run
+#                             before deploying a bind-mounted Python-CLI fix
+#
+#     The macOS HOST-side helpers for that shape live in their own section:
+#       make install-mcp-host-bash-server    host-bash MCP server -> ~/bin
+#       make install-cw-agent-stats-launchd  cw-agent-stats LaunchAgent
+#
+#     These are macOS-only by construction (launchctl / codesign) and will not
+#     do anything useful on the Linux host shape — that is expected, not rot.
+#     $(BIN_DIR) does NOT apply to install-mcp-host-bash-server: it delegates
+#     to crates/mcp-host-bash-server/Makefile, which installs to ~/bin.
+#
+# ---------------------------------------------------------------------------
+# EVERYWHERE
+# ---------------------------------------------------------------------------
+#   make test / test-*    the suites; CI runs these target-by-target, so a new
+#                         suite needs a target here AND a step in
+#                         .github/workflows/ci.yml
+#   make install-hooks    opt-in git pre-commit gate (core.hooksPath)
+#   make clean            cargo clean
+#
+# `make` with no target runs `test` (pinned below so it no longer depends on
+# which target happens to appear first in this file).
+.DEFAULT_GOAL := test
+
+# .PHONY mirrors the ##@ sections below, in the same order — when you add a
+# target to a section, add it to that section's .PHONY line.
+.PHONY: help
+# Tests — Rust daemon
+.PHONY: test test-verbose test-unit test-e2e test-live
+# Tests — host tooling (Python / shell)
+.PHONY: test-session-task test-obligations-init test-cw-agent-stats
+.PHONY: test-queue-minisite test-hooks test-agent-msg test-agent-tail
+.PHONY: test-claude-event test-pr-branches test-event-must-act
+.PHONY: test-self-clear test-self-login test-self-login-tmux test-self-mcp-reconnect
+.PHONY: test-watchers
+.PHONY: test-claude-events-exporter test-work-queue-exporter test-dashboard
+.PHONY: test-agent-psi-exporter
+# Tests — container image
+.PHONY: test-trust-workspace test-claude-tmux-env test-cron-toggle
+.PHONY: test-eval-queue-ready-unspawned
+.PHONY: test-cw-theme-sync
+.PHONY: test-hooks-shim test-entrypoint
+# Tests — compose stack + host shims
+.PHONY: test-cw test-hostjob test-ttyd-paste-handler test-ttyd-lock-toggle
+# Tests — macOS LaunchAgents + personal MCP host
+.PHONY: test-launchd-plist test-personal-mcp-host test-personal-mcp-host-plist
+.PHONY: test-personal-mcp-install
+# Tests — repo-wide gates + installers
+.PHONY: test-doc-links test-claude-md-size test-install-hooks
+.PHONY: test-install-host-skills test-install-host-cron test-install-links
+.PHONY: test-ci-apt-install test-make-help
+# Build + install / deploy — Linux host
+.PHONY: build install install-skills install-cron deploy-systemd deploy
+# Container image + compose stack (workbot)
+.PHONY: bootstrap container-build compose-build compose-up compose-down
+.PHONY: work-queue-exporter-build
+.PHONY: sync-main-clone deploy-container redeploy
+# macOS host helpers
+.PHONY: install-mcp-host-bash-server install-cw-agent-stats-launchd
+# Developer setup / housekeeping
+.PHONY: install-hooks clean
+
+help: ## Show this target index
+	@awk 'BEGIN {FS = ":.*?## "} \
+		/^##@ / {printf "\n%s\n", substr($$0, 5); next} \
+		/^[a-zA-Z0-9_-]+:.*?## / {printf "  %-32s %s\n", $$1, $$2}' \
+		$(MAKEFILE_LIST)
+
+##@ Tests — Rust daemon
+
+# Each of these prefers cargo-nextest (parallel) and falls back to plain
+# `cargo test` when it isn't installed. The fallback is an if/else, NOT
+# `nextest || cargo test`: that older form also fell through on a test
+# FAILURE, which re-ran the whole suite under the other runner and — for
+# the narrower fallbacks below — could turn a real nextest failure into a
+# green exit. Mirrors the same if/else in scripts/git-hooks/pre-commit.
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
-test:
-	@command -v cargo-nextest >/dev/null 2>&1 && \
-		cargo nextest run || \
-		cargo test
+test: ## Run the full Rust suite (nextest if available, else cargo test)
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run; \
+	else \
+		cargo test; \
+	fi
 
-# Verbose output (show stdout/stderr from passing tests too)
-test-verbose:
-	@command -v cargo-nextest >/dev/null 2>&1 && \
-		cargo nextest run --no-capture || \
-		cargo test -- --nocapture
+test-verbose: ## Full Rust suite with stdout/stderr from passing tests
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run --no-capture; \
+	else \
+		cargo test -- --nocapture; \
+	fi
 
-# Unit + fixture tests only (fast, ~0.1s)
-test-unit:
-	@command -v cargo-nextest >/dev/null 2>&1 && \
-		cargo nextest run -E 'not binary(~e2e_)' || \
-		cargo test --lib --test unit_activity_detection
+test-unit: ## Unit + fixture tests only (fast)
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run -E 'not binary(~e2e_)'; \
+	else \
+		cargo test --lib --test unit_activity_detection; \
+	fi
 
-# e2e tests only (tmux-based, ~10s)
-test-e2e:
-	@command -v cargo-nextest >/dev/null 2>&1 && \
-		cargo nextest run -E 'binary(~e2e_) and not test(~live)' || \
-		cargo test --test 'e2e_*' -- --skip live
+test-e2e: ## e2e tmux-based tests only
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run -E 'binary(~e2e_) and not test(~live)'; \
+	else \
+		cargo test --test 'e2e_*' -- --skip live; \
+	fi
 
-# Live e2e tests (spawn real Claude Code, ~1-2 min each, #[ignore] by default)
-test-live:
-	@command -v cargo-nextest >/dev/null 2>&1 && \
-		cargo nextest run --run-ignored=only || \
-		cargo test -- --ignored
+test-live: ## Live e2e tests (spawn real Claude Code, ~1-2 min each; #[ignore] by default)
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run --run-ignored=only; \
+	else \
+		cargo test -- --ignored; \
+	fi
+
+##@ Tests — host tooling (Python / shell)
 
 # Run the session-task Python tests (cross-session queue CLI under tools/).
 # Self-contained: each test runs against a tempdir HOME so the live
-# ~/.config/session/queue.json is never touched. ~36s, 165 cases.
-test-session-task:
+# ~/.config/session/queue.json is never touched. The slowest suite here
+# (order of a minute).
+test-session-task: ## session-task queue CLI pytest suite
 	uv run --python 3.11 --with pytest pytest tools/session-task/tests/ -v
 
 # Run the obligations-init pytest suite (user-manifest idempotency).
 # Self-contained: runs the real obligations-init + obligations CLIs against
 # a tempdir HOME so the live ~/.config/claude/obligations.json is untouched.
-test-obligations-init:
+test-obligations-init: ## obligations-init user-manifest idempotency pytest suite
 	uv run --python 3.11 --with pytest pytest tools/obligations/tests/ -v
+
+# Run the cw-agent-stats pytest suite: the vendored transcript survey/fold
+# library (tools/cw-agent-stats/agentstats.py -- formerly botchat's
+# src/botchat/agentstats.py) + the cw-agent-stats CLI (--out default
+# resolution, Prometheus textfile rendering, an end-to-end --once run).
+# Pins the agent-stats.json snapshot schema the queue-minisite joins on;
+# run together with test-queue-minisite when touching either side.
+# Self-contained: synthetic ~/.claude/projects tree under tmp_path, never
+# the live one or the live state dir.
+test-cw-agent-stats: ## cw-agent-stats producer (agentstats library + CLI) pytest suite
+	uv run --python 3.11 --with pytest pytest tools/cw-agent-stats/tests/ -v
 
 # Run the queue-minisite end-to-end suites (queue-minisite/test_*.py).
 # Each file is a standalone unittest script that boots the Flask app
@@ -60,7 +189,7 @@ test-obligations-init:
 # Resolving it from the checkout means the suites test this tree's CLIs
 # rather than whatever happens to be installed in the developer's ~/bin
 # (and gives a machine with nothing installed the same result as CI).
-test-queue-minisite:
+test-queue-minisite: ## queue-minisite Flask end-to-end suites
 	@set -e; \
 	export PATH="$(CURDIR)/tools/session-task:$(CURDIR)/tools/obligations:$(CURDIR)/tools/claude-event:$$PATH"; \
 	for f in queue-minisite/test_*.py; do \
@@ -74,7 +203,7 @@ test-queue-minisite:
 # an isolated $HOME tmpdir so the live obligations.json is never touched.
 # The pre-agent-queue-gate-hook test exercises the real `session-task`
 # binary; it must be on PATH (or installed via `make install`).
-test-hooks:
+test-hooks: ## obligations + PreToolUse/PostToolUse hook suites
 	python3 tools/obligations/shell_ast.py --test
 	tools/hooks/tests/pre-tool-obligations-gate-hook.test
 	tools/hooks/tests/pre-agent-queue-gate-hook.test
@@ -90,56 +219,125 @@ test-hooks:
 
 # Run the agent-msg embedded test suite (CLI for delivering async
 # messages to running Claude Code agents via the obligations gate).
-# The script's `--test` flag runs all 38 cases in-process against
+# The script's `--test` flag runs every case in-process against
 # isolated tmpdirs, no obligations side effects.
-test-agent-msg:
+test-agent-msg: ## agent-msg embedded --test suite
 	python3 tools/agent-msg/agent-msg --test
 
 # Run the agent-tail embedded test suite (CLI for streaming agent
 # JSONL transcripts). Tests cover pure helpers, format_record dispatch,
 # resolution under a fake projects tree, and the follow-mode handler
 # (truncation + rotation). All cases run in-process against tmpdirs.
-test-agent-tail:
+test-agent-tail: ## agent-tail embedded --test suite
 	python3 tools/agent-tail/agent-tail --test
 
-# Run the claude-event + claude-event-tail unit tests.
-test-claude-event:
+test-claude-event: ## claude-event + claude-event-tail unit tests
 	python3 tools/claude-event/tests/test_claude_event.py
 
-# Run the event-must-act toolchain tests. These four scripts
-# (event-classify, event-ack, eval-event-must-act,
-# user-prompt-ambient-inject-hook) now live in tools/event-must-act/ as
-# the SHARED, host-portable copy: the container bakes them via COPY, and
-# the non-container (systemd) host symlinks them into ~/bin. Plus the
+# Run the pr-branches tests (PR branch lifecycle CLI under tools/).
+# Fully offline: every GitHub/git accessor is stubbed out, so no test touches
+# a real repository, remote, or the GitHub API. Covers each classification
+# bucket, the squash-merge trap (ancestry must never decide merged-ness),
+# worktree/default-branch precedence, and the delete path refusing when the
+# live PR state disagrees with the classification.
+test-pr-branches: ## pr-branches classification + merge-assertion unit tests
+	python3 tools/pr-branches/tests/test_pr_branches.py
+
+# Run the event-must-act toolchain tests. The toolchain (event-classify,
+# event-ack, eval-event-must-act, user-prompt-ambient-inject-hook) lives in
+# tools/event-must-act/ as the SHARED, host-portable copy: the container
+# bakes them via COPY, and the non-container (systemd) host symlinks them
+# into ~/bin. Three of the four carry embedded --self-test suites (the
+# ambient-inject hook does not); this target runs those three plus the
 # cron-driven dead-watcher recovery injector (cw-watcher-health-check),
 # whose bash test stubs `claude-watch` so nothing is ever injected into a
 # real pane.
-test-event-must-act:
+#
+# producer-tier-e2e.test covers what the per-tool self-tests structurally
+# cannot: that a PRODUCER-shipped `data.tier` survives the WHOLE chain
+# (event file -> claude-event-watch -> event-ack ingest -> event-classify ->
+# pending/ambient). A unit test of classify() passes even when the watcher
+# never reads data.tier, so only the e2e proves the path is wired. It
+# sandboxes its own queue/state/lock/PATH and never touches a live watcher.
+test-event-must-act: ## event-must-act toolchain self-tests
 	python3 tools/event-must-act/event-classify --self-test
 	python3 tools/event-must-act/event-ack --self-test
 	python3 tools/event-must-act/eval-event-must-act --self-test
 	tools/event-must-act/tests/cw-watcher-health-check.test
+	tools/event-must-act/tests/producer-tier-e2e.test
 
 # Run the self-clear config-only smoke tests (the full inject flow needs
 # a live Claude Code tmux pane, which can't be reproduced in unit tests).
-test-self-clear:
+test-self-clear: ## self-clear config-only smoke tests
 	python3 tools/watchers/tests/test_self_clear_config.py
 
+# self-login pure predicates + config paths. No terminal needed.
+test-self-login: ## self-login unit tests (pane predicates, code validation, config)
+	python3 tools/watchers/tests/test_self_login.py
+
+# self-login end-to-end against a THROWAWAY tmux session running a fake login
+# screen — never a real Claude Code pane. Split from test-self-login because it
+# needs both tmux and a built claude-watch binary; it self-skips without them,
+# so it runs in the e2e CI job that has both rather than hiding a vacuous pass
+# in the shell-test job.
+test-self-login-tmux: ## self-login end-to-end against a real tmux pane
+	tools/watchers/tests/test_self_login_tmux.sh
+
+# self-mcp-reconnect pure predicates/parsers (menu-visibility, server/action
+# row parsing, result-line parsing) + config paths. No terminal needed — the
+# actual `/mcp` menu navigation (do_reconnect) needs a real Claude Code pane
+# and is exercised manually per the empirical transcript in the script's
+# module docstring / container/skills/self-mcp-reconnect.md.
+test-self-mcp-reconnect: ## self-mcp-reconnect unit tests (menu parsers, config)
+	python3 tools/watchers/tests/test_self_mcp_reconnect.py
+
 # Run the claude-event-watch fast-path smoke test.
-test-watchers: test-self-clear
+test-watchers: test-self-clear test-self-login test-self-mcp-reconnect ## claude-event-watch fast-path + self-clear/self-login/self-mcp-reconnect
 	tools/watchers/tests/test_claude_event_watch.sh
+
+# Run the claude-events-exporter suite: the heartbeat gauge that backs the
+# dashboard's "Last Ack Age" tile. Standalone script (not pytest); uv supplies
+# prometheus_client so no checked-in venv is needed. The suite rewrites
+# CLAUDE_EVENTS_DIR and re-execs the module per scenario, so it never reads a
+# real ~/claude-events.
+test-claude-events-exporter: ## claude-events-exporter queue-metric tests
+	uv run --python 3.11 --with prometheus_client \
+		python3 exporters/claude-events-exporter/test_claude_events_exporter.py
+
+# Same shape as the claude-events-exporter suite above: self-contained, one
+# scenario per owner-attribution / liveness case, re-execs the exporter module
+# per scenario against a tmpdir so it never reads a real queue.json or
+# active-agents.json. Covers the owner precedence ladder (active-agents qid ->
+# register-time agent_id stamp -> arm-hook binding) and the fail-loud posture
+# when the exporter cannot see its inputs at all.
+test-work-queue-exporter: ## work-queue-exporter owner-liveness tests
+	uv run --python 3.11 --with prometheus_client \
+		python3 exporters/work-queue-exporter/test_work_queue_exporter.py
+
+# Same shape as the exporter suites above: self-contained, pure-function
+# categorizer + two-agent some/full pressure math against synthetic
+# transcripts, plus one end-to-end scrape over a tmpdir projects dir. uv
+# supplies prometheus_client so no checked-in venv is needed.
+test-agent-psi-exporter: ## agent-psi-exporter categorizer + pressure tests
+	uv run --python 3.11 --with prometheus_client \
+		python3 exporters/agent-psi-exporter/test_agent_psi_exporter.py
 
 # Run the dashboard parser tests (sources dashboard-lib.sh in a bash
 # subshell and exercises conf_get / conf_windows / has_split / expected_panes
-# against fixtures). 33 cases, ~1s.
-test-dashboard:
+# against fixtures).
+test-dashboard: ## dashboard-lib.sh parser tests
 	tools/dashboard/tests/dashboard-parser.test
 
-# Run the trust-workspace embedded test suite (claude-container's
-# pre-seed for ~/.claude.json's projects[<workspace>].hasTrustDialogAccepted
-# entry; suppresses the in-container first-launch trust prompt). 11 cases,
-# <0.1s, all in-process against tmpdir HOMEs.
-test-trust-workspace:
+##@ Tests — container image
+
+# Container-side ~/.claude state helpers, all in-process against tmpdir
+# HOMEs:
+#   - trust-workspace.py        : pre-seeds ~/.claude.json's
+#     projects[<workspace>].hasTrustDialogAccepted, which suppresses the
+#     in-container first-launch trust prompt.
+#   - reconcile-native-claude   : reconciles the native-install state.
+#   - snapshot-claude-config    : snapshots ~/.claude.json + symlink farm.
+test-trust-workspace: ## container ~/.claude state helper suites
 	python3 container/bin/trust-workspace.py --test
 	python3 container/bin/reconcile-native-claude --test
 	python3 container/bin/snapshot-claude-config --test
@@ -147,85 +345,79 @@ test-trust-workspace:
 # Run the claude-tmux env / mount passthrough tests (corporate CA bundle
 # forwarding, proxy passthrough, host hooks-dir bind-mount, set-but-missing
 # path warnings). Exercises the wrapper's --print-docker-args debug hook so
-# no docker daemon is needed. 23 cases, ~1s.
-test-claude-tmux-env:
+# no docker daemon is needed.
+test-claude-tmux-env: ## claude-tmux env / mount passthrough tests
 	container/bin/tests/claude-tmux-env.test
 
 # Run the cron-toggle tests (cw-cron-run flag-file exec-wrapper +
 # cw-cron-toggle CLI). Uses a tempdir flag dir; no cron/root needed.
-test-cron-toggle:
+test-cron-toggle: ## cw-cron-run / cw-cron-toggle tests
 	container/bin/tests/cw-cron-toggle.test
 
-# Run the exec-hook shim tests (settings.json hook safe-exec wrapper for
-# cross-arch hooks — ELF passthrough, Mach-O / unknown / missing no-op,
-# dedup flag file), the generate-hooks-shim-settings rewrite tests
-# (container-local settings.json with every hook command wrapped in
-# /usr/local/bin/exec-hook), the generate-project-mcp-json tests
-# (project-tier .mcp.json with MCP server commands wrapped, the v21
-# follow-up fix), AND the devbar-analytics-spool tests (stdin-preserving
-# spool + container->host path rewrite for the `devbar ai-analytics
-# capture` hook, approach B). All run directly on Linux against synthetic
-# inputs; no container needed.
-test-hooks-shim:
+# Run the eval-queue-ready-unspawned tests (the queue_ready_unspawned
+# obligation evaluator, ob-2026-08-22-5e6e). Mocks `session-task` on PATH
+# with a JSON-fixture stub; no real queue state is touched.
+test-eval-queue-ready-unspawned: ## eval-queue-ready-unspawned obligation evaluator tests
+	container/bin/tests/eval-queue-ready-unspawned.test
+
+# Tests for cw-theme-sync's idle gate. Claude Code renders a suggestion inside
+# an EMPTY input box as DIM (SGR 2) ghost text; capturing the pane without
+# `-e` strips that attribute, so the gate read the ghost as typed input and
+# latched shut — silently, for hours. These pin the dim-vs-typed distinction
+# (including the "2" hiding inside extended-colour parameter lists) and the
+# reason strings a blocked gate now logs. Pure parsing; no tmux needed.
+test-cw-theme-sync: ## cw-theme-sync idle-gate / ghost-text tests
+	uv run --python 3.11 --with pytest pytest -v \
+		container/bin/tests/test_cw_theme_sync.py
+
+# Container hooks-shim suites. All run directly on Linux against synthetic
+# inputs; no container needed:
+#   - exec-hook                     : settings.json hook safe-exec wrapper for
+#     cross-arch hooks — ELF passthrough, Mach-O / unknown / missing no-op,
+#     dedup flag file.
+#   - exec-hook-bridge              : the MCP-bridge half of the same wrapper.
+#   - devbar-analytics-spool        : stdin-preserving spool + container->host
+#     path rewrite for the `devbar ai-analytics capture` hook (approach B).
+#   - generate-hooks-shim-settings  : container-local settings.json with every
+#     hook command wrapped in /usr/local/bin/exec-hook.
+#   - generate-project-mcp-json     : project-tier .mcp.json with MCP server
+#     commands wrapped (the v21 follow-up fix).
+test-hooks-shim: ## container hooks-shim / settings-rewrite suites
 	container/hooks-shim/tests/exec-hook.test
 	container/hooks-shim/tests/exec-hook-bridge.test
 	container/hooks-shim/tests/devbar-analytics-spool.test
 	container/hooks-shim/tests/generate-hooks-shim-settings.test
 	container/hooks-shim/tests/generate-project-mcp-json.test
 
-# No-broken-links gate for the docs baked into the container image. Runs the
-# checker's embedded self-tests, then verifies every relative markdown link in
-# container/baked-CLAUDE.md (and repo-wide) resolves to a path that exists in
-# the repo. baked-CLAUDE.md now links to its sibling docs by RELATIVE path
-# (they are COPYed into /opt/claude-container/ alongside it), so a link to an
-# un-baked path is a real in-container 404 — this gate catches it at CI time.
-test-doc-links:
-	python3 scripts/check-doc-links.py --self-test
-	python3 scripts/check-doc-links.py --all
-
-# CLAUDE.md size guard. Every CLAUDE.md is loaded into Claude Code's context
-# at session start and stays there all session; /doctor recommends each stay
-# under ~40,000 CHARACTERS. This gate fails when a tracked CLAUDE.md exceeds
-# the generic HARD_LIMIT (40k) — except container/baked-CLAUDE.md, which is
-# intentionally ~76k today and is pinned by a ratchet ceiling in the script's
-# ALLOWLIST so it cannot GROW (the lever that drives it back down). The SAME
-# script runs in scripts/git-hooks/pre-commit; CI is the real enforcement
-# since the local hook is bypassable with `git commit --no-verify`.
-test-claude-md-size:
-	python3 scripts/check-claude-md-size.py --self-test
-	python3 scripts/check-claude-md-size.py
-
-# Test the install-hooks target: asserts it sets a relative, repo-local
-# core.hooksPath (not --global, no .git/hooks symlink) and that a fresh
-# git worktree resolves + fires the pre-commit hook from its own checkout.
-test-install-hooks:
-	scripts/git-hooks/tests/install-hooks.test
-
-# Tests for scripts/install-host-skills.sh + its Makefile wiring: the
-# skills/ (deployment-agnostic) vs container/skills/ (container-only) split,
-# the `cw-` host prefix, absolute in-tree symlinks, idempotency, dry-run, the
-# refuse-to-clobber rules for the operator-managed destination dir, and
-# own-links-only pruning. Also guards the shipped skills against private-path
-# leakage. Runs against throwaway tmpdirs — never touches ~/.claude.
-test-install-host-skills:
-	scripts/tests/install-host-skills.test
-
-# Run the entrypoint CLAUDE_CMD construction tests. Extracts the
-# CLAUDE_CMD-building shell block from container/entrypoint.sh by regex
-# and exercises it in a fresh `bash -c` subshell against a matrix of
-# CLAUDE_SHIM_SETTINGS_PATH + CLAUDE_AUTO_CONTINUE values. Guards against
-# the v19 regression where the user-tier was loaded alongside the
-# rewritten shim file (additive merge → bare cross-arch hooks still
-# fired) AND the CLAUDE_AUTO_CONTINUE auto-resume integration. 12 cases,
-# <1s.
+# The container image's static-assertion suite: ~30 scripts that check the
+# entrypoint's runtime behaviour and that the Dockerfile actually baked what
+# the deployment contract assumes (hooks wired, gates wired, dirs present,
+# CLIs installed, volumes/pid1/cron shape). All run on plain Linux against
+# the checked-in sources — no docker daemon, no built image.
 #
-# Also runs the container-PATH tests that assert
-# /home/hndrewaall/.local/bin lives on the image PATH (Dockerfile ENV +
-# entrypoint defensive prepend). Without these, Claude Code's
-# native-install warning (`Native installation exists but ~/.local/bin
-# is not in your PATH`) prints on every launch as soon as a self-update
-# materialises ~/.local/bin/claude.
-test-entrypoint:
+# Three of them are worth calling out because they encode past regressions:
+#
+#   - entrypoint-claude-cmd.test extracts the CLAUDE_CMD-building shell
+#     block from container/entrypoint.sh by regex and exercises it in a
+#     fresh `bash -c` subshell across a matrix of CLAUDE_SHIM_SETTINGS_PATH
+#     + CLAUDE_AUTO_CONTINUE values. It guards the v19 regression where the
+#     user-tier was loaded alongside the rewritten shim file (additive merge
+#     -> bare cross-arch hooks still fired), plus the CLAUDE_AUTO_CONTINUE
+#     auto-resume integration.
+#   - container-path-includes-local-bin.test asserts
+#     /home/hndrewaall/.local/bin is on the image PATH (Dockerfile ENV +
+#     entrypoint defensive prepend). Without it, Claude Code's native-install
+#     warning (`Native installation exists but ~/.local/bin is not in your
+#     PATH`) prints on every launch as soon as a self-update materialises
+#     ~/.local/bin/claude.
+#   - task-init-keeps-session.test asserts the baked config keeps
+#     `[task_watch] enabled = true` AND that daemon_pane_command() falls back
+#     to the keepalive stub when the legacy `task-watch` CLI is missing. With
+#     it disabled, `task init` ran a binary the image doesn't ship, pane 0
+#     exited instantly, and tmux destroyed the `tasks` session right after
+#     "Session 'tasks' created" printed — `workload run` / `workload kill`
+#     were unusable in the container.
+test-entrypoint: ## Container entrypoint + baked-image assertion suites
 	container/tests/entrypoint-claude-cmd.test
 	container/tests/entrypoint-tmux-truecolor.test
 	container/tests/container-path-includes-local-bin.test
@@ -247,6 +439,7 @@ test-entrypoint:
 	container/tests/process-compose-pid1.test
 	container/tests/cron-default-baked.test
 	container/tests/in-container-daemon.test
+	container/tests/task-init-keeps-session.test
 	container/tests/iproute2-installed.test
 	container/tests/code-cli-installed.test
 	container/tests/claude-event-tail-baked.test
@@ -259,99 +452,28 @@ test-entrypoint:
 	container/tests/xclip-shim.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
+##@ Tests — compose stack + host shims (examples/compose)
+
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host
 # terminal to the running claude-container's tmux session via
 # `docker compose exec`). Uses the script's --print-cmd debug hook to
-# verify argv construction without requiring docker. 7 cases, <1s.
-test-cw:
+# verify argv construction without requiring docker.
+test-cw: ## cw host-shim argv-construction tests
 	examples/compose/bin/tests/cw.test
-
-# Run the mcp-host-bash host-shim tests (examples/compose/bin/mcp-host-bash —
-# uvx mcp-proxy + uvx cli-mcp-server launcher that fronts a generic
-# "run a bash command on the host" MCP server for the in-container claude
-# via CLAUDE_MCP_HTTP_BRIDGE). Uses the script's --print-cmd debug hook to
-# verify argv construction + default-policy floor + config-file overrides
-# without requiring uvx / mcp-proxy / cli-mcp-server. 11 cases, <1s.
-test-mcp-host-bash:
-	examples/compose/bin/tests/mcp-host-bash.test
 
 # Run the hostjob tests (examples/compose/bin/hostjob — the detached
 # host-job runner that lets an in-container agent launch host commands
 # past the 30s host-bash MCP cap, then poll/wait for them). Exercises the
 # real run/wait/poll/list/clean surface against a throwaway $HOME so no
 # operator state is touched. The legacy hostjob.test covers the core
-# run/wait/poll/list/clean surface (10 cases, ~3s); the pytest files cover
-# the queue-integration, stop-subcommand, and live-tail-broker features.
-test-hostjob:
+# run/wait/poll/list/clean surface; the pytest files cover the
+# queue-integration, stop-subcommand, and live-tail-broker features.
+test-hostjob: ## hostjob detached host-job runner tests
 	examples/compose/bin/tests/hostjob.test
 	uv run --python 3.11 --with pytest pytest -v \
 		examples/compose/bin/tests/test_hostjob_broker.py \
 		examples/compose/bin/tests/test_hostjob_queue.py \
 		examples/compose/bin/tests/test_hostjob_stop.py
-
-
-# Tests for examples/compose/bin/mcp-proxy-auth-shim — the bearer-token
-# reverse proxy that fronts mcp-proxy. Spins up an in-process fake
-# upstream + the shim as a subprocess, drives requests through urllib,
-# and asserts the auth gate + header passthrough behavior. 14 cases,
-# ~2s (each subprocess boot adds ~100ms; otherwise CPU-light).
-test-mcp-proxy-auth-shim:
-	examples/compose/bin/tests/mcp-proxy-auth-shim.test
-
-# Tests for examples/compose/bin/install-host-deps — the static
-# installer for mcp-proxy + cli-mcp-server. Exercises the uv → pip
-# fallback path (TLS-only) by injecting a fake uv via PATH so we
-# never actually fetch from PyPI. 10 cases, <1s.
-test-install-host-deps:
-	examples/compose/bin/tests/install-host-deps.test
-
-# Tests for examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist
-# — the macOS LaunchAgent template that persistently auto-starts
-# mcp-host-bash on operator-login. File-level structural validation
-# only (parses via stdlib plistlib + plutil-lint when available);
-# does NOT exercise launchctl because the test runs on Linux CI.
-# 21 cases, <1s.
-test-launchd-plist:
-	examples/compose/bin/tests/launchd-plist.test
-
-# Tests for examples/compose/bin/load-bearer-from-keychain — the
-# macOS-only Keychain wrapper that fetches the bearer from the user's
-# login Keychain and exec's mcp-host-bash. Mocks the `security` CLI
-# and mcp-host-bash via PATH override so the suite runs on Linux CI.
-# Covers Keychain hit / miss / empty / non-macOS / unknown failure,
-# plist-plaintext fallback, argv passthrough, secret-leak invariants,
-# special-char round-trip, custom service-name. 12 cases, <1s.
-test-load-bearer-from-keychain:
-	examples/compose/bin/tests/load-bearer-from-keychain.test
-
-# Tests for examples/personal-mac-mcp-host/personal-mcp-host.sh — the
-# wrapper that spawns mcp-host-bash + the reverse SSH tunnel for the
-# on-demand remote-access pattern. Uses --print-cmd to verify argv
-# construction without invoking ssh / mcp-host-bash. Covers env-file
-# loading, required-key enforcement, default ssh hardening options,
-# PERSONAL_MCP_SSH_EXTRA passthrough, soft kill switch. 17 cases, <1s.
-test-personal-mcp-host:
-	examples/personal-mac-mcp-host/tests/personal-mcp-host.test
-
-# Tests for examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.host.plist
-# — the macOS LaunchAgent template for on-demand bring-up of
-# personal-mcp-host.sh. Structural validation only (plistlib + plutil
-# when available); does NOT invoke launchctl. Covers
-# RunAtLoad=false enforcement (this is the on-demand pattern, NOT
-# auto-start), Label / paths / EnvironmentVariables shape, README
-# walkthrough coverage. 22 cases, <1s.
-test-personal-mcp-host-plist:
-	examples/personal-mac-mcp-host/tests/launchd-plist.test
-
-# Tests for examples/personal-mac-mcp-host/install.sh — the one-command
-# LaunchAgent installer that auto-resolves REPO / HOME, substitutes the
-# /PATH/TO/REPO and /PATH/TO/HOME placeholders, and copies the chosen
-# plist into ~/Library/LaunchAgents/. Runs in --print-cmd / temp-HOME
-# dry-run style; asserts the rendered plist has NO surviving /PATH/TO/
-# placeholders and points at the resolved repo / home. Idempotency +
-# missing-tunnel-plist guard covered. No launchctl. 21 checks, <1s.
-test-personal-mcp-install:
-	examples/personal-mac-mcp-host/tests/install.test
 
 # Tests for examples/compose/ttyd/inject-autodark.py PASTE_EVENT_HANDLER_JS
 # — the browser-side paste handler injected into ttyd's bundled
@@ -362,13 +484,249 @@ test-personal-mcp-install:
 #     so Cmd+V works for BOTH images and text in one keybinding.
 # Runs the JS body inside Node with DOM / clipboard / fetch stubs and
 # asserts on preventDefault + side-effects across text-only / image-only
-# / mixed / image-jpeg / empty-types synthetic paste events. 5 cases, <1s.
-test-ttyd-paste-handler:
+# / mixed / image-jpeg / empty-types synthetic paste events.
+test-ttyd-paste-handler: ## ttyd browser paste-handler JS tests
 	python3 examples/compose/ttyd/tests/test_paste_handler.py
 
+# Tests for examples/compose/ttyd/inject-autodark.py LOCK_TOGGLE_JS — the
+# subtle top-right padlock toggle injected into ttyd's bundled index.html.
+# When ACTIVE it suppresses keystrokes by returning false from xterm.js's
+# attachCustomKeyEventHandler hook (nothing reaches the PTY / input WS) and
+# flips window.__cwTerminalLocked so the paste handler also blocks paste.
+# Runs the JS body inside Node with DOM / window.term stubs and asserts the
+# button state (glyph, aria-pressed, cw-locked class) + key-veto return
+# value across the unlocked → locked → unlocked toggle cycle.
+#
+# Also covers the idle AUTO-LOCK: a fake wall clock drives the injected
+# poll to prove activity before the deadline resets the countdown, idling
+# past it engages the lock through the same setLocked() path (including
+# the localStorage write), and a window of 0 registers no listeners and
+# never locks. The TTYD_AUTOLOCK_SECONDS env var → baked-in
+# `var AUTO_LOCK_SECONDS = <n>;` resolution (default 300, 0 = off,
+# non-integer = build failure) is exercised by running inject-autodark.py
+# end-to-end against a minimal HTML document.
+test-ttyd-lock-toggle: ## ttyd browser lock-toggle JS tests
+	python3 examples/compose/ttyd/tests/test_lock_toggle.py
+
+##@ Tests — macOS LaunchAgents + personal MCP host
+
+# Tests for examples/compose/launchd/org.claude-watch.mcp-host-bash.plist
+# — the macOS LaunchAgent template that persistently auto-starts
+# mcp-host-bash on operator-login. File-level structural validation
+# only (parses via stdlib plistlib + plutil-lint when available);
+# does NOT exercise launchctl because the test runs on Linux CI.
+test-launchd-plist: ## mcp-host-bash LaunchAgent plist structure tests
+	examples/compose/bin/tests/launchd-plist.test
+
+# Tests for examples/personal-mac-mcp-host/personal-mcp-host.sh — the
+# wrapper that spawns mcp-host-bash + the reverse SSH tunnel for the
+# on-demand remote-access pattern. Uses --print-cmd to verify argv
+# construction without invoking ssh / mcp-host-bash. Covers env-file
+# loading, required-key enforcement, default ssh hardening options,
+# PERSONAL_MCP_SSH_EXTRA passthrough, soft kill switch, and the
+# `restart` verb (reap a wedged half-up stack, restart both pieces,
+# verify each, exit 4 naming whichever did not come back; launchd
+# units are driven with kickstart -k via a stand-in launchctl).
+# Slower than the other shell suites — the restart cases start real
+# stand-in processes.
+test-personal-mcp-host: ## personal-mcp-host.sh wrapper tests
+	examples/personal-mac-mcp-host/tests/personal-mcp-host.test
+
+# Tests for examples/personal-mac-mcp-host/launchd/org.claude-watch.personal-mcp.host.plist
+# — the macOS LaunchAgent template for on-demand bring-up of
+# personal-mcp-host.sh. Structural validation only (plistlib + plutil
+# when available); does NOT invoke launchctl. Covers
+# RunAtLoad=false enforcement (this is the on-demand pattern, NOT
+# auto-start), Label / paths / EnvironmentVariables shape, the per-mode
+# ProgramArguments flags (bundled passes --enable, tunnel-only passes
+# --tunnel-only), README walkthrough coverage.
+test-personal-mcp-host-plist: ## personal-mcp-host LaunchAgent plist tests
+	examples/personal-mac-mcp-host/tests/launchd-plist.test
+
+# Tests for examples/personal-mac-mcp-host/install.sh — the one-command
+# LaunchAgent installer that auto-resolves REPO / HOME, substitutes the
+# /PATH/TO/REPO and /PATH/TO/HOME placeholders, and copies the chosen
+# plist into ~/Library/LaunchAgents/. Runs in --print-cmd / temp-HOME
+# dry-run style; asserts the rendered plist has NO surviving /PATH/TO/
+# placeholders and points at the resolved repo / home. Idempotency +
+# missing-tunnel-plist guard covered. No launchctl.
+test-personal-mcp-install: ## personal-mcp-host install.sh dry-run tests
+	examples/personal-mac-mcp-host/tests/install.test
+
+##@ Tests — repo-wide gates + installers
+
+# No-broken-links gate for the docs baked into the container image. Runs the
+# checker's embedded self-tests, then verifies every relative markdown link in
+# container/baked-CLAUDE.md (and repo-wide) resolves to a path that exists in
+# the repo. baked-CLAUDE.md now links to its sibling docs by RELATIVE path
+# (they are COPYed into /opt/claude-container/ alongside it), so a link to an
+# un-baked path is a real in-container 404 — this gate catches it at CI time.
+test-doc-links: ## Gate: every relative markdown link resolves
+	python3 scripts/check-doc-links.py --self-test
+	python3 scripts/check-doc-links.py --all
+
+# CLAUDE.md size guard. Every CLAUDE.md is loaded into Claude Code's context
+# at session start and stays there all session; /doctor recommends each stay
+# under ~40,000 CHARACTERS. This gate fails when a tracked CLAUDE.md exceeds
+# the generic HARD_LIMIT (40k) — except container/baked-CLAUDE.md, which is
+# intentionally ~76k today and is pinned by a ratchet ceiling in the script's
+# ALLOWLIST so it cannot GROW (the lever that drives it back down). The SAME
+# script runs in scripts/git-hooks/pre-commit; CI is the real enforcement
+# since the local hook is bypassable with `git commit --no-verify`.
+test-claude-md-size: ## Gate: CLAUDE.md files stay under their size ceiling
+	python3 scripts/check-claude-md-size.py --self-test
+	python3 scripts/check-claude-md-size.py
+
+# Test the install-hooks target: asserts it sets a relative, repo-local
+# core.hooksPath (not --global, no .git/hooks symlink) and that a fresh
+# git worktree resolves + fires the pre-commit hook from its own checkout.
+test-install-hooks: ## Tests for the install-hooks target (core.hooksPath)
+	scripts/git-hooks/tests/install-hooks.test
+
+# Tests for scripts/install-host-skills.sh + its Makefile wiring: the
+# skills/ (deployment-agnostic) vs container/skills/ (container-only) split,
+# the `cw-` host prefix, absolute in-tree symlinks, idempotency, dry-run, the
+# refuse-to-clobber rules for the operator-managed destination dir, and
+# own-links-only pruning. Also guards the shipped skills against private-path
+# leakage. Runs against throwaway tmpdirs — never touches ~/.claude.
+test-install-host-skills: ## Tests for the host-skills installer + its wiring
+	scripts/tests/install-host-skills.test
+
+# Tests for cron.d/cw-host + scripts/install-host-cron.sh: that the shipped
+# fragment is fully parameterized (no operator paths in a public repo), that
+# every placeholder it uses is one the installer substitutes, that rendering
+# resolves all of them, and the refuse-to-install guards. Also pins the
+# single-binary-identity wiring the fragment depends on: deploy-systemd must
+# depend on `install`, or the $BIN_DIR copy goes stale again. Tmpdirs only —
+# never touches /etc/cron.d.
+test-install-host-cron: ## Tests for the host-cron fragment + its installer
+	scripts/tests/install-host-cron.test
+
+# The `install` target's TOOL_LINKS / MULTICALL_NAMES variables: every source
+# path resolves and is executable, `make -n install` lists every previously
+# host-missing name (agent-ctl, session-event, watcher-restart,
+# watcher-status, task-watch, claude-watch-metrics, dashboard,
+# dashboard-refit, queue-notify — NOT the deliberately-retired
+# heartbeat-ack), and the symlinking is idempotent. Tmpdirs only; no cargo
+# build (make -n).
+test-install-links: ## Tests for the install target's TOOL_LINKS / MULTICALL_NAMES coverage
+	scripts/tests/install-links.test
+
+# The bounded/retrying apt wrapper CI's two package-install steps run through.
+# Drives the real script against a fake apt-get that hangs on demand and
+# asserts on WALL-CLOCK behavior: a wedged attempt is aborted early, the retry
+# recovers, and a permanent wedge still stops inside the total budget. A retry
+# policy whose retries cannot fit inside the outer step cap is decoration, and
+# a "resilient" wrapper that hangs anyway is worse than none — it reads as
+# handled. Fakes only; never touches the real package manager.
+test-ci-apt-install: ## Tests for the bounded/retrying CI apt installer
+	scripts/tests/ci-apt-install.test
+
+# Gate: `make help` stays a truthful index. The help target is an awk pass
+# over two conventions -- `##@ ` section banners and trailing `## ` target
+# descriptions -- and nothing enforced either, so a target added without an
+# annotation silently never appeared in the index. Asserts help runs, that
+# every annotated target + section is rendered, and (the direction that
+# actually catches drift) that every .PHONY target IS annotated, except the
+# two deprecated aliases on an explicit allowlist. Read-only; builds nothing.
+test-make-help: ## Gate: `make help` indexes every public target
+	scripts/tests/make-help.test
+
+##@ Build + install — Linux host
+
 # Release build
-build:
+build: ## cargo build --release
 	cargo build --release
+
+# Install built binaries + scripts onto $PATH ($BIN_DIR, default ~/bin).
+# The recipe below is the authoritative list of what lands there — it used
+# to be restated in a comment here too, which had drifted to about half the
+# real set.
+#
+# Install policy:
+#   - The claude-watch Rust daemon is a build artifact, so it's a real
+#     file copy from target/release/ into $(BIN_DIR). Re-running `make
+#     install` after `make build` refreshes it.
+#
+#     WHY A COPY AND NOT A SYMLINK (this has been "fixed" the wrong way
+#     before): a symlink into target/release/ dangles the moment anyone
+#     runs `cargo clean` or switches profile, which makes the on-PATH CLI
+#     vanish rather than merely go stale — and `make install` would put
+#     the copy back on the next run anyway. The copy is right; what was
+#     wrong is that it used to go stale, because `deploy-systemd` did not
+#     depend on this target. It now does, so a host deploy refreshes this
+#     copy and restarts the service from the same build.
+#   - Every other tool is a script (Python / shell). Those install as
+#     ABSOLUTE-PATH symlinks back to the source under tools/ (or the repo
+#     root, for dashboard/dashboard-refit), so editing a script in-tree is
+#     immediately reflected in $(BIN_DIR) without another `make install`
+#     round-trip. `ln -sfn` makes the operation idempotent (overwrites
+#     existing files / stale symlinks; -n prevents following a directory
+#     at the link path).
+#   - A third class, MULTICALL_NAMES, are argv[0] aliases the daemon binary
+#     ITSELF dispatches on (busybox-style — see `multicall_rewrite_args` in
+#     src/main.rs, e.g. `agent-ctl list` becomes `claude-watch agent list`).
+#     Those install as symlinks to the installed $(BIN_DIR)/claude-watch
+#     copy, not to a separate script. Keep this list in sync with the match
+#     arms in `multicall_rewrite_args()`.
+BIN_DIR ?= $(HOME)/bin
+
+# name=path pairs (path relative to the repo root). This is the single
+# source of truth for install's script symlinks — `make -n install` and
+# `make test-install-links` both walk it, so a tool added here is proven
+# wired without hand-maintaining a second list.
+TOOL_LINKS := \
+	session-task=tools/session-task/session-task \
+	queue-notify=tools/session-task/queue-notify \
+	obligations=tools/obligations/obligations \
+	obligations-init=tools/obligations/obligations-init \
+	pre-agent-queue-gate-hook=tools/hooks/pre-agent-queue-gate-hook \
+	pre-tool-obligations-gate-hook=tools/hooks/pre-tool-obligations-gate-hook \
+	post-tool-obligations-update-hook=tools/hooks/post-tool-obligations-update-hook \
+	post-tool-mark-attachment-read-hook=tools/hooks/post-tool-mark-attachment-read-hook \
+	pre-agent-background-required-hook=tools/hooks/pre-agent-background-required-hook \
+	pre-agent-worktree-isolation-hook=tools/hooks/pre-agent-worktree-isolation-hook \
+	worktree-create-hook=tools/hooks/worktree-create-hook \
+	agent-msg=tools/agent-msg/agent-msg \
+	agent-tail=tools/agent-tail/agent-tail \
+	pr-branches=tools/pr-branches/pr-branches \
+	claude-event=tools/claude-event/claude-event \
+	claude-event-tail=tools/claude-event/claude-event-tail \
+	claude-event-watch=tools/watchers/claude-event-watch \
+	self-clear=tools/watchers/self-clear \
+	self-login=tools/watchers/self-login \
+	self-mcp-reconnect=tools/watchers/self-mcp-reconnect \
+	event-classify=tools/event-must-act/event-classify \
+	event-ack=tools/event-must-act/event-ack \
+	eval-event-must-act=tools/event-must-act/eval-event-must-act \
+	user-prompt-ambient-inject-hook=tools/event-must-act/user-prompt-ambient-inject-hook \
+	cw-watcher-health-check=tools/event-must-act/cw-watcher-health-check \
+	cw-agent-stats=tools/cw-agent-stats/cw-agent-stats \
+	dashboard=dashboard \
+	dashboard-refit=dashboard-refit
+
+# argv[0] multicall aliases of the daemon binary (see multicall_rewrite_args
+# in src/main.rs). Symlinked to $(BIN_DIR)/claude-watch, not to a script.
+MULTICALL_NAMES := agent-ctl task-watch watcher-ctl watcher-status workload claude-watch-metrics watcher-restart session-event
+install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
+	@mkdir -p $(BIN_DIR)
+	@install -m 0755 target/release/claude-watch $(BIN_DIR)/claude-watch
+	@for pair in $(TOOL_LINKS); do \
+		name=$${pair%%=*}; src=$${pair#*=}; \
+		ln -sfn "$(CURDIR)/$$src" "$(BIN_DIR)/$$name"; \
+	done
+	@for name in $(MULTICALL_NAMES); do \
+		ln -sfn "$(BIN_DIR)/claude-watch" "$(BIN_DIR)/$$name"; \
+	done
+	@echo "Installed to $(BIN_DIR):"
+	@echo "  - claude-watch (file copy, build artifact)"
+	@for pair in $(TOOL_LINKS); do \
+		name=$${pair%%=*}; src=$${pair#*=}; \
+		echo "  - $$name (symlink -> $$src)"; \
+	done
+	@for name in $(MULTICALL_NAMES); do \
+		echo "  - $$name (multicall symlink -> claude-watch)"; \
+	done
 
 # Install this repo's deployment-agnostic skills (skills/*.md) into the host
 # Claude Code commands dir as `cw-`-prefixed slash commands (`/cw-<name>`).
@@ -391,8 +749,27 @@ build:
 # symlink pointing outside skills/, and only prunes its own dangling links.
 # Idempotent; `-n` for a dry run. Override the destination with
 # CLAUDE_COMMANDS_DIR (default ~/.claude/commands).
-install-skills:
+install-skills: ## Install skills/ as /cw-<name> host slash commands
 	@scripts/install-host-skills.sh
+
+# Render + install the HOST cron fragment (cron.d/cw-host) into /etc/cron.d.
+#
+# The container bakes its crontab into the image (container/cron.d/cw-default);
+# this is the host equivalent. It can't be baked, because a host deployment has
+# no fixed install prefix — the fragment therefore ships @PLACEHOLDER@s and the
+# installer fills them in from the local checkout (binary path, user, home,
+# state dir), each overridable. That also keeps one operator's home path out of
+# this public repo, and lets a second deployment consume the same fragment.
+#
+# Deliberately NOT a dependency of deploy-systemd: it needs root, and a deploy
+# must not silently rewrite the host's crontab. Run it once at setup (and again
+# only when the fragment changes); cron re-reads /etc/cron.d on the next tick,
+# so there is nothing to restart. `-n` for a dry run that prints the rendered
+# file and writes nothing; `--help` for all flags.
+install-cron: ## Render + install cron.d/cw-host into /etc/cron.d (needs root)
+	@scripts/install-host-cron.sh
+
+##@ Deploy — Linux host (systemd)
 
 # Build + restart systemd service (HOST / systemd install — NOT used in the
 # Docker-container setup; see `deploy-container` for that).
@@ -401,113 +778,53 @@ install-skills:
 # skills — otherwise a skill added here is invisible on the host until someone
 # remembers to hand-install it (exactly how /distill shipped for weeks as a
 # container-only command).
-deploy-systemd: build install-skills
+#
+# Depends on `install` (which itself depends on `build`) for the SAME reason,
+# one layer down: a host/systemd deployment has TWO claude-watch binaries on
+# disk — the service's ExecStart runs target/release/ directly, while the
+# on-PATH CLI is the $(BIN_DIR) copy that `install` places. This target used to
+# depend on `build` alone, so a deploy rebuilt + restarted the service and left
+# the $(BIN_DIR) copy frozen at whenever `make install` last ran. The two then
+# drifted, silently: `claude-watch <subcommand>` on PATH kept running old code,
+# and any cron/tooling pointed at the copy reported that copy's compiled-in
+# build identity rather than the running daemon's. Depending on `install` makes
+# one deploy refresh both from the same build. Do NOT instead symlink
+# $(BIN_DIR)/claude-watch into target/release/ — see the install policy above.
+deploy-systemd: install install-skills ## Host/systemd deploy: build + install + skills + restart
 	sudo systemctl restart claude-watch
 
 # DEPRECATED alias — kept so any docs / muscle-memory invoking `make deploy`
 # keep working. Prefer `make deploy-systemd` (self-documenting). No recipe body;
 # just depends on the renamed target.
+#
+# Deliberately carries NO `##` help annotation: deprecated aliases stay out of
+# `make help` so the index only advertises the current names. It also keeps the
+# line in the bare `alias: target` form that container/tests/ asserts on for the
+# sibling `redeploy` alias — do not append a trailing comment here.
 deploy: deploy-systemd
 
-# Install built binaries + scripts onto $PATH ($BIN_DIR, default ~/bin).
-# Targets:
-#   - claude-watch                          : the Rust daemon
-#   - session-task                          : Python CLI (queue + resume action)
-#   - obligations                           : obligations gate CLI
-#   - pre-agent-queue-gate-hook             : PreToolUse hook (Agent matcher)
-#   - pre-tool-obligations-gate-hook        : PreToolUse hook (* matcher)
-#   - post-tool-obligations-update-hook     : PostToolUse hook (* matcher)
-#   - post-tool-mark-attachment-read-hook   : PostToolUse hook (Read matcher)
-#   - pre-agent-background-required-hook    : PreToolUse hook (Agent matcher)
-#   - pre-agent-worktree-isolation-hook     : PreToolUse hook (Agent matcher)
-#   - worktree-create-hook                  : WorktreeCreate/Remove hook
-#
-# Install policy:
-#   - The claude-watch Rust daemon is a build artifact, so it's a real
-#     file copy from target/release/ into $(BIN_DIR). Re-running `make
-#     install` after `make build` refreshes it.
-#   - Every other tool is a script (Python / shell). Those install as
-#     ABSOLUTE-PATH symlinks back to the source under tools/, so editing
-#     a script in-tree is immediately reflected in $(BIN_DIR) without
-#     another `make install` round-trip. `ln -sfn` makes the operation
-#     idempotent (overwrites existing files / stale symlinks; -n
-#     prevents following a directory at the link path).
-BIN_DIR ?= $(HOME)/bin
+##@ Container image + compose stack — the workbot deployment
 
-install: build
-	@mkdir -p $(BIN_DIR)
-	@install -m 0755 target/release/claude-watch $(BIN_DIR)/claude-watch
-	@ln -sfn $(abspath tools/session-task/session-task) $(BIN_DIR)/session-task
-	@ln -sfn $(abspath tools/obligations/obligations) $(BIN_DIR)/obligations
-	@ln -sfn $(abspath tools/hooks/pre-agent-queue-gate-hook) $(BIN_DIR)/pre-agent-queue-gate-hook
-	@ln -sfn $(abspath tools/hooks/pre-tool-obligations-gate-hook) $(BIN_DIR)/pre-tool-obligations-gate-hook
-	@ln -sfn $(abspath tools/hooks/post-tool-obligations-update-hook) $(BIN_DIR)/post-tool-obligations-update-hook
-	@ln -sfn $(abspath tools/hooks/post-tool-mark-attachment-read-hook) $(BIN_DIR)/post-tool-mark-attachment-read-hook
-	@ln -sfn $(abspath tools/hooks/pre-agent-background-required-hook) $(BIN_DIR)/pre-agent-background-required-hook
-	@ln -sfn $(abspath tools/hooks/pre-agent-worktree-isolation-hook) $(BIN_DIR)/pre-agent-worktree-isolation-hook
-	@ln -sfn $(abspath tools/hooks/worktree-create-hook) $(BIN_DIR)/worktree-create-hook
-	@ln -sfn $(abspath tools/agent-msg/agent-msg) $(BIN_DIR)/agent-msg
-	@ln -sfn $(abspath tools/agent-tail/agent-tail) $(BIN_DIR)/agent-tail
-	@ln -sfn $(abspath tools/claude-event/claude-event) $(BIN_DIR)/claude-event
-	@ln -sfn $(abspath tools/claude-event/claude-event-tail) $(BIN_DIR)/claude-event-tail
-	@ln -sfn $(abspath tools/watchers/claude-event-watch) $(BIN_DIR)/claude-event-watch
-	@ln -sfn $(abspath tools/watchers/self-clear) $(BIN_DIR)/self-clear
-	@echo "Installed to $(BIN_DIR):"
-	@echo "  - claude-watch              (file copy, build artifact)"
-	@echo "  - session-task              (symlink -> tools/session-task/)"
-	@echo "  - obligations               (symlink -> tools/obligations/)"
-	@echo "  - pre-agent-queue-gate-hook (symlink -> tools/hooks/)"
-	@echo "  - pre-tool-obligations-gate-hook (symlink -> tools/hooks/)"
-	@echo "  - post-tool-obligations-update-hook (symlink -> tools/hooks/)"
-	@echo "  - post-tool-mark-attachment-read-hook (symlink -> tools/hooks/)"
-	@echo "  - pre-agent-background-required-hook (symlink -> tools/hooks/)"
-	@echo "  - pre-agent-worktree-isolation-hook (symlink -> tools/hooks/)"
-	@echo "  - worktree-create-hook      (symlink -> tools/hooks/)"
-	@echo "  - agent-msg                 (symlink -> tools/agent-msg/)"
-	@echo "  - agent-tail                (symlink -> tools/agent-tail/)"
-	@echo "  - claude-event              (symlink -> tools/claude-event/)"
-	@echo "  - claude-event-tail         (symlink -> tools/claude-event/)"
-	@echo "  - claude-event-watch        (symlink -> tools/watchers/)"
-	@echo "  - self-clear                (symlink -> tools/watchers/)"
-
-# Install git pre-commit hook (warning-free build + unit/fixture tests).
-# Points core.hooksPath at the tracked scripts/git-hooks/ dir instead of
-# symlinking into .git/hooks/. Two reasons this is the correct form:
-#   1. The setting is RELATIVE, so it resolves against each worktree's own
-#      top-level — every worktree runs its own checked-out hooks.
-#   2. git config lives in the shared common dir, so this auto-applies to
-#      every existing AND future worktree of this repo. A symlink into
-#      .git/hooks/ does NOT: linked worktrees have a private gitdir and
-#      never consult the main repo's .git/hooks, so a fresh worktree
-#      silently ran with no pre-commit gate.
-# Scoped to THIS repo (local .git/config), NOT --global — other repos are
-# untouched. Idempotent: re-running just re-asserts the same value.
-install-hooks:
-	@git config core.hooksPath scripts/git-hooks
-	@echo "Pre-commit hook installed (core.hooksPath -> scripts/git-hooks; applies to all worktrees)."
-
-# --- examples/compose targets -----------------------------------------
-# Convenience wrappers around the integrated docker-compose example at
-# examples/compose/. The compose file wires claude-container +
-# queue-minisite + eichi-search; see examples/compose/README.md for
-# prerequisites (Docker, ANTHROPIC_API_KEY, sibling eichi clone).
+# Convenience wrappers around the integrated docker-compose stack at
+# examples/compose/, which wires claude-container + ttyd + queue-minisite +
+# eichi-search. See examples/compose/README.md for prerequisites (Docker,
+# ANTHROPIC_API_KEY, sibling eichi clone).
 
 # Run the bootstrap helper that checks prereqs, clones eichi sibling,
 # and seeds examples/compose/.env from .env.example.
-bootstrap:
+bootstrap: ## Check compose prereqs + seed examples/compose/.env
 	@bash examples/compose/bootstrap.sh
 
-# Build the compose stack images (skip the sibling eichi build context
-# if eichi isn't cloned next door — `docker compose build` will surface
-# the missing-context error if so).
+# --- build identity (shared by container-build / compose-build / deploy) ---
 #
 # GIT_SHA build-arg flows to container/Dockerfile's `LABEL
 # claude_watch_sha=...` so `docker inspect claude-container:dev --format
 # '{{ index .Config.Labels "claude_watch_sha" }}'` reports which local
 # revision was baked. `git rev-parse HEAD` is the working-tree HEAD;
 # operators who want origin/main should `git pull --rebase` before
-# invoking this target (the Dockerfile no longer pins a remote SHA — it
+# invoking these targets (the Dockerfile no longer pins a remote SHA — it
 # COPYs the local working tree).
+#
 # Host-computed build identity passed to container/Dockerfile's
 # claude-watch-builder stage (CW_BUILD_COMMIT / CW_BUILD_PR), which build.rs
 # bakes into the `claude_watch_build_info` Prometheus gauge. The Docker build
@@ -515,24 +832,25 @@ bootstrap:
 # the image — we resolve commit + PR HERE on the host (git available) and feed
 # them in. CW_BUILD_PR parses the trailing `(#N)` squash-merge convention from
 # the HEAD subject (empty if none — matches build.rs's "" fallback).
+#
+# Deliberately RECURSIVE (`=`, not the `:=` used by the plain path vars below):
+# the `$(shell git ...)` then runs only when a container/deploy target actually
+# expands it, instead of forking git twice on every `make help` / `make test`.
 CW_BUILD_COMMIT = $(shell git rev-parse --short HEAD 2>/dev/null)
 CW_BUILD_PR = $(shell git log -1 --format=%s 2>/dev/null | grep -oE '\#[0-9]+' | tail -1 | tr -d '\#')
 
-compose-build:
-	@cd examples/compose && \
-	  DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
-	  GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
-	  docker compose build \
-	    --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
-	    --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
-	    --build-arg CW_BUILD_PR="$(CW_BUILD_PR)"
+# Semver for the same build identity, read from Cargo.toml so the daemon and
+# the Python exporters can never disagree about which release they belong to.
+# Recursive for the same reason as the two above: only forked when a build
+# target actually expands it.
+CW_BUILD_VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
 # Build just the claude-container image directly (no compose). Same
 # GIT_SHA plumbing as compose-build. Context is the repo root because the
 # Dockerfile COPYs from sibling tools/ + container/ trees, and the
 # claude-watch-builder stage COPYs the whole working tree to compile the
 # Rust daemon.
-container-build:
+container-build: ## Build just the claude-container:dev image
 	DOCKER_BUILDKIT=1 docker build \
 	  --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
 	  --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
@@ -541,37 +859,117 @@ container-build:
 	  -f container/Dockerfile \
 	  .
 
+# Build the work-queue-exporter image with its build identity stamped in.
+#
+# The exporter's serving image is normally built by the OUT-OF-TREE monitoring
+# compose stack, which is why this target exists at all: it is the in-repo,
+# executable statement of the build-arg contract that stack has to satisfy
+# (`build.args: {CW_BUILD_COMMIT, CW_BUILD_VERSION}`), and it lets an operator
+# rebuild + verify locally without that stack. The args land in the image as
+# ENV and surface as `worktask_exporter_build_info{commit,version,source}` --
+# `curl -s localhost:9099/metrics | grep build_info` after a deploy.
+#
+# Context is the REPO ROOT, matching the compose stack's `build.context`,
+# because the Dockerfile COPYs the exporter sources by full in-repo path.
+work-queue-exporter-build: ## Build the work-queue-exporter image (build identity stamped)
+	DOCKER_BUILDKIT=1 docker build \
+	  --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
+	  --build-arg CW_BUILD_VERSION="$(CW_BUILD_VERSION)" \
+	  -t work-queue-exporter:dev \
+	  -f exporters/work-queue-exporter/Dockerfile \
+	  .
+
+# Build the compose stack images (skip the sibling eichi build context
+# if eichi isn't cloned next door — `docker compose build` will surface
+# the missing-context error if so).
+compose-build: ## Build all compose-stack images
+	@cd examples/compose && \
+	  DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
+	  GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
+	  docker compose build \
+	    --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
+	    --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
+	    --build-arg CW_BUILD_PR="$(CW_BUILD_PR)"
+
 # Bring the integrated compose stack up in the foreground.
-compose-up:
+compose-up: ## Bring the compose stack up in the foreground
 	@cd examples/compose && docker compose up
 
 # Tear down the compose stack (volumes survive; add -v to nuke
 # claude-container-versions).
-compose-down:
+compose-down: ## Tear the compose stack down (volumes survive)
 	@cd examples/compose && docker compose down
+
+# Sync the BIND-MOUNT SOURCE clone to origin/main (ff-only) — the activation
+# step for bind-mounted Python-CLI fixes. The compose bind-mount `${HOME}/repos/`
+# mounts the operator's MAIN CLONE (below), NOT whatever worktree built the
+# image, and the in-container obligations/session-task CLIs (+ tools/obligations/*)
+# resolve from it via PATH BEFORE the baked /usr/local/bin copy. So a stale main
+# clone SHADOWS merged+baked CLI fixes and `make deploy-container` alone won't
+# activate them (the recreate re-mounts the same stale clone). Run this before
+# deploying. Deliberately NOT a dependency of deploy-container — a target that
+# mutated the operator's working clone on every deploy is a bigger decision
+# (it could ff-fail on local commits); keep it explicit + opt-in. `--ff-only`
+# is safe: it refuses (non-zero) rather than clobbering divergent local work.
+CW_MAIN_CLONE := $(HOME)/repos/claude-watch
+sync-main-clone: ## ff-only sync the bind-mount source clone to origin/main
+	@echo "Syncing bind-mount source clone $(CW_MAIN_CLONE) to origin/main (ff-only)..."
+	@git -C "$(CW_MAIN_CLONE)" fetch origin
+	@git -C "$(CW_MAIN_CLONE)" merge --ff-only origin/main
+	@echo "Now at: $$(git -C "$(CW_MAIN_CLONE)" log -1 --oneline)"
 
 # Deploy/recreate the claude-container service (picks up new image / config).
 # This is the ONLY correct deploy for the Docker-container setup (the host/
 # systemd variant is `deploy-systemd`). `make redeploy` remains a working
 # DEPRECATED alias of this target.
 #
-# A SINGLE `docker compose up -d --force-recreate claude-container`.
-# This is deliberately one host-daemon operation so the target works
-# when issued FROM INSIDE the container (self-redeploy): the in-
-# container docker CLI hands the recreate request to the HOST docker
-# daemon, which performs the stop-old + start-new host-side and
-# COMPLETES it even after the issuing container (and the shell that ran
-# `make redeploy`) is torn down. The daemon owns the operation — no
-# backgrounding, no nohup, no disown, no second `&& up -d` that would
-# die with the issuing container.
+# Ordered compose ops, the SECOND-TO-LAST of which is the atomic
+# self-redeploy op:
+#   1. `docker compose up -d --build --force-recreate queue-minisite`
+#      (non-fatal on failure — q-site has its own Dockerfile, so a bare
+#      `up -d` below would never rebuild/recreate it on a code-only change).
+#   2. `docker compose up -d --build --force-recreate ttyd` (same reasoning:
+#      ttyd has its own Dockerfile under examples/compose/ttyd/, so it needs
+#      the same explicit rebuild+recreate step as queue-minisite, or a
+#      ttyd-only change — e.g. #721 — never goes live via this target).
+#      Non-fatal on failure.
+#   3. `docker compose up -d --force-recreate claude-container`  (atomic)
+#   4. `docker compose up -d`  (no service arg — fill in whatever's left of
+#      the stack, e.g. eichi-search — idempotently, WITHOUT --force-recreate
+#      so the just-recreated services are left running untouched).
 #
-# Why a single command and NOT a `rm -sf && up -d` split: when run from
-# inside the container, the FIRST command (`rm -sf` / `down`) destroys
-# the very container running the make recipe, so the shell dies and the
-# `&& up -d` never executes — the container goes down and never comes
-# back. `up -d --force-recreate` is atomic from the CLI's perspective:
-# it issues ONE create+start request that the daemon carries to
-# completion independently of the caller's lifetime.
+# Command 3 (the claude-container recreate) is deliberately ONE host-daemon
+# operation so the target works when issued FROM INSIDE the container
+# (self-redeploy): the in-container docker CLI hands the recreate request to
+# the HOST docker daemon, which performs the stop-old + start-new host-side
+# and COMPLETES it even after the issuing container (and the shell that ran
+# `make redeploy`) is torn down. The daemon owns that op — no backgrounding,
+# no nohup, no disown.
+#
+# Commands 1-2 (queue-minisite, ttyd) are ordered BEFORE the claude-container
+# recreate precisely so they still run to completion on self-redeploy — the
+# issuing container isn't torn down until command 3, so its shell survives
+# through 1-2. Command 3 is the pivot point: nothing AFTER it depends on the
+# issuing shell surviving except the idempotent trailing `up -d` (command 4).
+# On self-redeploy the recreate tears down the issuing container, the recipe
+# shell dies, and command 4 simply never runs — which is fine: self-redeploy
+# always runs on an already-up system where eichi-search (the only thing
+# command 4 would still need to touch) is ALREADY running. On a HOST cold
+# start (docker-autostart after a Docker Desktop restart, everything down),
+# the recipe shell runs host-side and SURVIVES the recreate, so command 4
+# executes and brings up whatever's left. This is the coverage fix for the
+# 'siblings missing after Docker Desktop restart' bug (ttyd / minisite /
+# eichi-search never came up because deploy-container only touched
+# claude-container). The trailing `up -d` is idempotent: on a normal
+# already-up host it no-ops.
+#
+# Why command 3 is a single op and NOT a `rm -sf && up -d` split: when run
+# from inside the container, a FIRST `rm -sf` / `down` destroys the very
+# container running the make recipe, so the shell dies and the `&& up -d`
+# never executes — the container goes down and never comes back.
+# `up -d --force-recreate` is atomic from the CLI's perspective: it issues
+# ONE create+start request the daemon carries to completion independently
+# of the caller's lifetime.
 #
 # Why force-recreate no longer wedges (the bug #292 worked around):
 # in-place recreate only ever stuck because a grandchild outlived PID
@@ -635,25 +1033,55 @@ COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 # `.env` if present, else the in-file defaults).
 DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 
-# Sync the BIND-MOUNT SOURCE clone to origin/main (ff-only) — the activation
-# step for bind-mounted Python-CLI fixes. The compose bind-mount `${HOME}/repos/`
-# mounts the operator's MAIN CLONE (below), NOT whatever worktree built the
-# image, and the in-container obligations/session-task CLIs (+ tools/obligations/*)
-# resolve from it via PATH BEFORE the baked /usr/local/bin copy. So a stale main
-# clone SHADOWS merged+baked CLI fixes and `make deploy-container` alone won't
-# activate them (the recreate re-mounts the same stale clone). Run this before
-# deploying. Deliberately NOT a dependency of deploy-container — a target that
-# mutated the operator's working clone on every deploy is a bigger decision
-# (it could ff-fail on local commits); keep it explicit + opt-in. `--ff-only`
-# is safe: it refuses (non-zero) rather than clobbering divergent local work.
-CW_MAIN_CLONE := $(HOME)/repos/claude-watch
-sync-main-clone:
-	@echo "Syncing bind-mount source clone $(CW_MAIN_CLONE) to origin/main (ff-only)..."
-	@git -C "$(CW_MAIN_CLONE)" fetch origin
-	@git -C "$(CW_MAIN_CLONE)" merge --ff-only origin/main
-	@echo "Now at: $$(git -C "$(CW_MAIN_CLONE)" log -1 --oneline)"
+# ── deploy-container local-override hook (q-2026-08-25-8065) ──────────────────
+# A machine-local makefile fragment in the config dir can inject an
+# EXTRA idempotent deploy step into `deploy-container` WITHOUT editing this
+# tracked, branch-protected Makefile. The motivating case is #3/#4 of the
+# "one-command deploy": deploying the Grafana dashboards LINKED IN from this
+# repo (monitoring/dashboards/*.json — claude-watch / claude-events /
+# work-queue) is performed by an EXTERNAL, machine-specific stack — the
+# external, machine-local monitoring/Grafana stack (kept OUT of this repo), which serves the local
+# `monitoring-grafana-1` Grafana container. That live
+# Grafana must be RESTARTED to re-provision from the bind-mounted dashboard
+# file (a POST /api/admin/provisioning reload does NOT overwrite an already-
+# provisioned dashboard), and the external makefile/stack path differs per
+# machine — so it MUST NOT be hardcoded in this shared repo.
+#
+# Mechanism: conditionally `-include` a local .mk (silently skipped when
+# absent, so a fresh host — or an in-container self-redeploy where the config
+# dir is not mounted — still deploys cleanly). That local .mk sets
+# DEPLOY_DASHBOARDS_CMD to the external, idempotent, SYNCHRONOUS (no `&`)
+# invocation. See examples/compose/deploy-container.local.mk.example. E.g.:
+#
+#   DEPLOY_DASHBOARDS_CMD = $(MAKE) -C /path/to/your/monitoring-stack deploy-grafana-dashboards
+# or simply:
+#   DEPLOY_DASHBOARDS_CMD = docker restart monitoring-grafana-1
+#
+# Empty default => a clean no-op on any host without the override.
+#
+# The config-dir path below is a SYMLINK to a TRACKED copy in the operator's
+# claude-config repo (claude-container/deploy-container.local.mk), which in turn
+# invokes the deploy-grafana-dashboards target in that external stack — so
+# the override is version-controlled + synced across hosts rather than hand-made and
+# untracked. See examples/compose/deploy-container.local.mk.example for setup.
+DEPLOY_LOCAL_MK := $(HOME)/.config/claude-container/deploy-container.local.mk
+-include $(DEPLOY_LOCAL_MK)
+DEPLOY_DASHBOARDS_CMD ?=
 
-deploy-container: container-build
+# Deploy the linked-in Grafana dashboards via the machine-local
+# override. Best-effort + idempotent: a failure never blocks the container
+# recreate. No-op (just an explanatory echo) unless the local .mk configured it.
+.PHONY: deploy-dashboards
+deploy-dashboards: ## Deploy linked-in Grafana dashboards via the machine-local override (no-op unless configured)
+ifneq ($(strip $(DEPLOY_DASHBOARDS_CMD)),)
+	@echo "[deploy-container] deploying linked-in Grafana dashboards via local override: $(DEPLOY_DASHBOARDS_CMD)"
+	@$(DEPLOY_DASHBOARDS_CMD) || echo "[deploy-container] WARN: dashboard deploy failed (non-fatal); continuing"
+else
+	@echo "[deploy-container] no DEPLOY_DASHBOARDS_CMD configured; skipping Grafana dashboard deploy (see examples/compose/deploy-container.local.mk.example)"
+endif
+
+deploy-container: container-build ## One-command deploy: dashboards + q-site + ttyd + force-recreate claude-container, then up -d the stack
+	@$(MAKE) --no-print-directory deploy-dashboards
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
 	  env_flag=""; \
@@ -661,19 +1089,83 @@ deploy-container: container-build
 	  export CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)"; \
 	  export CW_BUILD_PR="$(CW_BUILD_PR)"; \
 	  export GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"; \
-	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then \
-	    COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)" docker compose $$env_flag up -d --force-recreate claude-container; \
-	  else \
-	    docker compose $$env_flag up -d --force-recreate claude-container; \
-	  fi
+	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then export COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)"; fi; \
+	  echo "[deploy-container] redeploying queue-minisite (q-site)..."; \
+	  docker compose $$env_flag up -d --build --force-recreate queue-minisite || echo "[deploy-container] WARN: queue-minisite redeploy failed (non-fatal); continuing"; \
+	  echo "[deploy-container] redeploying ttyd..."; \
+	  docker compose $$env_flag up -d --build --force-recreate ttyd || echo "[deploy-container] WARN: ttyd redeploy failed (non-fatal); continuing"; \
+	  docker compose $$env_flag up -d --force-recreate claude-container && \
+	  docker compose $$env_flag up -d
 
 # DEPRECATED alias — kept so the baked image's own scripts/docs (entrypoint,
 # cwsr, container/tests/redeploy-self-recreate.test, baked-CLAUDE.md) and the
 # self-redeploy contract keep working until an image rebuild bakes the new name
 # `deploy-container` everywhere. `make redeploy` MUST keep working. No recipe
 # body; just depends on the renamed target.
+#
+# Deliberately carries NO `##` help annotation, and MUST stay in the bare
+# `redeploy: deploy-container` form: container/tests/redeploy-self-recreate.test
+# asserts on that exact line (regex `^redeploy:\s*deploy-container\s*$`), so
+# even a trailing comment fails the self-redeploy contract gate.
 redeploy: deploy-container
 
+##@ macOS host helpers (workbot host side)
+
+# Build + install the host-side host-bash MCP server
+# (crates/mcp-host-bash-server) to ~/bin, re-signing on macOS. This is the
+# single-process replacement for the old mcp-host-bash launcher + mcp-proxy +
+# cli-mcp-server + mcp-proxy-auth-shim chain. See that crate's Makefile.
+install-mcp-host-bash-server: ## Build + install the host-bash MCP server to ~/bin
+	$(MAKE) -C crates/mcp-host-bash-server install
+
+# Install + (re)start the cw-agent-stats macOS LaunchAgent: the host producer
+# that folds live Claude Code subagent transcripts into the agent tool-call /
+# token snapshot the queue-minisite dashboard reads (library + CLI both live
+# in tools/cw-agent-stats/ now -- no botchat checkout involved; see that
+# dir's README). Moved here from claude-config/botchat (was
+# org.claude-watch.botchat-agent-stats, installed by hand) so
+# claude-watch owns its own producer's install lifecycle. On Linux hosts the
+# equivalent is a cron line (README), and `make install` symlinks the CLI
+# into ~/bin. ProgramArguments[0] in the plist points directly at the
+# shebang'd tools/cw-agent-stats/cw-agent-stats script (never a bare python
+# interpreter -- see the plist's own header comment). Idempotent: bootout is
+# best-effort (no-op if not yet loaded), then bootstrap + kickstart -k always
+# leaves exactly one fresh instance running.
+#
+# The tracked plist is a TEMPLATE: launchd needs absolute paths, and every one
+# of them is rooted at the operator's home, so the checked-in file carries the
+# `__HOME__` placeholder instead of any particular account's home dir. Rendering
+# it with sed at install time is what keeps the repo free of operator-specific
+# paths while still installing a fully-resolved plist.
+install-cw-agent-stats-launchd: ## Install + kickstart the cw-agent-stats LaunchAgent (host producer)
+	@mkdir -p $(HOME)/Library/LaunchAgents
+	@sed 's|__HOME__|$(HOME)|g' tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist \
+		> $(HOME)/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
+	@launchctl bootout gui/$$(id -u)/org.claude-watch.cw-agent-stats 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
+	@launchctl kickstart -k gui/$$(id -u)/org.claude-watch.cw-agent-stats
+	@echo "Installed + started org.claude-watch.cw-agent-stats (tools/cw-agent-stats/cw-agent-stats)"
+
+##@ Developer setup
+
+# Install git pre-commit hook (warning-free build + unit/fixture tests).
+# Points core.hooksPath at the tracked scripts/git-hooks/ dir instead of
+# symlinking into .git/hooks/. Two reasons this is the correct form:
+#   1. The setting is RELATIVE, so it resolves against each worktree's own
+#      top-level — every worktree runs its own checked-out hooks.
+#   2. git config lives in the shared common dir, so this auto-applies to
+#      every existing AND future worktree of this repo. A symlink into
+#      .git/hooks/ does NOT: linked worktrees have a private gitdir and
+#      never consult the main repo's .git/hooks, so a fresh worktree
+#      silently ran with no pre-commit gate.
+# Scoped to THIS repo (local .git/config), NOT --global — other repos are
+# untouched. Idempotent: re-running just re-asserts the same value.
+install-hooks: ## Point core.hooksPath at scripts/git-hooks (pre-commit gate)
+	@git config core.hooksPath scripts/git-hooks
+	@echo "Pre-commit hook installed (core.hooksPath -> scripts/git-hooks; applies to all worktrees)."
+
+##@ Housekeeping
+
 # Clean build artifacts
-clean:
+clean: ## cargo clean
 	cargo clean

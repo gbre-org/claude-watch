@@ -31,7 +31,7 @@
 #   `cw-cron-run <job-name> ...` guard. To stop/resume a job without
 #   root, flip its flag file via `cw-cron-toggle disable|enable <name>`
 #   (job-names: active-agents, metrics, stale-ready-check, queue-check,
-#   watcher-health-check). Flags live under the uid-1000-writable,
+#   watcher-health-check, session-rotate, hostjob-reconcile). Flags live under the uid-1000-writable,
 #   named-volume-persistent /var/lib/claude-watch/cron-disabled. Takes
 #   effect next tick; persists across redeploys. See docs/cron-toggle.md.
 
@@ -67,7 +67,9 @@
 */5 * * * *  hndrewaall /usr/local/bin/cw-cron-run queue-check /usr/local/bin/claude-watch queue-check > /tmp/claude-watch-cron-queue-check.log 2>&1
 
 # Event-watcher health check. Every minute, look for .json event
-# files in the queue dir that have been sitting unconsumed for >2 min.
+# files in the queue dir that have been sitting unconsumed for >6 min
+# (the default; tunable via [watcher_health] stale_minutes in the runtime
+# override TOML -- see cw-watcher-health-check).
 # If any exist, the event watcher is dead (container recreate, session
 # clear, etc). Injects a [CLAUDE-WATCH] alert directly into the tmux
 # pane via `claude-watch inject` — bypasses the event system entirely
@@ -91,3 +93,28 @@
 # after that path provably failed. Disable per-deployment by dropping the
 # CW_WATCHER_HEALTH_AUTORESTART var (or set it to anything but "1").
 * * * * *  hndrewaall CW_WATCHER_HEALTH_PANE=claude-container:0.0 CW_WATCHER_HEALTH_RESTART_HINT='Restart the event watcher via /claude-container:start-watchers' CW_WATCHER_HEALTH_AUTORESTART=1 /usr/local/bin/cw-cron-run watcher-health-check /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log
+
+# Session-store rotation. Once a day (04:17), bound the two unbounded growers
+# under ~/.config/session/: prune old queue-logs/ transcript archives (age +
+# count cap) and roll completed-tasks.jsonl once it exceeds the size threshold
+# (older rows -> a dated gz segment under completed-archive/, recent tail kept
+# in the live file so the q-site DONE view still sees recent done items). The
+# roller is idempotent and no-ops when nothing is over threshold. Unlike the
+# other entries this invokes the bind-mounted `session-task` Python CLI (there
+# is no baked /usr/local/bin copy — see the Dockerfile profile.d note), so it
+# fail-soft skips on a stripped-down deploy without the ~/repos bind-mount.
+# All thresholds are overridable via ROTATE_* env vars (see the CLI --help).
+17 4 * * *  hndrewaall /usr/local/bin/cw-cron-run session-rotate /home/hndrewaall/repos/claude-watch/tools/session-task/session-task queue rotate > /tmp/claude-watch-cron-session-rotate.log 2>&1
+
+# Hostjob queue-row GC. Every 10 minutes, sweep queue.json for LEAKED
+# hostjob rows whose runner (status.json under HOSTJOB_LOG_DIR) reports the
+# worker is dead, and heal them in the shared store: (a) `running` rows whose
+# reaper done/abandon flip was dropped, and (b) `quarantined` rows from a
+# nonzero-exit hostjob that otherwise pin their `hostjob:<label>` scope
+# FOREVER (the exit-quarantine leak). Both scoped to hostjob:* only; a hostjob
+# still reporting `running` is never touched. Like session-rotate this invokes
+# the bind-mounted `session-task` Python CLI (there is no baked
+# /usr/local/bin copy), so it fail-soft skips on a stripped-down deploy
+# without the ~/repos bind-mount. `queue list` already runs this sweep inline;
+# this cron makes the leak self-heal even when no one lists the queue.
+*/10 * * * *  hndrewaall /usr/local/bin/cw-cron-run hostjob-reconcile /home/hndrewaall/repos/claude-watch/tools/session-task/session-task queue reconcile-hostjobs > /tmp/claude-watch-cron-hostjob-reconcile.log 2>&1

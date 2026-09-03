@@ -25,6 +25,31 @@ Metrics:
   - claude_events_processed_total{outcome}       counter (consumed = total_seen - depth)
   - claude_events_dir_last_modified              gauge  (mtime of queue dir)
   - claude_events_scrape_errors_total            counter
+
+Liveness is NOT exported here
+-----------------------------
+This exporter used to publish
+`claude_events_last_heartbeat_timestamp_seconds`, derived from a marker
+`claude-event-watch` wrote under `<queue>/.state/` each time it surfaced a
+`heartbeat-tick`. Both are GONE as of 2026-08-22:
+
+  - The quantity it approximated -- "how long since the main loop last
+    handled anything" -- is now measured directly and exactly, as the age of
+    `<ack state dir>/last-ack-timestamp`, which `event-ack` stamps on every
+    ack. `claude-watch metrics` exports it as
+    `claude_mainloop_last_ack_timestamp_seconds`. That emitter runs on the
+    host as the acking user, so it can simply read the file; this exporter
+    runs in a container with only the queue dir mounted and could not.
+
+  - The marker itself was a liability. It put a `.state/` subdirectory INSIDE
+    the queue dir, and `cw-watcher-health-check` scans that dir recursively
+    for unconsumed `*.json` -- so the marker fired a false
+    "WATCHER DOWN: 1 event(s) unconsumed >6min" twice in one day. State does
+    not belong in a queue.
+
+What remains here is queue observability -- depth, oldest-unconsumed age,
+emission rate -- which is genuinely derivable from the directory and is a
+different question from "is the main loop alive".
 """
 
 import json
@@ -73,6 +98,11 @@ KNOWN_TAGS = {
     "queue-idle-pending",
     "claude-watch-alert",
     "torrent-completed",
+    "keepalive",
+    # Pre-2026-08-22 name for keepalive; kept one release so an event from an
+    # older daemon still gets its own label instead of collapsing to "other".
+    "heartbeat-tick",
+    "memory-reminder",
 }
 
 REG = CollectorRegistry()
@@ -109,7 +139,6 @@ c_scrape_errors = Counter(
     "Number of failed reads of the events queue directory",
     registry=REG,
 )
-
 # Filename pattern: <ns_timestamp>_<safe_tag>.json (per claude-event emitter)
 FILENAME_RE = re.compile(r"^(?P<ns>\d+)_(?P<tag>[A-Za-z0-9_-]+)\.json$")
 

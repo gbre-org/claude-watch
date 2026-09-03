@@ -57,7 +57,23 @@ FROM rust:1-bookworm AS claude-watch-builder
 
 WORKDIR /build
 
+# COPY the working tree from the build context (the repo root). The
+# .dockerignore at the repo root prunes target/, __pycache__/, .git/,
+# editor swap files, etc. — only the source files Cargo + the rest of
+# the multi-stage build actually need land in this layer. The layer is
+# invalidated when any non-ignored file changes, which matches "I want
+# to rebuild whenever I edit Rust source" without requiring a
+# hand-drafted SHA arg per build.
+COPY . /build
+
 # Build-time git identity for the `claude_watch_build_info` Prometheus gauge.
+# PLACEMENT: these ARGs change every commit, so they sit LATE — after the
+# `COPY . /build` above and immediately before the `cargo build` below,
+# mirroring the GIT_SHA ARG at the very end of this file. A volatile ARG
+# invalidates its own layer PLUS every layer after it; keeping it here means
+# only the final build layer re-runs per commit (the expensive dependency
+# compile is preserved by the BuildKit cache mounts on the RUN below), never
+# the earlier builder-stage layers.
 #
 # build.rs stamps CW_GIT_COMMIT / CW_GIT_PR into the binary. It prefers live
 # git, but `.dockerignore` prunes `.git/` from this build context (see the
@@ -72,15 +88,6 @@ ARG CW_BUILD_COMMIT=
 ARG CW_BUILD_PR=
 ENV CW_BUILD_COMMIT=${CW_BUILD_COMMIT} \
     CW_BUILD_PR=${CW_BUILD_PR}
-
-# COPY the working tree from the build context (the repo root). The
-# .dockerignore at the repo root prunes target/, __pycache__/, .git/,
-# editor swap files, etc. — only the source files Cargo + the rest of
-# the multi-stage build actually need land in this layer. The layer is
-# invalidated when any non-ignored file changes, which matches "I want
-# to rebuild whenever I edit Rust source" without requiring a
-# hand-drafted SHA arg per build.
-COPY . /build
 
 # claude-watch's Cargo.toml has `profile.release = { strip = true, lto = true }`,
 # so the resulting binary is already stripped + LTO-optimised.
@@ -104,10 +111,22 @@ COPY . /build
 # `sharing=locked` serialises concurrent builds sharing the cache (safe if two
 # builds run at once); the cache is keyed per-target so it survives across
 # rebuilds of this stage.
+# Write the host-computed build identity to stamp FILES in the crate root
+# BEFORE `cargo build`, so build.rs reads them via `include`-style file reads
+# with `cargo:rerun-if-changed`. This is what makes the commit stamp survive
+# the `--mount=type=cache,target=/build/target` cache mount: that mount
+# persists build.rs's fingerprint + cached rustc-env output across image
+# builds, so `rerun-if-env-changed=CW_BUILD_COMMIT` alone did NOT force a
+# re-run (a stale build-script output was reused → commit="unknown"). The
+# stamp files are rewritten every build (fresh mtime > the cached fingerprint),
+# which forces cargo to re-run build.rs and restamp. Writing them in the SAME
+# RUN keeps them outside the cache mount (crate root /build is un-mounted).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release \
+    printf '%s' "${CW_BUILD_COMMIT}" > /build/.build-commit \
+    && printf '%s' "${CW_BUILD_PR}" > /build/.build-pr \
+    && cargo build --release \
     && cp /build/target/release/claude-watch /build/claude-watch \
     && /build/claude-watch --help >/dev/null
 
@@ -676,8 +695,12 @@ RUN case "$(uname -m)" in \
 # Container-tailored claude-watch config — pins the daemon to the in-container
 # tmux session `claude-container:0.0` (the claude pane created by
 # entrypoint.sh), points all writes at uid-1000-writable paths (/tmp/, ~/.cache),
-# and disables host-only features (auto_update, reauth, hybrid, task_watch)
-# that have no in-container backing yet (Phase 2 work). The host's
+# and disables host-only features (auto_update, reauth, hybrid)
+# that have no in-container backing yet (Phase 2 work). task_watch stays
+# ENABLED: it is what puts claude-watch's keepalive stub in pane 0 of the
+# `tasks` session instead of the legacy `task-watch daemon` CLI, which this
+# image does not ship — see the section comment in claude-watch.config.toml.
+# The host's
 # ~/.config/claude-watch/config.toml is NOT bind-mounted by the wrapper, so
 # without this file the daemon would FATAL on "no config file found". Phase 1e.
 COPY container/claude-watch.config.toml /etc/claude-watch/config.toml
@@ -821,6 +844,9 @@ ENV CLAUDE_WATCH_CONFIG=/etc/claude-watch/config.toml
 # read path; this env var covers the CLI path the main loop invokes when
 # the WATCHER(S) DOWN alert prompt tells it to run `watcher-ctl run
 # claude-event-watch`. src/watcher.rs config_path() honors WATCHERS_CONFIG.
+# The user-dir OVERRIDE layer (WATCHERS_CONFIG_EXTRA) is exported by the
+# entrypoint, $HOME-relative, pointing into the bind-mounted
+# ~/.config/claude-container/ dir — not baked here, since it is per-host.
 ENV WATCHERS_CONFIG=/opt/claude-container/watchmen/watchers.conf
 
 # /etc/profile.d/claude-tools.sh — discoverability for bind-mounted CLIs.
@@ -1163,6 +1189,12 @@ COPY tools/event-must-act/event-ack /usr/local/bin/event-ack
 # (event-classify --source X --tag Y) when manually triaging events.
 COPY tools/event-must-act/event-classify /usr/local/bin/event-classify
 
+# heartbeat-ack: RETIRED 2026-08-21 (#649 ack-driven redesign), and the host
+# heartbeat FILE it touched retired with it on 2026-08-22. Liveness is the age
+# of the last ack of ANY event; the main loop's per-batch reflex is
+# `event-ack ack-batch`, which clears every pending entry and stamps the
+# timestamp in one bare command.
+
 # user-prompt-ambient-inject-hook — UserPromptSubmit hook that drains
 # the ambient event queue on every prompt and emits the queued events
 # as additional context for the LLM's next turn. Non-blocking, no
@@ -1318,6 +1350,45 @@ COPY container/bin/xclip /usr/local/bin/xclip
 # same bytes.
 COPY container/bin/self-clear /usr/local/bin/self-clear
 
+# self-login — the /login counterpart to self-clear. Injects /login, answers
+# the login-method picker, scrapes the OAuth authorize URL off the pane, and
+# takes the operator's authorization code back in, so a container whose
+# credentials have lapsed can be re-authenticated without anyone attaching to
+# the tmux pane.
+#
+# It IMPORTS self-clear as a sibling for the shared pane primitives (pane
+# resolution, FleetView focus return, interrupt-and-wait) rather than carrying
+# a second copy, so it must land in the SAME directory as the baked self-clear
+# above — which /usr/local/bin is. Same source-of-truth arrangement:
+# container/bin/self-login is the file, tools/watchers/self-login is a symlink
+# into it, so the host chain and the image run the same bytes.
+COPY container/bin/self-login /usr/local/bin/self-login
+
+# self-mcp-reconnect — the /mcp counterpart to self-clear/self-login. Drives
+# the interactive "Manage MCP servers" picker end-to-end (open /mcp -> select
+# a server by name -> "Reconnect" -> confirm the inline Reconnected/Failed
+# result) to force a stale MCP server's TOOL DISCOVERY to refresh, e.g. after
+# `mcp-adaptor` is re-authenticated on the host and `claude mcp list` already
+# says Connected but the session's cached tool list (missing `doc_search`,
+# etc.) is stale. The older `mcp-reconnect` script only opens the /mcp list
+# and leaves it sitting there — it never drives an actual reconnect.
+#
+# It IMPORTS self-clear as a sibling for the shared pane primitives (pane
+# resolution, FleetView focus return, interrupt-and-wait), so it must land in
+# the SAME directory as the baked self-clear above. Same source-of-truth
+# arrangement: container/bin/self-mcp-reconnect is the file,
+# tools/watchers/self-mcp-reconnect is a symlink into it.
+COPY container/bin/self-mcp-reconnect /usr/local/bin/self-mcp-reconnect
+
+# cw-theme-sync — make Claude Code's TUI theme follow the browser theme.
+# Long-lived process-compose process (see container/process-compose.yml):
+# watches the theme-report file the clipboard-upload sidecar writes on the
+# shared volume and injects `/config theme=<dark|light>` into the claude
+# pane when idle. The "auto" theme only auto-detects the terminal
+# background at STARTUP, so it can't follow a live browser theme flip
+# without this. Disable via CLAUDE_CONTAINER_THEME_SYNC_DISABLED=true.
+COPY container/bin/cw-theme-sync /usr/local/bin/cw-theme-sync
+
 # cw-watcher-health-check — cron-driven dead-watcher detector.
 # Checks for unconsumed events in the queue dir older than 2 min;
 # if any exist, injects a [CLAUDE-WATCH] alert into the tmux pane
@@ -1360,6 +1431,9 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
              /usr/local/bin/mcp-reconnect \
              /usr/local/bin/xclip \
              /usr/local/bin/self-clear \
+             /usr/local/bin/self-login \
+             /usr/local/bin/self-mcp-reconnect \
+             /usr/local/bin/cw-theme-sync \
              /usr/local/bin/cw-watcher-health-check \
              /usr/local/bin/cw-cron-run \
              /usr/local/bin/cw-cron-toggle \

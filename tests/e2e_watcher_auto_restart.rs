@@ -64,20 +64,6 @@ fn unique_token(prefix: &str) -> String {
     format!("{}-{}-{}", prefix, std::process::id(), n)
 }
 
-/// Resolve a directory inside `target/debug/` for the daemon binary so we
-/// don't have to re-build inside the test (the common harness already
-/// rebuilds via `Self::daemon_binary()`).
-fn daemon_binary() -> PathBuf {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()
-        .expect("cargo build");
-    assert!(status.success(), "cargo build failed");
-    PathBuf::from(format!("{}/target/debug/claude-watch", manifest_dir))
-}
-
 /// Count processes matching a pgrep pattern.
 fn pgrep_count(pattern: &str) -> u32 {
     let out = Command::new("pgrep")
@@ -183,7 +169,7 @@ fn watcher_down_triggers_inject_and_main_loop_restarts_it() {
         "watcher-restart",
         TestEnvOptions {
             check_interval: 1,
-            heartbeat_stale_minutes: 9999, // disable heartbeat alerts
+            ack_stale_minutes: 9999, // disable ack-stale alerts
             foreground_threshold: 9999,    // disable foreground monitor
             // Watcher monitor: fast firing path.
             //   threshold=2 -> two consecutive missing checks -> ~2s
@@ -474,11 +460,12 @@ sleep infinity
     //    fixed wait then SIGTERM, but for this test we want to control
     //    the lifetime so we can synchronize on inject events. So spawn
     //    directly.
-    let binary = daemon_binary();
-    let daemon = Command::new(&binary)
-        .env("CLAUDE_WATCH_CONFIG", &env.config_path)
+    //    Built from `daemon_command()` so the isolation env (HOME, the
+    //    claude-event queue, the notify command) comes from the one place
+    //    that owns it; only PATH and log level are overridden here.
+    let daemon = env
+        .daemon_command()
         .env("PATH", &test_path)
-        .env("CLAUDE_STATUS_CMD", "1")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

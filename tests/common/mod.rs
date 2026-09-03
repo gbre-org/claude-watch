@@ -38,10 +38,13 @@ pub struct TestEnv {
     pub log_file: PathBuf,
     /// Legacy log file path.
     pub legacy_log_file: PathBuf,
-    /// Heartbeat file path.
-    pub heartbeat_file: PathBuf,
+    /// Ack state dir (`[ack] state_dir`) — holds `last-ack-timestamp`, the
+    /// liveness stamp `event-ack` writes and the daemon reads.
+    pub ack_state_dir: PathBuf,
     /// Path to mock bin directory (prepended to PATH).
     pub mock_bin_dir: PathBuf,
+    /// Where the mock `self-login` records that it was invoked.
+    pub self_login_log: PathBuf,
     /// Watchers config file path.
     pub watchers_config: PathBuf,
     /// Path to the mock self-clear invocation log (one line per invocation).
@@ -129,8 +132,9 @@ pub struct TestEnvOptions {
     pub dead_checks_required: u32,
     /// Fresh clear detections required (default: 2).
     pub fresh_clear_detections: u32,
-    /// Heartbeat stale minutes (default: 1 for fast tests).
-    pub heartbeat_stale_minutes: u64,
+    /// Minutes without an event ack before the loop reads as wedged
+    /// (`[ack] stale_minutes`; default 1 for fast tests).
+    pub ack_stale_minutes: u64,
     /// Foreground threshold seconds (default: 3 for fast tests).
     pub foreground_threshold: u64,
     /// Whether foreground interrupt is enabled (default: false for existing tests).
@@ -174,7 +178,7 @@ impl Default for TestEnvOptions {
             check_interval: 1,
             dead_checks_required: 2,
             fresh_clear_detections: 2,
-            heartbeat_stale_minutes: 1,
+            ack_stale_minutes: 1,
             foreground_threshold: 3,
             foreground_interrupt_enabled: false,
             foreground_interrupt_message: "[TEST-INTERRUPT] Foreground command was backgrounded."
@@ -228,8 +232,9 @@ impl TestEnv {
             state_file: tmp_dir.join("state.json"),
             log_file: log_dir.join("claude-watch.jsonl"),
             legacy_log_file: log_dir.join("claude-watch.log"),
-            heartbeat_file: tmp_dir.join("heartbeat"),
+            ack_state_dir: tmp_dir.join("ack-state"),
             self_clear_log: tmp_dir.join("self-clear.log"),
+            self_login_log: tmp_dir.join("self-login.log"),
             mock_bin_dir,
             watchers_config: tmp_dir.join("watchers.conf"),
             tmp_dir,
@@ -246,6 +251,7 @@ impl TestEnv {
 
         // Write mock self-clear script (logs invocation instead of injecting /clear)
         env.write_mock_self_clear_script();
+        env.write_mock_self_login_script();
 
         // Write empty watchers config
         fs::write(&env.watchers_config, "# test watchers\n").expect("write watchers config");
@@ -316,6 +322,34 @@ echo "$(date -Is) self-clear $@" >> "{log}"
         fs::read_to_string(&self.self_clear_log).unwrap_or_default()
     }
 
+    /// Write a mock `self-login` that records its invocation and does nothing.
+    ///
+    /// Not optional politeness. `test_path()` appends the DEVELOPER'S real
+    /// PATH, so without a mock ahead of it a daemon under test resolves the
+    /// real `self-login` and starts driving an actual OAuth login flow. It
+    /// would target the test pane rather than a live session, but a test
+    /// suite must not be one config default away from typing `/login`
+    /// anywhere at all.
+    fn write_mock_self_login_script(&self) {
+        let script = format!(
+            r#"#!/bin/bash
+# Mock self-login for e2e tests -- records invocation instead of logging in.
+echo "$(date -Is) self-login $@" >> "{log}"
+echo '{{"ok": false, "reason": "mock self-login (e2e); no login was attempted"}}'
+exit 4
+"#,
+            log = self.self_login_log.display()
+        );
+        let path = self.mock_bin_dir.join("self-login");
+        fs::write(&path, &script).expect("write mock self-login");
+        make_executable(&path);
+    }
+
+    /// Read the mock self-login invocation log (empty string if never invoked).
+    pub fn read_self_login_log(&self) -> String {
+        fs::read_to_string(&self.self_login_log).unwrap_or_default()
+    }
+
     /// Write mock tmux-healthcheck that returns OK.
     fn write_mock_tmux_healthcheck(&self) {
         let script = r#"#!/bin/bash
@@ -373,7 +407,6 @@ dashboard_session = "{session}"
 
 [claude]
 max_context_tokens = 200000
-heartbeat_file = "{heartbeat_file}"
 relaunch_script = "{tmp_dir}/relaunch.sh"
 
 [dead_process]
@@ -386,8 +419,22 @@ max_tokens = 5000
 detections_required = {fresh_clear_detections}
 cooldown = 5
 
-[heartbeat]
-stale_minutes = {heartbeat_stale_minutes}
+[ack]
+stale_minutes = {ack_stale_minutes}
+state_dir = "{ack_state_dir}"
+
+[stuck_detection]
+# Point the workload-heartbeat suppressor at a per-test EMPTY directory.
+#
+# Its production default is /run/claude/workloads, a real host path shared by
+# everything on the machine -- including this repo's own `workload` unit tests,
+# which write live heartbeat files there while running in parallel. A daemon
+# under test would then see `workload_heartbeat_fresh` and suppress the very
+# ack-stale detection the test is asserting, so `cargo nextest run` failed
+# reproducibly while the same test passed in isolation. A test must not read a
+# directory it does not own.
+workload_heartbeat_dir = "{workload_heartbeat_dir}"
+workload_heartbeat_max_age_secs = 60
 
 [alerts]
 initial_cooldown = 5
@@ -431,11 +478,12 @@ resume_prompt = "resume"
             legacy_log_file = self.legacy_log_file.display(),
             pane = self.tmux_pane,
             session = self.tmux_session,
-            heartbeat_file = self.heartbeat_file.display(),
+            ack_state_dir = self.ack_state_dir.display(),
+            workload_heartbeat_dir = self.tmp_dir.join("workload-heartbeats").display(),
             tmp_dir = self.tmp_dir.display(),
             dead_checks = opts.dead_checks_required,
             fresh_clear_detections = opts.fresh_clear_detections,
-            heartbeat_stale_minutes = opts.heartbeat_stale_minutes,
+            ack_stale_minutes = opts.ack_stale_minutes,
             foreground_threshold = opts.foreground_threshold,
             foreground_check_interval = opts.foreground_check_interval,
             foreground_interrupt_enabled = opts.foreground_interrupt_enabled,
@@ -501,21 +549,30 @@ resume_prompt = "resume"
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
-    /// Touch the heartbeat file (make it fresh).
-    pub fn touch_heartbeat(&self) {
-        fs::write(&self.heartbeat_file, "").expect("touch heartbeat");
+    /// Path of the liveness stamp inside [`Self::ack_state_dir`].
+    pub fn last_ack_file(&self) -> PathBuf {
+        self.ack_state_dir.join("last-ack-timestamp")
     }
 
-    /// Set heartbeat file mtime to N seconds in the past.
-    pub fn age_heartbeat(&self, seconds: u64) {
-        // Create the file if it doesn't exist
-        if !self.heartbeat_file.exists() {
-            fs::write(&self.heartbeat_file, "").expect("create heartbeat");
-        }
+    /// Record an ack right now — what `event-ack ack-batch` does when the main
+    /// loop handles an event batch.
+    pub fn record_ack(&self) {
+        fs::create_dir_all(&self.ack_state_dir).expect("create ack state dir");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs_f64();
+        fs::write(self.last_ack_file(), format!("{now}\n")).expect("write last-ack stamp");
+    }
+
+    /// Record an ack that happened N seconds ago (mtime aged to match) — a
+    /// loop that has gone quiet.
+    pub fn age_ack(&self, seconds: u64) {
+        self.record_ack();
         let past = filetime::FileTime::from_system_time(
             std::time::SystemTime::now() - std::time::Duration::from_secs(seconds),
         );
-        filetime::set_file_mtime(&self.heartbeat_file, past).expect("set heartbeat mtime");
+        filetime::set_file_mtime(self.last_ack_file(), past).expect("set last-ack mtime");
     }
 
     /// Read the JSONL log file and return parsed entries.
@@ -556,37 +613,69 @@ resume_prompt = "resume"
         format!("{}:{}", self.mock_bin_dir.display(), current_path)
     }
 
-    /// Build the daemon binary and return the path.
+    /// Path to the daemon binary under test.
+    ///
+    /// Cargo builds every bin target before running an integration test and
+    /// passes the path in `CARGO_BIN_EXE_<name>`, so the binary already exists
+    /// and is guaranteed to match this exact test build.
+    ///
+    /// Do NOT shell out to `cargo build` here. `.config/nextest.toml` sets
+    /// `test-threads = "num-cpus"`, so every test that spawns a daemon would
+    /// race for cargo's target-directory file lock; each loser stalls for the
+    /// full duration of the winner's build. Whenever anything made that build
+    /// non-trivial, the daemon-driven tests inflated 5-9x while tests that
+    /// never spawn a daemon stayed identical, taking the suite from ~85s to
+    /// past the 5-minute CI step limit.
     pub fn daemon_binary() -> PathBuf {
-        // Build in test mode — use CARGO_MANIFEST_DIR to find the project root
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let status = Command::new("cargo")
-            .args(["build"])
-            .current_dir(manifest_dir)
-            .status()
-            .expect("cargo build");
-        assert!(status.success(), "cargo build failed");
+        PathBuf::from(env!("CARGO_BIN_EXE_claude-watch"))
+    }
 
-        PathBuf::from(format!("{}/target/debug/claude-watch", manifest_dir))
+    /// A `Command` for the daemon under test with every isolation env var
+    /// already set. **Spawn the daemon through this, never by building a
+    /// `Command` by hand.**
+    ///
+    /// This is not a convenience wrapper, it is the isolation boundary. Two
+    /// tests once assembled their own `Command` because they wanted to
+    /// control the daemon's lifetime, and in copying the env list they
+    /// dropped `HOME`. Those daemons therefore ran against the developer's
+    /// real home directory: they read the real Claude Code credential store
+    /// and wrote real high-priority alerts into the real `~/claude-events/`,
+    /// where a live main loop picked them up and reported them to a human as
+    /// genuine. Controlling a daemon's lifetime is a fine reason to spawn it
+    /// directly; re-deriving its environment is not, so there is now exactly
+    /// one place that environment is written down.
+    pub fn daemon_command(&self) -> Command {
+        let mut cmd = Command::new(Self::daemon_binary());
+        cmd.env("CLAUDE_WATCH_CONFIG", &self.config_path)
+            .env("PATH", self.test_path())
+            .env("CLAUDE_STATUS_CMD", "1")
+            .env("RUST_LOG", "debug")
+            // Point HOME at the test tmp dir so the layered user config at
+            // ~/.config/claude-watch/config.toml does NOT overlay (and
+            // override e.g. [tmux] dashboard_pane onto) the test config —
+            // and so nothing under the real home is read at all.
+            .env("HOME", &self.tmp_dir)
+            // Event isolation. HOME already redirects the default
+            // `~/claude-events/`, but CLAUDE_EVENT_QUEUE is read FIRST and is
+            // inherited from whoever ran the suite, so a developer or CI
+            // runner with it set would put every test alert into the real
+            // queue. Setting it explicitly means the isolation does not
+            // depend on the ambient environment.
+            .env("CLAUDE_EVENT_QUEUE", self.tmp_dir.join("claude-events"))
+            .env("CRON_EVENT_QUEUE", self.tmp_dir.join("claude-events"))
+            // Empty = push notifications are skipped. A test suite must not
+            // be able to ring a real phone.
+            .env("CLAUDE_WATCH_NOTIFY_CMD", "");
+        cmd
     }
 
     /// Run the daemon for a specified number of check cycles, then kill it.
     /// Returns the process exit status.
     pub fn run_daemon_cycles(&self, cycles: u32, extra_wait_ms: u64) -> DaemonRun {
-        let binary = Self::daemon_binary();
         let wait_ms = (self.read_config_interval() * 1000 * cycles as u64) + extra_wait_ms;
 
-        let child = Command::new(&binary)
-            .env("CLAUDE_WATCH_CONFIG", &self.config_path)
-            .env("PATH", self.test_path())
-            .env("CLAUDE_STATUS_CMD", "1")
-            .env("RUST_LOG", "debug")
-            // Hermeticity: point HOME at the test tmp dir so the layered
-            // user config at ~/.config/claude-watch/config.toml does NOT
-            // overlay (and override e.g. [tmux] dashboard_pane onto) the
-            // test config. Without this, a developer's real config leaks
-            // into the daemon under test.
-            .env("HOME", &self.tmp_dir)
+        let child = self
+            .daemon_command()
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

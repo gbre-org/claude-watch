@@ -33,6 +33,9 @@ Test cases (PreToolUse):
  28. Exempt: Bash:^pgrep bypasses gate even with unread sidecar
  29. Exempt: Read tool bypasses gate even with unread sidecar
  30. Sidecar-write on Bash + run_in_background + watcher-ctl run -> sidecar appears
+     (project-slug-agnostic glob fallback; regression guard for the
+     HOME-vs-project-slug bug fixed in ah/fix-watcher-sidecar-session-uuid)
+ 30e. resolver is env-var-independent (finds real output despite mismatched CLAUDE_CODE_SESSION_ID)
  30a. exempt_command_patterns absent -> watcher-ctl sidecar still gates (baseline)
  30b. exempt_command_patterns matches watcher-ctl -> sidecar skipped, predicate allows
  30c. exempt_command_patterns doesn't skip non-matching sidecars (regression guard)
@@ -162,6 +165,12 @@ Test cases (PreToolUse):
 139. evaluator: OBLIGATIONS_BYPASS=1 forces allow past evaluator deny
 140. evaluator: argv list cmd form works (no shell)
 141. evaluator: env param merged into subprocess environment
+210. force-start gate as registered (all_of [is_main_loop, force_started_unspawned]): subagent -> allow
+211. force-start gate as registered: main loop, no agent, grace elapsed -> deny
+212. force_started_unspawned grace_secs: inside window -> allow (why names the grace)
+213. force_started_unspawned grace_secs: window elapsed -> deny
+214. force_started_unspawned grace elapsed + live agent -> allow
+215. force_started_unspawned grace_from param overrides queue anchor
 
 Each test uses a SEPARATE OBLIGATIONS_FILE path (not the live ~/.config/claude/
 one) by overriding via environment + an isolated state dir, so we never touch
@@ -1017,20 +1026,33 @@ def main() -> int:
         # --- Test 30: PostToolUse on Bash + run_in_background + watcher-ctl
         # writes a sidecar. We supply a deterministic backgroundTaskId and
         # pre-create the corresponding session-task output file so the
-        # session UUID resolver finds it.
-        # Layout: /tmp/claude-<uid>/<HOME-slug>/<uuid>/tasks/<id>.output
-        # where <HOME-slug> is HOME with `/` -> `-` and a leading `-`. We
-        # mirror the resolver in the hook (which derives the slug from $HOME
-        # at call time, so this hook is portable across users).
+        # resolver finds it via the fully-wildcarded glob fallback (no
+        # CLAUDE_CODE_SESSION_ID in env).
+        # Layout: /tmp/claude-<uid>/<project-slug>/<uuid>/tasks/<id>.output
+        # -- the resolver globs `/tmp/claude-<uid>/*/*/tasks/<id>.output`
+        # when no session-id env var is set, so the project-slug component
+        # (here a fake one, deliberately NOT matching $HOME) is irrelevant.
+        # This is the regression guard for the bug fixed in
+        # ah/fix-watcher-sidecar-session-uuid: the resolver used to derive
+        # the slug from $HOME, which never matches the REAL slug (the
+        # project cwd) whenever cwd != HOME -- e.g. this container, where
+        # HOME=/home/hndrewaall but sessions run against
+        # /Users/operator/repos. That mismatch made session-uuid
+        # resolution fail 100% of the time in production (40/40 observed
+        # `sidecar-no-session-uuid` log entries, sidecar dir never even
+        # created) -- the gate was permanently inert. Using an
+        # intentionally-wrong-looking fake slug here (instead of the real
+        # $HOME-derived one) proves the fix doesn't depend on the slug at
+        # all.
         fake_uuid = "deadbeef-cafe-1234-5678-abcdef012345"
         uid = os.geteuid()
-        home_slug = env["HOME"].replace("/", "-")
+        fake_slug = "-fake-project-slug-not-home"
         # Use a unique task id so we don't collide with a real Claude
         # session. The file we create here is what makes the resolver
         # succeed (it globs for an existing output file with this task id).
         fake_task_id = f"btestxx30{secrets.token_hex(2)}"
         fake_session_dir = Path(
-            f"/tmp/claude-{uid}/{home_slug}/{fake_uuid}/tasks")
+            f"/tmp/claude-{uid}/{fake_slug}/{fake_uuid}/tasks")
         fake_session_dir.mkdir(parents=True, exist_ok=True)
         fake_output = fake_session_dir / f"{fake_task_id}.output"
         fake_output.write_text("")  # exists, empty (so the predicate would allow)
@@ -1038,6 +1060,14 @@ def main() -> int:
         sidecar_dir2 = tmpdir / "watcher-output-pending-2"
         env_npwo2 = env.copy()
         env_npwo2["WATCHER_PENDING_DIR"] = str(sidecar_dir2)
+        # Strip any ambient session-id env vars (e.g. the REAL
+        # CLAUDE_CODE_SESSION_ID of the session running this test suite,
+        # inherited via env = os.environ.copy() above) so this test
+        # exercises the fully-wildcarded glob fallback deterministically,
+        # regardless of what environment the test suite itself runs under.
+        for _v in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_UUID",
+                   "CLAUDE_SESSION_ID"):
+            env_npwo2.pop(_v, None)
         rc, _stdout, _err = _hook_post(
             {
                 "tool_name": "Bash",
@@ -1081,6 +1111,69 @@ def main() -> int:
             if fake_session_dir.exists():
                 fake_session_dir.rmdir()
             fake_session_dir.parent.rmdir()
+        except OSError:
+            pass
+
+        # --- Test 30e: resolver is env-var-INDEPENDENT -- it must find the
+        # real output file purely by task id even when CLAUDE_CODE_SESSION_ID
+        # is set to a completely unrelated/"wrong" uuid. This is the
+        # regression guard for the second bug found while fixing this: an
+        # earlier iteration of the fix trusted CLAUDE_CODE_SESSION_ID to
+        # narrow the glob, but that env var was empirically observed to NOT
+        # match the session-uuid directory a subagent's background task
+        # output actually lands under (task outputs appear to be rooted at
+        # the TOP-LEVEL session's uuid, not the calling subagent's own id).
+        # Trusting it would have silently resolved to None (or the wrong
+        # file) for exactly that case. ---
+        real_uuid = "11111111-1111-1111-1111-111111111111"
+        wrong_uuid = "22222222-2222-2222-2222-222222222222"
+        fake_task_id_e = f"btestxx30e{secrets.token_hex(2)}"
+        real_dir = Path(f"/tmp/claude-{uid}/-fake-slug-e/{real_uuid}/tasks")
+        real_dir.mkdir(parents=True, exist_ok=True)
+        real_output = real_dir / f"{fake_task_id_e}.output"
+        real_output.write_text("")
+        sidecar_dir_e = tmpdir / "watcher-output-pending-e"
+        env_e = env.copy()
+        env_e["WATCHER_PENDING_DIR"] = str(sidecar_dir_e)
+        # Deliberately set the env var to a uuid that does NOT match the
+        # directory the real output lives under.
+        env_e["CLAUDE_CODE_SESSION_ID"] = wrong_uuid
+        for _v in ("CLAUDE_SESSION_UUID", "CLAUDE_SESSION_ID"):
+            env_e.pop(_v, None)
+        rc, _stdout, _err = _hook_post(
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "watcher-ctl run signal-wait-dm",
+                    "run_in_background": True,
+                },
+                "tool_response": {
+                    "backgroundTaskId": fake_task_id_e,
+                },
+            },
+            env_e,
+        )
+        sidecar_path_e = sidecar_dir_e / f"{fake_task_id_e}.json"
+        sidecar_matches_real = False
+        if sidecar_path_e.exists():
+            try:
+                sc_data_e = json.loads(sidecar_path_e.read_text())
+                sidecar_matches_real = (
+                    sc_data_e.get("output_file_path") == str(real_output))
+            except (OSError, json.JSONDecodeError):
+                pass
+        results.append(_check(
+            "30e. resolver finds real output despite a mismatched "
+            "CLAUDE_CODE_SESSION_ID (env-var-independent by design)",
+            rc == 0 and sidecar_matches_real,
+            f"rc={rc} sidecar={sidecar_path_e} matches_real={sidecar_matches_real}",
+        ))
+        try:
+            if sidecar_path_e.exists():
+                sidecar_path_e.unlink()
+            real_output.unlink()
+            real_dir.rmdir()
+            real_dir.parent.rmdir()
         except OSError:
             pass
 
@@ -1841,7 +1934,7 @@ def main() -> int:
         # --- Test 47: agent_inbox_empty with messages -> deny + why has body ---
         full_inbox = tmpdir / "full-inbox.json"
         full_inbox.write_text(json.dumps([{
-            "from": "andrew@signal", "ts": "2026-04-28",
+            "from": "main-loop", "ts": "2026-04-28",
             "queue_item": "q-test", "text": "hello agent please switch tasks"
         }]))
         ob_ain = _add_ob(
@@ -2744,13 +2837,24 @@ def main() -> int:
                 ((out or {}).get("hookSpecificOutput") or {})
                 .get("permissionDecisionReason", "")
             )
+            # The banner must carry the NEW wait guidance (pr-watch + exit
+            # for CI; foreground long Bash polling an artifact otherwise)
+            # and must NOT carry the old "arm a background loop and
+            # return" advice -- a subagent is not woken when a background
+            # Bash task completes, so that advice orphaned agents.
+            _old_bg_phrase = "run_in_background: true` so the agent blocks"
             results.append(_check(
                 "74a. Monitor gate: subagent + Monitor -> deny + banner",
                 (rc == 0 and _is_deny(out)
                  and "Monitor tool is disabled for subagents" in banner
-                 and "gh pr view" in banner
-                 and "run_in_background" in banner
-                 and "gh pr view" in reason),
+                 and "Do NOT arm a background task and return" in banner
+                 and "pr-watch add" in banner
+                 and "IN THE FOREGROUND" in banner
+                 and "600000" in banner
+                 and _old_bg_phrase not in banner
+                 and "so the agent blocks" not in banner
+                 and "pr-watch add" in reason
+                 and "run_in_background" not in reason),
                 f"rc={rc} banner={banner!r} reason={reason!r}",
             ))
 
@@ -2857,25 +2961,28 @@ def main() -> int:
             ))
 
         # ===================================================================
-        # Tests 74hb1-74hb9: heartbeat-liveness `touch` exemption.
+        # Tests 74hb1-74hb11: liveness-ack exemption.
         #
-        # claude-watch's stale-heartbeat fallback injects exactly
-        # `touch /var/run/claude/heartbeat`. That touch must execute even
-        # when the obligations gate would otherwise DENY (a stale heartbeat
-        # frequently coincides with a momentarily-down watcher tripping
+        # claude-watch's ack-stale recovery prompt injects exactly
+        # `event-ack ack-batch`. That command must execute even when the
+        # obligations gate would otherwise DENY (a stale ack frequently
+        # coincides with a momentarily-down watcher tripping
         # watchers_healthy / no_pending_watcher_outputs). The exemption is a
         # hardcoded ALLOW in the hook, evaluated before the obligations CLI
         # dispatch, tightly scoped via the AST: ONLY a single-segment bare
-        # `touch /var/run/claude/heartbeat` is exempt; a bundled command or a
-        # different path is NOT.
+        # `event-ack ack-batch` is exempt; a bundled command or a different
+        # subcommand is NOT.
+        #
+        # Until 2026-08-22 this ALLOW covered `touch /var/run/claude/heartbeat`
+        # instead; that file and its ritual are retired (74hb11 pins it).
         # ===================================================================
-        with tempfile.TemporaryDirectory(prefix="obligations-heartbeat-") as td_hb:
+        with tempfile.TemporaryDirectory(prefix="obligations-liveness-") as td_hb:
             tmpdir_hb = Path(td_hb)
             env_hb, _ = _make_isolated_env(tmpdir_hb)
 
             # Register a no_pending_watcher_outputs gate that ACTUALLY denies:
             # an unread sidecar with written output (same recipe as test 23).
-            # This proves the heartbeat touch passes even with a live deny.
+            # This proves the liveness ack passes even with a live deny.
             hb_sidecar_dir = tmpdir_hb / "watcher-output-pending"
             env_hb["WATCHER_PENDING_DIR"] = str(hb_sidecar_dir)
             _add_ob(
@@ -2926,16 +3033,16 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb2: bare `touch /var/run/claude/heartbeat` -> ALLOW despite
-            # the live denying gates (the whole point of the fix).
+            # 74hb2: bare `event-ack ack-batch` -> ALLOW despite the live
+            # denying gates (the whole point of the fix).
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {"command": "touch /var/run/claude/heartbeat"}},
+                 "tool_input": {"command": "event-ack ack-batch"}},
                 env_hb,
             )
             results.append(_check(
-                "74hb2. bare heartbeat touch -> allow despite unhealthy/unread gates",
+                "74hb2. bare `event-ack ack-batch` -> allow despite unhealthy/unread gates",
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
@@ -2944,105 +3051,185 @@ def main() -> int:
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {"command": "  touch /var/run/claude/heartbeat  "}},
+                 "tool_input": {"command": "  event-ack ack-batch  "}},
                 env_hb,
             )
             results.append(_check(
-                "74hb3. whitespace-padded heartbeat touch -> allow",
+                "74hb3. whitespace-padded liveness ack -> allow",
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb4: bundled `touch ... && rm -rf x` -> NOT exempt -> DENY.
-            # The exemption must never let a second action ride along.
+            # 74hb3b: an absolute path to the CLI is the same command. An
+            # operator recovering by hand types the installed path as often as
+            # the bare name, and the catch-22 is identical either way.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "/usr/local/bin/event-ack ack-batch"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb3b. absolute-path liveness ack -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb3c: the optional --action note does not disqualify it.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
                  "tool_input": {
-                     "command": "touch /var/run/claude/heartbeat && rm -rf /tmp/x",
+                     "command": "event-ack ack-batch --action 'restored liveness'",
                  }},
                 env_hb,
             )
             results.append(_check(
-                "74hb4. heartbeat touch bundled with `&& rm` -> NOT exempt -> deny",
-                rc == 0 and _is_deny(out),
+                "74hb3c. liveness ack with --action note -> allow",
+                rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb5: heartbeat touch piped -> NOT exempt -> DENY.
+            # 74hb3d: the now-mandatory --override-reason (a value-taking
+            # flag, same shape as --action) does not disqualify the exemption:
+            # its VALUE must not be misread as a second operand. Regression
+            # guard for the ack-batch mandatory-reason change.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
                  "tool_input": {
-                     "command": "touch /var/run/claude/heartbeat | cat",
+                     "command": "event-ack ack-batch --override-reason 'reviewed, nothing actionable'",
                  }},
                 env_hb,
             )
             results.append(_check(
-                "74hb5. heartbeat touch piped -> NOT exempt -> deny",
-                rc == 0 and _is_deny(out),
+                "74hb3d. liveness ack with --override-reason -> allow",
+                rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb6: `touch` of a DIFFERENT path -> NOT exempt -> DENY.
-            _write_hb_sidecar()
-            rc, out, _err = _hook_pre(
-                {"tool_name": "Bash",
-                 "tool_input": {"command": "touch /var/run/claude/other"}},
-                env_hb,
-            )
-            results.append(_check(
-                "74hb6. touch of a different path -> NOT exempt -> deny",
-                rc == 0 and _is_deny(out),
-                f"rc={rc} out={out}",
-            ))
-
-            # 74hb7: `touch` of the heartbeat path PLUS a second path ->
-            # NOT exempt -> DENY (a second operand smuggles work in).
+            # 74hb4: bundled `event-ack ack-batch && rm -rf x` -> NOT exempt
+            # -> DENY. The exemption must never let a second action ride along.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
                  "tool_input": {
-                     "command": "touch /var/run/claude/heartbeat /tmp/evil",
+                     "command": "event-ack ack-batch && rm -rf /tmp/x",
                  }},
                 env_hb,
             )
             results.append(_check(
-                "74hb7. heartbeat touch + second operand -> NOT exempt -> deny",
+                "74hb4. liveness ack bundled with `&& rm` -> NOT exempt -> deny",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb8: the heartbeat path mentioned only inside a quoted arg to
-            # another command (echo) is NOT a touch of it -> NOT exempt ->
-            # DENY (proves the exemption keys on the real command head, not
-            # substring presence of the path).
+            # 74hb5: liveness ack piped -> NOT exempt -> DENY.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {
-                     "command": "echo 'touch /var/run/claude/heartbeat'",
-                 }},
+                 "tool_input": {"command": "event-ack ack-batch | cat"}},
                 env_hb,
             )
             results.append(_check(
-                "74hb8. heartbeat path inside echo arg -> NOT exempt -> deny",
+                "74hb5. liveness ack piped -> NOT exempt -> deny",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb9: a value-taking touch flag (-r reffile) that smuggles a
-            # second path -> NOT exempt -> DENY.
+            # 74hb6: a DIFFERENT event-ack subcommand -> NOT exempt -> DENY.
+            # Only the recovery command the daemon actually asks for gets to
+            # bypass every gate; `clear` (which discards pending events
+            # wholesale) must not inherit that.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {
-                     "command": "touch -r /etc/passwd /var/run/claude/heartbeat",
-                 }},
+                 "tool_input": {"command": "event-ack clear"}},
                 env_hb,
             )
             results.append(_check(
-                "74hb9. heartbeat touch with -r reffile -> NOT exempt -> deny",
+                "74hb6. a different event-ack subcommand -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb7: `ack-batch` PLUS a second operand -> NOT exempt -> DENY.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "event-ack ack-batch extra-operand"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb7. liveness ack + second operand -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb8: the command mentioned only inside a quoted arg to another
+            # command (echo) is NOT an ack -> NOT exempt -> DENY (proves the
+            # exemption keys on the real command head, not substring presence).
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "echo 'event-ack ack-batch'"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb8. ack command inside echo arg -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb9: `--action ack-batch` is a VALUE, not the subcommand. A
+            # matcher that scanned for the token anywhere would let
+            # `event-ack clear --action ack-batch` bypass every gate.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "event-ack clear --action ack-batch"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb9. `ack-batch` as a flag VALUE -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # ---------------------------------------------------------------
+            # 74hb10: `heartbeat-ack` was RETIRED 2026-08-21 (#649 ack-driven
+            # redesign). A bare `heartbeat-ack` invocation falls through to the
+            # normal obligations dispatch like any other command.
+            # ---------------------------------------------------------------
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "heartbeat-ack"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb10. bare heartbeat-ack no longer hardcoded-ALLOW "
+                "-> denied like any other command under unhealthy/unread gates",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # ---------------------------------------------------------------
+            # 74hb11: the host heartbeat FILE was retired 2026-08-22. `touch
+            # /var/run/claude/heartbeat` used to hold THIS hardcoded ALLOW; it
+            # must no longer bypass anything. Pinned because a stale exemption
+            # is invisible: the command would keep succeeding, and the loop
+            # would keep "restoring liveness" by writing a file nothing reads.
+            # ---------------------------------------------------------------
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "touch /var/run/claude/heartbeat"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb11. retired heartbeat touch no longer hardcoded-ALLOW "
+                "-> denied like any other command",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
@@ -3155,6 +3342,75 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
             _run([str(CLI), "satisfy", ob_pp], env_p)
+
+        # ---------------------------------------------------------------
+        # Tests 74n1-74n10: no_output_consumed predicate (end-to-end).
+        #
+        # The "never filter <tool>'s output" rule used to be a
+        # no_pipe_pattern REGEX over the raw command string, which both
+        # LEAKED (a pattern written for `| tail -N` / `| head -N` let bare
+        # `| head`, `| grep`, `| jq` and `> /dev/null` straight through)
+        # and OVER-FIRED (any command that merely MENTIONED the tool name
+        # while piping was denied). no_output_consumed asks the AST "is
+        # this command's stdout consumed?" instead: no consumer list to
+        # keep exhaustive, and only real command HEADS are inspected.
+        #
+        # Registered exactly as an operator would: an AST-aware
+        # `Bashcmd:<glob>` tool_pattern paired with the AST predicate, so
+        # BOTH halves of the gate are structural.
+        # ---------------------------------------------------------------
+        with tempfile.TemporaryDirectory(prefix="obligations-nooutput-") as td_n:
+            tmpdir_n = Path(td_n)
+            env_n, _ob_n = _make_isolated_env(tmpdir_n)
+            _pipe = chr(124)
+            ob_nc = _add_ob(
+                env_n,
+                tool_pattern="Bashcmd:botchat-*",
+                predicate="no_output_consumed",
+                params={"commands": ["botchat-*"]},
+                ttl=0,
+                deny_msg="never filter botchat output -- fix the tool instead",
+            )
+
+            def _nc(name, command, expect_deny):
+                rc, out, _err = _hook_pre(
+                    {"tool_name": "Bash", "tool_input": {"command": command}},
+                    env_n,
+                )
+                good = _is_deny(out) if expect_deny else _is_allow(out)
+                results.append(_check(
+                    name, rc == 0 and good, f"rc={rc} out={out}"))
+
+            # DENY: output genuinely consumed. The dash-less forms are the
+            # ones the old regex silently permitted.
+            _nc("74n1. output_consumed: bare " + _pipe + " head -> deny",
+                "botchat-show 2008 " + _pipe + " head", True)
+            _nc("74n2. output_consumed: " + _pipe + " grep -> deny",
+                "botchat-history " + _pipe + " grep foo", True)
+            _nc("74n3. output_consumed: > /dev/null -> deny",
+                "botchat-show 2007-2008 > /dev/null", True)
+            _nc("74n4. output_consumed: dash-flag head -> deny",
+                "botchat-show 2008 " + _pipe + " head -20", True)
+
+            # ALLOW: the name appears only as an argument / string, so no
+            # gated command runs. These are the over-fire cases.
+            _nc("74n5. output_consumed: bare invocation -> allow",
+                "botchat-show 2008", False)
+            _nc("74n6. output_consumed: id range -> allow",
+                "botchat-show 2018-2024", False)
+            _nc("74n7. output_consumed: name as grep ARG -> allow",
+                "grep -n 'botchat-show' Dockerfile " + _pipe + " head", False)
+            _nc("74n8. output_consumed: name in echo string -> allow",
+                "echo 'botchat-send' " + _pipe + " wc -l", False)
+
+            # FAIL-CLOSED: unparseable command -> deny, not allow.
+            _nc("74n9. output_consumed: unparseable -> deny (fail-closed)",
+                "botchat-show 'unterminated " + _pipe + " head", True)
+
+            # Unrelated command -> allow (no regression).
+            _nc("74n10. output_consumed: unrelated command -> allow",
+                "ls -la /tmp", False)
+            _run([str(CLI), "satisfy", ob_nc], env_n)
 
         # ---------------------------------------------------------------
         # Tests 75-88: stale_ready_queue_present predicate.
@@ -6060,6 +6316,397 @@ def main() -> int:
                 rc_209 == 0 and _is_allow(out_209),
                 f"rc={rc_209} out={out_209}",
             ))
+
+        # ===================================================================
+        # Tests 210-215: the FORCE-START gate must not block subagents, and
+        # must give the main loop a dispatch grace window.
+        #
+        # Regression 2026-08-20: `session-task queue force-start` registered
+        # a BARE `force_started_unspawned` row on tool_pattern `*`. The gate
+        # evaluates every row for every PreToolUse -- including tool calls
+        # from subagents that were already running -- so in the seconds
+        # between the main loop's `force-start` and its `Agent` call, three
+        # unrelated subagents were denied with "spawn the agent for q=X"
+        # and fell back to audited bypasses. session-task now registers
+        # `all_of [is_main_loop, force_started_unspawned {grace_secs: 60}]`.
+        # These tests pin (a) the wrapped shape is inert for subagents,
+        # (b) it still denies the main loop once the grace has elapsed,
+        # (c) the grace window itself, anchored on the queue item's
+        # `force_started_at` (or an explicit `grace_from`).
+        # ===================================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-fsg-") as td_g:
+            tmpdir_g = Path(td_g)
+            env_g, _ob_g = _make_isolated_env(tmpdir_g)
+
+            def _write_queue_fs(path, qid, status="running",
+                                force_started_at=None):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                item = {
+                    "id": qid,
+                    "status": status,
+                    "group_id": "g-x",
+                    "summary": "grace test",
+                    "scope": ["test"],
+                    "created_at": "2026-08-20T00:00:00+00:00",
+                }
+                if force_started_at is not None:
+                    item["force_started_at"] = int(force_started_at)
+                path.write_text(json.dumps({"items": [item]}) + "\n")
+
+            def _write_agents_fs(path, records):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "subagents": [], "workloads": [], "agents": records,
+                }) + "\n")
+
+            def _wrapped_params(leaf_params):
+                # Exactly the shape `session-task queue force-start` writes.
+                return {"predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {"kind": "force_started_unspawned", "params": leaf_params},
+                ]}
+
+            bash_ls = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+            now_g = int(time.time())
+
+            # 210/211: the registered shape. Queue running, force-started
+            # 120s ago (grace 60s elapsed), no agent, no pending-spawn.
+            qfile_210 = tmpdir_g / "fs210-queue.json"
+            afile_210 = tmpdir_g / "fs210-agents.json"
+            pfile_210 = tmpdir_g / "fs210-pending.json"  # never written
+            _write_queue_fs(qfile_210, "q-fs-210-test",
+                            force_started_at=now_g - 120)
+            _write_agents_fs(afile_210, [])
+            ob_210 = _add_ob(
+                env_g,
+                tool_pattern="*",
+                predicate="all_of",
+                params=_wrapped_params({
+                    "queue_id": "q-fs-210-test",
+                    "grace_secs": 60,
+                    "queue_path": str(qfile_210),
+                    "agents_state_path": str(afile_210),
+                    "pending_spawns_path": str(pfile_210),
+                }),
+                ttl=120,
+                deny_msg="FORCE-START: spawn agent for q-fs-210-test",
+            )
+            # Subagent caller (non-empty agent_id) -> scope-guard inactive.
+            rc, out, _err = _hook_pre(
+                dict(bash_ls, agent_id="agent-sub-210"), env_g,
+            )
+            results.append(_check(
+                "210. force-start gate as registered: subagent -> allow "
+                "(is_main_loop scope-guard inactive)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            # Subagent via agent_type slug only (in-process teammate).
+            rc_t, out_t, _err = _hook_pre(
+                dict(bash_ls, agent_type="general-purpose"), env_g,
+            )
+            results.append(_check(
+                "210b. force-start gate as registered: subagent by "
+                "agent_type slug -> allow",
+                rc_t == 0 and _is_allow(out_t),
+                f"rc={rc_t} out={out_t}",
+            ))
+            # Main loop (no agent_id / agent_type) -> grace elapsed -> DENY.
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            banner = (out or {}).get("systemMessage", "")
+            results.append(_check(
+                "211. force-start gate as registered: main loop, grace "
+                "elapsed, no agent -> deny",
+                (rc == 0 and _is_deny(out)
+                 and "q-fs-210-test" in banner),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_210], env_g)
+
+            # 212: inside the grace window -> allow, why names the grace.
+            qfile_212 = tmpdir_g / "fs212-queue.json"
+            afile_212 = tmpdir_g / "fs212-agents.json"
+            _write_queue_fs(qfile_212, "q-fs-212-test",
+                            force_started_at=now_g)
+            _write_agents_fs(afile_212, [])
+            ob_212 = _add_ob(
+                env_g,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-212-test",
+                    "grace_secs": 60,
+                    "queue_path": str(qfile_212),
+                    "agents_state_path": str(afile_212),
+                    "pending_spawns_path": str(tmpdir_g / "nope.json"),
+                },
+                ttl=120,
+                deny_msg="(should not fire -- inside grace)",
+            )
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            chk = _run([str(CLI), "check", "--tool", "Bash",
+                        "--command-string", "ls", "--json"], env_g)
+            results.append(_check(
+                "212. force_started_unspawned grace_secs: inside window "
+                "-> allow",
+                rc == 0 and _is_allow(out) and chk.returncode == 0,
+                f"rc={rc} out={out} check={chk.stdout[:200]!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_212], env_g)
+
+            # 213: same row but force-started 61s ago -> grace elapsed -> DENY.
+            qfile_213 = tmpdir_g / "fs213-queue.json"
+            afile_213 = tmpdir_g / "fs213-agents.json"
+            _write_queue_fs(qfile_213, "q-fs-213-test",
+                            force_started_at=now_g - 61)
+            _write_agents_fs(afile_213, [])
+            ob_213 = _add_ob(
+                env_g,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-213-test",
+                    "grace_secs": 60,
+                    "queue_path": str(qfile_213),
+                    "agents_state_path": str(afile_213),
+                    "pending_spawns_path": str(tmpdir_g / "nope.json"),
+                },
+                ttl=120,
+                deny_msg="must spawn agent for q-fs-213-test",
+            )
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            results.append(_check(
+                "213. force_started_unspawned grace_secs: window elapsed "
+                "-> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            # 214: grace elapsed but a LIVE agent for the qid -> allow.
+            _write_agents_fs(afile_213, [{
+                "agent_id": "a-fs-213", "queue_id": "q-fs-213-test",
+                "alive": True,
+            }])
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            results.append(_check(
+                "214. force_started_unspawned grace elapsed + live agent "
+                "-> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_213], env_g)
+
+            # 215: explicit grace_from wins over the queue item's anchor.
+            # Queue says force-started long ago; grace_from says "just now".
+            qfile_215 = tmpdir_g / "fs215-queue.json"
+            afile_215 = tmpdir_g / "fs215-agents.json"
+            _write_queue_fs(qfile_215, "q-fs-215-test",
+                            force_started_at=now_g - 3600)
+            _write_agents_fs(afile_215, [])
+            ob_215 = _add_ob(
+                env_g,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-215-test",
+                    "grace_secs": 60,
+                    "grace_from": now_g,
+                    "queue_path": str(qfile_215),
+                    "agents_state_path": str(afile_215),
+                    "pending_spawns_path": str(tmpdir_g / "nope.json"),
+                },
+                ttl=120,
+                deny_msg="(should not fire -- grace_from just now)",
+            )
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            results.append(_check(
+                "215. force_started_unspawned grace_from param overrides "
+                "queue anchor -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_215], env_g)
+
+        # ===================================================================
+        # Tests 216-222: MonitorArm — the monitor-mode cure exemption.
+        #
+        # For a `mode=monitor` watcher `watcher-ctl run <name>` does not exec
+        # anything: it prints the Monitor-tool command and the main loop must
+        # ARM it. 2026-08-21: with claude-event-watch DOWN in monitor mode,
+        # the `watchers_healthy` gate DENIED that very Monitor call ("watchers
+        # unhealthy -- restart them first") -- the gate blocked its own cure
+        # and only `obligations override` got out. `MonitorArm` is the
+        # universal-floor (and DEFAULT_EXEMPT_PATTERNS) entry that lets the
+        # arm through: Monitor tool + command EXACTLY a configured, enabled
+        # monitor-mode watcher's monitor_cmd (per `watcher-ctl list --json`,
+        # trailing ` 2>&1` tolerated). Anything else stays gated; a missing /
+        # failing watcher-ctl is fail-CLOSED (no exemption).
+        # ===================================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-marm-") as td_ma:
+            tmpdir_ma = Path(td_ma)
+            env_ma, _ob_ma = _make_isolated_env(tmpdir_ma)
+            fake_bin_ma = tmpdir_ma / "fake-bin"
+            fake_bin_ma.mkdir()
+            monitor_cmd = "/opt/claude-container/watchers/claude-event-watch.sh --mode monitor"
+            # Fake layered-config reader: exactly the JSON shape
+            # `watcher-ctl list --json` prints. One ENABLED monitor-mode
+            # watcher, one DISABLED monitor-mode watcher, one oneshot (whose
+            # derived monitor_cmd must NOT count -- it is not in monitor mode).
+            (fake_bin_ma / "watcher-ctl").write_text(
+                "#!/bin/sh\n"
+                "[ \"$1\" = list ] || exit 1\n"
+                "cat <<'EOF'\n"
+                + json.dumps([
+                    {"name": "claude-event-watch", "pattern": "x", "min_count": 1,
+                     "enabled": True, "start_cmd": "/opt/claude-container/watchers/claude-event-watch.sh",
+                     "mode": "monitor", "monitor_cmd": monitor_cmd,
+                     "layer": "base", "overridden": ["mode"]},
+                    {"name": "disabled-mon", "pattern": "d", "min_count": 1,
+                     "enabled": False, "start_cmd": "disabled-mon",
+                     "mode": "monitor", "monitor_cmd": "disabled-mon --mode monitor",
+                     "layer": "override", "overridden": []},
+                    {"name": "botchat-wait", "pattern": "b", "min_count": 1,
+                     "enabled": True, "start_cmd": "botchat-wait",
+                     "mode": "oneshot", "monitor_cmd": "botchat-wait --mode monitor",
+                     "layer": "base", "overridden": []},
+                ])
+                + "\nEOF\n"
+            )
+            (fake_bin_ma / "watcher-ctl").chmod(0o755)
+            # Fake watcher-status: the exact unhealthy report the incident
+            # produced (monitor-mode watcher DOWN + the re-ARM footer), so the
+            # real `watchers_healthy` predicate FAILS.
+            (fake_bin_ma / "watcher-status").write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "claude-event-watch   DOWN      (0/1)    [monitor]\n"
+                "\n"
+                "WARNING: Some watchers are down or duplicated!\n"
+                "Recovery for DOWN state: `watcher-ctl run <name>` for each DOWN watcher (e.g. claude-event-watch).\n"
+                "Monitor-mode watcher(s) DOWN: claude-event-watch — `watcher-ctl run <name>` does NOT exec them; it prints the Monitor-tool command for the main loop to re-ARM (persistent: true). Arm it, then read every stdout line.\n"
+                "EOF\n"
+            )
+            (fake_bin_ma / "watcher-status").chmod(0o755)
+            env_ma["PATH"] = f"{fake_bin_ma}{os.pathsep}{env_ma['PATH']}"
+
+            ob_wh_ma = _add_ob(
+                env_ma,
+                tool_pattern="*",
+                predicate="watchers_healthy",
+                params={},
+                ttl=300,
+                deny_msg="watchers unhealthy — restart them first (test 216)",
+            )
+
+            def _monitor_payload(cmd, agent_id=None):
+                p = {"tool_name": "Monitor",
+                     "tool_input": {"command": cmd,
+                                    "description": "claude-event-watch (monitor-mode watcher)",
+                                    "persistent": True}}
+                if agent_id is not None:
+                    p["agent_id"] = agent_id
+                return p
+
+            # Baseline: the gate IS firing for an unrelated tool.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_ma)
+            results.append(_check(
+                "216. MonitorArm: baseline -- watchers_healthy gate fires on Bash",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 216b: the CURE -- the Monitor arm of the DOWN monitor-mode
+            # watcher, exactly as `watcher-ctl run` prints it (with ` 2>&1`)
+            # -> ALLOW even though watchers_healthy fails.
+            rc, out, _err = _hook_pre(_monitor_payload(monitor_cmd + " 2>&1"), env_ma)
+            results.append(_check(
+                "216b. MonitorArm: Monitor arm of the configured monitor_cmd "
+                "(+ ` 2>&1`) passes the firing watchers_healthy gate",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 217: same command without the redirect, and with sloppy
+            # whitespace -> still the same command -> ALLOW.
+            rc, out, _err = _hook_pre(_monitor_payload(monitor_cmd), env_ma)
+            rc2, out2, _err = _hook_pre(
+                _monitor_payload("  " + monitor_cmd.replace(" --mode", "   --mode") + "  2>&1 "),
+                env_ma)
+            results.append(_check(
+                "217. MonitorArm: bare monitor_cmd / whitespace-sloppy form both allowed",
+                rc == 0 and _is_allow(out) and rc2 == 0 and _is_allow(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+
+            # 218: a DIFFERENT Monitor command stays gated (narrowness).
+            rc, out, _err = _hook_pre(_monitor_payload("sleep 3600"), env_ma)
+            rc2, out2, _err = _hook_pre(
+                _monitor_payload(monitor_cmd + " --extra-flag 2>&1"), env_ma)
+            results.append(_check(
+                "218. MonitorArm: unrelated / extended Monitor command still denied",
+                rc == 0 and _is_deny(out) and rc2 == 0 and _is_deny(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+
+            # 219: a monitor_cmd that belongs to a watcher NOT in monitor mode
+            # (oneshot's derived form) or to a DISABLED monitor watcher is not
+            # an arm cure -> denied.
+            rc, out, _err = _hook_pre(
+                _monitor_payload("botchat-wait --mode monitor 2>&1"), env_ma)
+            rc2, out2, _err = _hook_pre(
+                _monitor_payload("disabled-mon --mode monitor 2>&1"), env_ma)
+            results.append(_check(
+                "219. MonitorArm: oneshot watcher's monitor_cmd / disabled "
+                "monitor watcher -> denied (only enabled mode=monitor counts)",
+                rc == 0 and _is_deny(out) and rc2 == 0 and _is_deny(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+
+            # 220: universal floor -- the arm passes an UNRELATED firing gate
+            # too (the cure must never be blocked by whatever else is armed).
+            ob_other_ma = _add_ob(
+                env_ma,
+                tool_pattern="*",
+                predicate="file_exists",
+                params={"path": str(tmpdir_ma / "definitely-missing")},
+                ttl=300,
+                deny_msg="unrelated policy gate (test 220)",
+            )
+            rc, out, _err = _hook_pre(_monitor_payload(monitor_cmd + " 2>&1"), env_ma)
+            rc2, out2, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_ma)
+            results.append(_check(
+                "220. MonitorArm: universal floor -- arm passes an unrelated "
+                "firing gate too, while Bash stays denied",
+                rc == 0 and _is_allow(out) and rc2 == 0 and _is_deny(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+            _run([str(CLI), "satisfy", ob_other_ma], env_ma)
+
+            # 221: FAIL-CLOSED -- watcher-ctl exits non-zero (or is absent):
+            # no exemption, the gate stands.
+            (fake_bin_ma / "watcher-ctl").write_text("#!/bin/sh\nexit 1\n")
+            rc, out, _err = _hook_pre(_monitor_payload(monitor_cmd + " 2>&1"), env_ma)
+            (fake_bin_ma / "watcher-ctl").write_text("#!/bin/sh\necho 'not json'\n")
+            rc2, out2, _err = _hook_pre(_monitor_payload(monitor_cmd + " 2>&1"), env_ma)
+            results.append(_check(
+                "221. MonitorArm: failing / garbage watcher-ctl => fail-closed (denied)",
+                rc == 0 and _is_deny(out) and rc2 == 0 and _is_deny(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+
+            # 222: the hardcoded subagent Monitor gate still wins -- MonitorArm
+            # is a main-loop cure, a subagent arming a watcher is still denied
+            # (watchers belong to the main loop).
+            rc, out, _err = _hook_pre(
+                _monitor_payload(monitor_cmd + " 2>&1", agent_id="agent-xyz"), env_ma)
+            results.append(_check(
+                "222. MonitorArm: subagent Monitor arm still denied by the "
+                "subagent Monitor gate",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_wh_ma], env_ma)
 
     total = len(results)
     passed = sum(1 for r in results if r)

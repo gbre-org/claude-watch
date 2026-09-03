@@ -23,6 +23,98 @@ needed only a binary-name swap:
 ``PRIORITY`` is one of ``low|normal|high|emergency`` (mapped to Pushover
 priority -1/0/1/2). ``--sound`` overrides the default ``vibrate``.
 
+Debounce + batch (coalesce bursts into ONE push)
+------------------------------------------------
+Queue lifecycle transitions fire in bursts — a `/clear`, a wave of agent
+completions, or a group of items registering/finishing together can emit
+a dozen `_pingme_notify` calls within seconds, and (pre-2026-08) each one
+became its own Pushover, spamming the recipient's phone.
+
+To fix that WITHOUT touching session-task's ~dozen per-event call sites,
+the debounce+batch layer lives HERE, between "invoked N times" and "POST
+once". session-task still invokes ``queue-notify`` once per transition
+(the historical contract, still exercised by the pingme test-suite); this
+tool spools each invocation and coalesces a burst into a SINGLE summarised
+push:
+
+    "5 queue events: 2 done, 2 started, 1 abandoned
+     • done q-... — <summary>
+     • started q-... — <summary>
+     ..."
+
+Mechanism (works across ephemeral CLI invocations — there is no long-lived
+process to hold a timer):
+
+  * Each invocation APPENDS a JSON record to a spool file (flock-guarded)
+    and spawns a detached "flusher" subprocess (``queue-notify
+    --__flush-spool``). Only the FIRST flusher wins a non-blocking lock;
+    the rest exit immediately, so a burst spawns exactly one live flusher.
+  * The flusher DEBOUNCES: it waits until no new event has landed for
+    ``QUEUE_NOTIFY_DEBOUNCE`` seconds (a quiet gap), bounded by a hard
+    ``QUEUE_NOTIFY_MAX_WINDOW`` ceiling so a continuous stream can't starve
+    the flush. Then it drains the spool and sends ONE push (a lone event
+    is sent verbatim; ≥2 are summarised).
+
+Batching is skipped (immediate synchronous send, legacy behaviour) when:
+  * ``QUEUE_NOTIFY_BATCH=0`` (kill switch / tests), or
+  * priority is ``emergency`` — a priority-2 alert with retry/expire must
+    never sit in a debounce window.
+
+Transition push policy (which transitions are worth a phone push)
+-----------------------------------------------------------------
+Not every queue lifecycle transition deserves to buzz a phone. ``started``
+and ``done`` are pure BOOKKEEPING: they fire on every register and every
+completion, they carry no decision for the operator, and the same
+information is already on the queue minisite and in the claude-event
+stream. In Aug 2026 those two transitions alone accounted for ~3,000
+Pushover messages in three weeks — about 31% of the account's monthly
+message allowance — spent entirely on "a thing started" / "a thing
+finished" notices nobody acts on.
+
+So this tool applies a POLICY before the debounce/batch layer: only
+transitions in the push set produce a Pushover. The default set is every
+known lifecycle transition EXCEPT ``started`` and ``done`` — i.e. the ones
+that actually ask something of the operator or report a failure:
+
+    abandoned, blocked, force-started, quarantined, unblocked, unwedged,
+    wedged
+
+Two properties matter:
+
+  * The claude-event emission is UNAFFECTED. session-task emits
+    ``queue-started`` / ``queue-done`` claude-events exactly as before, so
+    the main loop, the minisite and the exporter see no change at all.
+    Only the phone push is dropped.
+  * The filter FAILS OPEN on anything it does not recognise as a known
+    lifecycle transition (a hand-written title, or a transition kind added
+    to session-task later). A new transition pushes until someone
+    deliberately adds it to the suppressed set — silence is never the
+    default for something unknown.
+
+Override with ``QUEUE_NOTIFY_PUSH_TRANSITIONS`` (comma/space separated,
+case-insensitive; a leading ``queue `` on each entry is tolerated):
+
+    QUEUE_NOTIFY_PUSH_TRANSITIONS=all          # push everything (pre-2026-08)
+    QUEUE_NOTIFY_PUSH_TRANSITIONS=none         # push nothing known
+    QUEUE_NOTIFY_PUSH_TRANSITIONS=wedged,blocked
+    QUEUE_NOTIFY_PUSH_TRANSITIONS=default,done # the default set plus `done`
+
+``default`` expands to the built-in set, so re-enabling ONE transition
+does not mean re-listing all of them. A suppressed transition exits 0 —
+it is a policy decision, not a delivery failure.
+
+Env knobs (all optional):
+  * ``QUEUE_NOTIFY_PUSH_TRANSITIONS`` — transitions that earn a push
+    (default: all known lifecycle transitions except ``started`` /
+    ``done``). ``all`` / ``none`` / ``default`` are accepted tokens.
+  * ``QUEUE_NOTIFY_BATCH``       — ``0`` disables batching (default on).
+  * ``QUEUE_NOTIFY_DEBOUNCE``    — quiet-gap seconds (default 10).
+  * ``QUEUE_NOTIFY_MAX_WINDOW``  — hard coalesce ceiling seconds (default 60).
+  * ``QUEUE_NOTIFY_SPOOL``       — spool file path (default
+    ``$XDG_CACHE_HOME/queue-notify/spool.jsonl``).
+  * ``QUEUE_NOTIFY_SINK``        — dry-run: append the composed delivery as
+    a JSON line to this file INSTEAD of POSTing (tests / debugging).
+
 Credential lookup
 -----------------
 Token (dedicated, queue-only):
@@ -42,21 +134,127 @@ with a clear message; callers (session-task) swallow that so the queue op
 is never blocked by a notification failure.
 """
 import argparse
+import fcntl
+import json
 import os
+import socket
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 API_URL = "https://api.pushover.net/1/messages.json"
 DEFAULT_SOUND = "vibrate"
 
 _PRIORITY_MAP = {"low": -1, "normal": 0, "high": 1, "emergency": 2}
+_PRIORITY_REV = {v: k for k, v in _PRIORITY_MAP.items()}
+
+# Debounce/batch defaults (seconds).
+_DEFAULT_DEBOUNCE = 10.0
+_DEFAULT_MAX_WINDOW = 60.0
+# Cap on how many per-event detail lines the batched message spells out.
+_BATCH_DETAIL_CAP = 12
+# Keep the composed body under Pushover's 1024-char message limit.
+_MESSAGE_LIMIT = 1000
+
+# --- transition push policy ------------------------------------------------
+#
+# Every queue lifecycle transition session-task can emit, as the lower-cased
+# `kind` half of a "queue <kind>: q-..." title. Anything NOT in this set is
+# treated as an unknown/ad-hoc title and always pushes (fail open).
+KNOWN_TRANSITIONS = frozenset({
+    "started",
+    "done",
+    "abandoned",
+    "quarantined",
+    "force-started",
+    "wedged",
+    "unwedged",
+    "blocked",
+    "unblocked",
+})
+
+# Transitions that earn a phone push by DEFAULT.
+#
+# `started` and `done` are deliberately excluded: they are bookkeeping -- one
+# per register, one per completion -- with nothing for the operator to act
+# on, and between them they burned ~31% of the Pushover account's monthly
+# message allowance in Aug 2026. Their claude-events still fire unchanged;
+# only the push is dropped. What remains is either an operator ask or a
+# failure report.
+DEFAULT_PUSH_TRANSITIONS = frozenset(KNOWN_TRANSITIONS - {"started", "done"})
+
+# Tokens accepted in QUEUE_NOTIFY_PUSH_TRANSITIONS besides bare kinds.
+_PUSH_TOKEN_ALL = "all"
+_PUSH_TOKEN_NONE = "none"
+_PUSH_TOKEN_DEFAULT = "default"
+
+
+def _normalize_transition(raw: str) -> str:
+    """Normalise one transition token: lower-cased, no ``queue `` prefix."""
+    tok = (raw or "").strip().lower()
+    if tok.startswith("queue "):
+        tok = tok[len("queue "):].strip()
+    return tok
+
+
+def _push_transitions() -> frozenset:
+    """Resolve the set of transitions that earn a push.
+
+    Reads ``QUEUE_NOTIFY_PUSH_TRANSITIONS`` (comma and/or whitespace
+    separated, case-insensitive). Unset or empty -> the built-in default.
+    Special tokens: ``all`` (every known transition), ``none`` (no known
+    transition), ``default`` (expands to the built-in set, so re-enabling a
+    single transition does not mean re-listing the rest).
+    """
+    raw = os.environ.get("QUEUE_NOTIFY_PUSH_TRANSITIONS")
+    if raw is None or not raw.strip():
+        return DEFAULT_PUSH_TRANSITIONS
+    out: set = set()
+    for chunk in raw.replace(",", " ").split():
+        tok = _normalize_transition(chunk)
+        if not tok:
+            continue
+        if tok == "queue":
+            # A bare `queue` word, left over from a space-separated
+            # "queue done queue wedged" spelling. Never a transition.
+            continue
+        if tok == _PUSH_TOKEN_ALL:
+            out |= set(KNOWN_TRANSITIONS)
+        elif tok == _PUSH_TOKEN_NONE:
+            continue
+        elif tok == _PUSH_TOKEN_DEFAULT:
+            out |= set(DEFAULT_PUSH_TRANSITIONS)
+        else:
+            out.add(tok)
+    return frozenset(out)
+
+
+def _should_push(title: str) -> bool:
+    """True if this title's transition is push-worthy under current policy.
+
+    FAILS OPEN: a title whose kind is not a KNOWN lifecycle transition (an
+    ad-hoc/hand-written title, or a transition added to session-task after
+    this list was written) always pushes. Suppression is only ever applied
+    to kinds this file explicitly knows about.
+    """
+    kind = _event_kind(title)
+    if kind not in KNOWN_TRANSITIONS:
+        return True
+    return kind in _push_transitions()
+
 
 
 def _config_home() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+
+
+def _cache_home() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
 
 
 def _parse_env_file(path: Path) -> dict:
@@ -147,8 +345,261 @@ def _post(user: str, token: str, title: str, message: str,
         return (False, f"{exc.__class__.__name__}: {exc}")
 
 
+def _deliver(title: str, message: str, priority: int, sound: str) -> bool:
+    """Deliver ONE push (or dry-run to the sink). Returns True on success.
+
+    ``QUEUE_NOTIFY_SINK`` short-circuits the network POST: the composed
+    delivery is appended as a JSON line to that file. This is the seam the
+    test-suite uses to assert "a burst produced exactly ONE push" without
+    hitting Pushover, and is handy for local debugging.
+    """
+    sink = os.environ.get("QUEUE_NOTIFY_SINK")
+    if sink:
+        record = {
+            "title": title,
+            "message": message,
+            "priority": priority,
+            "sound": sound,
+            "ts": time.time(),
+        }
+        try:
+            with open(sink, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+            return True
+        except OSError as exc:
+            print(f"queue-notify: sink write failed: {exc}", file=sys.stderr)
+            return False
+
+    token = _resolve_token()
+    user = _resolve_user()
+    if not token or not user:
+        missing = []
+        if not token:
+            missing.append("PUSHOVER_TOKEN (queue-notify/env)")
+        if not user:
+            missing.append("PUSHOVER_USER (pingme/env or queue-notify/env)")
+        print(f"queue-notify: missing creds: {', '.join(missing)}",
+              file=sys.stderr)
+        return False
+
+    ok, body = _post(user, token, title, message, priority, sound)
+    if not ok:
+        print(f"queue-notify: delivery failed: {body}", file=sys.stderr)
+        return False
+    return True
+
+
+# --- debounce + batch spool ------------------------------------------------
+
+
+def _spool_path() -> Path:
+    override = os.environ.get("QUEUE_NOTIFY_SPOOL")
+    if override:
+        return Path(override)
+    return _cache_home() / "queue-notify" / "spool.jsonl"
+
+
+def _enqueue(spool: Path, record: dict) -> None:
+    """Append one event record to the spool (flock-guarded)."""
+    spool.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(spool), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.write(fd, (json.dumps(record) + "\n").encode("utf-8"))
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _read_records(spool: Path, truncate: bool) -> list[dict]:
+    """Read all spooled records under an exclusive lock.
+
+    With ``truncate=True`` the spool is atomically drained (read + emptied)
+    so no event is double-sent. Malformed lines are skipped.
+    """
+    try:
+        fd = os.open(str(spool), os.O_RDWR)
+    except FileNotFoundError:
+        return []
+    records: list[dict] = []
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with os.fdopen(os.dup(fd), "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except (ValueError, TypeError):
+                    continue
+        if truncate:
+            os.ftruncate(fd, 0)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+    return records
+
+
+def _spawn_flusher() -> None:
+    """Spawn a detached flusher. Cheap: extra flushers self-exit on the lock."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--__flush-spool"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=dict(os.environ),
+        )
+    except Exception as exc:  # noqa: BLE001 -- never block the queue op
+        print(f"queue-notify: flusher spawn failed "
+              f"({exc.__class__.__name__}): {exc}", file=sys.stderr)
+
+
+def _event_kind(title: str) -> str:
+    """Extract the transition kind from a lifecycle title.
+
+    Titles look like ``queue done: q-...``, ``queue force-started: q-...``,
+    ``queue WEDGED: q-...``. Returns the lower-cased kind ("done",
+    "force-started", "wedged", ...); falls back to "event".
+    """
+    head = (title or "").split(":", 1)[0].strip()
+    low = head.lower()
+    if low.startswith("queue "):
+        head = head[len("queue "):]
+    return head.strip().lower() or "event"
+
+
+def _event_id(title: str) -> str:
+    """Extract the queue id from a lifecycle title (text after the colon)."""
+    parts = (title or "").split(":", 1)
+    return parts[1].strip() if len(parts) == 2 else ""
+
+
+def _compose_batch(records: list[dict]) -> tuple[str, str, int, str]:
+    """Summarise ≥2 spooled events into ONE (title, message, priority, sound)."""
+    n = len(records)
+    counts = Counter(_event_kind(r.get("title", "")) for r in records)
+    breakdown = ", ".join(
+        f"{c} {k}" for k, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+    host = socket.gethostname().split(".")[0]
+    title = f"{host}: {n} queue events"
+
+    lines = [f"{n} queue events: {breakdown}", ""]
+    for r in records[:_BATCH_DETAIL_CAP]:
+        kind = _event_kind(r.get("title", ""))
+        qid = _event_id(r.get("title", ""))
+        summ = (r.get("message") or "").split("\n", 1)[0].strip()
+        seg = f"• {kind} {qid}".rstrip()
+        if summ:
+            seg += f" — {summ}"
+        lines.append(seg)
+    if n > _BATCH_DETAIL_CAP:
+        lines.append(f"…and {n - _BATCH_DETAIL_CAP} more")
+
+    message = "\n".join(lines)
+    if len(message) > _MESSAGE_LIMIT:
+        message = message[:_MESSAGE_LIMIT - 1] + "…"
+
+    priority = max(
+        (_PRIORITY_MAP.get(r.get("priority", "normal"), 0) for r in records),
+        default=0,
+    )
+    return title, message, priority, DEFAULT_SOUND
+
+
+def _deliver_records(records: list[dict]) -> None:
+    """Deliver a drained batch: 1 record verbatim, ≥2 summarised into one."""
+    if not records:
+        return
+    if len(records) == 1:
+        r = records[0]
+        _deliver(
+            r.get("title") or socket.gethostname().split(".")[0],
+            r.get("message", ""),
+            _PRIORITY_MAP.get(r.get("priority", "normal"), 0),
+            r.get("sound", DEFAULT_SOUND),
+        )
+        return
+    title, message, priority, sound = _compose_batch(records)
+    _deliver(title, message, priority, sound)
+
+
+def _flush_spool() -> int:
+    """Debounce loop: coalesce a burst, then send ONE push per batch.
+
+    A single flusher holds an exclusive, non-blocking lock; concurrent
+    invocations lose the lock and exit (the winner picks up their events).
+    """
+    spool = _spool_path()
+    lock_path = spool.with_name(spool.name + ".flush.lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0  # another flusher is already coalescing this burst
+
+        debounce = _env_float("QUEUE_NOTIFY_DEBOUNCE", _DEFAULT_DEBOUNCE)
+        max_window = _env_float("QUEUE_NOTIFY_MAX_WINDOW", _DEFAULT_MAX_WINDOW)
+        # Poll granularity: fine enough to be responsive, coarse enough to
+        # not busy-spin. Bounded by the debounce gap.
+        poll_cap = max(0.1, min(debounce, 2.0))
+
+        while True:
+            records = _read_records(spool, truncate=False)
+            if not records:
+                return 0
+            now = time.time()
+            newest = max(r.get("ts", now) for r in records)
+            oldest = min(r.get("ts", now) for r in records)
+            quiet_for = now - newest
+            age = now - oldest
+            if quiet_for >= debounce or age >= max_window:
+                drained = _read_records(spool, truncate=True)
+                _deliver_records(drained)
+                # Loop: catch stragglers that arrived during delivery.
+                continue
+            remaining = min(debounce - quiet_for, max_window - age)
+            time.sleep(max(0.1, min(remaining, poll_cap)))
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        return default
+    return val if val >= 0 else default
+
+
 def main(argv=None) -> int:
-    import socket
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Hidden debounce-flusher entry point (spawned detached by _spawn_flusher).
+    if argv and argv[0] == "--__flush-spool":
+        return _flush_spool()
 
     parser = argparse.ArgumentParser(
         prog="queue-notify",
@@ -166,21 +617,38 @@ def main(argv=None) -> int:
     title = args.title if args.title is not None else socket.gethostname().split(".")[0]
     priority = _PRIORITY_MAP[args.priority]
 
-    token = _resolve_token()
-    user = _resolve_user()
-    if not token or not user:
-        missing = []
-        if not token:
-            missing.append("PUSHOVER_TOKEN (queue-notify/env)")
-        if not user:
-            missing.append("PUSHOVER_USER (pingme/env or queue-notify/env)")
-        print(f"queue-notify: missing creds: {', '.join(missing)}", file=sys.stderr)
-        return 1
+    # Transition push policy. Applied BEFORE the batch/immediate split so a
+    # suppressed transition never reaches the spool and can never inflate a
+    # batch's event count. Exit 0: "not push-worthy" is a policy decision,
+    # not a delivery failure, and the caller (session-task) must not treat
+    # it as one. The matching claude-event is emitted by session-task
+    # independently and is unaffected by this.
+    if not _should_push(title):
+        return 0
 
-    ok, body = _post(user, token, title, args.message, priority, args.sound)
-    if not ok:
-        print(f"queue-notify: delivery failed: {body}", file=sys.stderr)
-        return 1
+    batch_enabled = os.environ.get("QUEUE_NOTIFY_BATCH", "1") != "0"
+    # Emergency (priority 2) must never wait in a debounce window; send now.
+    if not batch_enabled or priority >= _PRIORITY_MAP["emergency"]:
+        ok = _deliver(title, args.message, priority, args.sound)
+        return 0 if ok else 1
+
+    # Debounce + batch: spool this event and (re)arm a detached flusher.
+    try:
+        _enqueue(_spool_path(), {
+            "ts": time.time(),
+            "priority": args.priority,
+            "title": title,
+            "message": args.message,
+            "sound": args.sound,
+        })
+    except OSError as exc:
+        # Spool unwritable -> fall back to an immediate send so the event is
+        # never silently dropped.
+        print(f"queue-notify: spool write failed ({exc}); sending immediately",
+              file=sys.stderr)
+        ok = _deliver(title, args.message, priority, args.sound)
+        return 0 if ok else 1
+    _spawn_flusher()
     return 0
 
 

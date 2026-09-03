@@ -36,6 +36,7 @@ from app import (  # noqa: E402
     atomic_write,
     make_app,
     validate_and_decode,
+    validate_theme,
 )
 from aiohttp.test_utils import AioHTTPTestCase  # noqa: E402
 
@@ -195,7 +196,8 @@ class HandlerTests(AioHTTPTestCase):
     async def get_application(self):
         self.tmpdir = tempfile.mkdtemp()
         self.dest = os.path.join(self.tmpdir, "clipboard.png")
-        return make_app(dest_path=self.dest)
+        self.theme_dest = os.path.join(self.tmpdir, "theme")
+        return make_app(dest_path=self.dest, theme_dest_path=self.theme_dest)
 
     async def tearDownAsync(self):
         # AioHTTPTestCase doesn't guarantee filesystem cleanup; do it
@@ -282,6 +284,75 @@ class HandlerTests(AioHTTPTestCase):
             },
         )
         self.assertEqual(resp.status, 200)
+
+    async def test_post_theme_json_writes_file(self):
+        resp = await self.client.post(
+            "/theme-report",
+            data=b'{"theme":"dark"}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(resp.status, 200)
+        js = await resp.json()
+        self.assertTrue(js["ok"])
+        self.assertEqual(js["theme"], "dark")
+        with open(self.theme_dest) as f:
+            self.assertEqual(f.read().strip(), "dark")
+
+    async def test_post_theme_text_plain_writes_file(self):
+        resp = await self.client.post(
+            "/theme-report",
+            data=b"light",
+            headers={"Content-Type": "text/plain"},
+        )
+        self.assertEqual(resp.status, 200)
+        with open(self.theme_dest) as f:
+            self.assertEqual(f.read().strip(), "light")
+
+    async def test_post_theme_invalid_rejected(self):
+        resp = await self.client.post(
+            "/theme-report",
+            data=b'{"theme":"neon"}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertFalse(os.path.exists(self.theme_dest))
+
+
+
+class ValidateThemeTests(unittest.TestCase):
+    def test_json_dark(self):
+        self.assertEqual(validate_theme("application/json", b'{"theme":"dark"}'), "dark")
+
+    def test_json_light(self):
+        self.assertEqual(validate_theme("application/json", b'{"theme":"light"}'), "light")
+
+    def test_json_case_and_whitespace_normalised(self):
+        self.assertEqual(validate_theme("application/json", b'{"theme":" Dark "}'), "dark")
+
+    def test_text_plain_accepted(self):
+        self.assertEqual(validate_theme("text/plain", b"light"), "light")
+
+    def test_empty_content_type_defaults_json(self):
+        self.assertEqual(validate_theme("", b'{"theme":"dark"}'), "dark")
+
+    def test_invalid_theme_value_rejected(self):
+        with self.assertRaises(ValidationError) as cm:
+            validate_theme("application/json", b'{"theme":"solarized"}')
+        self.assertEqual(cm.exception.status, 400)
+
+    def test_missing_key_rejected(self):
+        with self.assertRaises(ValidationError) as cm:
+            validate_theme("application/json", b"{}")
+        self.assertEqual(cm.exception.status, 400)
+
+    def test_non_string_rejected(self):
+        with self.assertRaises(ValidationError):
+            validate_theme("application/json", b'{"theme":1}')
+
+    def test_unsupported_content_type_rejected(self):
+        with self.assertRaises(ValidationError) as cm:
+            validate_theme("image/png", b"dark")
+        self.assertEqual(cm.exception.status, 415)
 
 
 if __name__ == "__main__":

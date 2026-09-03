@@ -12,7 +12,9 @@ Covers:
   * `queue unwedge` refuses on non-wedged statuses
   * a wedged item still owns its scope (peer with overlapping scope is
     blocked)
-  * `queue done` and `queue abandon` accept wedged items (terminal exit)
+  * `queue done` and `queue abandon` accept wedged items (terminal exit;
+    abandon needs --confirmed-dead to skip the quarantine hop, since a
+    wedged item still owns its scope)
   * `queue list` (default view) includes wedged items
   * `queue list --json` emits status='wedged'
   * `queue groups` reports wedged_count
@@ -306,7 +308,14 @@ def test_done_from_wedged():
 
 
 def test_abandon_from_wedged():
-    """`queue abandon` accepts a wedged item (operator gives up)."""
+    """`queue abandon` accepts a wedged item (operator gives up).
+
+    A wedged item owns its scope, so a bare abandon quarantines it rather
+    than freeing the scope -- "the agent is stuck" is not "the agent is
+    gone". `--confirmed-dead` is the caller asserting it really did exit,
+    which is what this test exercises; the quarantine hop has its own
+    coverage in test_queue_quarantine.py.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         added = _add(env, "give up", ["repo:wedge-abandon"],
@@ -315,7 +324,7 @@ def test_abandon_from_wedged():
         _register(env, qid)
         _run(env, "queue", "wedge", qid, "--reason", "context_limit",
              "--silent", expect_exit=0)
-        _run(env, "queue", "abandon", qid, "--reason",
+        _run(env, "queue", "abandon", qid, "--confirmed-dead", "--reason",
              "operator gave up after wedge", "--silent", expect_exit=0)
         shown = _show(env, qid)
         assert shown["status"] == "abandoned"

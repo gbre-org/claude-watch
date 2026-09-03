@@ -5,7 +5,7 @@
 //! `pane_current_command == "claude"`. When the operator focuses a Claude Code
 //! TUI agent-view (a running SUBAGENT) — which spawns a second `claude` process
 //! in its own pane — that scan can resolve the SUBAGENT's pane, so the daemon's
-//! MAIN-LOOP-SCOPED injects (watcher-down restart, heartbeat-stale nudge,
+//! MAIN-LOOP-SCOPED injects (watcher-down restart, ack-stale nudge,
 //! resume) land in the subagent's context, where nothing can act on them.
 //!
 //! Fix: `status::find_claude_pane_with_config()` prefers the explicitly

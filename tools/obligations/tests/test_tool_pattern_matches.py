@@ -131,6 +131,28 @@ def test_bashcmd_multiple_names():
     assert m(pat, "Bash", "something-else") is False
 
 
+def test_bashcmd_glob_matches_family():
+    # A whole command family can be named without enumerating it.
+    assert m("Bashcmd:botchat-*", "Bash", "botchat-history --unread") is True
+    assert m("Bashcmd:botchat-*", "Bash", "botchat-show 2008") is True
+    assert m("Bashcmd:botchat-*", "Bash", "signal-history") is False
+
+
+def test_bashcmd_glob_still_head_only():
+    # The glob is only ever tested against a real command HEAD -- a mention
+    # as an argument or inside a quoted string never matches.
+    assert m("Bashcmd:botchat-*", "Bash", "grep botchat-show f") is False
+    assert m(
+        "Bashcmd:botchat-*", "Bash", "grep -n 'botchat-show' Dockerfile | head"
+    ) is False
+
+
+def test_bashcmd_glob_failsafe_on_unparseable():
+    # Unparseable => word-boundary fallback, glob translated to \S*.
+    assert m("Bashcmd:botchat-*", "Bash", "botchat-show 'unterminated") is True
+    assert m("Bashcmd:botchat-*", "Bash", "echo 'unterminated") is False
+
+
 def test_bashcmd_failsafe_on_unparseable():
     # Unterminated quote => ShellParseError => fail-safe word-boundary match.
     # The command is unparseable AND does contain the name as a word, so the
@@ -138,3 +160,225 @@ def test_bashcmd_failsafe_on_unparseable():
     assert m("Bashcmd:watcher-ctl", "Bash", "echo 'watcher-ctl") is True
     # ...and does NOT match when the name is absent from the raw string.
     assert m("Bashcmd:watcher-ctl", "Bash", "echo 'unterminated") is False
+
+
+# --- host-bash MCP tools: AST-aware command-HEAD matching (like Bashcmd:) ---
+#
+# In production the gate hook (`_short_command_string`) renders the host-bash
+# tool_input via json.dumps before matching, so command_string is a JSON blob
+# carrying the REAL command/script text. A bare-name REST must match only the
+# command HEAD of that body, NOT anywhere in the rendered JSON (the bug: a
+# gated name in a --body / heredoc / PR-body false-matched a body-wide
+# re.search). A regex REST stays a body-wide re.search (backward compat).
+
+import json  # noqa: E402
+
+
+def _run_command(cmd: str) -> str:
+    """Render a run_command tool_input the way the gate hook does."""
+    return json.dumps({"command": cmd})
+
+
+def _run_script(script: str, interpreter: str = "bash") -> str:
+    """Render a run_script tool_input the way the gate hook does."""
+    return json.dumps({"interpreter": interpreter, "script": script})
+
+
+def test_hostbash_run_command_real_invocation_matches():
+    # Real botchat invocation via run_command -> still matches (would deny).
+    assert m(
+        "mcp__host-bash__run_command:botchat-send",
+        "mcp__host-bash__run_command",
+        _run_command("botchat-send --mark-read 5 --ack 5"),
+    ) is True
+
+
+def test_hostbash_run_command_env_and_path_prefixed_matches():
+    # Env-prefixed + absolute-path invocation (the canonical botchat shape)
+    # still matches -- prefix stripping is AST-aware, not body-wide.
+    assert m(
+        "mcp__host-bash__run_command:botchat-send",
+        "mcp__host-bash__run_command",
+        _run_command(
+            "BOTCHAT_API_BASE=http://x /home/h/repos/botchat/bin/botchat-send"
+            " --mark-read 5"
+        ),
+    ) is True
+    assert m(
+        "mcp__host-bash__run_command:botchat-ack",
+        "mcp__host-bash__run_command",
+        _run_command("cd ~ && botchat-ack 7"),
+    ) is True
+
+
+def test_hostbash_run_command_body_arg_mention_not_matched():
+    # `botchat-wait` only inside a --body arg -> no match (would allow). This
+    # is the bug fix: the old body-wide re.search over the JSON matched here.
+    assert m(
+        "mcp__host-bash__run_command:botchat-wait",
+        "mcp__host-bash__run_command",
+        _run_command('gh pr create --body "waits like botchat-wait does"'),
+    ) is False
+    # Same for a short -m mention.
+    assert m(
+        "mcp__host-bash__run_command:botchat-send",
+        "mcp__host-bash__run_command",
+        _run_command('git commit -m "mirror the botchat-send clear-path"'),
+    ) is False
+
+
+def test_hostbash_run_script_real_invocation_matches():
+    # A run_script whose body is a real botchat-send -> matches.
+    assert m(
+        "mcp__host-bash__run_script:botchat-send",
+        "mcp__host-bash__run_script",
+        _run_script("botchat-send --mark-read 5 --ack 5"),
+    ) is True
+
+
+def test_hostbash_run_script_heredoc_body_mention_not_matched():
+    # A run_script whose heredoc / PR-body merely mentions the token -> no
+    # match (would allow). The gated name is inside the heredoc body, not a
+    # command head.
+    script = (
+        "gh pr create --base main --body \"$(cat <<'EOF'\n"
+        "This PR mirrors the botchat-send clear-path exempt.\n"
+        "EOF\n"
+        ")\""
+    )
+    assert m(
+        "mcp__host-bash__run_script:botchat-send",
+        "mcp__host-bash__run_script",
+        _run_script(script),
+    ) is False
+
+
+def test_hostbash_glob_family_head_only():
+    # Glob spec names a whole family, still only against a real head.
+    assert m(
+        "mcp__host-bash__run_command:botchat-*",
+        "mcp__host-bash__run_command",
+        _run_command("botchat-history --unread"),
+    ) is True
+    assert m(
+        "mcp__host-bash__run_command:botchat-*",
+        "mcp__host-bash__run_command",
+        _run_command("grep -n botchat-history file"),
+    ) is False
+
+
+def test_hostbash_regex_rest_still_body_wide():
+    # A REGEX spec (anchors / lookaheads) stays a body-wide re.search for
+    # backward compat with the arg-conditional botchat clear-path exempt.
+    # This mark-read-only invocation matches the lookahead exempt...
+    clear_path = (
+        r"^(?=.*\bbotchat-send\s+-)(?=.*\s--(?:mark-read|ack)\b)"
+        r"(?!.*\s--(?:body|to|reply-to|topic|image|file|message-file)\b)"
+        r"(?!.*\s-[bF]\b).*"
+    )
+    assert m(
+        "mcp__host-bash__run_command:" + clear_path,
+        "mcp__host-bash__run_command",
+        _run_command("botchat-send --mark-read 5 --ack 5"),
+    ) is True
+    # ...but a compose (with --body) does NOT match the exempt (stays gated).
+    assert m(
+        "mcp__host-bash__run_command:" + clear_path,
+        "mcp__host-bash__run_command",
+        _run_command("botchat-send --to andrew --body hi --ack 5"),
+    ) is False
+
+
+def test_hostbash_raw_text_fallback_still_matches():
+    # Fail-safe: a raw (non-JSON) command_string passed directly still gets
+    # AST head matching (the pre-existing test convention / defensive path).
+    assert m(
+        "mcp__host-bash__run_command:botchat-send",
+        "mcp__host-bash__run_command",
+        "botchat-send --mark-read 1",
+    ) is True
+    assert m(
+        "mcp__host-bash__run_command:botchat-send",
+        "mcp__host-bash__run_command",
+        "echo botchat-send",
+    ) is False
+
+
+def test_hostbash_wrong_tool_name_no_match():
+    # The host-bash pattern never matches the Bash tool (head must equal
+    # tool_name).
+    assert m(
+        "mcp__host-bash__run_command:botchat-send",
+        "Bash",
+        "botchat-send",
+    ) is False
+
+
+# --- Bashsole: AST-aware SOLE-simple-command form (read-CLI exemption) ---
+#
+# ``Bashsole:<names>`` matches the Bash tool iff a named command is the head
+# of the SOLE simple command -- no pipeline, redirect, list/compound, or
+# background operator. It scopes a read-CLI exemption to the RAW form only:
+# piping a botchat read strips attachment lines, so a piped ``botchat-show``
+# must NOT be exempted (and thus stays gated). FAIL-CLOSED on parse failure.
+
+def test_bashsole_bare_read_matches():
+    assert m("Bashsole:botchat-show,botchat-history", "Bash",
+             "botchat-show 42") is True
+    assert m("Bashsole:botchat-show,botchat-history", "Bash",
+             "botchat-history --unread") is True
+
+
+def test_bashsole_env_and_path_prefixed_bare_matches():
+    assert m("Bashsole:botchat-show", "Bash",
+             "FOO=1 /usr/local/bin/botchat-show 42") is True
+    assert m("Bashsole:botchat-show", "Bash",
+             "sudo botchat-show 42") is True
+
+
+def test_bashsole_piped_read_does_not_match():
+    # The whole point: a piped botchat read is NOT the sole command, so the
+    # exemption does not fire (leaving the no-pipe / mark-read gate in force).
+    assert m("Bashsole:botchat-show,botchat-history", "Bash",
+             "botchat-show 42 | tail -5") is False
+    assert m("Bashsole:botchat-show", "Bash",
+             "echo x | botchat-show") is False
+
+
+def test_bashsole_redirect_does_not_match():
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 > /tmp/x") is False
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 < /tmp/in") is False
+
+
+def test_bashsole_list_and_background_do_not_match():
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 ; echo done") is False
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 && echo ok") is False
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 &") is False
+
+
+def test_bashsole_arg_mention_does_not_match():
+    # A name that appears only as an argument is not the head -> no match.
+    assert m("Bashsole:botchat-show", "Bash",
+             "grep -n 'botchat-show' Dockerfile") is False
+
+
+def test_bashsole_glob_family():
+    assert m("Bashsole:botchat-*", "Bash", "botchat-show 2008") is True
+    assert m("Bashsole:botchat-*", "Bash", "botchat-show 2008 | head") is False
+    assert m("Bashsole:botchat-*", "Bash", "signal-history") is False
+
+
+def test_bashsole_wrong_tool_name_no_match():
+    assert m("Bashsole:botchat-show", "Read", "botchat-show 42") is False
+
+
+def test_bashsole_failclosed_on_unparseable():
+    # Unterminated quote => ShellParseError => FAIL CLOSED => NOT exempt
+    # (the opposite of Bashcmd, which fails SAFE to a word-boundary match).
+    # An unparseable command must not be waved through as a bare read.
+    assert m("Bashsole:botchat-show", "Bash", "botchat-show 'unterminated") is False

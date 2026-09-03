@@ -10,7 +10,11 @@ pub struct Config {
     pub claude: ClaudeConfig,
     pub dead_process: DeadProcessConfig,
     pub fresh_clear: FreshClearConfig,
-    pub heartbeat: HeartbeatConfig,
+    /// Ack-age liveness thresholds. Renamed from `[heartbeat]` 2026-08-22
+    /// (liveness is the age of the last event ack, not a touched file); the
+    /// old section name is still accepted via the serde alias.
+    #[serde(default, alias = "heartbeat")]
+    pub ack: AckConfig,
     pub alerts: AlertsConfig,
     pub foreground_monitor: ForegroundMonitorConfig,
     pub watcher_monitor: WatcherMonitorConfig,
@@ -43,8 +47,8 @@ pub struct Config {
     /// enabled. See `QueueCheckConfig`.
     #[serde(default)]
     pub queue_check: QueueCheckConfig,
-    /// Daemon-emitted cadence events (`heartbeat-tick` / `memory-reminder`).
-    /// Default ON with 60s / 900s intervals. See `CadenceConfig`.
+    /// Daemon-emitted cadence events (`keepalive` / `memory-reminder`).
+    /// Default ON. See `CadenceConfig`.
     #[serde(default)]
     pub cadence: CadenceConfig,
     /// Detect malformed (non-namespaced) tool-call blocks rendered as plain
@@ -186,15 +190,51 @@ pub struct TmuxConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClaudeConfig {
     pub max_context_tokens: u64,
-    /// Host heartbeat file the MAIN LOOP touches as its wedge-detector
-    /// proof-of-life. The daemon monitors this path for staleness (and
-    /// exports its mtime as a metric) but NEVER writes it. This same path is
-    /// carried in the `data.path` field of each `heartbeat-tick` cadence
-    /// event so the main loop is told exactly which file to touch — keeping
-    /// the "touch" target and the staleness-monitor target on one
-    /// user-configurable path.
-    pub heartbeat_file: String,
     pub relaunch_script: String,
+    /// Handle the Bypass-Permissions launch dialog on every relaunch.
+    ///
+    /// Claude Code renders a full-screen consent dialog when it starts with
+    /// `--dangerously-skip-permissions` and the acceptance is not persisted in
+    /// settings. Every relaunch this daemon performs passes that flag. The
+    /// dialog's cancel row renders the same `❯` glyph the idle-prompt detector
+    /// keys on, so an unhandled dialog looks like a ready prompt: the resume
+    /// prompt gets typed into it, the default-selected "No, exit" submits, and
+    /// Claude exits (operator-observed on Claude Code 2.1.251, 2026-08-29).
+    ///
+    /// When true (default) the relaunch paths (a) pre-accept the dialog by
+    /// setting the acceptance key in the Claude Code settings file, and (b)
+    /// still watch the pane for the dialog after the relaunch and select
+    /// "Yes, I accept" if it shows up anyway. Set to false to leave the dialog
+    /// entirely to a human.
+    #[serde(default = "default_handle_bypass_dialog")]
+    pub handle_bypass_dialog: bool,
+    /// Whether the relaunch paths may WRITE the acceptance key into the Claude
+    /// Code settings file (the same key the dialog itself writes when a human
+    /// accepts it). The write is surgical (one inserted line, no reflow),
+    /// atomic, idempotent, and never clobbers a settings file it cannot parse
+    /// — see `bypass_consent`. Set to false to keep claude-watch out of the
+    /// settings file entirely and rely only on the pane-side acceptance.
+    #[serde(default = "default_pre_accept_bypass_dialog")]
+    pub pre_accept_bypass_dialog: bool,
+    /// Seconds to wait for the Bypass-Permissions dialog to appear after a
+    /// relaunch, and (separately) for Claude to reach a real idle prompt after
+    /// the dialog is accepted. The appear-wait exits early the moment the pane
+    /// shows a genuine idle prompt, so on the overwhelmingly common no-dialog
+    /// path this costs one capture, not the full budget.
+    #[serde(default = "default_bypass_dialog_wait_secs")]
+    pub bypass_dialog_wait_secs: u64,
+}
+
+fn default_handle_bypass_dialog() -> bool {
+    true
+}
+
+fn default_pre_accept_bypass_dialog() -> bool {
+    true
+}
+
+fn default_bypass_dialog_wait_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -278,6 +318,24 @@ pub struct FreshClearConfig {
     /// count. `0` disables it. Default: 300 (5 min).
     #[serde(default = "default_post_clear_window_secs")]
     pub post_clear_window_secs: u64,
+    /// Grace window (seconds) AFTER a `self-clear` tool finishes delivering its
+    /// own resume/handoff prompt during which the daemon suppresses BOTH the
+    /// fresh-external-session inject and the post-clear resume inject.
+    ///
+    /// Why this exists: `self-clear` (daemon-, operator-, or skill-driven) holds
+    /// an flock for its `/clear`->resume handoff, and `inject_to_agent` /
+    /// `interrupt_and_wait` defer while that lock is HELD. But the lock releases
+    /// the instant the resume prompt is submitted+verified — while the fresh
+    /// session is still bootstrapping (status bar reads 0 tokens, pane idle) for
+    /// many more seconds. In that post-release window the daemon's fresh-session
+    /// gate (which has been accumulating dead_checks the whole time) fires its
+    /// GENERIC "You are a fresh session ..." prompt and CLOBBERS the handoff the
+    /// self-clearer just delivered (operator-reported #4799, 2026-08-18). The
+    /// `self-clear` tool stamps a completion marker (see
+    /// `tmux::self_clear_handoff_recent`); this window keys off that marker to
+    /// bridge the bootstrap gap. `0` disables it. Default: 120s.
+    #[serde(default = "default_self_clear_handoff_grace_secs")]
+    pub self_clear_handoff_grace_secs: u64,
 }
 
 fn default_suppress_when_active() -> bool {
@@ -288,14 +346,77 @@ fn default_post_clear_window_secs() -> u64 {
     300
 }
 
+fn default_self_clear_handoff_grace_secs() -> u64 {
+    120
+}
+
 fn default_fresh_clear_active_window_secs() -> u64 {
     60
 }
 
+/// Ack-age liveness thresholds (`[ack]`, formerly `[heartbeat]`).
+///
+/// The ONE liveness signal in the system is the age of the last ack of ANY
+/// claude-event: `event-ack` stamps `<state-dir>/last-ack-timestamp` on every
+/// ack (`event-ack ack-batch` is the per-batch reflex the main loop runs).
+/// When that timestamp is older than [`AckConfig::stale_minutes`] the daemon
+/// treats the loop as wedged. There is no second signal — the host heartbeat
+/// FILE and its `touch` ritual were retired 2026-08-22.
 #[derive(Debug, Deserialize, Clone)]
-pub struct HeartbeatConfig {
+pub struct AckConfig {
+    /// Minutes without ANY event ack before the loop is considered wedged.
+    /// Must be comfortably more than 2x [`crate::cadence::KEEPALIVE_INTERVAL_SECS`]
+    /// so a single missed keepalive can never trip it. Default 15 (min)
+    /// against a 5-minute keepalive.
+    #[serde(default = "default_ack_stale_minutes")]
     pub stale_minutes: u64,
+    /// Directory holding `last-ack-timestamp`. Empty (the default) resolves
+    /// at read time to `$CLAUDE_EVENT_STATE_DIR`, else `~/.config/claude-events`
+    /// — exactly how `event-ack` resolves it, so the writer and the reader
+    /// cannot drift. Deliberately NOT inside the event QUEUE dir: state in
+    /// `~/claude-events/` gets miscounted as an unconsumed event.
+    #[serde(default)]
+    pub state_dir: String,
 }
+
+impl Default for AckConfig {
+    fn default() -> Self {
+        Self {
+            stale_minutes: default_ack_stale_minutes(),
+            state_dir: String::new(),
+        }
+    }
+}
+
+impl AckConfig {
+    /// Absolute path of the directory holding `last-ack-timestamp`.
+    ///
+    /// Resolution order — identical to `event-ack`'s, so the writer and the
+    /// reader can never point at different directories:
+    ///   1. `[ack] state_dir`, when non-empty;
+    ///   2. `$CLAUDE_EVENT_STATE_DIR`, when set and non-empty;
+    ///   3. `$HOME/.config/claude-events`.
+    pub fn resolve_state_dir(&self) -> String {
+        let configured = self.state_dir.trim();
+        if !configured.is_empty() {
+            return configured.to_string();
+        }
+        if let Ok(env_dir) = std::env::var("CLAUDE_EVENT_STATE_DIR") {
+            if !env_dir.trim().is_empty() {
+                return env_dir;
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.config/claude-events", home)
+    }
+}
+
+fn default_ack_stale_minutes() -> u64 {
+    15
+}
+
+/// Basename of the liveness file `event-ack` stamps on every ack.
+pub const LAST_ACK_FILE: &str = "last-ack-timestamp";
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
@@ -304,22 +425,42 @@ pub struct AlertsConfig {
     pub escalation_tiers: Vec<u64>,
     pub max_pingme_alerts: u32,
     pub resume_prompt: String,
-    /// Prompt injected on the heartbeat-stale path specifically (as opposed
-    /// to the generic `resume_prompt`). The heartbeat file
-    /// (`[claude].heartbeat_file`) is a LIVENESS signal the main loop is
-    /// supposed to `touch` on each daemon-emitted `heartbeat-tick` event;
-    /// when it goes stale, the recovery action is to touch the file, NOT to
-    /// run a generic /cleanup. The generic `resume_prompt` never mentions
-    /// the heartbeat file, so injecting it left the file stale even after the
-    /// inject landed and the loop resumed working (2026-06-19: heartbeat sat
-    /// stale ~85 min while the loop was demonstrably active). This prompt is
-    /// a plain-text DIRECTIVE — the loop reads it and emits its own
-    /// well-formed `touch` tool call. It deliberately does NOT contain a raw
-    /// `<invoke>`/`<parameter>` payload: injecting raw tool-call tags as pane
-    /// text is the malformed-tool-call failure mode the daemon guards against
-    /// elsewhere; such text renders as prose and is silently dropped.
-    #[serde(default = "default_heartbeat_stale_prompt")]
-    pub heartbeat_stale_prompt: String,
+    /// Prompt injected on the ack-stale path specifically (as opposed to the
+    /// generic `resume_prompt`). The last-ack timestamp is the LIVENESS
+    /// signal: the main loop stamps it by acking each event batch, so when it
+    /// goes stale the recovery action is to ack, NOT to run a generic
+    /// /cleanup. The generic `resume_prompt` never mentions acking, so
+    /// injecting it left liveness stale even after the inject landed and the
+    /// loop resumed working (2026-06-19: the signal sat stale ~85 min while
+    /// the loop was demonstrably active). This prompt is a plain-text
+    /// DIRECTIVE — the loop reads it and emits its own well-formed tool call.
+    /// It deliberately does NOT contain a raw `<invoke>`/`<parameter>`
+    /// payload: injecting raw tool-call tags as pane text is the
+    /// malformed-tool-call failure mode the daemon guards against elsewhere;
+    /// such text renders as prose and is silently dropped.
+    ///
+    /// Renamed from `heartbeat_stale_prompt` 2026-08-22; the old key is still
+    /// accepted via the serde alias.
+    #[serde(default = "default_ack_stale_prompt", alias = "heartbeat_stale_prompt")]
+    pub ack_stale_prompt: String,
+    /// Prompt injected on the POST-CLEAR resume path specifically (as opposed
+    /// to the generic `resume_prompt`).
+    ///
+    /// That gate exists for one situation: a context clear was observed and
+    /// the pane has been sitting idle at an empty prompt ever since, so the
+    /// loop needs a nudge to pick its work back up. It is explicitly designed
+    /// to fire WITH background shells alive — surviving background shells are
+    /// the reason the other resume gates can't cover this case.
+    ///
+    /// The generic `resume_prompt` describes a stuck daemon-detected state
+    /// ("no background tasks running and not thinking") and asks for a watcher
+    /// cleanup. On this path both halves are wrong: the daemon's own log line
+    /// for the inject records the live background-shell count, and a cleanup
+    /// is not the recovery. Injecting it told the loop, in writing, something
+    /// the daemon knew to be false (2026-08-20), so this path gets its own
+    /// wording.
+    #[serde(default = "default_post_clear_resume_prompt")]
+    pub post_clear_resume_prompt: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -360,39 +501,50 @@ pub struct ForegroundMonitorConfig {
     /// parseable check; if it never parses, the fire fails open.
     #[serde(default = "default_min_tokens_delta")]
     pub min_tokens_delta: u64,
-    /// Host-heartbeat freshness gate (v3) for prolonged-thinking fires.
-    /// Complements the token-progress guard above: an ultra-quiet but
-    /// alive session (event-driven loops handling only periodic ticks)
-    /// can grow context tokens SLOWER than `min_tokens_delta` per backoff
-    /// window, so the v2 re-arm never engages and a parked-open idle turn
-    /// still fires. In deployments where the supervised session touches
-    /// the host heartbeat file (`[claude].heartbeat_file`) on a periodic
-    /// cadence (e.g. on each daemon-emitted `heartbeat-tick` event), the
-    /// file's mtime is a direct liveness signal: a wedged session stops
-    /// touching it BY DESIGN, and the daemon's separate heartbeat-stale
-    /// detection already escalates that case. At prolonged-thinking fire
-    /// time, if the heartbeat mtime is younger than this many seconds the
-    /// fire is suppressed and the thinking timer RE-ARMS (timer + token
-    /// baseline slide to now, same as the v2 re-arm); if it is stale the
-    /// fire proceeds. Fail-open: file missing/unreadable or mtime in the
-    /// future allows the fire. 0 disables the gate. Default 600 — two
-    /// 5-minute touch cadences, so one missed touch doesn't mask a wedge.
-    #[serde(default = "default_heartbeat_fresh_secs")]
-    pub heartbeat_fresh_secs: u64,
+    /// Ack-freshness gate (v3) for prolonged-thinking fires. Complements the
+    /// token-progress guard above: an ultra-quiet but alive session
+    /// (event-driven loops handling only periodic events) can grow context
+    /// tokens SLOWER than `min_tokens_delta` per backoff window, so the v2
+    /// re-arm never engages and a parked-open idle turn still fires. The
+    /// last-ack timestamp is a direct liveness signal: a wedged session stops
+    /// acking BY DESIGN, and the daemon's separate ack-stale detection
+    /// already escalates that case. At prolonged-thinking fire time, if the
+    /// last ack is younger than this many seconds the fire is suppressed and
+    /// the thinking timer RE-ARMS (timer + token baseline slide to now, same
+    /// as the v2 re-arm); if it is stale the fire proceeds. Fail-open: state
+    /// missing/unreadable or stamped in the future allows the fire. 0
+    /// disables the gate. Default 600 — two keepalive intervals, so one
+    /// missed ack doesn't mask a wedge.
+    ///
+    /// Renamed from `heartbeat_fresh_secs` 2026-08-22; the old key is still
+    /// accepted via the serde alias.
+    #[serde(default = "default_ack_fresh_secs", alias = "heartbeat_fresh_secs")]
+    pub ack_fresh_secs: u64,
 }
 
 fn default_interrupt_enabled() -> bool {
     true
 }
 
-/// Default heartbeat-stale recovery prompt. Single-line (the tmux inject
-/// pipeline assumes single-line). Explicitly instructs the loop to touch
-/// the host heartbeat file so liveness recovers — the whole point of the
-/// inject fallback. Marked `[CLAUDE-WATCH]` so the loop recognises it as a
-/// daemon interrupt, and asks for a watcher sanity-check + heartbeat-tick
-/// triage so a genuinely-wedged event pipeline still gets surfaced.
-fn default_heartbeat_stale_prompt() -> String {
-    "[CLAUDE-WATCH] The host heartbeat file went stale — you are not touching /var/run/claude/claude-heartbeat. Immediately run `touch /var/run/claude/claude-heartbeat` as a single well-formed Bash tool call to restore liveness, then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details.".to_string()
+/// Default ack-stale recovery prompt. Single-line (the tmux inject pipeline
+/// assumes single-line). Liveness is the age of the last ack of ANY event, so
+/// the prompt's only instruction is to run the per-batch ack reflex — one
+/// bare command, no key lookup, no file to touch. Marked `[CLAUDE-WATCH]` so
+/// the loop recognises it as a daemon interrupt, and asks for a watcher
+/// sanity-check so a genuinely-wedged event pipeline still gets surfaced.
+fn default_ack_stale_prompt() -> String {
+    "[CLAUDE-WATCH] No claude-event has been acked for longer than the stale window — from here the loop looks wedged. Run `event-ack ack-batch --override-reason \"<why>\"` NOW (--override-reason is required and audited; it acks every pending entry and stamps the liveness timestamp). Then check why events weren't reaching you (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM the operator with the details.".to_string()
+}
+
+/// Default post-clear resume prompt. Single-line (the tmux inject pipeline
+/// assumes single-line). Says what the daemon actually observed — a context
+/// clear followed by an idle prompt — and asks the loop to pick its recorded
+/// resume action back up. Deliberately makes NO claim about background tasks
+/// (this gate fires with background shells alive by design) and does NOT ask
+/// for a watcher cleanup, and it tells the loop what to check if the premise
+/// is wrong, so a misfire is reported rather than acted on.
+fn default_post_clear_resume_prompt() -> String {
+    "[CLAUDE-WATCH] A context clear was observed and the pane has been idle at an empty prompt since — nothing has picked the work back up. Resume from your recorded resume action (session-task) and continue; do NOT run a watcher cleanup on account of this message. If your context was NOT cleared (the conversation above is intact), this fired incorrectly: ignore it, finish what you were doing, and DM the operator with the details.".to_string()
 }
 
 fn default_interrupt_message() -> String {
@@ -411,7 +563,7 @@ fn default_min_tokens_delta() -> u64 {
     2000
 }
 
-fn default_heartbeat_fresh_secs() -> u64 {
+fn default_ack_fresh_secs() -> u64 {
     600
 }
 
@@ -420,10 +572,14 @@ fn default_heartbeat_fresh_secs() -> u64 {
 pub struct WatcherMonitorConfig {
     pub enabled: bool,
     pub watchers_config: String,
-    /// Optional supplementary watchers.conf path. Entries from this file are
-    /// merged with the primary `watchers_config`. Intended for operator-local
-    /// watchers (bind-mounted into the container) that aren't baked into the
-    /// image. Missing file is silently ignored.
+    /// Optional OVERRIDE watchers.conf path (the user-dir layer). Entries
+    /// here override same-named entries in `watchers_config` field-by-field
+    /// (blank = inherit; keyed `name|mode=monitor` form supported) and new
+    /// names are appended. Intended for operator-local config that is not
+    /// baked into the image (bind-mounted into the container; may be a
+    /// symlink into a config repo). Missing file is silently ignored. When
+    /// unset, falls back to the CLI's resolution: `$WATCHERS_CONFIG_EXTRA`,
+    /// else `$XDG_CONFIG_HOME/watchmen/watchers.override.conf`.
     #[serde(default)]
     pub watchers_config_extra: Option<String>,
     pub expected_watchmen: u32,
@@ -559,6 +715,32 @@ pub struct WatcherMonitorConfig {
     /// Set to 0 to disable (pure `grace_secs`-only behaviour).
     #[serde(default = "default_watcher_clean_exit_grace_secs")]
     pub clean_exit_grace_secs: u64,
+    /// ARMING grace (seconds) for `mode=monitor` watchers. `watcher-ctl run
+    /// <name>` does not exec a monitor-mode watcher: it prints the Monitor-tool
+    /// command for the main loop to arm and records the request in
+    /// `<pid_dir>/<name>.monitor-intent`. Between that print and the Monitor
+    /// actually going live (its pidfile showing a live pid) the watcher has no
+    /// process, so a naive liveness check reads DOWN -- which trips the
+    /// `watchers_healthy` obligation gate and the daemon's WATCHER(S) DOWN
+    /// path in the very gap where the loop is doing the right thing. For
+    /// this many seconds after a FRESH intent (one not superseded by a
+    /// runtime file written since), `watcher-ctl status` / the daemon's
+    /// watcher_monitor treat the watcher as `ARMING` (healthy-pending): not
+    /// DOWN, not counted as a miss. A live pidfile flips it to `ok`; past
+    /// the window with no live pid it is `DOWN` again (re-ARM footer).
+    ///
+    /// Override per process with `$CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS`
+    /// (the one-shot `watcher-status` CLI honours it; tests use it). Default:
+    /// 120s. 0 disables (an un-armed monitor reads DOWN immediately).
+    #[serde(default = "default_watcher_monitor_arming_grace_secs")]
+    pub monitor_arming_grace_secs: u64,
+}
+
+/// Code default for `[watcher_monitor].monitor_arming_grace_secs`.
+pub const DEFAULT_MONITOR_ARMING_GRACE_SECS: u64 = 120;
+
+fn default_watcher_monitor_arming_grace_secs() -> u64 {
+    DEFAULT_MONITOR_ARMING_GRACE_SECS
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -690,6 +872,94 @@ pub struct ReauthConfig {
     /// Interval between repeated reauth alerts in seconds (default: 10800 = 3 hours)
     #[serde(default = "default_reauth_alert_interval")]
     pub alert_interval_seconds: u64,
+
+    /// Drive `self-login` automatically when Claude Code prints its in-TUI
+    /// "Please run /login · API Error: 401 OAuth access token has expired"
+    /// banner AND the credential store agrees the access token is dead.
+    ///
+    /// A sibling of `expiry_auto_self_login`, kept separate because the two
+    /// interrupt different things. The proactive knob interrupts a WORKING
+    /// session days before anything breaks, which is a judgement call; this
+    /// one acts on a session that has ALREADY stopped being able to make API
+    /// calls, where the only alternative is a human typing `/login`. Default
+    /// on. The same retry / attempt / abandon bounds apply. When off, the
+    /// banner still raises the high-priority reauth alert — it is never
+    /// silent.
+    #[serde(default = "default_auth_error_auto_self_login")]
+    pub auth_error_auto_self_login: bool,
+
+    // --- Proactive expiry (the `[reauth]` section's second, forward-looking
+    // half). The fields above react to credentials that are ALREADY dead; the
+    // ones below act on Claude Code's warning that they are about to be.
+    /// Watch for the proactive "your login expires in N days" warning at all.
+    /// Turning this off leaves the reactive 401 path untouched.
+    #[serde(default = "default_expiry_watch_enabled")]
+    pub expiry_watch_enabled: bool,
+
+    /// Drive `self-login` automatically when the warning is corroborated,
+    /// instead of only alerting. AUTO-FIRE IS INTRUSIVE BY NATURE: `/login`
+    /// opens a modal that swallows the session's keystrokes until somebody
+    /// pastes the authorization code, so the loop stops working until then.
+    /// `self_login_abandon_seconds` is what bounds that.
+    #[serde(default = "default_expiry_auto_self_login")]
+    pub expiry_auto_self_login: bool,
+
+    /// Auto-fire only once the warning is down to this many days. Claude Code
+    /// itself starts SHOWING the warning three days out but only starts
+    /// nagging about it inside one day, and one day is the right side of that
+    /// line to interrupt a working session on.
+    #[serde(default = "default_expiry_auto_days")]
+    pub expiry_auto_days: u32,
+
+    /// Minimum gap between auto-fire attempts (default: 3600 = 1 hour). The
+    /// warning persists for days, so without this a poller re-fires every
+    /// cycle.
+    #[serde(default = "default_self_login_retry_seconds")]
+    pub self_login_retry_seconds: u64,
+
+    /// Give up after this many auto-fire attempts in one expiry window
+    /// (default: 3). Resets when the credentials are renewed. Failing loudly
+    /// is right; failing every hour forever is not.
+    #[serde(default = "default_self_login_max_attempts")]
+    pub self_login_max_attempts: u32,
+
+    /// Escape out of an unconsumed login dialog after this many seconds
+    /// (default: 1800 = 30 minutes), handing the session back. This is the
+    /// answer to "auto-fire ran at 3am and nobody pasted the code": the OAuth
+    /// link has a short life of its own, so parking the loop in a modal until
+    /// morning buys nothing and costs everything. 0 disables the watchdog and
+    /// leaves the dialog up indefinitely.
+    #[serde(default = "default_self_login_abandon_seconds")]
+    pub self_login_abandon_seconds: u64,
+
+    /// Let the credential store TRIGGER the expiry path on its own, rather
+    /// than only corroborating a warning seen on the pane.
+    ///
+    /// Off by default, and the reason is measured rather than theoretical. A
+    /// refresh token can be short-lived and rolling — on one live host, under
+    /// five hours, renewed silently long before it lapses. Against a
+    /// three-day warning window that credential classifies as "expiring in 1
+    /// day" permanently, so a store-driven trigger would fire forever on a
+    /// session that is in no trouble at all. The pane warning does not have
+    /// that failure mode: Claude Code renders it a bounded number of times,
+    /// not continuously.
+    ///
+    /// Turn it on where the refresh token's lifetime is known to be long
+    /// relative to the warning window. The cost of leaving it off is the one
+    /// stated above the `expiry_watch_enabled` docs: the transient form of
+    /// the warning can be missed between polls.
+    #[serde(default)]
+    pub expiry_from_credentials: bool,
+
+    /// Path to Claude Code's OAuth credential store, which is what the pane
+    /// warning is corroborated against. Empty = `$HOME/.claude/.credentials.json`.
+    #[serde(default)]
+    pub credentials_file: String,
+
+    /// Command used to drive the login flow. Overridable so a deployment that
+    /// installs the script elsewhere does not have to patch the binary.
+    #[serde(default = "default_self_login_command")]
+    pub self_login_command: String,
 }
 
 impl Default for ReauthConfig {
@@ -697,6 +967,16 @@ impl Default for ReauthConfig {
         Self {
             enabled: default_reauth_enabled(),
             alert_interval_seconds: default_reauth_alert_interval(),
+            auth_error_auto_self_login: default_auth_error_auto_self_login(),
+            expiry_watch_enabled: default_expiry_watch_enabled(),
+            expiry_auto_self_login: default_expiry_auto_self_login(),
+            expiry_auto_days: default_expiry_auto_days(),
+            self_login_retry_seconds: default_self_login_retry_seconds(),
+            self_login_max_attempts: default_self_login_max_attempts(),
+            self_login_abandon_seconds: default_self_login_abandon_seconds(),
+            expiry_from_credentials: false,
+            credentials_file: String::new(),
+            self_login_command: default_self_login_command(),
         }
     }
 }
@@ -707,6 +987,38 @@ fn default_reauth_enabled() -> bool {
 
 fn default_reauth_alert_interval() -> u64 {
     10800 // 3 hours
+}
+
+fn default_auth_error_auto_self_login() -> bool {
+    true
+}
+
+fn default_expiry_watch_enabled() -> bool {
+    true
+}
+
+fn default_expiry_auto_self_login() -> bool {
+    true
+}
+
+fn default_expiry_auto_days() -> u32 {
+    1
+}
+
+fn default_self_login_retry_seconds() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_self_login_max_attempts() -> u32 {
+    3
+}
+
+fn default_self_login_abandon_seconds() -> u64 {
+    1800 // 30 minutes
+}
+
+fn default_self_login_command() -> String {
+    "self-login".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -816,7 +1128,7 @@ fn default_update_resume_prompt() -> String {
     // 2026-05-15: q-6477 PR #203 sat green-and-unmerged for ~30 min
     // post-restart until WorkQueueOrphaned fired; this prompt makes
     // that recovery deterministic instead of alert-driven.
-    "You have ALREADY been restarted — this message was injected by claude-watch AFTER the restart completed, so do NOT restart again. Begin post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id>` (reason: agent orphaned across restart). Then resume normal dispatch.".to_string()
+    "You have ALREADY been restarted — this message was injected by claude-watch AFTER the restart completed, so do NOT restart again. Begin post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id> --confirmed-dead --reason 'agent orphaned across restart'` (--confirmed-dead because the restart demonstrably killed in-process agents; a bare abandon quarantines instead, holding the scope). Then resume normal dispatch.".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1000,7 +1312,7 @@ fn default_malformed_override_marker() -> String {
 }
 
 fn default_malformed_nudge() -> String {
-    "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). A one-off: re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn. But if malformed calls KEEP recurring, the render state is poisoned and retrying will just reproduce them — run /clear to reset it instead of re-emitting the same call.".to_string()
+    "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). A one-off: re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is up (watcher-ctl status) and re-run `event-ack ack-batch` if it was an event-ack turn. But if malformed calls KEEP recurring, the render state is poisoned and retrying will just reproduce them — run /clear to reset it instead of re-emitting the same call.".to_string()
 }
 
 fn default_malformed_hard_block_nudge() -> String {
@@ -1300,12 +1612,13 @@ fn default_queue_check_no_binding_grace_secs() -> u64 {
     150
 }
 
-/// Config for the daemon's cadence events. The daemon emits two periodic
-/// claude-events on its own monotonic clock: `heartbeat-tick` (a wake
-/// signal) and `memory-reminder` (the action checklist). This replaces the
-/// out-of-tree self-rescheduling reminder background task. The daemon
-/// NEVER writes the host heartbeat *file* — that stays the main loop's job
-/// so wedge detection still works (see `crate::cadence`).
+/// Config for the daemon's cadence events. The daemon emits two
+/// claude-events on its own monotonic clock: `keepalive` (a quiet-period
+/// poke, emitted ONLY when nothing has been acked for
+/// `keepalive_interval_secs`) and `memory-reminder` (the action checklist).
+/// This replaces the out-of-tree self-rescheduling reminder background task.
+/// The daemon NEVER stamps the liveness timestamp itself — that stays the
+/// main loop's job so wedge detection still works (see `crate::cadence`).
 #[derive(Debug, Deserialize, Clone)]
 pub struct CadenceConfig {
     /// Emit the cadence events. Default true — the whole point of the
@@ -1313,11 +1626,19 @@ pub struct CadenceConfig {
     /// on a host that sources these another way).
     #[serde(default = "default_cadence_enabled")]
     pub enabled: bool,
-    /// Seconds between `heartbeat-tick` events. Defaults to
-    /// [`crate::cadence::HEARTBEAT_TICK_INTERVAL_SECS`] (the single source
-    /// of truth for the value).
-    #[serde(default = "default_heartbeat_tick_interval_secs")]
-    pub heartbeat_tick_interval_secs: u64,
+    /// Quiet window before a `keepalive` event is emitted, in seconds. The
+    /// daemon ticks on this interval but emits ONLY when the last ack is at
+    /// least this old, so an acking loop never sees one. Defaults to
+    /// [`crate::cadence::KEEPALIVE_INTERVAL_SECS`] (the single source of
+    /// truth for the value).
+    ///
+    /// Renamed from `heartbeat_tick_interval_secs` 2026-08-22; the old key is
+    /// still accepted via the serde alias.
+    #[serde(
+        default = "default_keepalive_interval_secs",
+        alias = "heartbeat_tick_interval_secs"
+    )]
+    pub keepalive_interval_secs: u64,
     /// Seconds between `memory-reminder` events. Defaults to
     /// [`crate::cadence::MEMORY_REMINDER_INTERVAL_SECS`] (the single source
     /// of truth for the value).
@@ -1329,7 +1650,7 @@ impl Default for CadenceConfig {
     fn default() -> Self {
         Self {
             enabled: default_cadence_enabled(),
-            heartbeat_tick_interval_secs: default_heartbeat_tick_interval_secs(),
+            keepalive_interval_secs: default_keepalive_interval_secs(),
             memory_reminder_interval_secs: default_memory_reminder_interval_secs(),
         }
     }
@@ -1339,8 +1660,8 @@ fn default_cadence_enabled() -> bool {
     true
 }
 
-fn default_heartbeat_tick_interval_secs() -> u64 {
-    crate::cadence::HEARTBEAT_TICK_INTERVAL_SECS
+fn default_keepalive_interval_secs() -> u64 {
+    crate::cadence::KEEPALIVE_INTERVAL_SECS
 }
 
 fn default_memory_reminder_interval_secs() -> u64 {
@@ -1485,6 +1806,14 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
 pub fn try_load_config() -> Result<Config, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let user_path = format!("{}/.config/claude-watch/config.toml", home);
+    // Highest-precedence, operator-editable RUNTIME override. Path from
+    // $CLAUDE_WATCH_RUNTIME_CONFIG (empty/unset => no runtime layer). The
+    // container points this at a bind-mounted file under
+    // ~/.config/claude-container/ — a SEPARATE file, NOT an overlay over the
+    // config dir ~/.config/claude-watch (overlaying that historically
+    // root-broke the config dir). Editing it + the daemon's mtime auto-reload
+    // (see `config_layers_mtime`) changes cadence live, with no image rebuild.
+    let runtime_path = std::env::var("CLAUDE_WATCH_RUNTIME_CONFIG").unwrap_or_default();
 
     // Base layer: first existing of $CLAUDE_WATCH_CONFIG, then
     // ./config.toml, then the well-known container path
@@ -1544,6 +1873,24 @@ pub fn try_load_config() -> Result<Config, String> {
         loaded_from.push(user_path.clone());
     }
 
+    // Overlay the RUNTIME override LAST (highest precedence). This is the
+    // bind-mounted, operator-editable file ($CLAUDE_WATCH_RUNTIME_CONFIG); it
+    // lets an operator retune cadence (and any other field) WITHOUT rebuilding
+    // the image — pair it with the daemon's config-mtime auto-reload so edits
+    // take effect live. Empty/absent path => no-op (read_layer returns None).
+    if let Some(res) = read_layer(&runtime_path) {
+        let overlay = res?;
+        match merged.as_mut() {
+            Some(base) => merge_toml(base, overlay),
+            None => merged = Some(overlay),
+        }
+        loaded_from.push(runtime_path.clone());
+    }
+
+    if let Some(value) = merged.as_ref() {
+        warn_retired_keys(value, &loaded_from);
+    }
+
     match merged {
         Some(value) => match value.try_into::<Config>() {
             Ok(config) => {
@@ -1561,6 +1908,78 @@ pub fn try_load_config() -> Result<Config, String> {
             Err(format!("no config file found. Tried: {:?}", tried))
         }
     }
+}
+
+/// Keys that were REMOVED (not renamed) and are now silently ignored by
+/// serde. Serde has no hook for "unknown key" here — the loader deliberately
+/// does not `deny_unknown_fields`, because a strict parse would hard-fail a
+/// deployment on a leftover key. So a leftover retired key is invisible, and
+/// an operator can sit for weeks believing a value still does something.
+/// Naming them out loud at load time is the whole mechanism.
+///
+/// Renamed keys are NOT listed here: those still work through their serde
+/// aliases, so warning about them would be noise.
+const RETIRED_CONFIG_KEYS: &[(&str, &str, &str)] = &[(
+    "claude",
+    "heartbeat_file",
+    "the host heartbeat file was retired 2026-08-22 — liveness is now the age \
+     of the last event ack (`[ack] stale_minutes`), stamped by `event-ack \
+     ack-batch`. Delete the key; nothing touches that file any more",
+)];
+
+/// Warn (once per load) about retired keys still present in the merged config.
+fn warn_retired_keys(value: &toml::Value, loaded_from: &[String]) {
+    for (section, key, why) in RETIRED_CONFIG_KEYS {
+        let present = value
+            .get(section)
+            .and_then(|t| t.get(key))
+            .is_some();
+        if present {
+            tracing::warn!(
+                section = section,
+                key = key,
+                paths = ?loaded_from,
+                "IGNORED retired config key [{}] {}: {}",
+                section,
+                key,
+                why
+            );
+            eprintln!(
+                "claude-watch: WARNING: ignoring retired config key [{}] {} — {}",
+                section, key, why
+            );
+        }
+    }
+}
+
+/// All config-layer file paths the loader consults, lowest precedence first,
+/// with unset/empty entries dropped. The daemon samples these files' mtimes
+/// (see [`config_layers_mtime`]) to auto-reload on operator edits — the same
+/// precedence order [`try_load_config`] layers.
+pub fn config_layer_paths() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+    let mut paths = vec![
+        std::env::var("CLAUDE_WATCH_CONFIG").unwrap_or_default(),
+        "config.toml".to_string(),
+        "/etc/claude-watch/config.toml".to_string(),
+        format!("{}/.config/claude-watch/config.toml", home),
+        std::env::var("CLAUDE_WATCH_RUNTIME_CONFIG").unwrap_or_default(),
+    ];
+    paths.retain(|p| !p.is_empty());
+    paths
+}
+
+/// Newest modification time across all existing config-layer files, or `None`
+/// if none exist yet. The daemon samples this each loop pass; when it advances
+/// (an operator edited a bind-mounted config / runtime-override file) the
+/// daemon reloads config WITHOUT a manual SIGHUP, so cadence (and any other)
+/// tunables take effect live — no image rebuild, no redeploy.
+pub fn config_layers_mtime() -> Option<std::time::SystemTime> {
+    config_layer_paths()
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .filter_map(|m| m.modified().ok())
+        .max()
 }
 
 /// Parse config from a TOML string. Useful for testing.
@@ -2018,14 +2437,13 @@ cooldown = 300
         assert_eq!(config.foreground_monitor.thinking_backoff_multiplier, 2);
         // Token-progress guard default (no min_tokens_delta key in SAMPLE_CONFIG).
         assert_eq!(config.foreground_monitor.min_tokens_delta, 2000);
-        // Heartbeat-freshness gate default (no heartbeat_fresh_secs key in
-        // SAMPLE_CONFIG).
-        assert_eq!(config.foreground_monitor.heartbeat_fresh_secs, 600);
+        // Ack-freshness gate default (no ack_fresh_secs key in SAMPLE_CONFIG).
+        assert_eq!(config.foreground_monitor.ack_fresh_secs, 600);
         assert_eq!(config.tmux.dashboard_pane, "dashboard:0.0");
         assert_eq!(config.claude.max_context_tokens, 200000);
         assert_eq!(config.dead_process.checks_required, 3);
         assert_eq!(config.fresh_clear.min_tokens, 1000);
-        assert_eq!(config.heartbeat.stale_minutes, 15);
+        assert_eq!(config.ack.stale_minutes, 15);
         assert_eq!(config.alerts.escalation_tiers.len(), 5);
         assert!(config.foreground_monitor.enabled);
         assert!(config.watcher_monitor.enabled);
@@ -2040,6 +2458,9 @@ cooldown = 300
         // Health-grace default (no health_grace_secs key in SAMPLE_CONFIG).
         // KNOB #1 (2026-06-24): default raised 30 -> 180.
         assert_eq!(config.watcher_monitor.health_grace_secs, 180);
+        // Monitor-mode ARMING grace default (no key in SAMPLE_CONFIG).
+        assert_eq!(config.watcher_monitor.monitor_arming_grace_secs, 120);
+        assert_eq!(DEFAULT_MONITOR_ARMING_GRACE_SECS, 120);
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
         assert!(config.task_watch.enabled);
@@ -2049,6 +2470,53 @@ cooldown = 300
         assert_eq!(config.task_watch.agent_done_delay, 120);
         assert_eq!(config.task_watch.max_panes, 20);
         assert!(!config.task_watch.show_all);
+    }
+
+    /// The proactive-expiry knobs must all default without appearing in the
+    /// file. `[reauth]` predates them, so every existing deployment's config
+    /// is missing them and would fail to load if any were required.
+    #[test]
+    fn test_reauth_expiry_defaults_apply_to_a_config_that_predates_them() {
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert!(config.reauth.expiry_watch_enabled);
+        assert!(config.reauth.expiry_auto_self_login);
+        assert!(config.reauth.auth_error_auto_self_login);
+        assert_eq!(config.reauth.expiry_auto_days, 1);
+        assert_eq!(config.reauth.self_login_retry_seconds, 3600);
+        assert_eq!(config.reauth.self_login_max_attempts, 3);
+        assert_eq!(config.reauth.self_login_abandon_seconds, 1800);
+        assert!(!config.reauth.expiry_from_credentials);
+        assert_eq!(config.reauth.credentials_file, "");
+        assert_eq!(config.reauth.self_login_command, "self-login");
+    }
+
+    /// Auto-fire must be switchable off WITHOUT losing the reactive path or
+    /// the warning itself — "tell me, I'll handle it" is a supported mode.
+    #[test]
+    fn test_reauth_expiry_knobs_are_overridable() {
+        let toml = SAMPLE_CONFIG.replace(
+            "[reauth]\nenabled = true\nalert_interval_seconds = 10800\n",
+            "[reauth]\n\
+             enabled = true\n\
+             alert_interval_seconds = 10800\n\
+             expiry_auto_self_login = false\n\
+             auth_error_auto_self_login = false\n\
+             expiry_auto_days = 2\n\
+             self_login_abandon_seconds = 0\n\
+             self_login_command = \"/usr/local/bin/self-login\"\n",
+        );
+        assert!(
+            toml.contains("expiry_auto_days"),
+            "the [reauth] block moved; this test would have silently asserted defaults"
+        );
+        let config = parse_config(&toml).unwrap();
+        assert!(config.reauth.enabled);
+        assert!(config.reauth.expiry_watch_enabled);
+        assert!(!config.reauth.expiry_auto_self_login);
+        assert!(!config.reauth.auth_error_auto_self_login);
+        assert_eq!(config.reauth.expiry_auto_days, 2);
+        assert_eq!(config.reauth.self_login_abandon_seconds, 0);
+        assert_eq!(config.reauth.self_login_command, "/usr/local/bin/self-login");
     }
 
     #[test]
@@ -2124,38 +2592,81 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_stale_prompt_defaults_when_absent() {
-        // SAMPLE_CONFIG has no `heartbeat_stale_prompt` in [alerts] — the
-        // field must default (backward compat: existing configs in the field
-        // never set it) rather than fail to parse.
+    fn test_ack_stale_prompt_defaults_when_absent() {
+        // SAMPLE_CONFIG has no `ack_stale_prompt` in [alerts] — the field must
+        // default (backward compat: existing configs in the field never set
+        // it) rather than fail to parse.
         let config = parse_config(SAMPLE_CONFIG).unwrap();
-        let p = &config.alerts.heartbeat_stale_prompt;
-        assert!(!p.is_empty(), "heartbeat_stale_prompt should default non-empty");
+        let p = &config.alerts.ack_stale_prompt;
+        assert!(!p.is_empty(), "ack_stale_prompt should default non-empty");
     }
 
     #[test]
-    fn test_default_heartbeat_stale_prompt_targets_the_heartbeat_file() {
-        // The whole point of the heartbeat-stale recovery inject is to restore
-        // liveness by touching the host heartbeat file. A generic /cleanup
-        // directive (the old `resume_prompt`) left the file stale even after
-        // the inject landed (2026-06-19 incident). Pin that the default prompt
-        // actually names the file and the touch action.
-        let p = default_heartbeat_stale_prompt();
+    fn test_post_clear_resume_prompt_defaults_when_absent() {
+        // Same backward-compat contract as ack_stale_prompt: configs
+        // already deployed in the field don't carry the key.
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
         assert!(
-            p.contains("/var/run/claude/claude-heartbeat"),
-            "heartbeat-stale prompt must name the heartbeat file path; got: {p:?}"
-        );
-        assert!(
-            p.contains("touch"),
-            "heartbeat-stale prompt must instruct touching the file; got: {p:?}"
+            !config.alerts.post_clear_resume_prompt.is_empty(),
+            "post_clear_resume_prompt should default non-empty"
         );
     }
 
     #[test]
-    fn test_default_heartbeat_stale_prompt_is_single_line() {
+    fn test_default_post_clear_resume_prompt_makes_no_background_task_claim() {
+        // 2026-08-20: the post-clear gate injected the generic stuck-state
+        // resume_prompt, which asserts "no background tasks running and not
+        // thinking" and asks for /cleanup. The gate is designed to fire WITH
+        // background shells alive, and the daemon's own log line for the
+        // inject records the live count — so that wording states something
+        // already measured to be false, and points recovery at the wrong
+        // thing. Pin both properties out of the default.
+        let p = default_post_clear_resume_prompt();
+        assert!(
+            !p.contains("no background tasks"),
+            "post-clear prompt must not claim background tasks are idle — the \
+             gate exists for the case where they are still running; got: {p:?}"
+        );
+        assert!(
+            !p.contains("/cleanup"),
+            "post-clear prompt must not direct a watcher cleanup; got: {p:?}"
+        );
+        assert!(
+            !p.contains('\n'),
+            "post-clear prompt must be single-line for the tmux inject \
+             pipeline; got: {p:?}"
+        );
+        assert!(
+            p.contains("[CLAUDE-WATCH]"),
+            "post-clear prompt must be tagged as a daemon interrupt; got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_ack_stale_prompt_names_the_one_ack_command() {
+        // The whole point of the ack-stale recovery inject is to restore
+        // liveness by ACKING. A generic /cleanup directive (the old
+        // `resume_prompt`) left liveness stale even after the inject landed
+        // (2026-06-19 incident). Pin that the default prompt names the exact
+        // one-command reflex — and that the retired heartbeat-file `touch`
+        // ritual has not crept back in.
+        let p = default_ack_stale_prompt();
+        assert!(
+            p.contains("event-ack ack-batch"),
+            "ack-stale prompt must name the per-batch ack command; got: {p:?}"
+        );
+        assert!(
+            !p.contains("touch") && !p.to_lowercase().contains("heartbeat file"),
+            "ack-stale prompt must not resurrect the retired heartbeat-file \
+             touch ritual; got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_ack_stale_prompt_is_single_line() {
         // The tmux inject pipeline (inject_text) assumes a single-line
         // payload; a newline would split the submission.
-        let p = default_heartbeat_stale_prompt();
+        let p = default_ack_stale_prompt();
         assert!(
             !p.contains('\n'),
             "heartbeat-stale prompt must be single-line (tmux inject assumes single-line); got: {p:?}"
@@ -2163,13 +2674,13 @@ cooldown = 300
     }
 
     #[test]
-    fn test_default_heartbeat_stale_prompt_has_no_raw_tool_call_tags() {
+    fn test_default_ack_stale_prompt_has_no_raw_tool_call_tags() {
         // The prompt is a plain-text DIRECTIVE the loop reads to emit its OWN
         // well-formed tool call. It must NOT itself contain raw `<invoke>` /
         // `<parameter>` tags: injecting those as pane text is the
         // malformed-tool-call failure mode the daemon guards against — such
         // text renders as prose and is silently dropped (never runs).
-        let p = default_heartbeat_stale_prompt();
+        let p = default_ack_stale_prompt();
         assert!(
             !p.contains("<invoke") && !p.contains("<parameter"),
             "heartbeat-stale prompt must not embed raw tool-call tags; got: {p:?}"
@@ -2177,18 +2688,134 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_stale_prompt_override_parses() {
+    fn test_default_ack_stale_prompt_retired_heartbeat_ack() {
+        // heartbeat-ack was RETIRED 2026-08-21 (#649 ack-driven redesign):
+        // ANY ack refreshes liveness, so there is no distinct "heartbeat ack"
+        // step anymore. The default prompt must point at `event-ack`, not the
+        // retired wrapper.
+        let p = default_ack_stale_prompt();
+        assert!(
+            !p.contains("heartbeat-ack"),
+            "ack-stale prompt must not reference the retired heartbeat-ack wrapper; got: {p:?}"
+        );
+        assert!(
+            p.contains("event-ack"),
+            "ack-stale prompt must point at event-ack; got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_ack_stale_prompt_override_parses() {
         // An explicit override in [alerts] is honored. Inject the key into the
         // existing [alerts] section (appending to the end of SAMPLE_CONFIG
         // would land it under a later section, not [alerts]).
         let cfg_str = SAMPLE_CONFIG.replace(
             "resume_prompt = \"Resume your work.\"",
-            "resume_prompt = \"Resume your work.\"\nheartbeat_stale_prompt = \"custom hb recovery: touch /var/run/claude/heartbeat\"",
+            "resume_prompt = \"Resume your work.\"\nack_stale_prompt = \"custom recovery: event-ack ack-batch\"",
         );
         let config = parse_config(&cfg_str).unwrap();
         assert_eq!(
-            config.alerts.heartbeat_stale_prompt,
-            "custom hb recovery: touch /var/run/claude/heartbeat"
+            config.alerts.ack_stale_prompt,
+            "custom recovery: event-ack ack-batch"
+        );
+    }
+
+    #[test]
+    fn test_legacy_heartbeat_stale_prompt_key_still_parses() {
+        // Compat: a config still carrying the pre-2026-08-22 key name must
+        // keep working through the serde alias — a rename must not silently
+        // drop an operator's customised recovery prompt back to the default.
+        let cfg_str = SAMPLE_CONFIG.replace(
+            "resume_prompt = \"Resume your work.\"",
+            "resume_prompt = \"Resume your work.\"\nheartbeat_stale_prompt = \"legacy key wins\"",
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert_eq!(config.alerts.ack_stale_prompt, "legacy key wins");
+    }
+
+    #[test]
+    fn test_legacy_heartbeat_section_still_parses_as_ack() {
+        // Compat: `[heartbeat] stale_minutes` is the pre-rename spelling of
+        // `[ack] stale_minutes`. SAMPLE_CONFIG still uses it, so this asserts
+        // the ALIAS specifically rather than the default.
+        let cfg_str = SAMPLE_CONFIG.replace(
+            "[heartbeat]\nstale_minutes = 15",
+            "[heartbeat]\nstale_minutes = 42",
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert_eq!(
+            config.ack.stale_minutes, 42,
+            "[heartbeat] must still populate [ack]"
+        );
+    }
+
+    #[test]
+    fn test_ack_section_parses_and_wins_over_default() {
+        // The NEW spelling. Rewrite the fixture's legacy section header rather
+        // than appending a second one — an alias and its target are the SAME
+        // serde field, so having both present is a duplicate, not an override.
+        let cfg_str = SAMPLE_CONFIG.replace(
+            "[heartbeat]\nstale_minutes = 15",
+            "[ack]\nstale_minutes = 7",
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert_eq!(config.ack.stale_minutes, 7);
+    }
+
+    #[test]
+    fn test_ack_stale_minutes_default_exceeds_two_keepalive_intervals() {
+        // The stale window must be comfortably wider than the keepalive quiet
+        // window, or a SINGLE missed/undelivered keepalive reads as a wedge.
+        // This is the invariant that makes the one-signal design safe, so pin
+        // it rather than leaving it to two independently-edited literals.
+        let stale_secs = default_ack_stale_minutes() * 60;
+        let keepalive = default_keepalive_interval_secs();
+        assert!(
+            stale_secs >= 2 * keepalive,
+            "ack.stale_minutes ({stale_secs}s) must be >= 2x the keepalive \
+             interval ({keepalive}s)"
+        );
+    }
+
+    #[test]
+    fn test_legacy_cadence_interval_key_still_parses() {
+        // Compat: `heartbeat_tick_interval_secs` is the pre-rename spelling.
+        let cfg_str = format!(
+            "{}\n[cadence]\nenabled = true\nheartbeat_tick_interval_secs = 111\n",
+            SAMPLE_CONFIG
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert_eq!(config.cadence.keepalive_interval_secs, 111);
+    }
+
+    #[test]
+    fn test_retired_heartbeat_file_key_is_ignored_not_fatal() {
+        // `[claude] heartbeat_file` was REMOVED (not renamed) 2026-08-22.
+        // A config still carrying it must parse — a leftover key must never
+        // hard-fail a deployment — and the loader warns about it separately
+        // (see `warn_retired_keys` / RETIRED_CONFIG_KEYS).
+        assert!(
+            SAMPLE_CONFIG.contains("heartbeat_file"),
+            "fixture should still carry the retired key for this test to mean \
+             anything"
+        );
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert_eq!(config.claude.max_context_tokens, 200000);
+    }
+
+    #[test]
+    fn test_retired_config_keys_are_named_for_the_warning() {
+        // The warning is the ONLY signal an operator gets that a key stopped
+        // doing anything, so pin that heartbeat_file is registered and that
+        // the explanation points at what replaced it.
+        let entry = RETIRED_CONFIG_KEYS
+            .iter()
+            .find(|(section, key, _)| *section == "claude" && *key == "heartbeat_file")
+            .expect("claude.heartbeat_file must be registered as retired");
+        assert!(
+            entry.2.contains("event-ack"),
+            "retired-key explanation must point at the replacement; got: {:?}",
+            entry.2
         );
     }
 
@@ -2620,8 +3247,8 @@ cooldown = 300
     }
 
     #[test]
-    fn test_parse_config_heartbeat_fresh_secs_override() {
-        // An explicit heartbeat_fresh_secs in [foreground_monitor] must
+    fn test_parse_config_ack_fresh_secs_override() {
+        // An explicit ack_fresh_secs in [foreground_monitor] must
         // override the 600 default; 0 (gate disabled) must round-trip too.
         let base = |value: u64| {
             format!(
@@ -2680,10 +3307,13 @@ cooldown = 300
 "#
             )
         };
-        let config = parse_config(&base(1200)).expect("should parse heartbeat_fresh_secs override");
-        assert_eq!(config.foreground_monitor.heartbeat_fresh_secs, 1200);
-        let config = parse_config(&base(0)).expect("should parse heartbeat_fresh_secs = 0");
-        assert_eq!(config.foreground_monitor.heartbeat_fresh_secs, 0);
+        // NB: the fixture still writes the LEGACY key name, so this also
+        // pins the serde alias — an operator's tuned value must survive the
+        // rename rather than silently reverting to the default.
+        let config = parse_config(&base(1200)).expect("should parse ack_fresh_secs override");
+        assert_eq!(config.foreground_monitor.ack_fresh_secs, 1200);
+        let config = parse_config(&base(0)).expect("should parse ack_fresh_secs = 0");
+        assert_eq!(config.foreground_monitor.ack_fresh_secs, 0);
     }
 
     #[test]
@@ -2791,5 +3421,41 @@ legacy_log_file = "/tmp/ll"
         // newline.
         assert!(!nudge.contains('\n'), "phase-1 nudge must stay single-line");
         assert!(!hard.contains('\n'), "phase-2 hard block must stay single-line");
+    }
+
+    #[test]
+    fn test_runtime_override_layer_wins_for_cadence() {
+        // The runtime-override layer is the operator-editable, bind-mounted
+        // file that makes cadence retunable WITHOUT an image rebuild. Model the
+        // layering here: a baked base (memory-reminder = 3600, like the
+        // in-container config #612 bakes) with a runtime overlay dropping it to
+        // 600 must merge to 600 and still parse into a full Config. Uses
+        // merge_toml directly so the test is pure (no env/filesystem). Appends
+        // a [cadence] table to SAMPLE_CONFIG (which omits one, relying on the
+        // struct default) to stand in for the baked base layer.
+        let base_toml = format!(
+            "{}\n[cadence]\nenabled = true\nmemory_reminder_interval_secs = 3600\n",
+            SAMPLE_CONFIG
+        );
+        let mut base: toml::Value = toml::from_str(&base_toml).unwrap();
+        // Sanity: the base really carries the baked 3600 value.
+        assert_eq!(
+            base.get("cadence")
+                .and_then(|c| c.get("memory_reminder_interval_secs"))
+                .and_then(|v| v.as_integer()),
+            Some(3600)
+        );
+        let overlay: toml::Value =
+            toml::from_str("[cadence]\nmemory_reminder_interval_secs = 600\n").unwrap();
+        merge_toml(&mut base, overlay);
+        let config: Config = base.try_into().unwrap();
+        // Runtime overlay wins.
+        assert_eq!(config.cadence.memory_reminder_interval_secs, 600);
+        // A field the overlay did NOT set falls back to the code default
+        // (keepalive interval), proving the merge is per-field, not wholesale.
+        assert_eq!(
+            config.cadence.keepalive_interval_secs,
+            crate::cadence::KEEPALIVE_INTERVAL_SECS
+        );
     }
 }

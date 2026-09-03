@@ -52,6 +52,8 @@ Known job-names (one per `cw-default` entry):
 | `stale-ready-check` | `claude-watch stale-ready-check` (stale-ready watchdog) |
 | `queue-check` | `claude-watch queue-check` (orphaned/stuck watchdog) |
 | `watcher-health-check` | `cw-watcher-health-check` (dead-event-watcher [CLAUDE-WATCH] injector) |
+| `session-rotate` | `session-task queue rotate` (daily queue-logs prune + completed-tasks.jsonl roll) |
+| `hostjob-reconcile` | `session-task queue reconcile-hostjobs` (every 10 min; GC leaked hostjob rows — dropped-flip `running` + exit-`quarantined` — that pin their `hostjob:*` scope) |
 
 ### Silence the incident job right now
 

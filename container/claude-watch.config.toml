@@ -11,17 +11,28 @@
 #   - dashboard_pane = "claude-container:0.0" (the claude pane is left/main,
 #     pane 1 — this one — is the sidecar reading pane 0).
 #   - File paths follow the FHS: logs under /var/log/claude-watch/,
-#     runtime (locks, heartbeat, relaunch script) under /var/run/claude/,
+#     runtime (locks, relaunch script) under /var/run/claude/,
 #     persistent state under /var/lib/claude-watch/. All three are
 #     pre-created uid-1000-owned by the Dockerfile so the in-container
 #     daemon (uid 1000) writes them without root or runtime mkdir.
 #   - auto_update / reauth / hybrid hooks disabled (host integrations).
-#   - task_watch disabled (no in-container `tasks` session yet).
 # Phase 1e (q-2026-05-11-8a96).
 
 [general]
 check_interval = 5
-state_file = "/home/hndrewaall/.cache/claude-watch/state.json"
+# Persist the daemon's main state on the DURABLE named volume mounted at
+# /var/lib/claude-watch (compose service `claude-watch-state`), NOT the
+# ephemeral container-local ~/.cache. This is where every OTHER piece of
+# daemon state already lives (active-agents.json, queue-check-state.json,
+# stale-ready-state.json — see src/{queue_check,stale_ready}.rs
+# default_state_dir()). Keeping the main state.json here was the root cause of
+# `last_context_clear` (the `claude_last_context_clear_timestamp_seconds`
+# gauge) — and every cumulative `*_interrupts_total` counter — vanishing on a
+# `docker compose up --force-recreate`: ~/.cache is wiped with the container
+# FS, so the persisted timestamp was lost until the next observed /clear
+# (q-2026-08-18-e509). The metrics reader resolves the same path via
+# general.state_file, so daemon + emitter stay in sync.
+state_file = "/var/lib/claude-watch/state.json"
 log_file = "/var/log/claude-watch/claude-watch.jsonl"
 legacy_log_file = "/var/log/claude-watch/claude-watch.log"
 # Global post-interrupt cooldown (seconds): 5-min outer ceiling on ALL
@@ -50,8 +61,17 @@ focus_main_keys = []
 
 [claude]
 max_context_tokens = 1000000
-heartbeat_file = "/var/run/claude/claude-heartbeat"
+# heartbeat_file was REMOVED 2026-08-22 -- liveness is the age of the main
+# loop's last event ack ([ack] below), not a file the loop touches.
 relaunch_script = "/var/run/claude/claude-relaunch.sh"
+# Bypass-Permissions consent dialog handling (see config.toml for the full
+# rationale). In the container the relaunch argv passes
+# `--setting-sources project,local --settings <shim>`, which DROPS the user
+# settings tier -- so the pre-accept also writes the acceptance into the shim
+# file named by CLAUDE_SHIM_SETTINGS_PATH when it already exists.
+handle_bypass_dialog = true
+pre_accept_bypass_dialog = true
+bypass_dialog_wait_secs = 60
 
 [dead_process]
 checks_required = 3
@@ -70,8 +90,13 @@ max_tokens = 5000
 detections_required = 2
 cooldown = 120
 
-[heartbeat]
-stale_minutes = 10
+[ack]
+# Minutes without ANY claude-event ack before the loop reads as wedged. The
+# loop stamps this by running `event-ack ack-batch` after each event batch;
+# the daemon emits a `keepalive` event once nothing has been acked for
+# [cadence] keepalive_interval_secs, so even an idle loop has something to
+# ack. Renamed from [heartbeat] 2026-08-22; the old name still parses.
+stale_minutes = 20
 
 [queue_check]
 # Enable in-tree stuck/orphaned queue-item detection events. The cron
@@ -95,6 +120,19 @@ emit_events = true
 # Grace window (seconds) before a running item with no active-agent binding
 # is flagged orphaned (never-spawned case). Default 150.
 no_binding_grace_secs = 150
+
+# --- Event-watcher health check (cw-watcher-health-check cron) --------------
+# CONSUMED BY THE cw-watcher-health-check CRON SCRIPT, not the claude-watch
+# daemon (the daemon ignores unknown sections). Sets how many minutes a
+# claude-event may sit unconsumed in the spool dir before the script injects a
+# "[CLAUDE-WATCH] WATCHER DOWN: N event(s) unconsumed >Nmin" recovery alert.
+# Default 6 -- >= 2x the event watcher's ~3min ($EVENT_WATCH_DEBOUNCE_SECONDS=180)
+# debounce window, so a normal debounce never false-fires before the batch
+# surfaces. Tunable LIVE (next cron tick) via the runtime override
+# ($CLAUDE_WATCH_RUNTIME_CONFIG); an explicit CW_WATCHER_HEALTH_STALE_MIN env
+# var still pins/overrides it.
+#[watcher_health]
+#stale_minutes = 6
 
 [alerts]
 initial_cooldown = 600
@@ -125,6 +163,12 @@ enabled = true
 # Baked in-container watcher list. Format documented in the file.
 # Currently registers: claude-event-watch (fire-and-exit event watcher).
 watchers_config = "/opt/claude-container/watchmen/watchers.conf"
+# OVERRIDE layer: the operator-editable, bind-mounted user config dir
+# ($HOME/.config/claude-container/ — $HOME inside the container is
+# /home/hndrewaall). Same-named entries override the baked list field-by-
+# field (`claude-event-watch|mode=monitor`); unknown names are appended;
+# a missing file is a silent no-op. Must match the WATCHERS_CONFIG_EXTRA the
+# entrypoint exports so `watcher-ctl` and this daemon see one layered view.
 watchers_config_extra = "/home/hndrewaall/.config/claude-container/watchers/watchers.conf"
 # Used only for the legacy host-side `bin/watchmen` daemon count.
 # Zero in container -- no host-side watchmen daemon runs here.
@@ -171,8 +215,15 @@ inject_cooldown = 300
 # WATCHER(S) DOWN flap during the busy-loop restart gap. Genuine down is
 # preserved: a crash writes no fresh marker (marker older than the rewritten
 # pidfile → DOWN fires); a dead session's marker ages past the window and
-# heartbeat-stale / dead_process catch it independently. 0 disables.
+# ack-stale / dead_process catch it independently. 0 disables.
 clean_exit_grace_secs = 600
+# monitor_arming_grace_secs: ARMING window for `mode=monitor` watchers. After
+# `watcher-ctl run <name>` prints the Monitor command (and writes
+# `<name>.monitor-intent`) the watcher reads ARMING — healthy-pending, not
+# DOWN — for this long (unless a runtime file supersedes the intent), so the
+# obligations gate / WATCHER(S) DOWN do not fire in the print→arm gap. A live
+# pidfile flips it to ok; past the window with no pid it is DOWN again.
+monitor_arming_grace_secs = 120
 # max_suppress_secs (per-watcher watcher-down suppression CAP), 2026-08-12.
 # active-turn suppression drops the in-pane watcher-down inject while the main
 # loop is busy (the out-of-band claude-event still fires). Bug: during a long
@@ -227,8 +278,30 @@ relaunch_command = ["cwsr", "--no-upgrade"]
 enabled = false
 
 [task_watch]
-# Disabled — no in-container `tasks` session yet.
-enabled = false
+# ENABLED. The original "no in-container `tasks` session yet" note went stale:
+# the image pre-creates /var/run/claude/workload-state uid-1000-owned so
+# `workload run` works, and `workload run` / `claude-watch task init` create
+# the `tasks` session in the container's own tmux server.
+#
+# `enabled` also decides what pane 0 of that session RUNS. With `false`,
+# `task init` put the LEGACY `task-watch daemon` there — a Python CLI that is
+# not in this image. The pane command exited instantly, tmux destroyed the
+# only pane, and the session was gone microseconds after `task init` printed
+# "Session 'tasks' created, daemon running in pane 0" — so `workload run` /
+# `workload kill` were unusable in the container (operator report,
+# 2026-08-22). With `true`, pane 0 gets claude-watch's keepalive stub
+# (`echo ...; sleep infinity`) and the in-process task-watch loop manages the
+# task panes.
+#
+# `task init` now ALSO falls back to the stub whenever `task-watch` is absent
+# from PATH (src/task_watch.rs::daemon_pane_command), so a missing binary can
+# never silently kill the session again. This flag is the intent; that is the
+# safety net.
+#
+# The loop's TASKS_BASE (/tmp/claude-1000/-home-hndrewaall) matches this
+# image's uid-1000 `hndrewaall` home, so it finds the in-container Claude Code
+# task outputs; with no tasks directory present it just idles.
+enabled = true
 
 [suppression]
 max_consecutive_suppressions = 3
@@ -260,3 +333,22 @@ enabled = false
 # container — calling it would fall straight through to LaunchFailed).
 enabled = false
 respawn_command = ["cwsr", "--no-upgrade"]
+
+[cadence]
+# Daemon-emitted cadence claude-events (keepalive + memory-reminder).
+# See the top-level config.toml [cadence] section and src/cadence.rs for the
+# full contract. Container-specific override: the memory-reminder cadence is
+# stretched from the 30-min code default to 1 hour for this deployment
+# (operator directive, botchat #4712) — the reminder checklist (update logs,
+# commit + push repos) is heavier-touch than a 30-min beat warrants here.
+# keepalive_interval_secs is left unset -> inherits the 300s (5-min) code
+# default. This is a plain daemon config VALUE, not an overlay mount.
+#
+# NOTE: this value is the baked DEFAULT — frozen into the image. To retune the
+# cadence WITHOUT a rebuild + redeploy, edit the operator runtime override at
+# ~/.config/claude-container/claude-watch.override.toml on the host (a separate
+# bind-mounted file, seeded commented on first boot). The daemon layers it on
+# top of this file and auto-reloads on its mtime change, so edits take effect
+# live. See $CLAUDE_WATCH_RUNTIME_CONFIG in container/entrypoint.sh.
+enabled = true
+memory_reminder_interval_secs = 3600

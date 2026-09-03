@@ -280,6 +280,56 @@ pub fn find_claude_pid_with_paths(versions_dir: &str, container_mode: bool) -> O
     None
 }
 
+/// Every live Claude Code PID, using the same `/proc/<pid>/exe` predicate as
+/// [`find_claude_pid`] but WITHOUT stopping at the first hit.
+///
+/// `find_claude_pid` deliberately returns the first match in `/proc` readdir
+/// order. That is fine for "is Claude up / who do I inject into", but it is
+/// order-dependent whenever more than one claude binary is live at once — and
+/// that happens routinely: short-lived `claude -p` invocations (hooks,
+/// tooling) exec the SAME versions-dir binary as the long-running main loop,
+/// so a point-in-time single-pid lookup can land on a process that is
+/// milliseconds old. Callers that need to reason about the SESSION (e.g. the
+/// process-age gauge in `metrics`) must see every candidate and pick
+/// deliberately — normally the OLDEST, which is the main loop.
+///
+/// Returns pids in `/proc` readdir order; empty when `/proc` is unreadable or
+/// nothing matches. Honors `CLAUDE_WATCH_CONTAINER_MODE` like
+/// [`find_claude_pid`].
+pub fn find_claude_pids() -> Vec<u32> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+    let versions_dir = format!("{}/.local/share/claude/versions", home);
+    let container_mode = std::env::var("CLAUDE_WATCH_CONTAINER_MODE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    find_claude_pids_with_paths(&versions_dir, container_mode)
+}
+
+/// Pure variant of [`find_claude_pids`]: caller supplies the versions-dir
+/// prefix and the container-mode toggle, so tests need not mutate process env.
+pub fn find_claude_pids_with_paths(versions_dir: &str, container_mode: bool) -> Vec<u32> {
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut pids = Vec::new();
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        // Non-numeric /proc entries (`self`, `net`, ...) fail the parse and
+        // are skipped; no separate is-all-digits guard needed.
+        let pid: u32 = match name.to_string_lossy().parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid_is_claude(pid, versions_dir, container_mode) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
 /// Get all direct child processes of a PID.
 pub fn get_children(ppid: u32) -> Vec<ChildProcess> {
     let output = match std::process::Command::new("ps")
@@ -1676,12 +1726,14 @@ mod tests {
                 queue_id: Some("q-2026-07-11-abcd".to_string()),
                 alive: true,
                 jsonl_age_seconds: Some(15),
+                in_flight_tool_use: false,
             },
             AgentRecord {
                 agent_id: "a0000000000000000".to_string(),
                 queue_id: None,
                 alive: true,
                 jsonl_age_seconds: None,
+                in_flight_tool_use: false,
             },
         ];
         let w = format_in_process_warning(&live, 600).expect("warning");

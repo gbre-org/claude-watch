@@ -25,6 +25,19 @@ Wire shape:
   -> 413 {"ok": false, "error": "..."}   when body > MAX_BYTES
   -> 415 {"ok": false, "error": "..."}   on unsupported Content-Type
 
+  POST /theme-report  (dynamic-theme feature)
+    Content-Type: application/json body: {"theme": "dark"|"light"}
+    Content-Type: text/plain       body: dark | light
+
+  Atomically writes the bare value to THEME_DEST_PATH on the shared
+  volume; the sibling claude-container's cw-theme-sync daemon reads it
+  and injects `/config theme=<x>` so the Claude Code TUI theme follows
+  the browser's prefers-color-scheme.
+
+  -> 200 {"ok": true, "theme": "dark"}   on success
+  -> 400 {"ok": false, "error": "..."}   on malformed / invalid value
+  -> 415 {"ok": false, "error": "..."}   on unsupported Content-Type
+
 Health:
   GET /healthz -> 200 "ok\n"
 """
@@ -53,6 +66,17 @@ MAX_BYTES = 10 * 1024 * 1024
 # Default destination on the shared volume. Override with
 # CLIPBOARD_DEST_PATH (handy for tests).
 DEFAULT_DEST = "/host-clipboard/clipboard.png"
+
+# Browser colour-scheme report destination (dynamic-theme feature). The
+# ttyd frontend POSTs {"theme":"dark"|"light"} to /theme-report; we write
+# the bare value to this file on the shared volume, where the sibling
+# claude-container's cw-theme-sync daemon reads it and injects
+# `/config theme=<x>` into the Claude Code TUI. Override with
+# THEME_DEST_PATH. Rides on the same shared volume as the clipboard file.
+DEFAULT_THEME_DEST = "/host-clipboard/theme"
+
+# Accepted colour-scheme values (what prefers-color-scheme can express).
+VALID_THEMES = ("dark", "light")
 
 log = logging.getLogger("clipboard-upload")
 
@@ -180,6 +204,63 @@ async def handle_upload(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "bytes": n})
 
 
+def validate_theme(content_type: str, raw_body: bytes) -> str:
+    """Pure: return "dark"/"light" or raise ValidationError.
+
+    Accepts either a JSON body {"theme": "dark"|"light"} or a bare
+    text/plain body of "dark"/"light" (case-insensitive, whitespace
+    trimmed). Kept tiny + side-effect-free so tests can exercise it
+    without the aiohttp server.
+    """
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct in ("application/json", ""):
+        # Default to JSON when unspecified (the frontend sends JSON).
+        try:
+            obj = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise ValidationError(400, f"invalid JSON body: {e}") from e
+        if not isinstance(obj, dict) or "theme" not in obj:
+            raise ValidationError(400, 'JSON body must be {"theme": "dark|light"}')
+        val = obj["theme"]
+        if not isinstance(val, str):
+            raise ValidationError(400, "theme must be a string")
+    elif ct in ("text/plain", "application/x-www-form-urlencoded"):
+        try:
+            val = raw_body.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise ValidationError(400, f"body not UTF-8: {e}") from e
+    else:
+        raise ValidationError(
+            415, "Content-Type must be application/json or text/plain"
+        )
+    val = val.strip().lower()
+    if val not in VALID_THEMES:
+        raise ValidationError(
+            400, f"theme must be one of {VALID_THEMES}, got {val!r}"
+        )
+    return val
+
+
+async def handle_theme_report(request: web.Request) -> web.Response:
+    """POST /theme-report — validate + atomic-write the colour scheme."""
+    raw = await request.read()
+    try:
+        theme = validate_theme(request.headers.get("Content-Type", ""), raw)
+    except ValidationError as e:
+        return _err(e.status, e.message)
+
+    dest = Path(request.app["theme_dest_path"])
+    try:
+        atomic_write(dest, (theme + "\n").encode("utf-8"))
+    except OSError as e:
+        log.exception("theme atomic_write failed: %s", e)
+        return _err(500, f"write failed: {e}")
+
+    uid = request.headers.get("X-Auth-Uid", "-")
+    log.info("theme report ok uid=%s theme=%s dest=%s", uid, theme, dest)
+    return web.json_response({"ok": True, "theme": theme})
+
+
 async def handle_health(_request: web.Request) -> web.Response:
     return web.Response(text="ok\n")
 
@@ -188,10 +269,15 @@ def _err(status: int, message: str) -> web.Response:
     return web.json_response({"ok": False, "error": message}, status=status)
 
 
-def make_app(dest_path: str = DEFAULT_DEST) -> web.Application:
+def make_app(
+    dest_path: str = DEFAULT_DEST,
+    theme_dest_path: str = DEFAULT_THEME_DEST,
+) -> web.Application:
     app = web.Application(client_max_size=MAX_BYTES + 1024)
     app["dest_path"] = dest_path
+    app["theme_dest_path"] = theme_dest_path
     app.router.add_post("/clipboard-upload", handle_upload)
+    app.router.add_post("/theme-report", handle_theme_report)
     app.router.add_get("/healthz", handle_health)
     return app
 
@@ -202,9 +288,15 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     dest = os.environ.get("CLIPBOARD_DEST_PATH", DEFAULT_DEST)
+    theme_dest = os.environ.get("THEME_DEST_PATH", DEFAULT_THEME_DEST)
     port = int(os.environ.get("PORT", "9701"))
-    log.info("clipboard-upload starting on :%d dest=%s", port, dest)
-    web.run_app(make_app(dest), host="0.0.0.0", port=port, print=None)
+    log.info(
+        "clipboard-upload starting on :%d dest=%s theme_dest=%s",
+        port, dest, theme_dest,
+    )
+    web.run_app(
+        make_app(dest, theme_dest), host="0.0.0.0", port=port, print=None
+    )
 
 
 if __name__ == "__main__":

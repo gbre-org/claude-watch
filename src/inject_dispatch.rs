@@ -107,9 +107,19 @@ pub struct RealBackends;
 #[async_trait::async_trait]
 impl InjectBackends for RealBackends {
     async fn tmux_inject(&self, pane: &str, text: &str) {
+        // SERIALIZE with every other injector (see `inject_lock`). The daemon
+        // is the population a per-caller lock convention can never cover: it
+        // never shells out to `claude-watch inject`, so the only place its
+        // alerts can be serialized against an out-of-process injector is right
+        // here, at the backend boundary.
+        let _guard = crate::inject_lock::InjectLock::acquire("daemon-cancelling").await;
         crate::tmux::inject_text(pane, text).await;
     }
     async fn tmux_inject_queued(&self, pane: &str, text: &str) {
+        // Same serialization as `tmux_inject`. This is the ROUTINE tier — the
+        // exact path that typed the WATCHER DOWN banner which `cw-theme-sync`
+        // interleaved with on 2026-08-19.
+        let _guard = crate::inject_lock::InjectLock::acquire("daemon-queued").await;
         crate::tmux::inject_text_queued(pane, text).await;
     }
     fn pidfd_inject(&self, agent_pid: u32, text: &str) -> ProbeOutcome {
@@ -309,6 +319,19 @@ pub async fn inject_to_agent_queued(pane: &str, text: &str) {
 }
 
 async fn inject_to_agent_inner(pane: &str, text: &str, cancel_turn: bool) {
+    // Defer to an in-flight self-clear handoff (see tmux::self_clear_in_progress):
+    // typing a daemon alert / stuck-state prompt into the pane while self-clear
+    // is driving `/clear`->resume would OVERWRITE the resume handoff
+    // (operator-reported, 2026-08-17). Skip the inject; the daemon re-evaluates
+    // on its next cycle once self-clear releases the lock.
+    if crate::tmux::self_clear_in_progress() {
+        info!(
+            pane = %pane,
+            cancel_turn,
+            "inject_to_agent: self-clear in progress -- deferring daemon inject"
+        );
+        return;
+    }
     let backends = RealBackends;
     let agent_pid = resolve_agent_pid_for_pane(pane).await;
     let mode = mode_for(agent_pid);

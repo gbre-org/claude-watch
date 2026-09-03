@@ -25,8 +25,37 @@ NOT classified here, see "Signal exclusion" below):
                    distinct even if it fits conceptually. too mission
                    critical to risk on new shared infra".
 
-The classification map is DATA (the ``CLASSIFICATIONS`` table below),
-not hardcoded. New event sources are added by appending to the table.
+PRECEDENCE -- the PRODUCER owns its own classification
+=====================================================
+
+An event SOURCE ships its own tier alongside the event (claude-event
+``data.tier``); that decision is NOT duplicated here. The table below is
+the FALLBACK for producers that ship nothing, plus a place for genuine
+CONSUMER policy. Duplicating a producer's decision in a second place is a
+two-sources-of-truth bug (Andrew, botchat #2486-#2490: "note that pr watch
+sends its classification along w its events" / "that isnt defined in cw or
+local config" / "or shouldnt be" / "where possible event sources should
+also define their priority" / "w user side overrides as needed").
+
+  0. EXCLUDED consumer policy   ABSOLUTE (signal/* only)
+  1. USER-SIDE OVERRIDE         operator file, outranks the producer
+  2. PRODUCER-SHIPPED TIER      the event's own ``data.tier``
+  3. CLASSIFICATIONS table      consumer-side FALLBACK (below)
+  4. fail-LOUD default          ``actionable``, marked UNCLASSIFIED
+
+Rung 3 is DATA (the ``CLASSIFICATIONS`` table below), not hardcoded. But
+prefer rung 2: when you own the producer, stamp ``data.tier`` there rather
+than adding a row here.
+
+Rung 4 marks the result ``unclassified`` and attaches a directive reason
+naming the three fixes, so a missing classification reads as "add a rule /
+have the producer ship a tier" rather than as mysterious gating. The
+fail-loud default itself is deliberate and unchanged.
+
+Operator overrides (rung 1) live in an OPTIONAL JSON file --
+``$EVENT_CLASSIFY_OVERRIDES`` or ``~/.config/claude-events/
+tier-overrides.json``, never created by this tool. Schema + examples: see
+``load_user_overrides`` below, or run ``event-classify --list-rules``.
 
 Source/tag schema is documented in
 ``tools/claude-event/claude-event``'s ``VALID_SOURCES`` (``cron``,
@@ -50,19 +79,21 @@ Usage:
   above the catch-alls, so only TRULY-unmatched pairs hit this).
 
 Self-tests: ``event-classify --self-test``. Embedded suite covers
-every entry in ``CLASSIFICATIONS`` plus a "no match -> default"
-case, an excluded-takes-precedence-over-ambient case, and the
-message-substring conditional rule (``pr-status-change`` is
-actionable iff the message contains "CI failure"/"CI success"/
-"mergeable=conflicting" [a merge CONFLICT], ambient otherwise —
-incl. a conflict RESOLUTION "mergeable=mergeable (was: conflicting)").
+every entry in ``CLASSIFICATIONS``, the full precedence ladder above,
+the override-file parser, the UNCLASSIFIED marking, and the
+message-substring conditional rule (``pr-status-change`` is actionable
+iff the message contains "CI failure" or "mergeable=conflicting" [a merge
+CONFLICT]; ambient otherwise — incl. "CI success" and a conflict
+RESOLUTION "mergeable=mergeable (was: conflicting)").
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from pathlib import Path
 from typing import Callable
 
 # --- Tier vocabulary ------------------------------------------------------
@@ -83,8 +114,8 @@ VALID_TIERS = {AMBIENT, ACTIONABLE, EXCLUDED, UNKNOWN}
 #   predicate:      None or a callable(message: str) -> bool. When set,
 #                   the rule matches only if the predicate returns True
 #                   for the message. Used for message-conditional rules
-#                   like pr-status-change (actionable iff "CI failure"/
-#                   "CI success" in message; ambient otherwise).
+#                   like pr-status-change (actionable iff "CI failure" or
+#                   "mergeable=conflicting" in message; ambient otherwise).
 #   tier:           "ambient" / "actionable" / "excluded"
 #   reason:         human-readable docstring; surfaced in --json output.
 #
@@ -114,6 +145,134 @@ def _normalize_shipped_tier(value: str | None) -> str | None:
     if v in (ACTIONABLE, AMBIENT, EXCLUDED):
         return v
     return None
+
+
+# --- User-side override layer (OPERATOR, highest non-absolute rung) -------
+#
+# Andrew (botchat #2489/#2490): "where possible event sources should also
+# define their priority" ... "w user side overrides as needed". The operator
+# must be able to re-tier a producer that classifies badly WITHOUT editing
+# that producer and WITHOUT editing this file. Overrides therefore outrank
+# both the producer-shipped tier and the CLASSIFICATIONS table.
+#
+# The file is OPTIONAL and is NEVER created by this tool. Absent file (the
+# normal state) == no overrides == unchanged behavior.
+#
+# Path: $EVENT_CLASSIFY_OVERRIDES, else ~/.config/claude-events/
+# tier-overrides.json.
+#
+# Schema -- either a bare list of rules, or {"overrides": [ ... ]}:
+#
+#   {"overrides": [
+#      {"source": "cron", "tag": "pr-ci-red", "tier": "ambient",
+#       "reason": "the first nudge is noise; I watch PRs myself"},
+#      {"source": "*", "tag": "pr-status-change", "contains": "merged",
+#       "tier": "ambient"}
+#   ]}
+#
+#   source / tag  same pattern grammar as CLASSIFICATIONS (exact, "*",
+#                 "<prefix>*"). Missing key defaults to "*".
+#   contains      OPTIONAL message substring; the rule matches only when
+#                 the message contains it. Data, not code -- an operator
+#                 config never executes a predicate.
+#   tier          actionable | ambient | excluded (required, validated).
+#   reason        OPTIONAL human note, surfaced in --json output.
+#
+# Rules are evaluated in file order; first match wins. A malformed file is
+# IGNORED wholesale (default-open: a typo in operator config must never
+# break event routing) -- run `event-classify --list-rules` to see the
+# parse error.
+
+DEFAULT_OVERRIDES_PATH = "~/.config/claude-events/tier-overrides.json"
+
+# Cache: (resolved_path, mtime_ns) -> (rules, error). Keeps the per-event
+# classify() call from re-reading + re-parsing the file every time, while
+# still picking up an operator edit without a restart.
+_OVERRIDES_CACHE: dict = {}
+
+
+def overrides_path() -> "os.PathLike[str] | str":
+    """Resolved path of the operator override file (never created here)."""
+    env = os.environ.get("EVENT_CLASSIFY_OVERRIDES", "").strip()
+    return Path(env).expanduser() if env else Path(
+        DEFAULT_OVERRIDES_PATH).expanduser()
+
+
+def _coerce_override(raw: object, idx: int) -> tuple[dict | None, str | None]:
+    """Validate one raw override entry -> (rule, error)."""
+    if not isinstance(raw, dict):
+        return None, f"override[{idx}]: not an object"
+    tier = _normalize_shipped_tier(raw.get("tier"))
+    if tier is None:
+        return None, (f"override[{idx}]: tier={raw.get('tier')!r} is not one "
+                      f"of actionable/ambient/excluded")
+    src = raw.get("source", "*")
+    tag = raw.get("tag", "*")
+    if not isinstance(src, str) or not isinstance(tag, str):
+        return None, f"override[{idx}]: source/tag must be strings"
+    contains = raw.get("contains")
+    if contains is not None and not isinstance(contains, str):
+        return None, f"override[{idx}]: contains must be a string"
+    reason = raw.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return None, f"override[{idx}]: reason must be a string"
+    return {"source": src or "*", "tag": tag or "*", "tier": tier,
+            "contains": contains, "reason": reason or ""}, None
+
+
+def load_user_overrides(path=None) -> tuple[list[dict], str | None]:
+    """Load + validate the operator override file.
+
+    Returns ``(rules, error)``. A missing file is the normal case and
+    returns ``([], None)``. Any parse/validation problem returns
+    ``([], "<message>")`` -- overrides are dropped WHOLESALE rather than
+    partially applied, so a half-valid file can't silently re-tier some
+    events and not others. Default-open by design."""
+    p = Path(path).expanduser() if path is not None else Path(overrides_path())
+    try:
+        st = p.stat()
+    except OSError:
+        return [], None  # absent == no overrides (the normal state)
+
+    ck = (str(p), st.st_mtime_ns, st.st_size)
+    hit = _OVERRIDES_CACHE.get(ck)
+    if hit is not None:
+        return hit
+
+    try:
+        doc = json.loads(p.read_text())
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        res: tuple[list[dict], str | None] = ([], f"{p}: unreadable JSON ({exc})")
+        _OVERRIDES_CACHE[ck] = res
+        return res
+
+    if isinstance(doc, dict):
+        raw_rules = doc.get("overrides", [])
+    elif isinstance(doc, list):
+        raw_rules = doc
+    else:
+        res = ([], f"{p}: top level must be a list or an object with "
+                   f"an 'overrides' key")
+        _OVERRIDES_CACHE[ck] = res
+        return res
+
+    if not isinstance(raw_rules, list):
+        res = ([], f"{p}: 'overrides' must be a list")
+        _OVERRIDES_CACHE[ck] = res
+        return res
+
+    rules: list[dict] = []
+    for i, raw in enumerate(raw_rules):
+        rule, err = _coerce_override(raw, i)
+        if err is not None:
+            res = ([], f"{p}: {err}")
+            _OVERRIDES_CACHE[ck] = res
+            return res
+        rules.append(rule)  # type: ignore[arg-type]
+
+    res = (rules, None)
+    _OVERRIDES_CACHE[ck] = res
+    return res
 
 
 CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] = [
@@ -160,22 +319,35 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "Fatal claude-watch alert (context/crash/main pane); needs "
         "immediate action."),
 
-    # pr-status-change is conditionally actionable: a CI outcome (CI
-    # failure / CI success) OR a merge CONFLICT (pr-watch emits
-    # "mergeable=conflicting" on a tracked PR going CONFLICTING/DIRTY)
-    # demands attention. "new push" / "CI pending" / a conflict
+    # pr-status-change is conditionally actionable: a CI FAILURE OR a merge
+    # CONFLICT (the upstream producer emits "mergeable=conflicting" on a
+    # tracked PR going CONFLICTING/DIRTY) demands attention. "new push" /
+    # "CI pending" / **"CI success"** / a conflict
     # RESOLUTION ("mergeable=mergeable (was: conflicting)") are routine
-    # context and stay ambient via the catch-all below. Matching the
-    # PRECISE token "mergeable=conflicting" (the NEW value in pr-watch's
+    # context and stay ambient via the catch-all below.
+    #
+    # "CI success" was DROPPED from this predicate (Andrew, botchat
+    # #2484/#2485: "the status changes can be ambient" / "except like,
+    # failures obviously"). A green build needs no active response — the
+    # merge decision rides on the operator's next pass, not on a blocking
+    # gate. FAILURE stays actionable HERE, on the transition itself, so a
+    # newly-red PR is actionable IMMEDIATELY; the separate `pr-ci-red`
+    # nudge (which ships its OWN data.tier) is a re-notification for a red
+    # PR left unattended, NOT the first signal. There is therefore no
+    # window in which a freshly-red PR is merely ambient while the nudge
+    # dwell elapses.
+    #
+    # Matching the
+    # PRECISE token "mergeable=conflicting" (the NEW value in the producer's
     # `mergeable={new} (was: {old})` message) is deliberate: it fires
     # only when a PR BECOMES conflicting, never when one is resolved —
     # so it doesn't flood on benign transitions. (botchat #3583/#2936:
     # merge conflicts sat unnoticed because they routed ambient.)
     ("*", "pr-status-change",
-        _contains_any("CI failure", "CI success", "mergeable=conflicting"),
+        _contains_any("CI failure", "mergeable=conflicting"),
         ACTIONABLE,
-        "PR status change with CI outcome or merge CONFLICT "
-        "(mergeable=conflicting); needs investigation/merge."),
+        "PR CI FAILURE or merge CONFLICT (mergeable=conflicting); "
+        "needs investigation."),
 
     # workbot-prompt -> needs dispatch (legacy v1 actionable tag).
     ("*", "workbot-prompt", None, ACTIONABLE,
@@ -196,17 +368,44 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("queue", "queue-stale-ready", None, ACTIONABLE,
         "Queue item ready but stale; needs spawn/abandon decision."),
 
-    # heartbeat-tick -> the main loop MUST touch the heartbeat file named in
-    # the event's `data.path` (surfaced on the EVENT[] one-liner as `path=`).
-    # The file is the daemon's wedge-detector: if the idle loop never
-    # refreshes it, it goes stale at the ~10-min threshold and the daemon
-    # fires a spurious "heartbeat stale" alert. This is a tiny self-service
-    # action (one `touch`), not an agent-spawn — but it IS required, so it's
+    # watcher-down -> the main loop MUST relaunch the named watcher. The daemon
+    # (src/policy.rs watcher_monitor) emits this on the bus when a session
+    # watcher (the botchat / claude-event-watch watchers) has been DOWN past
+    # threshold.
+    # Routing it ambient (the old claude-watch/* catch-all) meant a down comms
+    # watcher surfaced only as passive context and the busy main loop never
+    # relaunched it -- the comms watcher sat DOWN ~4h with Andrew's messages
+    # unsurfaced (incident 2026-08-21). Actionable so it lands on the pending
+    # list + N-call gate and DRIVES a `watcher-ctl run <name>` relaunch. The
+    # daemon ALSO stamps data.tier=actionable (producer rung wins); this row is
+    # the consumer-side fallback and MUST precede the claude-watch/* ambient
+    # catch-all. NOTE: the daemon's OTHER watcher-down emission path
+    # (alert::emit_event) ships tag="claude-watch-alert" with
+    # data.alert_type="watcher-down" and relies on the producer-stamped
+    # data.tier, not this tag rule.
+    ("claude-watch", "watcher-down", None, ACTIONABLE,
+        "Watcher DOWN; relaunch it now with `watcher-ctl run <name>` "
+        "(name in the message / data.watcher)."),
+
+    # keepalive -> the daemon emits this ONLY when nothing has been acked for
+    # the whole quiet window, so by construction the loop is idle and the one
+    # required action is to ack. Acking stamps `last-ack-timestamp`, whose age
+    # IS the daemon's wedge-detector: leave it and the ack-stale alert fires.
+    # A tiny self-service action, not an agent-spawn — but required, so
     # actionable rather than ambient. Placed before the claude-watch/* ambient
     # catch-all below.
+    ("claude-watch", "keepalive", None, ACTIONABLE,
+        "Keepalive: nothing acked recently. Run `event-ack ack-batch` (one "
+        "bare command) to clear this and stamp liveness."),
+
+    # heartbeat-tick: the pre-2026-08-22 name for keepalive. Kept for one
+    # release so an event emitted by an older daemon — or one still sitting on
+    # the queue across the upgrade — classifies the same way instead of
+    # falling through to the claude-watch/* ambient catch-all and silently
+    # losing its required action.
     ("claude-watch", "heartbeat-tick", None, ACTIONABLE,
-        "Heartbeat tick; touch the heartbeat file at data.path (path=… on "
-        "the event line) to keep the loop's wedge-detector fresh."),
+        "Keepalive (legacy `heartbeat-tick` tag): run `event-ack ack-batch` "
+        "to clear this and stamp liveness."),
 
     # memory-reminder -> ambient context-hygiene reminder emitted by the
     # daemon every 30min (carries the memory checklist in the event message).
@@ -221,24 +420,24 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("*", "slack-unread", None, ACTIONABLE,
         "Slack DM unread; needs read+reply."),
 
-    # comment-triage-needed -> pr-watch's bot-comment-triage DETECTOR (botchat
+    # comment-triage-needed -> the upstream bot-comment-triage DETECTOR (botchat
     # #3337/3339) found a PR with un-collapsed bot/automation issue-comments.
     # The producer makes NO triage judgment; this event tells the main loop to
     # dispatch a triage AGENT to review/collapse/act on those comments. The
-    # producer emits source="cron" (pr-watch runs under launchd/cron), so this
+    # producer emits source="cron" (the producer runs under launchd/cron), so this
     # row MUST precede the ("cron", "*") ambient catch-all below or it would be
     # swallowed as routine cron context.
     ("cron", "comment-triage-needed", None, ACTIONABLE,
         "PR has un-collapsed bot comments; dispatch a triage agent to "
-        "review/collapse them (pr-watch detector, botchat #3337/3339)."),
+        "review/collapse them (bot-comment detector, botchat #3337/3339)."),
     # Back-compat: a future producer emitting the same tag under a different
     # source still routes actionable.
     ("*", "comment-triage-needed", None, ACTIONABLE,
         "PR has un-collapsed bot comments; dispatch a triage agent "
-        "(pr-watch detector, botchat #3337/3339)."),
+        "(bot-comment detector, botchat #3337/3339)."),
 
     # comment-triage-STUCK -> ESCALATED fallback (Andrew botchat #3610). The
-    # pr-watch detector re-emits ``comment-triage-needed`` on a dwell while a
+    # upstream detector re-emits ``comment-triage-needed`` on a dwell while a
     # backlog stays live, and the loop is pressed to ACK each one — but an ack is
     # not a RESOLUTION. When the un-triaged count fails to DROP across several
     # consecutive emissions (the loop ack-looped "residual" without progress),
@@ -250,10 +449,30 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("cron", "comment-triage-STUCK", None, ACTIONABLE,
         "PR comment-triage is STUCK (un-triaged count not dropping across "
         "cycles); force a real resolution or ping the operator — a residual-ack "
-        "is no longer sufficient (pr-watch escalation, botchat #3610)."),
+        "is no longer sufficient (triage escalation, botchat #3610)."),
     ("*", "comment-triage-STUCK", None, ACTIONABLE,
         "PR comment-triage is STUCK (no progress); force a resolution or ping "
-        "the operator (pr-watch escalation, botchat #3610)."),
+        "the operator (triage escalation, botchat #3610)."),
+
+    # A RUNNING queue item that no owner can be attributed to -- no agent
+    # record on the qid, no register-time `agent_id` stamp, no arm-hook
+    # binding. NOT the same failure as queue-orphaned: orphaned means a
+    # KNOWN owner is gone, owner-unknown means the item is not attributable
+    # to anyone at all, which is what a queue entry meant for an agent that
+    # never got one assigned looks like. Actionable because there is a
+    # concrete remedy the loop can perform: spawn the missing agent, or
+    # stamp the owner of a resumed one (`session-task queue assign <id>
+    # --agent <agent_id>`), or abandon the item.
+    #
+    # The producer emits source="cron", so this row MUST precede the
+    # ("cron", "*") ambient catch-all below. It is written out here rather
+    # than left to the producer-shipped tier on purpose: a producer that
+    # forgets to ship `data.tier` would otherwise land this in ambient and
+    # the ownerless item would go on being ownerless, quietly.
+    ("cron", "queue-owner-unknown", None, ACTIONABLE,
+        "Running queue item has NO attributable owner (never assigned an "
+        "agent, or a resumed agent whose owner stamp was never retrofitted); "
+        "spawn the agent, `queue assign` the owner, or abandon the item."),
 
     # --- AMBIENT ----------------------------------------------------------
     #
@@ -322,12 +541,13 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("queue", "queue-abandoned", None, AMBIENT,
         "Queue item abandoned; context only."),
 
-    # Routine PR status changes: "new push", "CI pending", conflict
-    # RESOLUTION, plain "mergeable". The conditional ACTIONABLE rule
-    # above catches CI failure/success AND merge CONFLICT
+    # Routine PR status changes: "new push", "CI pending", "CI success",
+    # conflict RESOLUTION, plain "mergeable", "merged". The conditional
+    # ACTIONABLE rule above catches CI FAILURE and merge CONFLICT
     # (mergeable=conflicting); this catches everything else.
     ("*", "pr-status-change", None, AMBIENT,
-        "Routine PR status (push/pending/mergeable); context only."),
+        "Routine PR status (push/pending/CI success/mergeable); "
+        "context only."),
 
     # Workload routine.
     ("*", "workload-done", None, AMBIENT,
@@ -355,17 +575,53 @@ def _match_pattern(pattern: str, value: str) -> bool:
     return pattern == value
 
 
+UNCLASSIFIED_MARK = "UNCLASSIFIED"
+
+
+def _unclassified_reason(src: str, tag: str, tier: str) -> str:
+    """The 'add a rule' signal (botchat #2483). Rendered wherever an
+    unclassified event surfaces: --json output, pending-actions.json, and
+    the event-must-act deny banner."""
+    return (
+        f"{UNCLASSIFIED_MARK}: no rule matched ({src}/{tag}) AND the producer "
+        f"shipped no data.tier -> fail-loud default ({tier}). "
+        f"Acking clears this event, NOT the cause. Fix one of: "
+        f"(1) PREFERRED - have the producer stamp data.tier="
+        f"actionable|ambient on the event (classification belongs with the "
+        f"source); (2) add a rule to CLASSIFICATIONS in event-classify; "
+        f"(3) add a user override in {overrides_path()}."
+    )
+
+
 def classify(source: str, tag: str, message: str = "",
              shipped_tier: str | None = None,
-             default_tier: str = ACTIONABLE) -> dict:
-    """Return a dict with keys 'tier' and 'reason'. First matching
-    rule wins; falls back to ``default_tier`` if no rule matches.
+             default_tier: str = ACTIONABLE,
+             overrides: list[dict] | None = None) -> dict:
+    """Classify one event. Returns a dict with keys ``tier``, ``reason``,
+    ``matched`` and ``unclassified``.
+
+    PRECEDENCE (highest first) -- the PRODUCER is the source of truth for
+    its own events; this table is a FALLBACK plus an operator escape hatch
+    (Andrew, botchat #2486-#2490):
+
+      0. EXCLUDED consumer policy  -- ABSOLUTE (signal/*; see below)
+      1. USER-SIDE OVERRIDE        -- operator file, outranks the producer
+      2. PRODUCER-SHIPPED TIER     -- the event's own ``data.tier``
+      3. CLASSIFICATIONS table     -- consumer-side FALLBACK
+      4. ``default_tier``          -- fail-LOUD default (actionable)
+
+    Rung 0 sits above the operator override on purpose: the Signal
+    exclusion is a mission-critical invariant ("too mission critical to
+    risk on new shared infra"), so neither a producer NOR an override may
+    pull a signal event into the shared gate. An override may still move
+    anything else, and may move anything TO ``excluded`` (which only ever
+    removes an event from the gate, never adds one).
 
     The fallback default is ``actionable`` (fail-LOUD): an
     UNKNOWN (source, tag) pair that matches no rule above is surfaced
     in the actionable tier so the loop is pressed to handle it or add
     a classifier rule, rather than silently absorbed as ambient
-    context. Every intentionally-ambient pair (heartbeat-tick is
+    context. Every intentionally-ambient pair (keepalive is
     actionable; routine cron / queue-running|done|abandoned /
     memory-reminder / alertmanager / etc.) already has an EXPLICIT
     rule above the catch-alls, so this fallback only changes the fate
@@ -387,10 +643,28 @@ def classify(source: str, tag: str, message: str = "",
     for src_pat, tag_pat, pred, tier, reason in CLASSIFICATIONS:
         if tier == EXCLUDED and _rule_matches(src_pat, tag_pat, pred):
             return {"tier": EXCLUDED, "reason": reason,
-                    "matched": f"{src_pat}/{tag_pat}"}
+                    "matched": f"{src_pat}/{tag_pat}", "unclassified": False}
 
-    # (a) Honor a PRODUCER-SHIPPED tier when present + valid. Self-describing
-    # events carry their own routing (e.g. pr-watch stamps data.tier=actionable
+    # (a) USER-SIDE OVERRIDE -- the operator's word beats the producer's.
+    # #2490: "w user side overrides as needed". This is the escape hatch for
+    # a producer that ships a BAD tier: re-tier it here instead of patching
+    # (or waiting on) the producer. Absent file == no overrides.
+    if overrides is None:
+        overrides, _ = load_user_overrides()
+    for rule in overrides or []:
+        if not (_match_pattern(rule["source"], src)
+                and _match_pattern(rule["tag"], tg)):
+            continue
+        if rule.get("contains") and rule["contains"] not in msg:
+            continue
+        note = f": {rule['reason']}" if rule.get("reason") else ""
+        return {"tier": rule["tier"],
+                "reason": (f"user override ({rule['source']}/{rule['tag']}"
+                           f" -> {rule['tier']}){note}"),
+                "matched": "user-override", "unclassified": False}
+
+    # (b) Honor a PRODUCER-SHIPPED tier when present + valid. Self-describing
+    # events carry their own routing (e.g. a producer stamps data.tier=actionable
     # on nonzero-unresolved-comment events, botchat #3879), so per-PRODUCER
     # knowledge lives with the producer -- NOT as a per-tag catalog in this
     # central classifier.
@@ -398,9 +672,9 @@ def classify(source: str, tag: str, message: str = "",
     if st is not None:
         return {"tier": st,
                 "reason": f"producer-shipped tier ({st}) honored",
-                "matched": "shipped-tier"}
+                "matched": "shipped-tier", "unclassified": False}
 
-    # (b) Consumer-side policy table (first match wins). Holds genuine
+    # (c) Consumer-side policy table (first match wins). Holds genuine
     # consumer-side overrides (alertmanager/* -> ambient "Andrew gets push";
     # routine cron/queue transitions -> ambient) plus a shrinking set of legacy
     # per-tag rules to be migrated to shipped-priority over time. Excluded rules
@@ -409,9 +683,19 @@ def classify(source: str, tag: str, message: str = "",
         if not _rule_matches(src_pat, tag_pat, pred):
             continue
         return {"tier": tier, "reason": reason,
-                "matched": f"{src_pat}/{tag_pat}"}
-    return {"tier": default_tier, "reason": "no rule matched (default)",
-            "matched": None}
+                "matched": f"{src_pat}/{tag_pat}", "unclassified": False}
+
+    # (d) NOTHING matched and the producer shipped nothing -> fail-LOUD
+    # default. The default STAYS actionable (deliberate; see the docstring
+    # above) -- what changes here is that the event is MARKED
+    # ``unclassified`` and carries a directive reason, so an operator sees
+    # "add a rule / have the producer ship a tier" instead of a mystery
+    # gate. Consumers (event-ack, eval-event-must-act) propagate the flag
+    # into pending-actions.json and the deny banner. Observability only --
+    # the routing outcome is unchanged (Andrew, botchat #2483).
+    return {"tier": default_tier,
+            "reason": _unclassified_reason(src, tg, default_tier),
+            "matched": None, "unclassified": True}
 
 
 # --- CLI ------------------------------------------------------------------
@@ -453,10 +737,28 @@ def main() -> int:
         return _self_test()
 
     if args.list_rules:
+        ov, ov_err = load_user_overrides()
+        print(f"# USER OVERRIDES (rung 1, beats producer + table) "
+              f"-- {overrides_path()}")
+        if ov_err:
+            print(f"#   !! IGNORED (all of them): {ov_err}")
+        elif not ov:
+            print("#   (none -- file absent or empty)")
+        for r in ov:
+            c = f" [contains {r['contains']!r}]" if r.get("contains") else ""
+            note = f"  {r['reason']}" if r.get("reason") else ""
+            print(f"{r['source']:>16} / {r['tag']:<24}  -> "
+                  f"{r['tier']:<10}{c}{note}")
+        print()
+        print("# CLASSIFICATIONS table (rung 3, FALLBACK for producers that "
+              "ship no data.tier)")
         for src_pat, tag_pat, pred, tier, reason in CLASSIFICATIONS:
-            cond = f" (conditional)" if pred else ""
+            cond = " (conditional)" if pred else ""
             print(f"{src_pat:>16} / {tag_pat:<24}  -> {tier:<10} {reason}{cond}")
-        return 0
+        print()
+        print(f"# Unmatched + unshipped -> {ACTIONABLE} (fail-loud), marked "
+              f"{UNCLASSIFIED_MARK}.")
+        return 1 if ov_err else 0
 
     if not args.source or not args.tag:
         p.error("--source and --tag are required (or use --self-test "
@@ -478,6 +780,14 @@ def main() -> int:
 # --- Embedded self-test ---------------------------------------------------
 
 def _self_test() -> int:
+    # Isolate from a REAL operator override file: point at a path that
+    # cannot exist so the suite tests the shipped defaults, never whatever
+    # the host happens to have configured.
+    import tempfile
+    _iso = Path(tempfile.gettempdir()) / "event-classify-self-test-no-such-file"
+    os.environ["EVENT_CLASSIFY_OVERRIDES"] = str(_iso)
+    _OVERRIDES_CACHE.clear()
+
     cases = [
         # Excluded (signal): exact + wildcard
         (("manual", "signal-dm-inbound", ""), EXCLUDED),
@@ -492,7 +802,7 @@ def _self_test() -> int:
         (("manual", "workbot-prompt", ""), ACTIONABLE),
         (("queue", "queue-stale-ready", ""), ACTIONABLE),
         (("manual", "slack-unread", ""), ACTIONABLE),
-        # comment-triage-needed: pr-watch bot-comment detector. Emitted under
+        # comment-triage-needed: bot-comment detector. Emitted under
         # source="cron"; MUST route actionable (win over cron/* ambient).
         (("cron", "comment-triage-needed", ""), ACTIONABLE),
         (("manual", "comment-triage-needed", ""), ACTIONABLE),
@@ -500,9 +810,20 @@ def _self_test() -> int:
         # actionable, and MUST win over cron/* ambient.
         (("cron", "comment-triage-STUCK", ""), ACTIONABLE),
         (("manual", "comment-triage-STUCK", ""), ACTIONABLE),
-        # heartbeat-tick is actionable (touch the file), and must win over
-        # the claude-watch/* ambient catch-all below it.
+        # queue-owner-unknown: emitted under source="cron"; MUST win
+        # over the cron/* ambient catch-all so an ownerless running item
+        # actually presses the loop.
+        (("cron", "queue-owner-unknown", ""), ACTIONABLE),
+        # keepalive is actionable (ack it), and must win over the
+        # claude-watch/* ambient catch-all below it.
+        (("claude-watch", "keepalive", "keepalive: no event acked recently"),
+            ACTIONABLE),
+        # ... and so must its legacy tag, for one release.
         (("claude-watch", "heartbeat-tick", "heartbeat tick"), ACTIONABLE),
+        # watcher-down is actionable (relaunch the watcher) and MUST win over
+        # the claude-watch/* ambient catch-all (incident 2026-08-21).
+        (("claude-watch", "watcher-down", "Watcher DOWN"),
+            ACTIONABLE),
         # queue-orphaned / queue-stuck are actionable (respawn/resurrect the
         # item) and MUST win over the claude-watch/* ambient catch-all. These
         # are the events `claude-watch queue-check` emits; routing them ambient
@@ -527,12 +848,21 @@ def _self_test() -> int:
         # pr-status-change: conditional
         (("manual", "pr-status-change", "CI failure on PR #1234"),
             ACTIONABLE),
-        (("manual", "pr-status-change", "CI success on PR #1234"),
-            ACTIONABLE),
+        # "CI success" is AMBIENT (botchat #2484/#2485). Real producer
+        # wording, verified against live traffic.
+        (("cron", "pr-status-change",
+          "PR owner/repo#642: CI success (was: pending)"), AMBIENT),
+        # ...and the matching real FAILURE wording stays ACTIONABLE on the
+        # transition itself, so there is no ambient window before the
+        # separate red-PR nudge.
+        (("cron", "pr-status-change",
+          "PR owner/repo#642: CI failure (was: pending)"), ACTIONABLE),
+        (("cron", "pr-status-change",
+          "PR owner/repo#642: merged (was: open)"), AMBIENT),
         (("manual", "pr-status-change", "new push to branch"), AMBIENT),
         (("manual", "pr-status-change", "CI pending"), AMBIENT),
         (("manual", "pr-status-change", "mergeable"), AMBIENT),
-        # Merge CONFLICT is actionable: pr-watch emits
+        # Merge CONFLICT is actionable: the producer emits
         # "PR <name>: mergeable=conflicting (was: <old>)" when a tracked
         # PR goes CONFLICTING/DIRTY. The operator must resolve it.
         # (botchat #3583/#2936: conflicts sat unnoticed as ambient.)
@@ -566,7 +896,7 @@ def _self_test() -> int:
         (("hostjob", "hostjob-done", ""), AMBIENT),
         (("claude-watch", "memory-reminder", ""), AMBIENT),
         (("manual", "watcher-cleanup", ""), AMBIENT),
-        # claude-watch/* catch-all stays ambient for non-heartbeat tags.
+        # claude-watch/* catch-all stays ambient for non-keepalive tags.
         (("claude-watch", "some-other-tag", ""), AMBIENT),
 
         # Unknown -> default. The fallback default is now ACTIONABLE
@@ -623,7 +953,7 @@ def _self_test() -> int:
 
     # --- Shipped-priority precedence (botchat #3879 redesign) ---------------
     # A PRODUCER-SHIPPED tier wins over the consumer-side table. This is how
-    # pr-watch's unresolved-comment events now route actionable -- via the
+    # the producer's unresolved-comment events now route actionable -- via the
     # SHIPPED tier, NOT a message regex in this file.
     r = classify("cron", "pr-status-change",
                  "PR foo/bar#12: 3 unresolved comment(s) (was: 0)",
@@ -665,12 +995,112 @@ def _self_test() -> int:
     if r["tier"] != EXCLUDED:
         failures.append(f"  shipped cannot un-exclude signal: got {r['tier']}")
 
+    # --- 'add a rule' signal (#2483) ----------------------------------------
+    # An unmatched + unshipped pair still routes ACTIONABLE (fail-loud,
+    # UNCHANGED) but is now MARKED, with a reason naming the three fixes.
+    r = classify("novel-source", "novel-tag", "")
+    if r["tier"] != ACTIONABLE or not r.get("unclassified"):
+        failures.append(f"  unclassified marking: expected actionable+marked, "
+                        f"got {r['tier']}/unclassified={r.get('unclassified')}")
+    for needle in (UNCLASSIFIED_MARK, "data.tier", "CLASSIFICATIONS",
+                   "user override"):
+        if needle not in r["reason"]:
+            failures.append(f"  unclassified reason missing {needle!r}: "
+                            f"{r['reason']!r}")
+    # Every CLASSIFIED path must NOT be marked (no false 'add a rule' noise).
+    for args_ in (("cron", "tv-check", ""),
+                  ("torrent", "torrent-completed", ""),
+                  ("manual", "signal-dm-inbound", "")):
+        if classify(*args_).get("unclassified"):
+            failures.append(f"  false unclassified mark on {args_}")
+    if classify("cron", "anything", "", shipped_tier="ambient").get(
+            "unclassified"):
+        failures.append("  false unclassified mark on a shipped tier")
+
+    # --- USER OVERRIDES (rung 1, #2490) -------------------------------------
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        opath = Path(_td) / "tier-overrides.json"
+
+        def _write(doc):
+            opath.write_text(json.dumps(doc))
+            _OVERRIDES_CACHE.clear()
+            return load_user_overrides(opath)
+
+        # 1. Override BEATS a producer-shipped tier -- the whole point of
+        #    #2490: re-tier a badly-classifying producer without editing it.
+        rules, err = _write({"overrides": [
+            {"source": "cron", "tag": "pr-ci-red", "tier": "ambient",
+             "reason": "I watch PRs myself"}]})
+        if err:
+            failures.append(f"  override parse: unexpected error {err}")
+        r = classify("cron", "pr-ci-red", "CI still RED",
+                     shipped_tier="actionable", overrides=rules)
+        if r["tier"] != AMBIENT or r["matched"] != "user-override":
+            failures.append(f"  override must beat shipped tier: got "
+                            f"{r['tier']}/{r['matched']}")
+        if "I watch PRs myself" not in r["reason"]:
+            failures.append(f"  override reason not surfaced: {r['reason']!r}")
+
+        # 2. Override BEATS the consumer table too.
+        rules, _ = _write([{"tag": "tv-check", "tier": "actionable"}])
+        r = classify("cron", "tv-check", "", overrides=rules)
+        if r["tier"] != ACTIONABLE or r["matched"] != "user-override":
+            failures.append(f"  override must beat table: got "
+                            f"{r['tier']}/{r['matched']}")
+
+        # 3. Override CANNOT un-exclude signal (rung 0 is absolute).
+        rules, _ = _write([{"tag": "signal-*", "tier": "actionable"}])
+        r = classify("manual", "signal-dm-inbound", "from alice",
+                     overrides=rules)
+        if r["tier"] != EXCLUDED:
+            failures.append(f"  override must NOT un-exclude signal: "
+                            f"got {r['tier']}")
+
+        # 4. `contains` narrows an override to matching messages only.
+        rules, _ = _write([{"tag": "pr-status-change", "contains": "merged",
+                            "tier": "actionable"}])
+        if classify("cron", "pr-status-change", "PR x#1: merged (was: open)",
+                    overrides=rules)["tier"] != ACTIONABLE:
+            failures.append("  override 'contains' should have matched")
+        if classify("cron", "pr-status-change", "PR x#1: new push",
+                    overrides=rules)["tier"] != AMBIENT:
+            failures.append("  override 'contains' should NOT have matched")
+
+        # 5. An override can silence the fail-loud default for a known-noisy
+        #    pair without touching CLASSIFICATIONS.
+        rules, _ = _write([{"source": "queue", "tag": "queue-*",
+                            "tier": "ambient"}])
+        r = classify("queue", "queue-blocked", "", overrides=rules)
+        if r["tier"] != AMBIENT or r.get("unclassified"):
+            failures.append(f"  override should pre-empt fail-loud: "
+                            f"got {r['tier']}")
+
+        # 6. MALFORMED overrides are dropped WHOLESALE + default-open: bad
+        #    operator config must never break routing or partially apply.
+        opath.write_text("{ not json")
+        _OVERRIDES_CACHE.clear()
+        rules, err = load_user_overrides(opath)
+        if rules != [] or not err:
+            failures.append(f"  bad JSON: expected ([], err) got ({rules}, {err})")
+        rules, err = _write({"overrides": [
+            {"tag": "a", "tier": "ambient"},
+            {"tag": "b", "tier": "urgent"}]})  # 'urgent' is not a tier
+        if rules != [] or not err:
+            failures.append(f"  invalid tier must drop ALL rules: "
+                            f"got ({rules}, {err})")
+        # 7. Absent file is the NORMAL state: no overrides, no error.
+        rules, err = load_user_overrides(Path(_td) / "nope.json")
+        if rules != [] or err is not None:
+            failures.append(f"  absent override file: got ({rules}, {err})")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         return 1
-    print(f"OK: {len(cases) + 9} cases pass.")
+    print(f"OK: {len(cases) + 30} cases pass "
+          f"(incl. precedence ladder, overrides, unclassified marking).")
     return 0
 
 

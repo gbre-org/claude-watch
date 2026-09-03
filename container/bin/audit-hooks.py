@@ -139,6 +139,9 @@ KNOWN_BUILTINS = {
     "event-classify",
     "event-ack",
     "eval-event-must-act",
+    # heartbeat-ack was RETIRED 2026-08-21 (#649 ack-driven redesign): a
+    # plain `event-ack ack` already refreshes liveness, so the dedicated
+    # touch+ack wrapper is no longer baked.
     "eval-queue-ready-unspawned",
     "user-prompt-ambient-inject-hook",
 }

@@ -13,6 +13,10 @@ Covers:
      --force overrides the guard.
   3. stop on an already-gone pid marks the job stopped (not an error).
   4. stop on a missing label errors.
+  5. the queue/event traffic a `run` generates is confined to the harness.
+
+Operator state is isolated by `hostjob_testkit.install` — see that module for
+why `--no-queue` is NOT an opt-out of the queue row.
 
 Run::
 
@@ -24,9 +28,7 @@ Run::
 from __future__ import annotations
 
 import importlib.util
-import os
-import shutil
-import tempfile
+import sys
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -34,6 +36,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 HOSTJOB = HERE.parent / "hostjob"
+
+# Importable when run directly (`python3 test_hostjob_stop.py`), not just
+# under pytest's rootdir-prepend.
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import hostjob_testkit  # noqa: E402
 
 
 def _load_hostjob():
@@ -50,7 +59,11 @@ class _RunArgs:
         self.cmd = cmd
         self.cwd = cwd
         self.force = False
-        self.no_queue = True      # don't touch the real session-task queue
+        # NB: --no-queue does NOT mean "no queue row" — it only skips the
+        # scope-claiming `queue register`. The row is still created, which is
+        # why isolation (hostjob_testkit) is what keeps this off the
+        # operator's queue, not this flag.
+        self.no_queue = True
         self.no_broker = True     # don't spin up the live-tail broker
         self.depends_on = []
 
@@ -73,16 +86,17 @@ class StopTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.mod = _load_hostjob()
-        # Isolate state under a temp dir so we never touch the operator's
-        # real ~/.cache/hostjob jobs.
-        cls.tmp = tempfile.mkdtemp(prefix="hostjob-stop-test-")
-        cls._orig_root = cls.mod.STATE_ROOT
-        cls.mod.STATE_ROOT = cls.tmp
+        # Isolate EVERY piece of operator state a run touches: hostjob's
+        # ~/.cache/hostjob job dirs, the session-task queue, and the
+        # claude-event stream.
+        cls.iso = hostjob_testkit.install(cls.mod, prefix="hostjob-stop-test-")
 
     @classmethod
     def tearDownClass(cls):
-        cls.mod.STATE_ROOT = cls._orig_root
-        shutil.rmtree(cls.tmp, ignore_errors=True)
+        cls.iso.teardown()
+
+    def setUp(self):
+        self.iso.reset_logs()
 
     def _wait_pid_dead(self, pid, timeout=5):
         deadline = time.time() + timeout
@@ -171,6 +185,48 @@ class StopTest(unittest.TestCase):
     def test_stop_missing_label_errors(self):
         rc = self.mod.cmd_stop(_StopArgs(label="no-such-job-xyz", grace=2))
         self.assertEqual(rc, 1)
+
+    def test_run_queue_traffic_stays_inside_the_harness(self):
+        """Regression guard: these tests used to leak rows into the operator's
+        live queue. `run` DOES create a queue row even with --no-queue, so the
+        only thing keeping it off the real queue is the isolation — assert the
+        isolation is actually in force and that the row landed on the shim."""
+        self.assertTrue(self.iso.shimmed(hostjob_testkit.SESSION_TASK),
+                        "session-task must resolve to the harness shim")
+        self.assertTrue(self.iso.shimmed(hostjob_testkit.CLAUDE_EVENT),
+                        "claude-event must resolve to the harness shim")
+
+        label = "isolation-job"
+        self.mod.cmd_run(_RunArgs(label, ["true"]))
+        adds = self.iso.calls_starting("queue add")
+        self.assertEqual(len(adds), 1,
+                         "run must create exactly one (isolated) queue row: %r"
+                         % self.iso.calls())
+        self.assertIn("--scope hostjob:%s" % label, adds[0])
+
+        # Let the reaper land its terminal flip + hostjob-done event, and
+        # confirm those went to the shims too rather than the real CLIs.
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            st = self.mod.read_status(label)
+            if st and st.get("status") != "running":
+                break
+            time.sleep(0.05)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if self.iso.calls(hostjob_testkit.CLAUDE_EVENT):
+                break
+            time.sleep(0.05)
+        self.assertTrue(
+            self.iso.calls_starting("queue done")
+            or self.iso.calls_starting("queue abandon"),
+            "reaper's terminal queue flip must hit the shim: %r"
+            % self.iso.calls())
+        self.assertTrue(
+            self.iso.calls_starting("emit", hostjob_testkit.CLAUDE_EVENT),
+            "hostjob-done event must hit the shim: %r"
+            % self.iso.calls(hostjob_testkit.CLAUDE_EVENT))
+        self.mod.cmd_clean(_CleanArgs(label=label))
 
 
 if __name__ == "__main__":

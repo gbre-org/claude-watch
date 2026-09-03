@@ -202,5 +202,54 @@ class FleetViewDetectionTest(unittest.TestCase):
                     os.environ["CLAUDE_WATCH_CONFIG"] = saved
 
 
+class InjectCommandTest(unittest.TestCase):
+    """The argv `inject()` hands to `claude-watch inject`.
+
+    `--escape` is the flag that decides whether an Escape blast is fired into
+    the pane. Since 2026-08-18 the subcommand does NOT escape unless asked, and
+    this wrapper mirrors that default rather than re-arming it — self-login
+    shares this helper to drive a pane that may be showing a modal, where an
+    Escape cancels the login. Both directions are pinned here because a silent
+    flip either way is invisible until it costs somebody a cleared context or a
+    cancelled login.
+    """
+
+    def setUp(self):
+        self.mod = _import_self_clear()
+        self.calls = []
+        self.mod.run = lambda cmd, timeout=None: (self.calls.append(cmd), ("", 0))[1]
+        self.mod.log = lambda *a, **k: None
+        self.mod.capture_pane_text = lambda pane: ""
+
+    def _argv(self, **kwargs):
+        self.calls.clear()
+        self.mod.inject("sess:0.0", "payload", **kwargs)
+        self.assertEqual(len(self.calls), 1, self.calls)
+        return self.calls[0]
+
+    def test_default_does_not_escape(self):
+        argv = self._argv()
+        self.assertNotIn("--escape", argv)
+        self.assertNotIn("--cancel", argv)
+
+    def test_escape_true_passes_the_flag(self):
+        self.assertIn("--escape", self._argv(escape=True))
+
+    def test_slash_command_is_independent_of_escape(self):
+        argv = self._argv(slash_command=True)
+        self.assertIn("--slash-command", argv)
+        self.assertNotIn("--escape", argv)
+        argv = self._argv(slash_command=True, escape=True)
+        self.assertIn("--slash-command", argv)
+        self.assertIn("--escape", argv)
+
+    def test_payload_and_pane_are_passed_through(self):
+        argv = self._argv()
+        self.assertEqual(argv[:2], ["claude-watch", "inject"])
+        self.assertIn("--pane", argv)
+        self.assertEqual(argv[argv.index("--pane") + 1], "sess:0.0")
+        self.assertEqual(argv[argv.index("--submit") + 1], "payload")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

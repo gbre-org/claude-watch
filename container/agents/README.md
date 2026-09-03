@@ -1,6 +1,6 @@
 # container/agents/
 
-Agent prompt source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each file describes one custom agent the in-container `claude` process can spawn via the `Agent` tool (e.g. `Agent(subagent_type="claude-container:explore", ...)`).
+Agent prompt source files baked into the [claude-container](https://github.com/gbre-org/claude-watch/tree/main/container) image. Each file describes one custom agent the in-container `claude` process can spawn via the `Agent` tool (e.g. `Agent(subagent_type="claude-container:explore", ...)`).
 
 ## What goes here
 

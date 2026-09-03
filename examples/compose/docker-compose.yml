@@ -11,7 +11,7 @@
 #     claude-watch/        (this repo)
 #       container/         (claude-container source, this-repo subdir)
 #       examples/compose/  (this file)
-#     eichi/               (https://github.com/hndrewaall/eichi)
+#     eichi/               (https://github.com/gbre-org/eichi)
 #
 # In-container paths hardcode the `hndrewaall` user because that is the
 # UID-1000 user baked into the claude-container and eichi search-minisite
@@ -102,6 +102,18 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       # Forwarded if set on the host (VSCode IDE port).
       CLAUDE_CODE_SSE_PORT: ${CLAUDE_CODE_SSE_PORT:-}
+      # TZ — container-local timezone. Unset (default) leaves the image
+      # clock at UTC. Set to an IANA zone (e.g. America/New_York) so
+      # in-container `date`, log timestamps, and cron fire in that local
+      # time to match the operator's host — the image ships tzdata, so
+      # glibc resolves the named zone via this env var alone. We use a TZ
+      # env var rather than bind-mounting /etc/localtime because on Docker
+      # Desktop (macOS) the host's /etc/localtime symlinks into
+      # /var/db/timezone/zoneinfo, which is not a reliably shareable mount
+      # path; a TZ env var is portable across host OSes and needs no mount.
+      # Set the concrete value per-operator in deploy.env / the override
+      # (e.g. TZ=America/New_York).
+      TZ: ${TZ:-}
       # Corporate-network passthrough: SSL CA bundles + proxy settings for
       # operators on enterprise VPNs where the host
       # injects a corp CA into NODE_EXTRA_CA_CERTS / SSL_CERT_FILE etc.
@@ -222,10 +234,10 @@ services:
       CLAUDE_HOST_HOOK_BRIDGE_FORWARD_ENV: ${CLAUDE_HOST_HOOK_BRIDGE_FORWARD_ENV:-}
       # CLAUDE_HOST_HOOK_BRIDGE_BEARER — shared-secret bearer token
       # the bridge sends as `Authorization: Bearer <token>` on every
-      # POST. Must match MCP_HOST_BASH_BEARER on the host launcher
+      # POST. Must match MCP_HOST_BASH_BEARER on the host server
       # side (see examples/compose/.env.example). Empty / unset =
-      # no Authorization header sent. Required when the host launcher
-      # is running behind mcp-proxy-auth-shim.
+      # no Authorization header sent. Required when the host server
+      # enforces bearer auth.
       CLAUDE_HOST_HOOK_BRIDGE_BEARER: ${CLAUDE_HOST_HOOK_BRIDGE_BEARER:-}
       # Host-project-dir signal — read by the entrypoint's
       # trust-workspace pre-seed so the workspace at the bind-mounted
@@ -254,6 +266,32 @@ services:
       # claude-events inside the container), preserving the legacy
       # shape for operators who don't bridge the host spool.
       CLAUDE_EVENT_QUEUE: ${CLAUDE_HOST_EVENTS_DIR:-}
+      # CW_PROMETHEUS_URL — Prometheus HTTP API base the `claude-watch
+      # metrics` cron queries to REHYDRATE the operator desk-streak
+      # (claude_operator_desk_streak_seconds{kind=current|max}) from the
+      # scraped `claude_operator_present` series each emit, so BOTH the
+      # current streak AND the day's max survive a container/cw restart
+      # instead of resetting to zero. The metrics cron runs INSIDE this
+      # container, so the default points at the host gateway (Prometheus
+      # is typically published on the host); override in .env if your
+      # Prometheus is reachable at a different URL (e.g. a compose-network
+      # `http://prometheus:9090`). Set EMPTY to disable rehydration and
+      # fall back to the on-disk sidecar (restart-lossy). host.docker.internal
+      # is already mapped via extra_hosts above.
+      CW_PROMETHEUS_URL: ${CW_PROMETHEUS_URL:-http://host.docker.internal:9090}
+      # CLAUDE_WATCH_PROM_FILE — absolute path the baked `claude-watch
+      # metrics` cron (cron.d/cw-default) writes the node-exporter textfile
+      # to. It MUST match the directory your node-exporter actually scrapes
+      # (its --collector.textfile.directory / the dir bind-mounted into the
+      # node-exporter container). Left UNSET, the emitter falls back to its
+      # built-in /var/lib/node-exporter/textfile/claude_watch.prom, which on
+      # a containerized/macOS deploy is typically NOT the scraped dir (and is
+      # unwritable without root) — so the metrics never reach Grafana unless
+      # you set this. The entrypoint propagates it into the cron environment
+      # via /etc/cron.d/00-env. Example: a host-shared dir under the rw ~/repos
+      # mount that node-exporter mounts read-only, e.g.
+      # /home/hndrewaall/repos/.claude-watch-textfile/claude_watch.prom.
+      CLAUDE_WATCH_PROM_FILE: ${CLAUDE_WATCH_PROM_FILE:-}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in
@@ -435,6 +473,14 @@ services:
       # session-task writes go to /home/hndrewaall/.config/session inside
       # the container's own filesystem, which is invisible to the minisite.
       - "${HOME}/.config/session:/home/hndrewaall/.config/session:rw"
+      # Host ~/.config/claude — same reasoning as ~/.config/session above,
+      # for the arm-hook's agent-queue-bindings.json (v133 / #697 owner
+      # attribution). Without this, post-tool-agent-arm-hook running for a
+      # container-spawned Agent writes bindings to /home/hndrewaall/.config/claude
+      # inside the container's own filesystem only — invisible to both
+      # queue-minisite and work-queue-exporter (which read the HOST path,
+      # matching queue-minisite's own ~/.config/claude mount below).
+      - "${HOME}/.config/claude:/home/hndrewaall/.config/claude:rw"
       # Corporate SSL CA bundle — ro. Forwarded NODE_EXTRA_CA_CERTS /
       # SSL_CERT_FILE / etc. env vars carry an ABSOLUTE host path that
       # has to resolve inside the container; we bind-mount the host file
@@ -570,6 +616,20 @@ services:
       # HOME drives where the vendored session-task / claude-event /
       # obligations CLIs read + write — they all use Path.home().
       HOME: /queue-home
+      # Path to the canonical session-task script the write endpoints
+      # (Stop / Abandon / Force-start / depend) shell out to. Points INTO
+      # the directory bind mount below (../../tools/session-task ->
+      # /app/session-task-src) rather than at a single-file mount. A
+      # single-file bind mount binds the source inode at container start,
+      # so when the host script is replaced via atomic rename (every edit,
+      # deploy, and git checkout does this) the mount goes stale — it keeps
+      # pointing at the now-unlinked inode and open() fails with ENOENT,
+      # breaking every write endpoint with an opaque "session-task <op>
+      # failed". A DIRECTORY mount resolves the filename fresh on each
+      # open(), so replacement is picked up transparently and hot-reload
+      # (the whole reason session-task is mounted rather than baked) keeps
+      # working. See the app.py `_session_task_preflight` defense-in-depth.
+      SESSION_TASK_BIN: /app/session-task-src/session-task
       QUEUE_JSON: /queue-home/.config/session/queue.json
       AGENTS_JSONL_ROOT: /agents-jsonl
       CACHE_TTL_SECONDS: "5"
@@ -614,6 +674,26 @@ services:
       # obligations write path) — so no new mount is required; this env var
       # just points the loader at the in-container path explicitly.
       AGENT_QUEUE_BINDINGS_JSON: /queue-home/.config/claude/agent-queue-bindings.json
+      # Live per-agent activity counters (tool calls + tokens) for running
+      # rows + the header totals pill. Points INTO the read-only directory
+      # mount below (CLAUDE_HOST_AGENT_STATS_DIR). The host-side producer
+      # (tools/cw-agent-stats/cw-agent-stats, via cron or the launchd plist
+      # beside it) writes the snapshot atomically (tmp + rename) every few
+      # seconds, so the DIRECTORY is mounted, not the single file — a
+      # single-file bind mount pins the original inode and goes stale on
+      # the first rewrite (the SESSION_TASK_BIN lesson). Unset operators get
+      # /dev/null mounted at /agent-stats, the open() fails with ENOTDIR,
+      # and the feature hides itself cleanly (no pill, no cell).
+      #
+      # The producer's DEFAULT --out is <claude-watch state dir>/agent-stats.json
+      # ($CLAUDE_WATCH_STATE_DIR, else /var/lib/claude-watch) — i.e. beside
+      # active-agents.json in the dir mounted at /agents-state above — and
+      # the minisite's own default is the sibling of AGENT_STATE_JSON, so
+      # when CW_STATE_PATH is a host bind-mount of that same dir you can
+      # DROP this env var + the CLAUDE_HOST_AGENT_STATS_DIR mount entirely
+      # and both sides agree with zero config. Keep this pair when the
+      # state dir is the named volume (a host cron can't write into it).
+      QUEUE_MINISITE_AGENT_STATS_FILE: /agent-stats/agent-stats.json
     volumes:
       # session-task queue.json — rw because the Stop button mutates it
       # via session-task (atomic tmp+rename + flock).
@@ -636,14 +716,29 @@ services:
       # real hierarchical subagent tree — see AGENT_QUEUE_BINDINGS_JSON above.
       - "${HOME}/.config/claude:/queue-home/.config/claude:rw"
       # Canonical session-task script — bind-mounted read-only so the
-      # container always runs the upstream version. Path is relative to
+      # container always runs the upstream version without a rebuild. We
+      # mount the containing DIRECTORY (not the single file) so an atomic-
+      # rename replacement of the script on the host (edit / deploy / git
+      # checkout) is picked up transparently: a single-file bind mount
+      # binds the source inode and goes stale on replacement, breaking the
+      # write endpoints (see SESSION_TASK_BIN above). Path is relative to
       # the build context (claude-watch repo root).
-      - "../../tools/session-task/session-task:/app/session-task:ro"
+      - "../../tools/session-task:/app/session-task-src:ro"
       # Hostjob output dir — read-only tail target for queue items bound to
       # the host-side `hostjob` runner (scope `hostjob:<label>`). The runner
       # writes ~/.cache/hostjob/<label>/log on the host; the live-log modal
       # tails it via <HOSTJOB_LOG_DIR>/<label>/log (HOSTJOB_LOG_DIR above).
       - "${HOME}/.cache/hostjob:/hostjobs:ro"
+      # Agent activity snapshot dir — read-only. Set CLAUDE_HOST_AGENT_STATS_DIR
+      # (in .env / the override) to the host directory that holds
+      # agent-stats.json — wherever the host cw-agent-stats producer's --out /
+      # CW_AGENT_STATS_OUT points (default: the claude-watch state dir,
+      # /var/lib/claude-watch, which is also what CW_STATE_PATH mounts at
+      # /agents-state — in that case this mount is redundant, see above).
+      # Default /dev/null = graceful no-op: the minisite hides the counters
+      # entirely. See QUEUE_MINISITE_AGENT_STATS_FILE above for why the
+      # DIRECTORY (not the file) is what gets mounted.
+      - "${CLAUDE_HOST_AGENT_STATS_DIR:-/dev/null}:/agent-stats:ro"
     restart: unless-stopped
 
   # ---------------------------------------------------------------------
@@ -723,6 +818,15 @@ services:
     build:
       context: ./ttyd
       dockerfile: Dockerfile
+      args:
+        # Idle window (seconds) after which the browser terminal's lock
+        # toggle engages itself, so an unattended tab can't take stray
+        # keystrokes into the live tmux session. 300 = 5 min (default);
+        # 0 disables auto-lock and leaves the manual padlock as the only
+        # path. Build-time because the image bakes one static index.html
+        # — change it and rebuild (`docker compose build ttyd`), or use
+        # the per-tab `?autolock=<seconds>` URL override for a one-off.
+        TTYD_AUTOLOCK_SECONDS: ${TTYD_AUTOLOCK_SECONDS:-300}
     image: claude-ttyd:dev
     ports:
       - "7681:7681"

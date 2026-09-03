@@ -1003,7 +1003,7 @@ def cmd_send(args) -> int:
 
     agent_id = args.agent_id
     text = args.text
-    from_label = args.from_label or "andrew@signal"
+    from_label = args.from_label or "main-loop"
     queue_item = args.queue_item
     dry_run = args.dry_run
 
@@ -1871,7 +1871,7 @@ def test_send_accepts_unicode():
 
 
 def test_send_default_from_label():
-    """send without --from defaults to andrew@signal."""
+    """send without --from defaults to main-loop."""
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         tmpdir = Path(td)
@@ -1879,7 +1879,7 @@ def test_send_default_from_label():
         cmd_send(_make_args(agent_id="dflt", text="hi", inbox_dir=inbox_dir))
         path = Path(inbox_dir) / "dflt.json"
         data = _load_inbox_messages(path)
-        assert data[0]["from"] == "andrew@signal"
+        assert data[0]["from"] == "main-loop"
     return True
 
 
@@ -4007,7 +4007,7 @@ def build_parser():
                         help="override the q-id->agent-id binding map path "
                              "(default: ~/.config/claude/agent-queue-bindings.json)")
     p_send.add_argument("--from", dest="from_label", default=None,
-                        help="sender label (default: andrew@signal)")
+                        help="sender label (default: main-loop)")
     p_send.add_argument("--queue-item", default=None,
                         help="associated queue item id")
     p_send.add_argument("--inbox-dir", default=None,

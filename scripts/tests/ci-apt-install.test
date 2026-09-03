@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Tests for scripts/ci-apt-install.sh — the bounded, retrying apt installer.
+
+Background: CI installs `inotify-tools` on GitHub's Ubuntu runners for the
+claude-event-watch tests. That install wedges intermittently, in `apt-get
+update`, with no middle ground: a healthy run takes ~21s, a wedged one goes
+silent and runs flat into whatever bound it is given (312s / 21s / 313s on
+three consecutive runs of one branch).
+
+`timeout-minutes: 5` on the step is the right outer bound and must stay — a
+larger bound buys longer failures, not passes. But a step cap alone only turns
+the hang into a failed job: the first wedged attempt eats the whole budget and
+nothing retries. And a retry loop that re-runs the identical command against
+the identical mirror list is decoration too — that is exactly how one captured
+failure burned all three attempts against the same dead mirror.
+
+So `ci-apt-install.sh` now does three things, and this suite pins all three:
+
+  * It installs from the runner image's PRE-BAKED package lists first and only
+    runs `apt-get update` when that fails. The ~11 MB index refresh is the
+    entire observed failure surface, and on the happy path it never happens.
+  * When it does retry, it CHANGES SOMETHING — the known-stalling mirror is
+    dropped from the runner's mirrorlist so the next attempt goes elsewhere.
+  * It bounds every attempt well inside the outer step cap, under a shared
+    wall-clock deadline.
+
+The properties worth pinning are about that budget arithmetic and about the
+retries being meaningful, so the suite drives the REAL script against a fake
+apt-get that hangs (and fails-on-stale-lists) on demand, and asserts on
+wall-clock behavior, not just exit codes.
+
+What's covered:
+
+  1. The script exists, is executable, and is public-repo clean.
+  2. Happy path: ONE install, NO `apt-get update` at all, exit 0.
+  3. Stale pre-baked lists fall back to `update` + install, and recover.
+  4. A wedged `apt-get update` is ABORTED at the inner timeout, not left to
+     run — the whole invocation finishes in seconds, not minutes.
+  5. A wedged-then-healthy update RECOVERS. This is the entire point.
+  6. A wedged `apt-get install` is bounded and retried the same way.
+  7. The preflight install gets exactly one attempt, so it cannot eat the
+     budget the `update` fallback needs.
+  8. Retries are capped by attempt count, and the failure names the wedge.
+  9. The shared deadline is respected: the script never runs past its total
+     budget, so a total wedge still fails inside the outer step cap.
+ 10. The stalling mirror is dropped before a retry — and NOT on the happy
+     path, where its throughput is worth keeping.
+ 11. apt's own acquire timeouts are passed through (the root-cause mitigation:
+     apt's 120s-per-connection default is what lets one dead mirror stall).
+ 12. Usage error with no packages.
+ 13. CI wiring: the one remaining apt step goes through this script and keeps
+     its `timeout-minutes` backstop, and the e2e job no longer installs tmux
+     (the runner image ships it) but still asserts it is present.
+
+Run:  ./scripts/tests/ci-apt-install.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "ci-apt-install.sh"
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+PRIVATE_SENTINELS = [
+    "/mnt/Raiden",
+    "/mnt/Scorpion",
+    "ADHPrivate",
+    "~/repos/claude-config",
+    "~/repos/server-config",
+]
+
+failures: list[str] = []
+
+
+def check(cond: bool, msg: str) -> None:
+    if cond:
+        print(f"  ok: {msg}")
+    else:
+        print(f"  FAIL: {msg}")
+        failures.append(msg)
+
+
+# A fake apt-get.
+#
+#   HANG_ON                   names the subcommand that should hang; a per-
+#                             subcommand counter file lets the first N calls
+#                             hang and the rest succeed, so "wedged then
+#                             healthy" is expressible.
+#   FAIL_INSTALL_UNTIL_UPDATE models the real stale-pre-baked-lists case:
+#                             `install` fails fast until an `update` has run.
+FAKE_APT = """#!/usr/bin/env bash
+sub="${1:-}"
+
+[ "$sub" = "update" ] && : > "$FAKE_STATE.updated"
+
+n=$(cat "$FAKE_STATE.$sub" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$FAKE_STATE.$sub"
+
+if [ "$sub" = "$HANG_ON" ] && [ "$n" -lt "${HANG_TIMES:-9999}" ]; then
+    echo "fake $sub: hanging (call $((n + 1)))"
+    sleep 600
+fi
+
+if [ "$sub" = "install" ] \
+   && [ "${FAIL_INSTALL_UNTIL_UPDATE:-0}" = "1" ] \
+   && [ ! -f "$FAKE_STATE.updated" ]; then
+    echo "fake install: package lists are stale (no update has run)" >&2
+    exit 100
+fi
+
+echo "FAKEAPT $*"
+exit 0
+"""
+
+
+def run_script(
+    packages: list[str],
+    *,
+    hang_on: str = "",
+    hang_times: int = 9999,
+    budget: int = 20,
+    attempt_timeout: int = 2,
+    attempts: int = 3,
+    backoff: int = 0,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess, float, Path]:
+    """Run the real script against the fake apt-get.
+
+    Returns (proc, elapsed, state_prefix); per-subcommand call counts live at
+    ``{state_prefix}.{subcommand}``.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="ci-apt-test-"))
+    fake = tmp / "fake-apt-get"
+    fake.write_text(FAKE_APT)
+    fake.chmod(0o755)
+    state = tmp / "calls"
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "CI_APT_GET": str(fake),
+            "CI_APT_DPKG": "true",
+            "CI_APT_TEE": "tee",
+            "CI_APT_TOTAL_BUDGET": str(budget),
+            "CI_APT_ATTEMPT_TIMEOUT": str(attempt_timeout),
+            "CI_APT_ATTEMPTS": str(attempts),
+            "CI_APT_BACKOFF": str(backoff),
+            "HANG_ON": hang_on,
+            "HANG_TIMES": str(hang_times),
+            "FAKE_STATE": str(state),
+        }
+    )
+    if extra_env:
+        env.update(extra_env)
+
+    start = time.monotonic()
+    proc = subprocess.run(
+        [str(SCRIPT), *packages],
+        capture_output=True,
+        text=True,
+        env=env,
+        # Hard backstop: if the script ever fails to bound its own child, this
+        # is what turns a hung suite into a failed assertion. Deliberately much
+        # larger than any configured budget above.
+        timeout=180,
+    )
+    return proc, time.monotonic() - start, state
+
+
+def calls(state: Path, sub: str) -> int:
+    f = Path(f"{state}.{sub}")
+    return int(f.read_text().strip()) if f.exists() else 0
+
+
+def mirrorlist(tmpdir: Path, body: str) -> Path:
+    """A stand-in for the runner's /etc/apt/apt-mirrors.txt."""
+    p = tmpdir / "apt-mirrors.txt"
+    p.write_text(body)
+    return p
+
+
+STALE = {"FAIL_INSTALL_UNTIL_UPDATE": "1"}
+
+# -----------------------------------------------------------------------------
+print("1. Script exists, is executable, public-repo clean")
+# -----------------------------------------------------------------------------
+check(SCRIPT.is_file(), "scripts/ci-apt-install.sh exists")
+check(os.access(SCRIPT, os.X_OK), "ci-apt-install.sh is executable")
+text = SCRIPT.read_text() if SCRIPT.is_file() else ""
+for sentinel in PRIVATE_SENTINELS:
+    check(sentinel not in text, f"free of private sentinel {sentinel!r}")
+check(
+    subprocess.run(["bash", "-n", str(SCRIPT)]).returncode == 0,
+    "passes `bash -n` syntax check",
+)
+
+# -----------------------------------------------------------------------------
+print("2. Happy path: install from the pre-baked lists, NO apt-get update")
+# -----------------------------------------------------------------------------
+# The ~11 MB index refresh is the entire observed failure surface. Not running
+# it is the single largest reliability win available, so this is the assertion
+# most worth having: a regression that restores update-first would be invisible
+# on a green runner and only show up the next time a mirror had a bad day.
+proc, elapsed, state = run_script(["inotify-tools"])
+check(proc.returncode == 0, f"exit 0 (got {proc.returncode})")
+check("FAKEAPT install" in proc.stdout, "ran `apt-get install`")
+check("FAKEAPT update" not in proc.stdout, "did NOT run `apt-get update`")
+check(calls(state, "update") == 0, "not even one update call was made")
+check("pre-baked lists" in proc.stdout, "says which lists it used")
+check("inotify-tools" in proc.stdout, "passed the package name through")
+check("attempt 2/" not in proc.stdout, "did not retry a healthy run")
+
+# -----------------------------------------------------------------------------
+print("3. Stale pre-baked lists fall back to update + install")
+# -----------------------------------------------------------------------------
+# The fallback has to exist, or the optimisation above becomes a correctness
+# bug the first time a package is newer than the runner image.
+proc, elapsed, state = run_script(["inotify-tools"], extra_env=STALE)
+check(proc.returncode == 0, f"recovers via update and exits 0 (got {proc.returncode})")
+check(calls(state, "update") == 1, f"ran update once (got {calls(state, 'update')})")
+check("after refresh" in proc.stdout, "re-ran the install after the refresh")
+check(calls(state, "install") == 2, "install ran twice: pre-baked, then refreshed")
+
+# -----------------------------------------------------------------------------
+print("4. A wedged `apt-get update` is aborted at the inner timeout")
+# -----------------------------------------------------------------------------
+# The fake hangs for 600s. If the inner timeout were absent or ineffective the
+# call below would sit there until the subprocess backstop fired.
+proc, elapsed, _ = run_script(
+    ["inotify-tools"],
+    hang_on="update",
+    budget=12,
+    attempt_timeout=2,
+    attempts=3,
+    extra_env=STALE,
+)
+check(proc.returncode != 0, "a permanently wedged update fails (non-zero exit)")
+check(
+    elapsed < 30,
+    f"aborted early rather than hanging: finished in {elapsed:.1f}s "
+    f"against a 600s fake hang",
+)
+check("TIMED OUT" in proc.stderr, "names the timeout in the failure output")
+
+# -----------------------------------------------------------------------------
+print("5. Wedged-then-healthy update RECOVERS (the point of the change)")
+# -----------------------------------------------------------------------------
+proc, elapsed, state = run_script(
+    ["inotify-tools"],
+    hang_on="update",
+    hang_times=1,
+    budget=20,
+    attempt_timeout=2,
+    extra_env=STALE,
+)
+check(proc.returncode == 0, f"recovers and exits 0 (got {proc.returncode})")
+check("attempt 2/" in proc.stdout, "a second update attempt actually ran")
+check("after refresh" in proc.stdout, "the install still ran after recovery")
+check(
+    elapsed < 20,
+    f"recovery fits well inside the outer step cap ({elapsed:.1f}s)",
+)
+
+# -----------------------------------------------------------------------------
+print("6. A wedged `apt-get install` is bounded and retried too")
+# -----------------------------------------------------------------------------
+# The observed wedge is in `update`, but `install` pulls the .debs from the same
+# mirrors, so leaving it unbounded would move the hang rather than fix it.
+proc, elapsed, state = run_script(
+    ["inotify-tools"],
+    hang_on="install",
+    hang_times=1,
+    budget=20,
+    attempt_timeout=2,
+    extra_env={"CI_APT_UPDATE_MODE": "always"},
+)
+check(proc.returncode == 0, f"install retry recovers (got {proc.returncode})")
+check(
+    "apt-get install" in proc.stdout and "attempt 2/" in proc.stdout,
+    "a second install attempt actually ran",
+)
+
+proc, elapsed, _ = run_script(
+    ["inotify-tools"],
+    hang_on="install",
+    budget=12,
+    attempt_timeout=2,
+    extra_env={"CI_APT_UPDATE_MODE": "always"},
+)
+check(proc.returncode != 0, "a permanently wedged install fails")
+check(elapsed < 30, f"and is bounded ({elapsed:.1f}s, not 600s)")
+
+# -----------------------------------------------------------------------------
+print("7. The preflight install gets exactly one attempt")
+# -----------------------------------------------------------------------------
+# Budget arithmetic: the preflight runs before the `update` fallback, so if it
+# retried three times against a wedged mirror it would consume the budget the
+# fallback needs and the fallback would never run at all.
+proc, elapsed, state = run_script(
+    ["inotify-tools"],
+    hang_on="install",
+    budget=60,
+    attempt_timeout=2,
+    extra_env={"CI_APT_UPDATE_MODE": "never"},
+)
+check(proc.returncode != 0, "a wedged preflight install fails")
+check(
+    calls(state, "install") == 1,
+    f"exactly one preflight attempt (got {calls(state, 'install')})",
+)
+check(elapsed < 20, f"and it is bounded ({elapsed:.1f}s)")
+
+# -----------------------------------------------------------------------------
+print("8. Retries are capped by attempt count")
+# -----------------------------------------------------------------------------
+proc, elapsed, state = run_script(
+    ["inotify-tools"],
+    hang_on="update",
+    budget=60,
+    attempt_timeout=1,
+    attempts=2,
+    extra_env=STALE,
+)
+u = calls(state, "update")
+check(u == 2, f"exactly 2 update attempts with CI_APT_ATTEMPTS=2 (got {u})")
+check("all 2 attempts failed" in proc.stderr, "reports the attempt cap in the error")
+
+# -----------------------------------------------------------------------------
+print("9. The shared deadline caps total wall-clock time")
+# -----------------------------------------------------------------------------
+# A generous attempt count against a permanent wedge must still stop at the
+# budget, so the wrapper can never be the thing that blows the 5-minute step
+# cap it lives under.
+budget = 8
+proc, elapsed, _ = run_script(
+    ["inotify-tools"],
+    hang_on="update",
+    budget=budget,
+    attempt_timeout=2,
+    attempts=99,
+    extra_env=STALE,
+)
+check(proc.returncode != 0, "permanent wedge still fails")
+check(
+    elapsed <= budget + 8,
+    f"stopped near the {budget}s budget rather than running 99 attempts "
+    f"(took {elapsed:.1f}s)",
+)
+
+# -----------------------------------------------------------------------------
+print("10. The stalling mirror is dropped before a retry — and only then")
+# -----------------------------------------------------------------------------
+# In the captured failure all three attempts ran against the same wedged
+# mirror. A retry that changes nothing is not a retry.
+MIRRORS = (
+    "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
+    "http://archive.ubuntu.com/ubuntu/\n"
+    "http://security.ubuntu.com/ubuntu/\n"
+)
+
+tmp = Path(tempfile.mkdtemp(prefix="ci-apt-mirror-"))
+ml = mirrorlist(tmp, MIRRORS)
+proc, _, _ = run_script(
+    ["inotify-tools"],
+    extra_env={**STALE, "CI_APT_MIRRORLIST": str(ml)},
+)
+after = ml.read_text()
+check(proc.returncode == 0, "the run still succeeds")
+check("azure.archive.ubuntu.com" not in after, "the stalling mirror was dropped")
+check("archive.ubuntu.com/ubuntu/" in after, "a working mirror survives")
+check("security.ubuntu.com" in after, "unrelated mirror lines are preserved")
+check("dropping azure.archive.ubuntu.com" in proc.stdout, "says what it did")
+
+# The Azure mirror is normally the FAST one (measured 8 MB/s). Paying its
+# reliability cost on every run — including the ones where nothing failed —
+# would be a bad trade, so the happy path must leave the mirrorlist alone.
+tmp = Path(tempfile.mkdtemp(prefix="ci-apt-mirror-"))
+ml = mirrorlist(tmp, MIRRORS)
+proc, _, _ = run_script(["inotify-tools"], extra_env={"CI_APT_MIRRORLIST": str(ml)})
+check(proc.returncode == 0, "happy path succeeds")
+check(
+    ml.read_text() == MIRRORS,
+    "happy path leaves the mirrorlist untouched (keeps the fast mirror)",
+)
+
+# Dropping the stalling mirror must never leave apt with nowhere to go.
+tmp = Path(tempfile.mkdtemp(prefix="ci-apt-mirror-"))
+ml = mirrorlist(tmp, "http://azure.archive.ubuntu.com/ubuntu/\n")
+proc, _, _ = run_script(
+    ["inotify-tools"],
+    extra_env={**STALE, "CI_APT_MIRRORLIST": str(ml)},
+)
+after = ml.read_text()
+check(proc.returncode == 0, "a single-entry mirrorlist still succeeds")
+check(after.strip() != "", "never leaves an EMPTY mirrorlist behind")
+check("archive.ubuntu.com" in after, "falls back to the canonical archive")
+
+# A missing mirrorlist is not an error — not every image has one.
+tmp = Path(tempfile.mkdtemp(prefix="ci-apt-mirror-"))
+proc, _, _ = run_script(
+    ["inotify-tools"],
+    extra_env={**STALE, "CI_APT_MIRRORLIST": str(tmp / "nope.txt")},
+)
+check(proc.returncode == 0, "an absent mirrorlist is tolerated, not fatal")
+
+# -----------------------------------------------------------------------------
+print("11. apt's own acquire timeouts are passed through")
+# -----------------------------------------------------------------------------
+proc, _, _ = run_script(["inotify-tools"])
+for opt in ("Acquire::http::Timeout", "Acquire::https::Timeout", "Acquire::Retries"):
+    check(opt in proc.stdout, f"passes -o {opt} to apt-get")
+check(
+    "Acquire::http::Timeout=15" in proc.stdout,
+    "the acquire timeout is short (15s), not apt's 120s default",
+)
+
+# -----------------------------------------------------------------------------
+print("12. Usage error with no packages")
+# -----------------------------------------------------------------------------
+proc = subprocess.run([str(SCRIPT)], capture_output=True, text=True)
+check(proc.returncode == 2, f"exit 2 on no arguments (got {proc.returncode})")
+check("usage:" in proc.stderr, "prints usage")
+
+# -----------------------------------------------------------------------------
+print("13. CI wiring: apt steps go through the script and keep their backstop")
+# -----------------------------------------------------------------------------
+wf = WORKFLOW.read_text() if WORKFLOW.is_file() else ""
+check(bool(wf), ".github/workflows/ci.yml is readable")
+
+# Any step that still calls apt-get directly is one this fix does not cover.
+raw_apt = [
+    ln.strip()
+    for ln in wf.splitlines()
+    if "apt-get" in ln and "ci-apt-install" not in ln and not ln.strip().startswith("#")
+]
+check(
+    not raw_apt,
+    f"no CI step calls apt-get directly (found {raw_apt})",
+)
+
+steps = re.findall(r"run: [^\n]*ci-apt-install\.sh[^\n]*", wf)
+check(len(steps) == 1, f"exactly one apt-installing step remains (found {len(steps)})")
+check(
+    all("inotify-tools" in s for s in steps),
+    "and it is the inotify-tools one",
+)
+
+# tmux ships preinstalled on ubuntu-latest — apt reported "already the newest
+# version, 0 newly installed". Installing it was a pure no-op whose only real
+# effect was triggering an index refresh, i.e. pure exposure to the mirror
+# wedge for zero benefit. Re-adding that step would be a regression.
+check(
+    not re.search(r"ci-apt-install\.sh[^\n]*\btmux\b", wf),
+    "the e2e job does not apt-install tmux (the runner image ships it)",
+)
+# ...but something must still fail loudly if a future image drops it.
+check("tmux -V" in wf, "the e2e job asserts tmux is present before using it")
+
+# The outer bound must survive the restructure — losing it would silently
+# restore the 360-minute job-ceiling behavior this whole fix exists to avoid.
+blocks = [b for b in wf.split("- name:") if "ci-apt-install.sh" in b]
+check(bool(blocks), "found the apt-installing step block(s)")
+for b in blocks:
+    label = b.strip().splitlines()[0].strip()
+    check(
+        "timeout-minutes:" in b,
+        f"step {label!r} keeps its timeout-minutes backstop",
+    )
+
+# -----------------------------------------------------------------------------
+print()
+if failures:
+    print(f"{len(failures)} FAILURE(S):")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+print("All ci-apt-install tests passed.")

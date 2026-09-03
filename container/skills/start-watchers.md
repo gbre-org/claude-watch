@@ -40,6 +40,7 @@ This skill exists so the in-container agent has a single canonical place to:
 
    - **Already running** (e.g. an earlier launch in this same session — `watcher-ctl status` shows `ok`): do NOT double-launch.
    - **Not running** (`watcher-ctl status` shows `DOWN`): launch via `watcher-ctl run <name>`, invoked **only through Claude Code's `run_in_background: true` Bash invocation** — never via shell `&` or `nohup` (matches the host's cardinal watcher rule: watchers can ONLY be started by Claude Code's main loop). `watcher-ctl run` writes the `<name>.pid` / `<name>.runlock` files (so the daemon's pidfile-based liveness check can see the watcher) and is idempotent (it no-ops if a live instance already holds the slot). Capture the resulting `bash_id` so the watcher can be monitored / killed later.
+   - **Monitor-mode watcher** (`watcher-ctl list` shows `MODE monitor` — set per watcher in the layered `watchers.conf`, override layer at `$WATCHERS_CONFIG_EXTRA`): the `watcher-ctl run <name>` background task exits immediately and its output is the exact `Monitor` tool invocation to arm (command, `persistent: true`). Arm it from the main loop, then read every stdout line it emits as an event batch. `watcher-ctl status` shows a live monitor as `ok (1/1)` with a `[monitor]` tag.
 
    > Do NOT launch the raw `bash /opt/claude-container/watchers/<name>.sh` directly: a raw launch skips the pidfile/runlock bookkeeping `watcher_run` performs, so the daemon's watcher_monitor (pidfile-based since PR #339) can't see it and will report a false DOWN.
 
@@ -55,7 +56,7 @@ The claude-watch daemon's `[watcher_monitor]` is the fallback alert layer: if a 
 
 To add a container-baked watcher in a future PR:
 
-1. Drop `<name>.sh` (executable launcher; MUST follow block-print-exit: block until trigger, print results, exit — do NOT loop forever) and `<name>.toml` (metadata) under [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers) in the claude-watch repo. Authoring guide: `docs/adding-watchers.md`.
+1. Drop `<name>.sh` (executable launcher; MUST follow block-print-exit: block until trigger, print results, exit — do NOT loop forever) and `<name>.toml` (metadata) under [`container/watchers/`](https://github.com/gbre-org/claude-watch/tree/main/container/watchers) in the claude-watch repo. Authoring guide: `docs/adding-watchers.md`.
 2. The `Dockerfile` `COPY` line for `container/watchers/` already lands them at `/opt/claude-container/watchers/<name>.{sh,toml}` (this skill auto-discovers them).
 3. Update `container/watchers/README.md` to document what the watcher does and what events it produces, and register it in `container/watchers.conf` so the daemon's watcher_monitor can alert when it's down.
 4. Rebuild the image and `cwsr` (or `docker compose up -d --force-recreate` if entrypoint-time wiring changed).
@@ -64,4 +65,4 @@ To add a container-baked watcher in a future PR:
 
 - This skill never starts host-side watchers and never schedules host cron jobs. For host-side scheduled work, see the "Host-side scheduled tasks (via `host-bash`)" section of `/etc/claude-code/CLAUDE.md`.
 - The `container/watchers/README.md` documents the on-disk schema (`name`, `description`, `launcher`, `restart_policy`, `log_path`); change there first, then bump the consumers.
-- Source dir in repo: [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers). Baked path inside the container: `/opt/claude-container/watchers/`.
+- Source dir in repo: [`container/watchers/`](https://github.com/gbre-org/claude-watch/tree/main/container/watchers). Baked path inside the container: `/opt/claude-container/watchers/`.

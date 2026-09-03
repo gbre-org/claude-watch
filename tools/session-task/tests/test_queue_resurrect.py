@@ -339,7 +339,7 @@ def test_resurrect_refuses_done_item():
         _run(env, "queue", "done", old_id)
 
         r = _run(env, "queue", "resurrect", old_id, expect_exit=1)
-        assert "must be running or wedged" in r.stderr
+        assert "must be running, wedged or quarantined" in r.stderr
         assert "queue add" in r.stderr
 
 
@@ -351,20 +351,28 @@ def test_resurrect_refuses_pending_item():
         old_id = item["id"]
         # No register.
         r = _run(env, "queue", "resurrect", old_id, expect_exit=1)
-        assert "must be running or wedged" in r.stderr
+        assert "must be running, wedged or quarantined" in r.stderr
 
 
 def test_resurrect_refuses_abandoned_item():
-    """An abandoned item is terminal — same shape as done."""
+    """An abandoned item is terminal — same shape as done.
+
+    Note `--confirmed-dead`: a bare `abandon` on a registered item now
+    quarantines it (holding the scope) rather than going terminal, and
+    resurrect deliberately ACCEPTS a quarantined item — that is the respawn
+    path for an agent that really did die. To reach the terminal state this
+    test is about, the caller has to assert positive evidence of exit.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         item = _add(env, "abandoned", ["repo:abnd"], "--summary", "a")
         old_id = item["id"]
         _run(env, "queue", "register", old_id)
-        _run(env, "queue", "abandon", old_id, "--reason", "test")
+        _run(env, "queue", "abandon", old_id, "--confirmed-dead",
+             "--reason", "test")
 
         r = _run(env, "queue", "resurrect", old_id, expect_exit=1)
-        assert "must be running or wedged" in r.stderr
+        assert "must be running, wedged or quarantined" in r.stderr
 
 
 def test_resurrect_refuses_missing_item():

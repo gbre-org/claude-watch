@@ -149,36 +149,111 @@ or anything else PATH-resolvable. The supervisor execs it directly via
 `tokio::process::Command::new(args[0]).args(&args[1..])`.
 
 The supervisor expects the watcher to be on `$PATH` (or installed via
-`make install`, which copies `tools/watchers/<name>` into `$BIN_DIR`,
+`make install`, which symlinks `tools/watchers/<name>` into `$BIN_DIR`,
 default `~/bin/`). The convention in this repo is that `tools/watchers/`
-contents are mirrored into `~/bin/` by `make install`.
+contents are mirrored into `~/bin/` by `make install` — as absolute-path
+symlinks back into the checkout, so in-tree edits take effect without a
+re-install. The list is explicit in the `install` target, so add your new
+watcher there.
 
 ### Registering with `watchers.conf`
 
-`watcher-ctl` reads `~/.config/watchmen/watchers.conf` (override with
-`$WATCHERS_CONFIG` for tests). Each non-comment line declares one
-watcher:
+`watcher-ctl` (and the daemon's `watcher_monitor`) read a **layered**
+config: the base file `$XDG_CONFIG_HOME/watchmen/watchers.conf`
+(`~/.config/watchmen/watchers.conf`; override the path with
+`$WATCHERS_CONFIG` — tests and the container do) plus an optional
+**override file** in the user dir, `$XDG_CONFIG_HOME/watchmen/watchers.override.conf`
+(path from `$WATCHERS_CONFIG_EXTRA`; an EMPTY value disables the layer).
+Each non-comment line declares one watcher:
 
 ```
-name|pgrep_pattern|min_count|enabled|start_cmd[|on_restart_cmd]
+name|pgrep_pattern|min_count|enabled|start_cmd[|on_restart_cmd[|mode[|monitor_cmd]]]   # positional
+name|key=value|key=value                                                                 # keyed
 ```
 
-Field semantics:
+A field of the form `<known-key>=<value>` is keyed and sets that key
+regardless of position; every other field is positional by slot. The two
+forms may mix on one line. Field semantics:
 
 | Field | Required | Default | Meaning |
 |-------|----------|---------|---------|
 | `name` | yes | — | Identifier for `watcher-ctl run/enable/disable <name>` |
-| `pgrep_pattern` | yes | — | `pgrep -f` pattern that matches the live watcher process. `watcher-status` uses this to detect DOWN / DUPLICATE |
+| `pgrep_pattern` | yes | — | `pgrep -f` pattern that matches the live watcher process. `watcher-status` uses this to detect DUPLICATE (liveness itself is pidfile-based). Only stable hits count: a match that is already gone, is the prober's own process tree, is a `pgrep`/`pkill` itself, or is younger than 2 s (a concurrent status run's own `pgrep` child) is never a duplicate |
 | `min_count` | no | `1` | How many concurrent pollers should be alive. Almost always `1` |
 | `enabled` | no | `true` | `true` / `false`. `watcher-ctl enable/disable` flips this |
 | `start_cmd` | no | empty | Command line `watcher-ctl run <name>` execs. Whitespace-split (no shell expansion) |
 | `on_restart_cmd` | no | empty | Optional history-dump command run when a stale PID file is detected. Useful for "show me what I missed" semantics |
+| `mode` | no | `oneshot` | `oneshot` (block-print-exit, run as a background Bash task; `exit` / `one-shot` accepted) or `monitor` (long-lived, armed once from the main loop through a line-streaming launcher such as Claude Code's `Monitor` tool). See [Monitor mode](#monitor-mode-line-streaming-launcher) |
+| `monitor_cmd` | no | `<start_cmd> --mode monitor` | The command the main loop arms when `mode=monitor`. Only needed when the watcher's monitor flag is not `--mode monitor` |
 
 Example entry (the canonical `claude-event-watch` line):
 
 ```
 claude-event-watch|bin/claude-event-watch|1|true|claude-event-watch
 ```
+
+#### The override layer (user dir, may be a symlink into a repo)
+
+The committed/base file stays the source of *what exists*; the override
+file is where a deployment flips *how it runs*. A line naming an existing
+watcher changes **only the fields it sets** (blank positional fields and
+omitted keys inherit from base); a line naming an unknown watcher is
+appended as a new entry. Later lines win. So flipping the event watcher to
+monitor mode is one line in the override file:
+
+```
+# ~/.config/watchmen/watchers.override.conf
+claude-event-watch|mode=monitor
+```
+
+and `watcher-ctl list` shows the effective value plus which layer set it
+(`SOURCE` column: `base`, `override`, or `base+override(mode,...)`) and
+names both files in its `layers:` footer. A missing override is a silent
+no-op — the base loads on its own. The file is read through symlinks, so it
+can live in a dotfiles/config repo and be linked into the user dir.
+`watcher-ctl enable/disable` edits the BASE file and refuses when the
+override pins `enabled` (it points you at the override instead), so a flag
+is never written where it has no effect.
+
+**Inside a container** the user dir is whatever is bind-mounted: the
+claude-container entrypoint exports
+`WATCHERS_CONFIG_EXTRA=$HOME/.config/claude-container/watchers/watchers.conf`
+(the operator-editable mount, `$HOME`-relative — never a host-absolute path)
+and the baked daemon config names the same file, so CLI and daemon agree.
+A symlinked override works through the mount **only if its target is also
+inside the mounted tree**; a link whose target lives outside the mount
+dangles and is treated as absent (`watcher-ctl list` reports the override
+`absent — base only`).
+
+#### Monitor mode (line-streaming launcher)
+
+`mode=monitor` declares that the watcher is **armed once** by the main loop
+through a launcher that turns each stdout line into its own notification
+(Claude Code's `Monitor` tool, `persistent: true`) and stays alive across
+batches — instead of the block-print-exit cycle that costs a restart per
+batch. For such a watcher `watcher-ctl run <name>` does **not** exec the
+one-shot (a block-print-exit supervisor above a monitor would capture its
+stdout until an exit that never comes): it prints the exact command to arm
+(`<monitor_cmd> 2>&1`, so stderr joins the event stream), a reminder that
+every stdout line must be read and acted on, records the request in
+`<pid_dir>/<name>.monitor-intent`, and exits 0. If a live instance is already
+recorded it says so and exits 0 (idempotent). `watcher-ctl status` judges a
+monitor-mode watcher by the same pidfile model as any other (`<name>.lock`
+written by the watcher itself), tags its row `[monitor]`, and in the DOWN
+footer says to re-arm rather than re-run; `watcher-restart` stops it like any
+other watcher (and removes the `.monitor-intent`, voiding a pending arm).
+Between `watcher-ctl run` printing the command and the Monitor actually
+being live there is no process yet; for that gap the row reads **`ARMING`**
+(healthy-pending — not counted by `--unhealthy-only`, not a daemon miss) for
+up to `[watcher_monitor].monitor_arming_grace_secs` (default 120s, env
+override `CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS`), provided no runtime file
+has been written since the intent (a `.lock` younger than the intent means
+the monitor went live and then died — real DOWN, immediately). The Monitor
+call that arms it (exactly the printed command, trailing ` 2>&1` tolerated)
+is exempt from every obligations gate via the `MonitorArm` token — see
+`tools/obligations/README.md`. Flipping back is the same one-line edit (`mode=oneshot`) plus
+a normal `watcher-ctl run <name>` background task — no rebuild, no revert, no
+session restart in either direction.
 
 The pattern `bin/claude-event-watch` matches any descendant of `~/bin/`
 running the script; that's why `make install` symlinks the canonical
@@ -265,9 +340,10 @@ Example: `claude-event-watch` reads `$CLAUDE_EVENT_QUEUE` (default
 `~/.config/claude-events/`). Mirror that shape — env-var with a sane
 default — so the watcher is unit-testable.
 
-The supervisor itself reads ONLY `~/.config/watchmen/watchers.conf`
-(override `$WATCHERS_CONFIG`). It does not pass anything else to the
-child beyond the env it was invoked with.
+The supervisor itself reads ONLY the layered watchers config —
+`~/.config/watchmen/watchers.conf` (`$WATCHERS_CONFIG`) plus the optional
+`watchers.override.conf` (`$WATCHERS_CONFIG_EXTRA`). It does not pass
+anything else to the child beyond the env it was invoked with.
 
 ### Tests
 
@@ -532,8 +608,8 @@ Watchers ship with two test layers:
   outside CI (run manually or as a `#[ignore]`-gated cargo test).
 
 Wire new test files into `make test-watchers` (host) or
-`make test-container` (container) so the pre-commit hook + CI catch
-regressions.
+`make test-entrypoint` (container — it runs the `container/tests/`
+suites) so the pre-commit hook + CI catch regressions.
 
 ## Pointers
 
@@ -546,3 +622,8 @@ regressions.
 - `/start-watchers` skill: [`container/skills/start-watchers.md`](../container/skills/start-watchers.md)
 - Cardinal rule reference (why watchers are main-loop-only):
   [`docs/watchers.md#cardinal-rule-watchers-belong-to-the-main-loop`](watchers.md#cardinal-rule-watchers-belong-to-the-main-loop)
+
+<!-- Merge queue end-to-end check, 2026-09-01: this branch was cut one commit
+     behind main on purpose, so classic strict protection would have demanded a
+     manual update-branch before merging. The queue rebuilds it on top of main
+     instead. -->

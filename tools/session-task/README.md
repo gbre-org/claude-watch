@@ -44,6 +44,36 @@ session-task queue done q-2026-05-01-XXXX
 `session-task queue spawn-check <id>` is a read-only re-check (exit 0 = clear, exit 2 = blocked
 or not found).
 
+### Owner attribution (`queue assign`)
+
+A running item should name the agent that owns it (`agent_id`), so the
+dashboard and the owner-unknown alert can tell "actively worked" from
+"registered and forgotten". Two paths stamp it automatically: the
+spawn-time arm hook (original spawn) and `queue register --agent-id`
+(the first register of an item).
+
+Neither covers an agent **resumed onto a rotated queue id** — no fresh
+spawn hook fires, and `register` cannot retrofit the stamp:
+
+* `register --agent-id --if-absent` short-circuits at `already running`
+  and stamps nothing.
+* `register` without `--if-absent` refuses a running item on purpose —
+  a register against a running item is the double-spawn signal, and
+  relaxing it to permit an owner edit would blunt that guard.
+
+So owner attribution has its own verb:
+
+```bash
+session-task queue assign q-2026-05-01-XXXX --agent <agent_id>
+```
+
+It writes ONLY `agent_id`, `agent_id_source: "assign"` and
+`agent_id_stamped_at` — no status change, no scope re-acquisition, and
+deliberately no `last_heartbeat_at` bump (an owner stamp is not evidence
+of liveness). Accepted on `running` / `wedged` / `blocked`; refused on
+`pending` (nothing was spawned, so an owner would be invented) and on
+`done` / `abandoned` / `quarantined` (the item is over).
+
 **Note on `--force-enqueue`**: dual purpose as of 2026-05-19 (rev 2):
 
   * **Bypass for the workload-scope hard-fail**. `queue add` REFUSES (exit 3,
@@ -115,11 +145,80 @@ scope, defaulting open on any ambiguity.
 - `~/.config/session/queue.json` — queue state (Layer 2)
 - `~/.config/session/resume-action.json` — single resume slot (Layer 1)
 - `~/.config/session/completed-tasks.jsonl` — completion log (both layers)
+- `~/.config/session/queue-logs/` — per-completed-item transcript archives
+- `~/.config/session/completed-archive/` — dated gz segments of rolled
+  `completed-tasks.jsonl` history (see "Rotation / archival" below)
 
 The schema is **stable**: `{"schema_version": 2, "items": [...]}`. Items have:
 `id, description, summary, scope, group_id, group_head, status, priority, created_at,
 created_by`, plus optional `started_at, registered_at, completed_at, abandoned_at,
-abandon_reason, pid, last_heartbeat_at, context`.
+abandon_reason, pid, last_heartbeat_at, context, agent_id, agent_id_source,
+agent_id_stamped_at`.
+
+## Push notifications (`queue-notify`)
+
+Every queue lifecycle transition does two independent things:
+
+1. Emits a **claude-event** (`queue-started`, `queue-done`, `queue-abandoned`,
+   `queue-blocked`, …) into `~/claude-events/`, which is how the main loop, the
+   queue minisite and the exporter learn about the transition.
+2. Shells out to **`queue-notify`** (`tools/session-task/queue-notify`), the
+   dedicated Pushover path, for a phone push.
+
+Those two are **decoupled**, and only the second one is filtered.
+
+### Transition push policy
+
+`queue-notify` pushes a transition only if it is in the *push set*. The default
+set is every known lifecycle transition **except `started` and `done`**:
+
+```
+abandoned  blocked  force-started  quarantined  unblocked  unwedged  wedged
+```
+
+**Why:** `started` and `done` are pure bookkeeping — one fires on every
+`queue register`, one on every `queue done` — and neither asks the operator for
+anything or reports a failure. In Aug 2026 those two transitions alone produced
+roughly 3,000 Pushover messages in three weeks, about 31% of the account's
+monthly message allowance, spent entirely on "a thing started" / "a thing
+finished" notices nobody acts on. The remaining transitions all either need a
+human decision (blocked, wedged, quarantined, force-started) or report an
+outcome that isn't the happy path (abandoned), so they keep their push.
+
+Two properties are deliberate:
+
+- **claude-events are untouched.** `queue-started` / `queue-done` still fire
+  exactly as before, with the same tag, data and timing. Nothing downstream of
+  the event stream changes; only the phone push is dropped. If you want to see
+  starts and completions, the queue minisite and `claude-event-tail` still have
+  every one of them.
+- **The filter fails open.** Only transition kinds `queue-notify` explicitly
+  knows about can be suppressed. A hand-written title, or a transition kind
+  added to `session-task` later, always pushes — silence is never the default
+  for something unrecognised.
+
+`--silent` and `PINGME_SESSION_TASK=0` are unchanged and still suppress both
+the push and the claude-event at the `session-task` end.
+
+### Re-enabling without a code change
+
+`QUEUE_NOTIFY_PUSH_TRANSITIONS` overrides the push set. Comma and/or whitespace
+separated, case-insensitive, and a leading `queue ` on an entry is tolerated:
+
+```bash
+QUEUE_NOTIFY_PUSH_TRANSITIONS=all             # push every transition (pre-policy behaviour)
+QUEUE_NOTIFY_PUSH_TRANSITIONS=none            # push no known transition
+QUEUE_NOTIFY_PUSH_TRANSITIONS=wedged,blocked  # exactly these two
+QUEUE_NOTIFY_PUSH_TRANSITIONS=default,done    # the default set, plus `done`
+```
+
+`default` expands to the built-in set, so re-enabling one transition doesn't
+mean re-listing the rest. A suppressed transition exits **0** — not pushing is
+a policy decision, not a delivery failure, and `session-task` must not treat it
+as one.
+
+Other `queue-notify` env knobs (debounce/batch, spool path, dry-run sink) are
+documented in that file's module docstring.
 
 ## Implementation note
 
@@ -139,7 +238,7 @@ cd tools/session-task
 uv run --python 3.11 --with pytest pytest tests/ -v
 ```
 
-165 cases, ~36s. All tests are self-contained — each runs against a
+382 cases, ~2min. All tests are self-contained — each runs against a
 tempdir `$HOME` so the live `~/.config/session/queue.json` is never
 touched. CI runs the same suite via `make test-session-task`.
 
@@ -172,3 +271,53 @@ record` stderr warning and skip the archive step. The lifecycle
 transition (done / abandon) always completes regardless.
 
 Set `CLAUDE_AGENTS_STATE_FALLBACK_BIN=""` to disable the fallback.
+
+### Rotation / archival (`queue rotate`)
+
+Both `queue-logs/` and `completed-tasks.jsonl` grow **unbounded** — nothing
+pruned them (queue-logs reached ~2500 entries; completed-tasks grew multi-MB,
+which made the 2026-08-16 queue.json corruption incident bigger). `session-task
+queue rotate` bounds both:
+
+```bash
+session-task queue rotate                 # apply defaults
+session-task queue rotate --dry-run --json # preview, mutate nothing
+```
+
+1. **queue-logs prune** — deletes transcript archives (files OR dirs) older
+   than `--queue-logs-max-age` days (default 30), then enforces a hard
+   `--queue-logs-max-count` floor (default 500), deleting the oldest-by-mtime
+   beyond it. Recent transcripts stay so the q-site "View log" affordance keeps
+   working on recent Done cards.
+
+2. **completed-tasks roll** — once the live file exceeds `--completed-max-mb`
+   (default 5 MB), the oldest rows move into a dated
+   `completed-archive/completed-tasks-<UTC>.jsonl.gz` segment and the most
+   recent `--completed-retain` lines (default 2000) stay in the **live** file.
+   Old gz segments are themselves capped (default 20; `ROTATE_COMPLETED_ARCHIVE_MAX`).
+
+**q-site DONE-view coordination (#581):** the DONE view reads the live
+`completed-tasks.jsonl`. Rotation deliberately keeps the recent tail *in that
+live file*, so a roll never hides recent done items from the view — no minisite
+change is required. Deep history lives in the gz segments.
+
+**Safety** (reuses the #580 atomic-write/lock patterns): the completed-tasks
+roll holds the same `fcntl.flock` the append path (`log_completed`) takes, so a
+concurrent `queue done`/`complete` is never lost mid-roll. The gz segment is
+written (temp + `os.replace`) **before** the live file is truncated, so a crash
+leaves a benign superset, never a gap; the live rewrite is atomic
+(`_atomic_write_text`).
+
+Every threshold is overridable via env var (`ROTATE_QUEUE_LOGS_MAX_AGE_DAYS`,
+`ROTATE_QUEUE_LOGS_MAX_COUNT`, `ROTATE_COMPLETED_MAX_BYTES`,
+`ROTATE_COMPLETED_RETAIN`, `ROTATE_COMPLETED_ARCHIVE_MAX`; malformed values
+fall back to defaults) as well as per-invocation CLI flag.
+
+**Scheduling:** wired as a daily cron-producer, NOT a watcher (per the repo's
+watcher-vs-producer guidance) — job-name `session-rotate` in
+`container/cron.d/cw-default` (04:17 daily), toggle via
+`cw-cron-toggle disable|enable session-rotate`. A commented equivalent row
+ships in `cron.d/cw-host` for host/systemd deploys, tagged
+`# optional: session-rotate`; enable it at install time with
+`scripts/install-host-cron.sh --enable session-rotate` (or
+`CW_HOST_CRON_ENABLE=session-rotate`) — no template edit needed.

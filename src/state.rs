@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::error;
+use tracing::{error, warn};
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct State {
@@ -87,6 +87,14 @@ pub struct State {
     pub last_known_pane: String,
     #[serde(default)]
     pub last_known_tokens: u64,
+    /// Consecutive polls a transient status-bar token misparse (a large,
+    /// same-pane context momentarily reading 0) has been smoothed over by
+    /// carrying `last_known_tokens` forward. Bounded by
+    /// `policy::MISPARSE_CARRY_MAX` so a genuine sustained collapse (real
+    /// `/clear`, crashed process) still registers. See
+    /// `policy::carry_forward_token_misparse`.
+    #[serde(default)]
+    pub token_carry_count: u32,
     #[serde(default)]
     pub last_known_bashes: u64,
     // Context monitoring
@@ -94,11 +102,28 @@ pub struct State {
     pub context_clear_triggered: bool,
     #[serde(default)]
     pub last_context_clear: Option<String>,
+    /// Epoch (float secs) at which THIS daemon process started. Set once at
+    /// daemon startup (`run_daemon`); persisted so the short-lived
+    /// `claude-watch metrics` scraper can use it as a platform-independent
+    /// fallback anchor for the "time since last clear" panel when no explicit
+    /// /clear has been observed yet (e.g. right after a deploy/recreate wipes
+    /// the observed-clear state). NOT reset on load -- `run_daemon` overwrites
+    /// it each start.
+    #[serde(default)]
+    pub daemon_start_epoch: Option<f64>,
     #[serde(default)]
     pub context_clear_child_pid: Option<u32>,
     /// Last observed token count (for detecting external clears)
     #[serde(default)]
     pub last_seen_tokens: Option<u64>,
+    /// Filesystem mtime (epoch float secs) of the `self-clear` handoff marker
+    /// (`tmux::self_clear_handoff_path`) we have ALREADY stamped
+    /// `last_context_clear` from. Dedupes the poll-gap self-clear fallback in
+    /// `policy::maybe_stamp_self_clear_handoff` so it stamps ONCE per
+    /// self-clear rather than on every poll while the marker stays inside its
+    /// grace window. Transient.
+    #[serde(default)]
+    pub self_clear_handoff_stamped_mtime: Option<f64>,
     /// RFC3339 timestamp of the FIRST check cycle on which the context
     /// threshold was seen crossed in the current episode. Anchors the hard
     /// ceiling on hook-deferral (`hybrid.context_fallback_max_secs`): the
@@ -284,6 +309,49 @@ pub struct State {
     pub last_reauth_alert: Option<String>,
     #[serde(default)]
     pub login_injected: bool,
+    /// Latched while Claude Code's in-TUI "Please run /login · API Error: 401
+    /// OAuth access token has expired" banner is standing on the pane. Used
+    /// only to log the first sighting and the resolution once each; the
+    /// decision to act is re-made against the credential store every cycle.
+    #[serde(default)]
+    pub reauth_banner_detected: bool,
+
+    // Proactive login-expiry tracking (the forward-looking half of reauth).
+    /// Latched while Claude Code's "your login expires in N days" warning is
+    /// standing. Cleared when the credentials are renewed, which is also what
+    /// resets the auto-fire attempt budget.
+    #[serde(default)]
+    pub login_expiry_detected: bool,
+    /// Days-left reported by the most recent detection, for the log/alert.
+    #[serde(default)]
+    pub login_expiry_days_left: Option<u32>,
+    /// Last time the expiry warning was alerted on (rate limiting).
+    #[serde(default)]
+    pub last_login_expiry_alert: Option<String>,
+    /// Last time `self-login` was auto-fired (retry spacing).
+    #[serde(default)]
+    pub last_self_login_attempt: Option<String>,
+    /// Auto-fire attempts spent in the CURRENT expiry window. Reset when the
+    /// warning clears — never on a timer, or the budget is not a budget.
+    #[serde(default)]
+    pub self_login_attempts_this_window: u32,
+    /// When auto-fire last put a login dialog on the pane. Set BEFORE the
+    /// flow runs, not after it succeeds: a `self-login start` that fails
+    /// partway can still have left a modal up, and that modal has to be
+    /// cleaned up by the same watchdog. Cleared once the watchdog has handed
+    /// the pane back, or when the credentials are renewed.
+    #[serde(default)]
+    pub self_login_dialog_opened_at: Option<String>,
+    /// Cumulative count of auto-fired `self-login` runs (for metrics).
+    #[serde(default)]
+    pub self_login_autofire_total: u64,
+    /// Last observed `refreshTokenExpiresAt`. Watched for MOVEMENT, not
+    /// position: a value that jumps forward is the credentials being renewed,
+    /// which is the one unambiguous "this is resolved" signal available. It
+    /// works even for a short-lived rolling token that never leaves the
+    /// warning window and therefore never "resolves" by position alone.
+    #[serde(default)]
+    pub last_seen_refresh_expiry_ms: Option<i64>,
     /// Tracks whether we've already injected "resume" for a fresh external session
     /// (tokens=0 with Claude idle prompt visible). Reset when tokens become non-zero.
     #[serde(default)]
@@ -348,8 +416,36 @@ pub struct State {
     /// Cumulative count of cycles where claude-watch suppressed an interrupt
     /// fire because api_retry was active. Persisted across daemon restarts
     /// so Prometheus metrics can graph the suppression rate.
+    ///
+    /// NOT a proxy for "the API is overloaded right now": it counts
+    /// SUPPRESSIONS, so it stops advancing the moment
+    /// `evaluate_api_retry_state` gives up suppressing (past
+    /// `api_retry.max_stuck_secs`) even though the retry banner is still on
+    /// screen — i.e. it goes flat exactly when a storm is at its worst. Use
+    /// `api_retry_last_seen` for the "is it happening now" question.
     #[serde(default)]
     pub api_retry_suppressions_total: u64,
+    /// Timestamp of the most recent check cycle where the pane showed an
+    /// upstream-API retry banner. Stamped on EVERY detection, independent of
+    /// whether suppression is active — that is the whole point: it keeps
+    /// advancing past `api_retry.max_stuck_secs`, when suppression
+    /// deliberately stops but the storm has not. Cleared as soon as a cycle
+    /// observes no banner, so a resolved storm reads resolved on the next
+    /// cycle rather than decaying.
+    ///
+    /// The metrics emitter turns this into `claude_watch_api_retry_active` by
+    /// checking the stamp's freshness, which also covers the cases where the
+    /// daemon simply STOPS observing (guard disabled, pane gone) and would
+    /// otherwise leave a stale episode pinned open forever.
+    /// Transient — reset on daemon load.
+    #[serde(default)]
+    pub api_retry_last_seen: Option<String>,
+    /// Cumulative count of distinct upstream-API retry episodes entered —
+    /// incremented on the 0 -> 1 edge of `api_retry_consecutive`, so one
+    /// multi-minute storm counts once. Persisted across daemon restarts so
+    /// Prometheus can graph storm FREQUENCY independently of storm duration.
+    #[serde(default)]
+    pub api_retry_episodes_total: u64,
 
     // --- Auto-respawn-on-hang -------------------------------------------
     /// Sliding-window observation history of "Claude Code is hung" signals.
@@ -445,6 +541,160 @@ pub struct WatcherState {
     // still deserialize cleanly — serde ignores unknown fields by default.
 }
 
+// ---------------------------------------------------------------------------
+// Watcher-health reconciliation
+//
+// `State.watcher_health` is a persisted map keyed by watcher name, and it is
+// only ever GROWN: the watcher monitor inserts an entry the first time it sees
+// a configured+enabled watcher, and nothing ever removes one. That made the map
+// an append-only record of every watcher the daemon has EVER monitored, so a
+// watcher later RETIRED (deleted from the watchers config) or TURNED OFF (its
+// config line flipped to disabled) kept its last-known entry forever —
+// including `enabled: true` and a `consecutive_missing` counter that climbs
+// without bound, because the monitor's per-cycle loop skips absent/disabled
+// watchers entirely and therefore never touches those entries again.
+//
+// The stale belief is load-bearing downstream:
+//   * `claude_watchers_missing` counts entries with `enabled: true` AND
+//     `consecutive_missing > 3`, so a retired watcher pins the gauge above
+//     zero permanently and any alert built on it fires forever;
+//   * `collect_non_pane_signals` reads the same two fields to decide whether a
+//     watcher outage counts as a hang signal, so retired entries can feed a
+//     permanently-true input into respawn decisions.
+//
+// The fix is RECONCILIATION rather than a one-off prune of today's offenders:
+// the map is brought back into agreement with the CURRENT config every time the
+// config is read, so the divergence cannot reappear the next time a watcher is
+// retired or toggled.
+// ---------------------------------------------------------------------------
+
+/// What a [`reconcile_watcher_health`] pass changed. Returned (rather than only
+/// logged) so callers can log it in their own format and so the behaviour is
+/// directly assertable in tests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WatcherHealthReconciliation {
+    /// Watchers dropped from `watcher_health` because the config no longer
+    /// mentions them at all.
+    pub removed: Vec<String>,
+    /// Watchers whose stored entry was flipped to `enabled: false` because the
+    /// config disables them.
+    pub disabled: Vec<String>,
+    /// Watchers whose stored entry was flipped back to `enabled: true` because
+    /// the config enables them again (the mirror case — without this a
+    /// disable/re-enable cycle would leave the entry stuck at `false`, since
+    /// the monitor only ever sets `enabled` at insert time).
+    pub re_enabled: Vec<String>,
+    /// True when the pass was SKIPPED because the parsed config yielded no
+    /// entries at all. A missing/unreadable config is indistinguishable from a
+    /// genuinely empty one at this layer, and pruning the whole map on a
+    /// transient read failure would silently zero the watcher gauges. Failing
+    /// closed (change nothing) keeps a stale entry, which is strictly less
+    /// harmful than deleting live health for every watcher.
+    pub skipped_empty_config: bool,
+}
+
+impl WatcherHealthReconciliation {
+    /// True when the pass actually mutated the map.
+    pub fn changed(&self) -> bool {
+        !self.removed.is_empty() || !self.disabled.is_empty() || !self.re_enabled.is_empty()
+    }
+}
+
+/// Bring `state.watcher_health` back into agreement with the watcher config.
+///
+/// Two distinct shapes are corrected, and they are different code paths:
+///
+/// 1. **Absent from config** — the watcher was retired; its entry is REMOVED
+///    (along with any dangling `watcher_down_since` key), because there is no
+///    such watcher left to hold health for.
+/// 2. **Present but disabled** — the watcher still exists but is switched off;
+///    its entry is KEPT (so re-enabling it does not lose the last-seen history)
+///    but forced to `enabled: false`, and the missing-run bookkeeping
+///    (`consecutive_missing` / `down_since` / `event_emitted_at`) is cleared,
+///    since a watcher that is not supposed to be running cannot meaningfully be
+///    "missing".
+///
+/// The `enabled` flag is synced in BOTH directions, so a watcher re-enabled in
+/// the config gets its stored flag restored too.
+///
+/// `entries` is the fully-merged watcher list (primary config plus any extra
+/// config), exactly as the watcher monitor builds it. When the same name
+/// appears more than once, enabled-anywhere wins.
+pub fn reconcile_watcher_health(
+    state: &mut State,
+    entries: &[crate::status::WatcherEntry],
+) -> WatcherHealthReconciliation {
+    let mut outcome = WatcherHealthReconciliation::default();
+
+    if entries.is_empty() {
+        outcome.skipped_empty_config = true;
+        if !state.watcher_health.is_empty() {
+            warn!(
+                tracked = state.watcher_health.len(),
+                "watcher config parsed to zero entries — skipping watcher_health reconciliation \
+                 (cannot distinguish an unreadable config from an empty one)"
+            );
+        }
+        return outcome;
+    }
+
+    let mut configured: HashMap<&str, bool> = HashMap::new();
+    for entry in entries {
+        configured
+            .entry(entry.name.as_str())
+            .and_modify(|e| *e |= entry.enabled)
+            .or_insert(entry.enabled);
+    }
+
+    // Shape 1: retired watchers — drop the entry entirely.
+    let mut removed: Vec<String> = Vec::new();
+    state.watcher_health.retain(|name, _| {
+        let keep = configured.contains_key(name.as_str());
+        if !keep {
+            removed.push(name.clone());
+        }
+        keep
+    });
+    removed.sort();
+
+    // Shape 2: watchers the config disables (and the mirror re-enable case).
+    // Names whose separate `watcher_down_since` key must go too, collected here
+    // because that map cannot be touched while `watcher_health` is borrowed.
+    let mut clear_down_since: Vec<String> = removed.clone();
+    for (name, health) in state.watcher_health.iter_mut() {
+        let enabled = configured
+            .get(name.as_str())
+            .copied()
+            .unwrap_or(health.enabled);
+        if health.enabled != enabled {
+            health.enabled = enabled;
+            if enabled {
+                outcome.re_enabled.push(name.clone());
+            } else {
+                outcome.disabled.push(name.clone());
+            }
+        }
+        if !enabled {
+            // Not expected to run -> not meaningfully missing. Clearing the
+            // counter is what actually takes the entry out of the
+            // missing-watcher count and out of the hang-signal predicate; the
+            // `enabled` flag alone only covers the readers that check it.
+            health.consecutive_missing = 0;
+            health.down_since = None;
+            health.event_emitted_at = None;
+            clear_down_since.push(name.clone());
+        }
+    }
+    for name in &clear_down_since {
+        state.watcher_down_since.remove(name);
+    }
+    outcome.removed = removed;
+    outcome.disabled.sort();
+    outcome.re_enabled.sort();
+
+    outcome
+}
+
 pub fn load_state(path: &str) -> State {
     load_state_with_now(path, &chrono::Utc::now().to_rfc3339())
 }
@@ -510,10 +760,16 @@ pub fn load_state_with_now(path: &str, startup_now: &str) -> State {
     state.first_suppression_at = None;
     // api_retry tracking is transient — daemon downtime makes the
     // "current episode" timestamp meaningless and the consecutive count
-    // unreliable. Reset on load. (api_retry_suppressions_total persists
-    // for metrics.)
+    // unreliable. Reset on load. (api_retry_suppressions_total and
+    // api_retry_episodes_total persist for metrics.)
     state.api_retry_consecutive = 0;
     state.api_retry_first_seen = None;
+    // Same reason for the liveness stamp: a stamp from before the daemon
+    // went down must not read as a live storm. Clearing it makes
+    // `claude_watch_api_retry_active` fall to 0 across a restart, and the
+    // first post-restart cycle that still sees a banner re-stamps it (and
+    // counts a fresh episode, since api_retry_consecutive reset to 0 too).
+    state.api_retry_last_seen = None;
     // AskUserQuestion stale-monitor timer is transient — daemon downtime
     // makes the elapsed measurement unreliable. Reset on load so tracking
     // starts fresh (mirrors thinking_start).
@@ -862,6 +1118,40 @@ mod tests {
     }
 
     #[test]
+    fn test_api_retry_observability_state_transient_vs_cumulative() {
+        // `api_retry_last_seen` drives the `claude_watch_api_retry_active`
+        // gauge, so a stamp from before a daemon restart must NOT survive
+        // load -- otherwise the gauge would report a live retry storm that
+        // ended while the daemon was down. `api_retry_episodes_total` is a
+        // Prometheus counter and must survive.
+        let path = "/tmp/claude-watch-test-api-retry-observability.json";
+        let mut state = State::default();
+        state.api_retry_last_seen = Some("2026-09-03T09:28:00-04:00".to_string());
+        state.api_retry_episodes_total = 7;
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert!(
+            loaded.api_retry_last_seen.is_none(),
+            "the liveness stamp must not survive a daemon restart"
+        );
+        assert_eq!(loaded.api_retry_episodes_total, 7);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_api_retry_observability_fields_default_on_legacy_state() {
+        // A state file written before these fields existed must deserialize
+        // cleanly to "no storm ever observed".
+        let path = "/tmp/claude-watch-test-api-retry-observability-legacy.json";
+        std::fs::write(path, "{}").unwrap();
+        let loaded = load_state(path);
+        assert!(loaded.api_retry_last_seen.is_none());
+        assert_eq!(loaded.api_retry_episodes_total, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn test_api_retry_suppressions_total_default_to_zero() {
         // Old state files (written before this field existed) deserialize
         // cleanly with the counter at 0.
@@ -924,4 +1214,271 @@ mod tests {
         let _ = std::fs::remove_file(path2);
     }
 
+
+    // -----------------------------------------------------------------------
+    // watcher_health reconciliation
+    // -----------------------------------------------------------------------
+
+    fn watcher_entry(name: &str, enabled: bool) -> crate::status::WatcherEntry {
+        crate::status::WatcherEntry {
+            name: name.to_string(),
+            pattern: format!("/usr/local/bin/{name}"),
+            min_count: 1,
+            enabled,
+            start_cmd: None,
+            on_restart_cmd: None,
+            ..Default::default()
+        }
+    }
+
+    fn health(enabled: bool, consecutive_missing: u32) -> WatcherState {
+        WatcherState {
+            last_seen_running: Some("2026-06-01T00:00:00Z".to_string()),
+            consecutive_missing,
+            enabled,
+            event_emitted_at: Some("2026-06-01T00:05:00Z".to_string()),
+            down_since: Some("2026-06-01T00:05:00Z".to_string()),
+        }
+    }
+
+    /// Count of watchers the `claude_watchers_missing` gauge would report:
+    /// entries that are `enabled` AND past the missing threshold. Mirrors the
+    /// predicate in `metrics::build_metrics` so the tests assert the actual
+    /// user-visible consequence, not just the map contents.
+    fn missing_gauge(state: &State) -> usize {
+        state
+            .watcher_health
+            .values()
+            .filter(|w| w.enabled && w.consecutive_missing > 3)
+            .count()
+    }
+
+    #[test]
+    fn reconcile_watcher_health_drops_watchers_absent_from_config() {
+        // Shape 1: the watcher was RETIRED (its line deleted from the config).
+        // The monitor loop never iterates a name it cannot see, so the entry
+        // would otherwise keep `enabled: true` and its climbing miss counter
+        // forever.
+        let mut state = State::default();
+        state
+            .watcher_health
+            .insert("retired-watcher".to_string(), health(true, 71));
+        state
+            .watcher_health
+            .insert("live-watcher".to_string(), health(true, 0));
+        state
+            .watcher_down_since
+            .insert("retired-watcher".to_string(), "2026-06-01T00:05:00Z".into());
+
+        let outcome = reconcile_watcher_health(&mut state, &[watcher_entry("live-watcher", true)]);
+
+        assert_eq!(outcome.removed, vec!["retired-watcher".to_string()]);
+        assert!(outcome.disabled.is_empty());
+        assert!(outcome.changed());
+        assert!(!state.watcher_health.contains_key("retired-watcher"));
+        assert!(state.watcher_health.contains_key("live-watcher"));
+        // The parallel down-since map is keyed by the same names; a dangling
+        // key there would outlive the watcher too.
+        assert!(!state.watcher_down_since.contains_key("retired-watcher"));
+        assert_eq!(missing_gauge(&state), 0);
+    }
+
+    #[test]
+    fn reconcile_watcher_health_disables_watchers_the_config_disables() {
+        // Shape 2 — a DIFFERENT code path from shape 1: the watcher is still
+        // listed, but its config line is switched off. The entry is kept (so a
+        // later re-enable does not lose history) but must stop counting as an
+        // enabled, missing watcher.
+        let mut state = State::default();
+        state
+            .watcher_health
+            .insert("switched-off".to_string(), health(true, 84));
+        state
+            .watcher_down_since
+            .insert("switched-off".to_string(), "2026-06-01T00:05:00Z".into());
+        assert_eq!(missing_gauge(&state), 1);
+
+        let outcome = reconcile_watcher_health(&mut state, &[watcher_entry("switched-off", false)]);
+
+        assert_eq!(outcome.disabled, vec!["switched-off".to_string()]);
+        assert!(outcome.removed.is_empty());
+        let entry = &state.watcher_health["switched-off"];
+        assert!(!entry.enabled);
+        // The miss bookkeeping is cleared too: a watcher that is not supposed
+        // to run cannot be "missing", and the hang-signal predicate reads the
+        // counter directly.
+        assert_eq!(entry.consecutive_missing, 0);
+        assert!(entry.down_since.is_none());
+        assert!(entry.event_emitted_at.is_none());
+        assert!(!state.watcher_down_since.contains_key("switched-off"));
+        assert_eq!(missing_gauge(&state), 0);
+    }
+
+    #[test]
+    fn reconcile_watcher_health_re_enables_when_config_turns_a_watcher_back_on() {
+        // Mirror of shape 2. The monitor only ever sets `enabled` when it
+        // INSERTS an entry, so without a re-enable pass a disable/enable cycle
+        // would leave the stored flag stuck at false and the watcher invisible
+        // to every reader that gates on it.
+        let mut state = State::default();
+        state
+            .watcher_health
+            .insert("back-on".to_string(), health(false, 0));
+
+        let outcome = reconcile_watcher_health(&mut state, &[watcher_entry("back-on", true)]);
+
+        assert_eq!(outcome.re_enabled, vec!["back-on".to_string()]);
+        assert!(state.watcher_health["back-on"].enabled);
+    }
+
+    #[test]
+    fn reconcile_watcher_health_clears_both_stale_shapes_together() {
+        // The observed failure: one retired watcher plus one config-disabled
+        // watcher, each with a large miss counter, pinning the missing gauge at
+        // 2 indefinitely. Both shapes must clear in a single pass.
+        let mut state = State::default();
+        state
+            .watcher_health
+            .insert("retired".to_string(), health(true, 71));
+        state
+            .watcher_health
+            .insert("disabled-in-config".to_string(), health(true, 84));
+        state
+            .watcher_health
+            .insert("healthy".to_string(), health(true, 0));
+        assert_eq!(missing_gauge(&state), 2);
+
+        let outcome = reconcile_watcher_health(
+            &mut state,
+            &[
+                watcher_entry("disabled-in-config", false),
+                watcher_entry("healthy", true),
+            ],
+        );
+
+        assert_eq!(outcome.removed, vec!["retired".to_string()]);
+        assert_eq!(outcome.disabled, vec!["disabled-in-config".to_string()]);
+        assert_eq!(missing_gauge(&state), 0);
+        // A genuinely enabled watcher is untouched.
+        assert!(state.watcher_health["healthy"].enabled);
+    }
+
+    #[test]
+    fn reconcile_watcher_health_leaves_enabled_watchers_untouched() {
+        // Reconciliation must not disturb live health: a real outage on a
+        // configured+enabled watcher still counts.
+        let mut state = State::default();
+        state
+            .watcher_health
+            .insert("down-for-real".to_string(), health(true, 9));
+
+        let outcome = reconcile_watcher_health(&mut state, &[watcher_entry("down-for-real", true)]);
+
+        assert!(!outcome.changed());
+        assert_eq!(state.watcher_health["down-for-real"].consecutive_missing, 9);
+        assert_eq!(missing_gauge(&state), 1);
+    }
+
+    #[test]
+    fn reconcile_watcher_health_skips_when_config_parses_to_nothing() {
+        // A missing/unreadable config parses to zero entries, which is
+        // indistinguishable from a genuinely empty one. Pruning on that would
+        // wipe every watcher's health (and silently zero the gauges) on a
+        // transient read failure, so the pass fails closed instead.
+        let mut state = State::default();
+        state
+            .watcher_health
+            .insert("still-configured".to_string(), health(true, 2));
+
+        let outcome = reconcile_watcher_health(&mut state, &[]);
+
+        assert!(outcome.skipped_empty_config);
+        assert!(!outcome.changed());
+        assert!(state.watcher_health.contains_key("still-configured"));
+    }
+
+    #[test]
+    fn reconcile_watcher_health_enabled_anywhere_wins_across_merged_configs() {
+        // The daemon merges the primary watchers config with an optional extra
+        // one, so the same name can appear twice. A watcher enabled in either
+        // file is enabled.
+        let mut state = State::default();
+        state
+            .watcher_health
+            .insert("dual-listed".to_string(), health(false, 0));
+
+        let outcome = reconcile_watcher_health(
+            &mut state,
+            &[
+                watcher_entry("dual-listed", false),
+                watcher_entry("dual-listed", true),
+            ],
+        );
+
+        assert_eq!(outcome.re_enabled, vec!["dual-listed".to_string()]);
+        assert!(state.watcher_health["dual-listed"].enabled);
+    }
+
+    #[test]
+    fn reconcile_watcher_health_survives_a_save_load_roundtrip() {
+        // The reconciled map is what gets persisted, so the stale entry is gone
+        // from the state file the metrics exporter reads (it reads the file,
+        // not the daemon's in-memory state).
+        let path = "/tmp/claude-watch-test-watcher-health-reconcile.json";
+        let mut state = State::default();
+        state
+            .watcher_health
+            .insert("retired".to_string(), health(true, 71));
+        state
+            .watcher_health
+            .insert("kept".to_string(), health(true, 0));
+
+        reconcile_watcher_health(&mut state, &[watcher_entry("kept", true)]);
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert!(!loaded.watcher_health.contains_key("retired"));
+        assert!(loaded.watcher_health.contains_key("kept"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reconcile_watcher_health_reads_both_shapes_from_a_real_watchers_config() {
+        // Cover the seam both call sites actually use: parse the config file,
+        // then reconcile. The disabled shape depends on the parser's fourth
+        // column, so asserting it through real config text (rather than a
+        // hand-built entry) is what proves the disabled case is wired up.
+        let path = "/tmp/claude-watch-test-watchers-reconcile.conf";
+        std::fs::write(
+            path,
+            "# name|pattern|min_count|enabled\n\
+             live-watcher|/usr/local/bin/live-watcher|1|true\n\
+             off-watcher|/usr/local/bin/off-watcher|1|false\n",
+        )
+        .unwrap();
+
+        let mut state = State::default();
+        // Retired: no longer in the file at all.
+        state
+            .watcher_health
+            .insert("gone-watcher".to_string(), health(true, 71));
+        // Present but switched off in the file.
+        state
+            .watcher_health
+            .insert("off-watcher".to_string(), health(true, 84));
+        state
+            .watcher_health
+            .insert("live-watcher".to_string(), health(true, 0));
+        assert_eq!(missing_gauge(&state), 2);
+
+        let entries = crate::status::parse_watchers_config(path);
+        let outcome = reconcile_watcher_health(&mut state, &entries);
+
+        assert_eq!(outcome.removed, vec!["gone-watcher".to_string()]);
+        assert_eq!(outcome.disabled, vec!["off-watcher".to_string()]);
+        assert!(!state.watcher_health["off-watcher"].enabled);
+        assert!(state.watcher_health["live-watcher"].enabled);
+        assert_eq!(missing_gauge(&state), 0);
+        let _ = std::fs::remove_file(path);
+    }
 }

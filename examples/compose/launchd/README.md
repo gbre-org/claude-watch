@@ -1,153 +1,81 @@
-# Persistent macOS auto-start for `mcp-host-bash`
+# Persistent macOS auto-start for `mcp-host-bash-server`
 
-The host-side `mcp-host-bash` launcher (see
-[`examples/compose/bin/mcp-host-bash`](../bin/mcp-host-bash) and the
-"`mcp-host-bash` — generic 'run a bash command on the host' MCP server"
-section of [`examples/compose/README.md`](../README.md)) is a foreground
-process. Run it by hand and it stays up until your terminal exits, you
-log out, or the laptop reboots — at which point the in-container
-`claude` loses its bridge into the host and any tool it depends on
-(corp git, host CLIs, etc.) starts failing until you respawn the
-launcher.
+`mcp-host-bash-server` (the single self-contained Rust binary built
+from [`crates/mcp-host-bash-server`](../../../crates/mcp-host-bash-server)
+— see the "`host-bash` — generic 'run a bash command on the host' MCP
+server" section of [`examples/compose/README.md`](../README.md)) is a
+foreground process. Run it by hand and it stays up until your terminal
+exits, you log out, or the laptop reboots — at which point the
+in-container `claude` loses its bridge into the host and any tool it
+depends on (corp git, host CLIs, etc.) starts failing until you respawn
+it.
 
 This directory ships a macOS LaunchAgent that registers
-`mcp-host-bash` with `launchd` so it starts automatically at login,
-restarts if it dies, and survives reboots without manual intervention.
+`mcp-host-bash-server` with `launchd` so it starts automatically at
+login, restarts if it dies, and survives reboots without manual
+intervention.
 
-The default plist invokes
-[`examples/compose/bin/load-bearer-from-keychain`](../bin/load-bearer-from-keychain),
-a macOS-only wrapper that fetches the bearer token from the user's
-login Keychain and exports it as `MCP_HOST_BASH_BEARER` before exec'ing
-the real launcher — so the secret never lives in the plist or any
-backup that captures `~/Library/LaunchAgents/`. Operators who prefer
-the v50 plist-plaintext path can opt out (see Step 0 below).
+The bearer token (`MCP_HOST_BASH_BEARER`) is configured in EITHER the
+operator config file
+(`~/.config/claude-container/mcp-host-bash.env`) OR the plist's
+`EnvironmentVariables` block — there is no separate Keychain step. The
+server validates `Authorization: Bearer <token>` in-process on every
+request; leave it unset only for a loopback-only bind.
 
-**Non-macOS operators** (Linux laptops / servers) don't get a clean
-Keychain analog — `libsecret` / `secret-service` is fragmented across
-desktop environments, and headless servers don't have a graphical
-session for password prompts. The documented alternatives:
+**Non-macOS operators** (Linux laptops / servers) use a systemd
+`user@.service` instead of a LaunchAgent. `mcp-host-bash-server` itself
+is cross-platform (it builds and runs on Linux); only this launchd
+wrapper is macOS-specific. Set `MCP_HOST_BASH_BEARER` via a systemd
+`Environment=` line, an `EnvironmentFile=` pointing at a 600-mode
+`~/.config/claude-container/mcp-host-bash.env`, or your secrets manager.
 
-1. Plain env-var path in a systemd `user@.service` drop-in:
-   `Environment=MCP_HOST_BASH_BEARER=...` (still plaintext, but in a
-   root-readable unit file rather than the operator's home).
-2. `EnvironmentFile=` pointing at a 600-mode file under the operator's
-   home (`~/.config/claude-container/mcp-host-bash.env`); the
-   launcher already sources that file at startup, so adding
-   `MCP_HOST_BASH_BEARER=...` to it Just Works.
-3. A `gnome-keyring` / `kwallet` / `pass(1)`-based wrapper modeled on
-   `load-bearer-from-keychain`; out of scope for this directory.
+LaunchAgent (NOT LaunchDaemon): the server runs as the operator's user.
+Its `run_command` / `run_script` exec under the operator's `$HOME` /
+`$PATH` / login keychain, and it binds a loopback port that Docker
+Desktop's VM reaches via `host.docker.internal`. None of that needs
+root, and a LaunchDaemon would invert the trust model (processes
+spawned by the server would run as root).
 
-LaunchAgent (NOT LaunchDaemon): the launcher runs as the operator's
-user. It dials `cli-mcp-server`, which exec's commands under the
-operator's `$HOME` / `$PATH` / login keychain, and it binds a loopback
-port that Docker Desktop's VM reaches via `host.docker.internal`. None
-of that needs root, and a LaunchDaemon would invert the trust model
-(processes spawned by `mcp-host-bash` would run as root).
+## 0. Build + install the binary
 
-## 0. Prereqs
-
-- macOS (this is a `launchd` plist; for Linux see systemd user units,
-  not covered here).
-- The compose stack itself works (you've gotten through
-  `examples/compose/README.md` at least once).
-- `mcp-proxy` and `cli-mcp-server` are statically installed via the
-  bundled installer:
-
-  ```sh
-  examples/compose/bin/install-host-deps
-  ```
-
-  Both binaries land in `~/.local/bin/`. The plist's `PATH`
-  environment variable below adds that to the LaunchAgent's `PATH`
-  search list because `launchd` does NOT inherit your interactive
-  shell's `PATH`.
-
-- An interactive run of `mcp-host-bash` succeeded once (so you know
-  the launcher itself works on this host before you wrap it in
-  `launchd`):
-
-  ```sh
-  examples/compose/bin/mcp-host-bash
-  # Ctrl-C after you see the "starting" banner.
-  ```
-
-### Step 0: store the bearer in the macOS Keychain (recommended)
-
-The default `ProgramArguments[0]` in the shipped plist invokes
-`examples/compose/bin/load-bearer-from-keychain`, which looks up the
-bearer in the macOS login Keychain and exports it as
-`MCP_HOST_BASH_BEARER` before exec'ing the real launcher. This keeps
-the secret out of `~/Library/LaunchAgents/<plist>` (and out of any
-backup that captures that directory).
-
-Bootstrap (one-time per host) — pick **one** of:
+From the repo root:
 
 ```sh
-# Interactive prompt. The value never appears in shell history.
-security add-generic-password -s claude-watch.mcp-host-bash \
-                              -a "$USER" -w
+make install-mcp-host-bash-server
 ```
+
+That compiles `crates/mcp-host-bash-server` and copies the release
+binary to `~/bin/mcp-host-bash-server` (re-signed in place on macOS so
+Gatekeeper doesn't SIGKILL it). No PyPI dependencies, no separate
+installer. Re-run it any time to pick up a new build.
+
+Verify it runs once interactively before wrapping it in `launchd`:
 
 ```sh
-# Scripted. Acknowledged trade-off: the secret appears in `history`
-# (and any shell-history sync). Prefer the interactive form unless
-# you're piping the value from a secrets manager.
-security add-generic-password -s claude-watch.mcp-host-bash \
-                              -a "$USER" -w "$BEARER"
+~/bin/mcp-host-bash-server --print-config   # prints the effective policy + bind, exits
 ```
 
-Default service name is `claude-watch.mcp-host-bash` (reverse-DNS-ish
-naming the `security` tool's users expect). The default account is
-`$USER`. Override either via `KEYCHAIN_SERVICE` /
-`KEYCHAIN_ACCOUNT` env vars on the launcher (set them in the plist's
-`EnvironmentVariables` block).
+### Configure the bearer (optional but recommended)
 
-Generate a fresh secret if you don't have one yet:
+Generate a fresh secret if you don't have one:
 
 ```sh
 head -c 32 /dev/urandom | base64
 ```
 
-The SAME secret must be set as `CLAUDE_HOST_HOOK_BRIDGE_BEARER` in
-the compose `.env` so the in-container hook bridge sends the matching
-header. Open `~/repos/claude-watch/examples/compose/.env` and set it
-once after generating.
-
-Verify the entry is in place (prints the bearer to stdout; pipe to
-`pbcopy` if you want the clipboard instead of the screen):
+Set it in `~/.config/claude-container/mcp-host-bash.env` (the server
+reads that file at startup and its values win over the process
+environment):
 
 ```sh
-security find-generic-password -s claude-watch.mcp-host-bash \
-                               -a "$USER" -w
+MCP_HOST_BASH_BEARER=...your base64 secret...
 ```
 
-The first time `launchd` exec's the wrapper, macOS will pop a
-permission prompt asking whether the `security` helper can read this
-keychain item. Click **Always Allow** so the prompt doesn't fire on
-every (re)spawn.
-
-#### Opting out: plist plaintext path
-
-Operators who don't want a Keychain hop can point
-`ProgramArguments[0]` directly at
-`examples/compose/bin/mcp-host-bash` and add an
-`MCP_HOST_BASH_BEARER` `<string>` entry inside `EnvironmentVariables`.
-The launcher itself reads `MCP_HOST_BASH_BEARER` from its env regardless
-of how it got there — Keychain wrapper, plist plaintext, or an
-interactive shell `export`. Keychain is the default for new installs;
-operators upgrading from the v50 plist plaintext plist keep working
-unchanged until they migrate.
-
-The wrapper also implements a **fallback** path: when the Keychain
-entry is missing (`security` exit 44, `errSecItemNotFound`), it
-exec's `mcp-host-bash` without touching the env. If the plist
-`EnvironmentVariables` carries a value, the launcher picks that up.
-This means a hybrid configuration (Keychain wins, plist plaintext
-fallback) works out of the box, useful while migrating.
-
-If the Keychain entry exists but is **empty**, the wrapper refuses
-to start (exit 2) — an empty bearer would defeat the auth shim, and
-silently falling through to no-auth is worse than a noisy refusal.
+...or as a `<string>` entry in the plist's `EnvironmentVariables` block
+(step 2). Either way, the SAME secret must be set as
+`CLAUDE_HOST_HOOK_BRIDGE_BEARER` in the compose `.env` so the
+in-container hook bridge sends the matching header. Required for any
+non-loopback bind.
 
 ## 1. Copy the plist into `~/Library/LaunchAgents/`
 
@@ -156,12 +84,12 @@ It refuses to follow symlinks (and refuses files outside that tree).
 So `cp`, not `ln -s`:
 
 ```sh
-cp examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist \
+cp examples/compose/launchd/org.claude-watch.mcp-host-bash.plist \
    ~/Library/LaunchAgents/
 ```
 
 The filename must match the plist's `Label` key
-(`org.gbre.claude-watch.mcp-host-bash`) — `launchd` keys off the
+(`org.claude-watch.mcp-host-bash`) — `launchd` keys off the
 filename for `bootstrap` / `bootout` / `print`.
 
 ## 2. Edit the absolute paths + EnvironmentVariables
@@ -170,15 +98,15 @@ filename for `bootstrap` / `bootout` / `print`.
 literal paths. Open the copy in your editor:
 
 ```sh
-$EDITOR ~/Library/LaunchAgents/org.gbre.claude-watch.mcp-host-bash.plist
+$EDITOR ~/Library/LaunchAgents/org.claude-watch.mcp-host-bash.plist
 ```
 
 Search/replace:
 
-- `/PATH/TO/REPO` → absolute path to your local `claude-watch`
-  checkout (e.g. `/Users/yourname/code/claude-watch`).
 - `/PATH/TO/HOME` → your home directory (e.g. `/Users/yourname`).
-  Run `echo $HOME` if unsure.
+  Run `echo $HOME` if unsure. It appears in `ProgramArguments`
+  (`/PATH/TO/HOME/bin/mcp-host-bash-server`), `PATH`,
+  `WorkingDirectory`, and the two log paths.
 
 Then tune the `EnvironmentVariables` dict to your needs. Every key is
 optional; defaults match a fresh install:
@@ -186,19 +114,19 @@ optional; defaults match a fresh install:
 | Key | Default in the template | When to change |
 |---|---|---|
 | `MCP_HOST_BASH_BIND` | `127.0.0.1` (loopback only) | `0.0.0.0` (or a specific interface IP) for Linux Docker bridge-net containers that reach the host via `host.docker.internal` — those callers can't dial host loopback. Pair with `MCP_HOST_BASH_BEARER` (below) when widening — `run_command` is a host-shell privilege escalator, anything reachable on the port can exec as the operator user. macOS Docker Desktop's `host.docker.internal` NAT routes loopback for the default setup, so the safe default works there. |
-| `MCP_HOST_BASH_BEARER` | (not in template) | Default is supplied by the `load-bearer-from-keychain` wrapper via macOS Keychain — see Step 0 above. Opt-out to plist plaintext by pointing ProgramArguments[0] at `examples/compose/bin/mcp-host-bash` directly AND adding `MCP_HOST_BASH_BEARER` as a `<string>` entry here. The launcher itself reads the env var regardless of how it got there. Required for any non-loopback bind. Generate once with `head -c 32 /dev/urandom \| base64` and keep out of version control. Mirror the same value into `CLAUDE_HOST_HOOK_BRIDGE_BEARER` in the docker-compose `.env` file. |
-| `CW_PROFILE` | `corp-dev` (read-y allow-list) | `corp-dev-trusted` to widen for host scheduling, file mutation, container management. See the launcher's script header for the full surface. |
+| `MCP_HOST_BASH_BEARER` | (not in template) | Shared-secret bearer token. Set it here as a `<string>` entry OR in `~/.config/claude-container/mcp-host-bash.env` (the `.env` value wins). The server validates `Authorization: Bearer <token>` in-process. Required for any non-loopback bind. Generate once with `head -c 32 /dev/urandom \| base64` and keep out of version control. Mirror the same value into `CLAUDE_HOST_HOOK_BRIDGE_BEARER` in the docker-compose `.env` file. |
+| `CW_PROFILE` | `corp-dev` (read-y allow-list) | `corp-dev-trusted` to widen for host scheduling, file mutation, container management. See the server's `show_security_rules` output for the full surface. |
 | `ALLOW_SHELL_OPERATORS` | `false` (block pipes / `&&` / redirects) | `true` only if a workflow specifically needs shell operators. Loosens the safety floor. |
 | `SSL_CERT_FILE` | empty | Absolute path to your corporate CA bundle if `run_command` invocations of curl / git / pip have to validate a corp chain. |
 | `CLAUDE_HOOK_BRIDGE_BINS` | empty | Comma-separated basenames of host hook binaries the in-container exec-hook bridge is allowed to invoke (e.g. `telemetry-hook,corp-trace-hook`). |
-| `PATH` | `/PATH/TO/HOME/.local/bin:/usr/local/bin:/usr/bin:/bin` | Extend if `mcp-proxy` / `cli-mcp-server` live elsewhere, or if your `run_command` workflows need binaries in `/opt/homebrew/bin`, `~/.cargo/bin`, etc. |
+| `PATH` | `/PATH/TO/HOME/.local/bin:/usr/local/bin:/usr/bin:/bin` | Extend if your `run_command` workflows need binaries in `/opt/homebrew/bin`, `~/.cargo/bin`, etc. |
 
 If you'd rather keep policy out of the plist entirely, leave the
 defaults and put your full overrides in
-`~/.config/claude-container/mcp-host-bash.env` instead — the launcher
-sources that file at startup, and operator-supplied values there beat
+`~/.config/claude-container/mcp-host-bash.env` instead — the server
+reads that file at startup, and operator-supplied values there beat
 the profile-derived defaults. The plist is the right place for things
-that have to be set BEFORE the launcher exec's (most importantly
+that have to be set BEFORE the server exec's (most importantly
 `PATH`); everything else can live in the operator config.
 
 Pre-create the log directory once (launchd auto-creates the log files
@@ -212,7 +140,7 @@ mkdir -p ~/Library/Logs
 
 ```sh
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.claude-watch.mcp-host-bash.plist
+    ~/Library/LaunchAgents/org.claude-watch.mcp-host-bash.plist
 ```
 
 `gui/$(id -u)` is the per-user GUI domain — the right scope for a
@@ -226,17 +154,17 @@ If `bootstrap` returns nothing, it succeeded. If it errors, see
 ## 4. Verify it's running
 
 ```sh
-launchctl print gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash
+launchctl print gui/$(id -u)/org.claude-watch.mcp-host-bash
 ```
 
 Look for:
 
-- `state = running` — the launcher is up.
+- `state = running` — the server is up.
 - `last exit code = 0` — last clean shutdown (or never exited yet).
 - `last exit reason: ...` — only present if a previous run died;
   triages crashloops.
-- `program = /PATH/TO/REPO/examples/compose/bin/mcp-host-bash` —
-  matches what you edited.
+- `program = /PATH/TO/HOME/bin/mcp-host-bash-server` — matches what
+  you edited.
 
 Then confirm the process actually owns the listen port:
 
@@ -244,10 +172,9 @@ Then confirm the process actually owns the listen port:
 lsof -nP -i :8766
 ```
 
-You should see one row, `COMMAND=mcp-proxy` (the static binary the
-launcher exec's), `USER=<your username>`, `NODE=TCP`,
-`NAME=*:8766 (LISTEN)`. If nothing is listening, check the launcher's
-log files (step 6).
+You should see one row, `COMMAND=mcp-host-b` (the truncated binary
+name), `USER=<your username>`, `NODE=TCP`, `NAME=*:8766 (LISTEN)`. If
+nothing is listening, check the log files (step 6).
 
 Inside the container, the in-container `claude` should now see
 `host-bash: Connected` from `claude mcp list` (assuming
@@ -261,77 +188,57 @@ compose README for the wiring).
 the plist after that does NOT take effect until you re-bootstrap:
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash
+launchctl bootout gui/$(id -u)/org.claude-watch.mcp-host-bash
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.claude-watch.mcp-host-bash.plist
+    ~/Library/LaunchAgents/org.claude-watch.mcp-host-bash.plist
 ```
 
 Same dance for changes to `~/.config/claude-container/mcp-host-bash.env`
-— the launcher only sources that file at process start, so a new
-allow-list takes effect on the next launcher (re)spawn.
+— the server only reads that file at process start, so a new
+allow-list takes effect on the next (re)spawn. Ditto after a fresh
+`make install-mcp-host-bash-server` swaps the binary — bounce the unit
+so launchd exec's the new build.
 
-If you only want to bounce the launcher WITHOUT touching the plist,
-`launchctl kickstart -k gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash`
+If you only want to bounce the server WITHOUT touching the plist,
+`launchctl kickstart -k gui/$(id -u)/org.claude-watch.mcp-host-bash`
 sends SIGTERM and lets `KeepAlive` respawn it. Faster than the
 bootout / bootstrap pair.
 
 ## 6. Logs
 
-The launcher writes to two places by default:
+launchd captures the server's `stdout` / `stderr`:
 
-- launchd-captured `stdout` / `stderr`:
-  - `~/Library/Logs/mcp-host-bash.out.log` (mostly empty — the
-    launcher logs to stderr)
-  - `~/Library/Logs/mcp-host-bash.err.log` (the startup banner +
-    every JSON-RPC line from `mcp-proxy` + every `run_command`
-    invocation from `cli-mcp-server`)
-- The launcher's own audit log:
-  - `~/.local/state/claude-container/mcp-host-bash.log` — same
-    stderr stream, tee'd by the launcher itself. Useful when you
-    want a per-launch chronological view independent of launchd's
-    rotation.
+- `~/Library/Logs/mcp-host-bash.out.log` (mostly empty — the server
+  logs to stderr)
+- `~/Library/Logs/mcp-host-bash.err.log` (the startup banner + every
+  tracing line, including `run_command` / `run_script` invocations)
 
-Tail any of them live with `tail -F <path>`.
+Tail either live with `tail -F <path>`.
 
 ## 7. Disable temporarily
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash
+launchctl bootout gui/$(id -u)/org.claude-watch.mcp-host-bash
 ```
 
 `bootout` unregisters the LaunchAgent. The plist file under
 `~/Library/LaunchAgents/` stays put, so a future `bootstrap` brings
 it back without re-editing.
 
-For a soft kill switch that survives reboots WITHOUT touching launchd,
-set `MCP_HOST_BASH_DISABLED=1` in the plist's `EnvironmentVariables`
-(or in `~/.config/claude-container/mcp-host-bash.env`) and
-re-bootstrap. The launcher then exits 0 immediately on every
-(re)spawn, and `KeepAlive` settles into the `ThrottleInterval` cadence
-without doing real work.
-
 ## 8. Permanently uninstall
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash
-rm ~/Library/LaunchAgents/org.gbre.claude-watch.mcp-host-bash.plist
+launchctl bootout gui/$(id -u)/org.claude-watch.mcp-host-bash
+rm ~/Library/LaunchAgents/org.claude-watch.mcp-host-bash.plist
 ```
 
-Optionally remove the log files and operator config:
+Optionally remove the log files, operator config, and the binary:
 
 ```sh
 rm -f ~/Library/Logs/mcp-host-bash.out.log
 rm -f ~/Library/Logs/mcp-host-bash.err.log
-rm -f ~/.local/state/claude-container/mcp-host-bash.log
 rm -f ~/.config/claude-container/mcp-host-bash.env
-```
-
-And the Keychain entry from Step 0 (skip if you went the plist
-plaintext route and never bootstrapped it):
-
-```sh
-security delete-generic-password -s claude-watch.mcp-host-bash \
-                                 -a "$USER"
+rm -f ~/bin/mcp-host-bash-server
 ```
 
 ## Troubleshooting
@@ -377,14 +284,13 @@ common surprises:
 
 - **`PATH`** is `/usr/bin:/bin:/usr/sbin:/sbin` — no Homebrew, no
   `~/.local/bin`, no `~/.cargo/bin`. The plist template adds
-  `${HOME}/.local/bin` because that's where `install-host-deps`
-  drops the static binaries; extend the list if your `run_command`
+  `${HOME}/.local/bin`; extend the list if your `run_command`
   workflows need others.
 - **`HOME`** IS set (to `/Users/<you>`).
 - **Keychain access** works in the GUI domain (`gui/$(id -u)`) but
-  NOT in the user domain (`user/$(id -u)`). If `mcp-host-bash`
-  passes through to a tool that reads the login keychain (codesign,
-  some corp CLIs), use the GUI domain.
+  NOT in the user domain (`user/$(id -u)`). If a `run_command`
+  invocation reads the login keychain (codesign, some corp CLIs),
+  use the GUI domain.
 - **No `~/.zshrc` / `~/.bash_profile` sourcing.** Anything those
   files set has to be declared in `EnvironmentVariables` or in
   `~/.config/claude-container/mcp-host-bash.env`.
@@ -397,22 +303,21 @@ fails under launchd, the diff is almost always one of these.
 macOS's app-management protections (System Settings → Privacy &
 Security → App Management / Full Disk Access) sometimes block
 LaunchAgents that exec from a path outside your home directory. The
-fix is either to keep the launcher under `${HOME}` (the template
-default — `examples/compose/bin/mcp-host-bash` lives wherever you
-cloned the repo) or to grant Terminal / your editor "Full Disk
-Access" so it can write the LaunchAgent in the first place. If the
-error persists, run `log show --predicate 'subsystem == "com.apple.xpc.launchd"' --last 5m`
+binary lives under `${HOME}/bin` (the template default), which sits
+inside your home dir, so this is usually moot; if the error persists,
+grant Terminal / your editor "Full Disk Access" so it can write the
+LaunchAgent in the first place, or run
+`log show --predicate 'subsystem == "com.apple.xpc.launchd"' --last 5m`
 to get launchd's actual rejection reason.
 
-### The launcher exits with `cannot find required binaries on PATH`
+### The server exits immediately with a bind error
 
-Two common causes:
+`~/Library/Logs/mcp-host-bash.err.log` shows `cannot bind
+127.0.0.1:8766`. A stale prior instance still owns the port:
 
-1. `install-host-deps` was never run (or ran in a shell with a
-   different `PATH`, so the shims went somewhere else). Re-run
-   `examples/compose/bin/install-host-deps` and confirm
-   `~/.local/bin/mcp-proxy` exists.
-2. The plist's `EnvironmentVariables` `PATH` entry doesn't include
-   `${HOME}/.local/bin` (or wherever the shims actually live).
-   `which mcp-proxy` from your interactive shell tells you the
-   real path; mirror it in the plist.
+```sh
+lsof -nP -iTCP:8766 -sTCP:LISTEN
+```
+
+Kill the surviving PID (or pick a different port via
+`MCP_HOST_BASH_BIND` / the `--port` arg) and re-bootstrap.

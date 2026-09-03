@@ -37,15 +37,16 @@ Examples that are OK inline (single tool call):
 - A single Edit when the change is one localized hunk and you've already
   read the file in a prior turn
 
-**Agents MUST be backgrounded — never foreground.** Always spawn with
-`run_in_background: true`. A foreground Agent call blocks this loop until the
-subagent finishes, freezing everything the dispatcher must keep doing (babysit
-the queue, answer agent-chat, refresh the heartbeat, field claude-watch
-alerts) and making a long subagent look wedged to the daemon. Enforced: the
-`pre-agent-background-required-hook` PreToolUse gate DENIES any Agent spawn
-whose `run_in_background` isn't `true`. (Emergency override: env
-`AGENT_FOREGROUND_OK=1`, or `FOREGROUND_AGENT_OK: <reason>` in the Agent
-prompt.) After spawning, track via the queue and `agent-msg`/`agent-tail`.
+**Agents MUST be backgrounded — never foreground.** A foreground Agent call
+blocks this loop until the subagent finishes, freezing everything the
+dispatcher must keep doing (babysit the queue, answer agent-chat, ack event
+batches, field claude-watch alerts) and making a long subagent look wedged
+to the daemon. If your Agent schema has `run_in_background`, pass `true`;
+newer builds dropped it and background natively, so just spawn. Enforced:
+`pre-agent-background-required-hook` DENIES an explicitly-falsy
+`run_in_background`, allows absence. (Override: env
+`AGENT_FOREGROUND_OK=1`, or `FOREGROUND_AGENT_OK: <reason>`.) After
+spawning, track via the queue and `agent-msg`/`agent-tail`.
 
 ## claude-watch alerts — STOP EVERYTHING — NON-NEGOTIABLE
 
@@ -150,52 +151,47 @@ not the host's full automation stack, so these checks are all that's needed.
    [`container/agents/`](/opt/claude-container/container/agents),
    [`container/watchers/`](/opt/claude-container/container/watchers).
 7. **Start event watchers via `/claude-container:start-watchers`**.
-   Watchers are **session-scoped `run_in_background` Bash tasks** that
-   must be (re)started on every session start, `/clear`, resume, or
-   context compaction. They do NOT survive across sessions — there is
-   no long-lived supervisor process.
+   A watcher is a **live `run_in_background` Bash shell the main loop
+   holds** — NOT a daemon or pidfile process. It is "running" ONLY while
+   the session holds a live background shell for it; nothing supervises
+   watchers across sessions, so (re)start them on every session start,
+   `/clear`, resume, or compaction. A launcher exiting 0 is NOT liveness
+   proof: `watcher-ctl run` exits 0 idempotently when another instance
+   already holds the slot ("already running…" / "spawn lock held").
 
-   The canonical watcher is `claude-event-watch` (block-print-exit
-   pattern):
-   - Blocks on `inotifywait` until a new `.json` event file appears
-     in `~/claude-events/` (or `$CLAUDE_EVENT_QUEUE`)
-   - Debounces (default 30s) to batch burst events
-   - Prints all pending events as one-liners:
-     `EVENT[source/tag] message`
-   - Deletes processed event files
-   - Prints a restart banner and **EXITS**
+   The canonical watcher, `claude-event-watch`, is **block-print-exit**:
+   it blocks on `inotifywait` for a `.json` in `~/claude-events/` (or
+   `$CLAUDE_EVENT_QUEUE`), debounces (default 30s) to batch bursts, prints
+   each pending event as `EVENT[source/tag] message`, deletes the files,
+   prints a restart banner, and **EXITS**. On exit it is no longer running:
+   Claude Code delivers its stdout as a task-completion notification, and
+   you relaunch IMMEDIATELY (before processing) so nothing is missed.
 
-   Claude Code delivers the watcher's stdout back to the session as a
-   background-task completion notification. **On receiving watcher
-   output, IMMEDIATELY restart the watcher** (before processing the
-   events) to avoid missing events during processing.
+   **READ every completion's output — the ONLY way to tell what happened.**
+   It is either a real event batch (parse ambient, handle actionable) OR a
+   no-op notice ("already running" / spawn-lock) meaning a duplicate was
+   suppressed and NO watcher was delivered. Never treat a completion as
+   routine or skip the read.
 
-   The `/claude-container:start-watchers` skill starts (or restarts)
-   all watchers. Run it at step 7 of this checklist and again whenever
-   a watcher exits with output.
+   The daemon does NOT run watchers — its `[watcher_monitor]` only ALERTS.
+   After a sustained pidfile-liveness outage (a clean block-print-exit is
+   graced, not flapped) it fires `WATCHER(S) DOWN`, tmux-injecting
+   `watcher-ctl run <name>` so the MAIN LOOP respawns it (cardinal rule:
+   watchers spawn only from the main loop). A down `claude-event-watch`
+   can't be alerted via the very bus it drains, so it injects directly.
 
-**Event watchers inside this container are scoped narrowly.** The container
-is a code-writing sandbox, not a host automation hub. Don't start torrent /
-podcast watchers or anything from the host's resume-checklist playbook; the
-relevant tools and services aren't installed here. The baked watcher
-(`claude-event-watch`) covers the in-container event bus at
-`~/claude-events/`.
+**Event watchers here are scoped narrowly.** The container is a
+code-writing sandbox, not a host automation hub. Don't start torrent /
+podcast watchers or the host's resume-checklist playbook — those tools
+aren't installed here. The baked set is `claude-event-watch` (the
+`~/claude-events/` bus) and `botchat-wait` (inbound chat). A job needing a
+host-side watcher / notifier runs on the host or bridges over `host-bash`.
 
-If a job genuinely needs a host-side watcher / notifier, run it on the host
-(via the operator's host Claude Code session) or bridge the event over
-`host-bash`.
-
-> **Watcher vs. producer (cron) decision:** before adding a new *watcher*
-> (a one-shot, main-loop-supervised tool that blocks-prints-exits), confirm
-> one is actually needed. A *cron producer* — a script that emits a
-> claude-event and exits, surfaced by the existing `claude-event-watch`
-> watcher — is almost always simpler: no persistent supervised slot, no
-> restart cycles, no DOWN-state alerts. A dedicated watcher is justified only
-> when sub-minute reactivity is required AND no kernel event mechanism
-> (inotify, systemd path units) fits. See
-> [`docs/watchers.md` § Watcher vs. producer (cron)](/opt/claude-container/docs/watchers.md#watcher-vs-producer-cron--pick-the-right-tool)
-> for the full decision framework, alternatives (kernel events, extending
-> claude-watch, cron + internal poll loop), and a concrete example.
+> **Watcher vs. producer (cron):** prefer a *cron producer* (emits a
+> claude-event, surfaced by `claude-event-watch`) over a new watcher — no
+> session-restart cycles, no DOWN alerts; a watcher is justified only for
+> sub-minute reactivity with no kernel-event (inotify, path-unit) fit. Full
+> framework: [`docs/watchers.md`](/opt/claude-container/docs/watchers.md#watcher-vs-producer-cron--pick-the-right-tool).
 
 ## Main loop is a coordinator, not a worker
 
@@ -1023,10 +1019,9 @@ see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
   job (`mcp-proxy`, `mcphost`, etc.); the container only rewrites the
   in-container `.mcp.json`. Full surface in
   [container/README.md](/opt/claude-container/container/README.md#blast-radius).
-- **`host-bash`** — generic "run a safe command on the host" MCP server,
-  an off-the-shelf
-  [`cli-mcp-server`](https://github.com/MladenSU/cli-mcp-server) +
-  [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) combo with an
+- **`host-bash`** — generic "run a safe command on the host" MCP server:
+  the single self-contained `mcp-host-bash-server` binary (bearer auth +
+  allow-list in-process), with an
   env-var-driven allow-list. Default (`CW_PROFILE=corp-dev`, conservative
   read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, no path
   boundary by default, 30s timeout (shell-operator gating: see `run_command` vs
@@ -1034,15 +1029,15 @@ see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
   host-scheduling tooling (see "Host-side scheduled tasks").
   **Reach for host-bash as a normal tool, not a last resort** — the supported
   way to do host-side work from the container. Not listed by `/mcp` => operator
-  hasn't wired the launcher
-  ([examples/compose/bin/mcp-host-bash](/opt/claude-container/examples/compose/bin)).
+  hasn't installed the server
+  ([examples/compose/README.md](/opt/claude-container/examples/compose/README.md)).
 
   **Boundary discipline**: host-bash is a *window* to the host. Report "I ran X
   on the host via host-bash", not "I ran X" / "I'm on the host" — the
   in-container claude orchestrates, the host shell executes.
 
   **`run_command` vs `run_script` — pick by quoting; NEVER base64-ferry.** Two
-  tools. `run_command` runs the string through cli-mcp-server's allow-list
+  tools. `run_command` runs the string through the server's allow-list
   tokenizer; top-level operators (`|`, `;`, `&&`, `>`, `2>&1`) between separate
   commands work (`ALLOW_SHELL_OPERATORS=true` on a typical host), but the
   tokenizer splits on those chars **without respecting quotes**, so an operator
@@ -1124,10 +1119,10 @@ event, is worse). If your team requires telemetry from container sessions:
    path the host config references (coordinate with the hook's owning team).
 2. **Enable the host-bash bridge** (`CLAUDE_HOST_HOOK_BRIDGE=1`): exec-hook
    hands every Mach-O / wrong-arch hook off to `exec-hook-bridge`, which
-   marshals the call across the host-bash MCP server (`mcp-host-bash` at
-   `host.docker.internal:8766/mcp`) so the REAL host binary runs with the same
+   marshals the call across the host-bash MCP server
+   (`host.docker.internal:8766/mcp`) so the REAL host binary runs with the same
    env + args and its exit code propagates back. The operator must also add
-   the hook basename to the `mcp-host-bash` allow-list via
+   the hook basename to the `mcp-host-bash-server` allow-list via
    `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook` (comma-separated for many). Bridge
    failures (host-bash unreachable, allow-list reject) fall back to the
    silent-no-op contract — a misconfigured bridge never brings the session
@@ -1163,7 +1158,7 @@ This session runs inside an isolated container. Strengths and limits:
 
 ## Semantic search — query eichi before grepping
 
-The container has access to [eichi](https://github.com/hndrewaall/eichi), a
+The container has access to [eichi](https://github.com/gbre-org/eichi), a
 local sqlite-vec + sentence-transformers semantic search index. Use it as the
 **default first lookup** for open-ended recall questions ("where is X", "what
 did we decide about Y").
@@ -1248,26 +1243,23 @@ vs. recent corpus activity, flag it to the operator — re-indexing is host-side
 > individual `claude-event` is triaged), not the event→obligation→interruption
 > *force ladder*. The concept doc's terminology applies here verbatim:
 >
-> - A **watcher** is the one-shot tool the main loop runs
->   (`claude-event-watch`) — it **blocks, prints events to stdout, and exits**;
->   the loop reads that stdout and respawns a fresh instance. Event-*delivery*,
->   not a long-lived poller.
+> - A **watcher** (see checklist step 7) is a block-print-exit background
+>   shell the main loop respawns — event *delivery*, not a long-lived poller.
 > - An **event producer** (cron job, alertmanager, the queue) *emits* a
 >   `claude-event` onto the bus for the `claude-event-watch` watcher to surface.
 >   Cron ticks below are producer output — cron jobs are **not** watchers.
 
 When `claude-event-watch` delivers events, the container classifies each into
-one of three tiers by its `source` and `tag`. The tiers escalate from "purely
-informational" to "blocking" so the LLM sees the right pressure per event
-class.
+one of three tiers, escalating from "purely informational" to "blocking" so
+the LLM sees the right pressure per event class.
 
 ### Tier 1 — Ambient (info-only, context-inject only)
 
 Routine, non-actionable events: alerts that Andrew already gets push for, cron
 ticks, routine queue transitions (running/done/abandoned), workload-done,
-non-fatal claude-watch alerts, routine PR status (push/pending/mergeable), etc.
+non-fatal claude-watch alerts, routine PR status (push/pending/CI success), etc.
 
-  - Routed by `event-ack ingest` into `ambient-context.json`.
+  - Routed into `ambient-context.json`.
   - Surfaced by the `user-prompt-ambient-inject-hook` (UserPromptSubmit) on
     the NEXT user prompt as additional context.
   - **Non-blocking**. No gate. The LLM sees them, acts if something stands
@@ -1278,70 +1270,65 @@ non-fatal claude-watch alerts, routine PR status (push/pending/mergeable), etc.
 Events that demand a response within a reasonable window: torrent-completed
 (agent spawn), manual/request-fulfilled (requester DM), queue/queue-api-dead
 (respawn), fatal claude-watch alerts (CONTEXT CRITICALLY LOW, main pane crashed),
-PR CI failure/success, workbot-prompt, queue-stale-ready, slack-unread,
-**claude-watch/heartbeat-tick**.
+PR CI failure / merge conflict, workbot-prompt, queue-stale-ready, slack-unread,
+**claude-watch/keepalive**.
 
-> **`heartbeat-tick` — touch the heartbeat file.** Every ~5 min the
-> claude-watch daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick
-> [path=<FILE> interval_secs=…]`. When you see it, run **`touch <FILE>`** (the
-> path on the event line, e.g. `/var/run/claude/claude-heartbeat`). That file
-> is the daemon's wedge-detector: if its mtime goes stale (~10 min) the
-> daemon fires a "heartbeat stale" alert and may try to recover the loop. The
-> touch MUST come from you acting on the event (it proves the loop is alive);
-> the daemon never touches it. One command, no agent spawn.
+> **`keepalive` = the daemon asking whether you are alive.** Emitted only
+> when nothing has been acked for the quiet window (5 min), so if you ack
+> your batches you never see one. Clear it like any batch:
+> **`event-ack ack-batch --override-reason "<why>"`**. The stamp must come from YOU, never the daemon:
+> that is the wedge detector. Miss it past `[ack] stale_minutes` (20) and
+> claude-watch nudges + alerts.
 
-  - Routed by `event-ack ingest` into `pending-actions.json`.
+  - Routed into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt
     Bash tool calls while pending. **Default N=3**: under threshold = ALLOW +
     bump counter; threshold reached = DENY. Override via `$EVENT_MUST_ACT_N`.
-  - **Each `event-ack` transaction resets the counter to 0**, so the LLM gets
-    a fresh N-call grace window after every ack.
-  - The gate does NOT fire immediately on every actionable event — only after
-    the LLM has missed N consecutive triage opportunities (only TRULY actionable
-    events go into pending; the gate escalates after N missed calls).
+  - Any `event-ack` transaction resets the counter, so the gate fires only
+    after N missed triage opportunities.
 
 ### Tier 3 — Unknown (defaults to ACTIONABLE — fail-LOUD)
 
-A source/tag pair matching no `event-classify` rule now defaults to
-**actionable** (flipped from ambient): a brand-new event source must be handled
-or get a rule, never silently swallowed. Routine events are unaffected —
-ambient pairs (`cron/*`, `alertmanager/*`, `claude-watch/*`, queue
-transitions) have explicit rules above the catch-alls; only unmatched pairs hit
-this default.
+A pair matching no rule **and** shipping no tier defaults to **actionable**:
+a brand-new source must be handled or get a classification, never silently
+swallowed. Such an event is **marked `UNCLASSIFIED`** and the deny banner
+names the fixes — acking clears the event, NOT the cause.
 
-### Event classification table
+### Event classification — the PRODUCER is the source of truth
 
-The mapping is DATA, in `event-classify`'s `CLASSIFICATIONS` table. Inspect:
-
-```sh
-event-classify --list-rules
-event-classify --source <src> --tag <tag> [--message <text>] --json
-```
-
-Adding a new event source = appending a row to the table. No gate-logic code
-change.
+A source ships its tier in `data.tier`; that is NOT duplicated here or in
+local config — the `CLASSIFICATIONS` table is only the FALLBACK. Precedence:
+`excluded` (**absolute**, `signal/*`) → **user override**
+(`~/.config/claude-events/tier-overrides.json`) → **producer `data.tier`** →
+table → fail-LOUD `actionable`. Inspect: `event-classify --list-rules`.
+**New source: stamp `data.tier` in the producer**, don't add a row.
 
 ### Workflow
 
-1. **Watcher fires** — `claude-event-watch` prints `EVENT[source/tag]
-   message` lines and exits.
-2. **Restart watcher immediately** (before processing).
-3. **For each event line**, call `event-ack ingest --source <src> --tag <tag>
-   --message "<msg>"`. The classifier routes it to the right queue.
-4. **For actionable events**, queue an agent / act directly / dismiss, then
-   `event-ack ack "<key>" --action "<what you did>"` (resets the N-counter).
-5. **Ambient events** need no action — they surface in the next prompt's
-   context via the UserPromptSubmit hook.
+1. **Watcher fires**: `claude-event-watch` prints `EVENT[source/tag]` lines
+   (monitor mode keeps streaming; exit mode prints one batch and exits).
+2. **Restart the watcher immediately** if it exited (before processing).
+3. Ingest is automatic (the watcher does it as it drains).
+4. **Handle the batch**: queue an agent / act directly / dismiss, per event.
+5. **Ack the batch, every batch: `event-ack ack-batch --override-reason
+   "<why>"`** (REQUIRED, audited): clears all pending, resets the
+   N-counter, stamps `last-ack-timestamp` (its age is claude-watch's ONLY
+   liveness signal). Monitor mode prints an `EVENT-ACK REQUIRED:` line per
+   batch. Per-key `event-ack ack "<key>"` only to leave part of a batch
+   pending.
+6. **Ambient events** need no action: they surface in the next prompt's
+   context via the UserPromptSubmit hook. Ack the batch anyway.
 
 ### CLI reference
 
 ```sh
-# Route an event through the classifier + into the correct queue.
+# Replay one event by hand (the watcher ingests as it drains).
 event-ack ingest --source <src> --tag <tag> --message "<msg>"
 
 # Pending-actions surface (actionable tier).
+event-ack ack-batch --override-reason "<why>"  # per-batch reflex
 event-ack add "<key>" [--source "<src>"]   # Manual add (rare)
-event-ack ack "<key>" --action "<text>"    # Ack -> resets N-counter
+event-ack ack "<key>" --action "<text>"    # Ack ONE key (partial batch only)
 event-ack list                             # Show pending + counter
 event-ack clear                            # Clear all (escape hatch)
 

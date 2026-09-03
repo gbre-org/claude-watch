@@ -22,7 +22,7 @@
 #   └──────────────────────────────────┬─────────────────────────────┘
 #                                      │  SSH
 #   ┌──────────────────────────────────▼─────────────────────────────┐
-#   │ remote host (gomorrah)                                          │
+#   │ remote host (the-host)                                          │
 #   │                                                                │
 #   │   ~/.cache/claude-clipboard-bridge/  ← rsync target            │
 #   │      ↑                                                          │
@@ -49,21 +49,31 @@
 # Usage:
 #
 #   # Foreground (debugging):
-#   clipboard-bridge-daemon --remote-host hndrewaall@gomorrah
+#   clipboard-bridge-daemon --remote-host user@the-host
 #
 #   # Background (launchd-managed):
 #   # install the .plist from examples/compose/launchd/
-#   launchctl load ~/Library/LaunchAgents/org.gbre.claude-watch.clipboard-bridge.plist
+#   launchctl load ~/Library/LaunchAgents/org.claude-watch.clipboard-bridge.plist
 #
 #   # Override poll interval / remote path:
-#   clipboard-bridge-daemon --interval 0.5 --remote-host gomorrah \
+#   clipboard-bridge-daemon --interval 0.5 --remote-host the-host \
 #                           --remote-dir '~/.cache/claude-clipboard-bridge/'
 #
 # Env var override (matches what launchd typically passes):
-#   CLIPBOARD_BRIDGE_REMOTE_HOST   (e.g. hndrewaall@gomorrah)
+#   CLIPBOARD_BRIDGE_REMOTE_HOST   (e.g. user@the-host)
 #   CLIPBOARD_BRIDGE_REMOTE_DIR    (default: ~/.cache/claude-clipboard-bridge/)
 #   CLIPBOARD_BRIDGE_INTERVAL      (default: 1.0 seconds)
 #   CLIPBOARD_BRIDGE_LOCAL_DIR     (default: ~/.cache/claude-clipboard-bridge/)
+#   CLIPBOARD_BRIDGE_THEME_DISABLED set to 1/true to NOT emit the theme file
+#
+# Theme sync (PR #579): in addition to the clipboard image, this daemon
+# mirrors the macOS light/dark appearance into the bridge dir as a one-word
+# `theme` file ("dark"/"light"). The in-container cw-theme-sync daemon
+# (container/bin/cw-theme-sync) watches it and injects `/config theme=<x>`
+# so Claude Code's TUI theme follows the Mac live. This is the host-daemon
+# producer for theme-sync -- the analogue of the clipboard-upload sidecar's
+# /theme-report route, for deployments that use this host clipboard bridge
+# instead of the browser-POST sidecar.
 #
 # Security:
 #
@@ -90,6 +100,13 @@ INTERVAL="${CLIPBOARD_BRIDGE_INTERVAL:-1.0}"
 ONESHOT=0
 DRY_RUN=0
 VERBOSE=0
+
+# Theme emit (PR #579). Mirror macOS appearance into $LOCAL_DIR/theme so the
+# in-container cw-theme-sync daemon can drive Claude Code's TUI theme.
+THEME_FILE_NAME="${CLIPBOARD_BRIDGE_THEME_FILE_NAME:-theme}"
+EMIT_THEME=1
+case "${CLIPBOARD_BRIDGE_THEME_DISABLED:-}" in 1|true|yes|on) EMIT_THEME=0 ;; esac
+LAST_THEME=""
 
 usage() {
     sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
@@ -219,11 +236,53 @@ push_image_if_changed() {
 }
 
 # ---------------------------------------------------------------------------
+# Theme emit: mirror the macOS light/dark appearance into the bridge dir as a
+# one-word `theme` file. macOS exposes appearance via
+# `defaults read -g AppleInterfaceStyle`: it prints "Dark" in dark mode and
+# the key is ABSENT (command errors) in light mode. Only writes on an actual
+# change, so cw-theme-sync's mtime poll stays quiet otherwise.
+# ---------------------------------------------------------------------------
+
+emit_theme_if_changed() {
+    (( EMIT_THEME )) || return 0
+    local mode
+    if defaults read -g AppleInterfaceStyle 2>/dev/null | grep -qi dark; then
+        mode="dark"
+    else
+        mode="light"
+    fi
+    [[ "$mode" == "$LAST_THEME" ]] && return 0
+    LAST_THEME="$mode"
+
+    local target="$LOCAL_DIR/$THEME_FILE_NAME"
+    local tmp
+    tmp="$(mktemp -t clipboard-bridge-theme-XXXXXX)"
+    printf '%s\n' "$mode" > "$tmp"
+    mv -f "$tmp" "$target"   # atomic rename into the bridge dir
+
+    if (( VERBOSE )); then
+        printf '[clipboard-bridge] theme -> %s\n' "$mode" >&2
+    fi
+
+    # Push to remote if configured (same hop as the image files).
+    if [[ -n "$REMOTE_HOST" ]]; then
+        if (( DRY_RUN )); then
+            printf '[clipboard-bridge] DRY-RUN: would rsync %s -> %s:%s\n' \
+                "$target" "$REMOTE_HOST" "$REMOTE_DIR" >&2
+        else
+            rsync -a --partial "$target" "$REMOTE_HOST:$REMOTE_DIR" 2>&1 \
+                | { (( VERBOSE )) && cat || cat >/dev/null; } || true
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 if (( ONESHOT )); then
     push_image_if_changed || true
+    emit_theme_if_changed || true
     exit 0
 fi
 
@@ -234,5 +293,6 @@ fi
 
 while :; do
     push_image_if_changed || true
+    emit_theme_if_changed || true
     sleep "$INTERVAL"
 done

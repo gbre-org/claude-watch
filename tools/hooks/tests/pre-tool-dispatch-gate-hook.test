@@ -269,7 +269,10 @@ def test_baked_bash_exempt_patterns_allow():
             "event-classify --list-rules",
             "event-classify --source s --tag t --json",
             "/usr/local/bin/event-classify --source s --tag t",
-            # Heartbeat-liveness touch (both watched paths).
+            # Heartbeat-liveness touch (both watched paths). heartbeat-tick's
+            # normal clear-path is now a plain `event-ack ack` (already
+            # exempt above, tested a few lines up) -- the `heartbeat-ack`
+            # wrapper was retired 2026-08-21.
             "touch /var/run/claude/heartbeat",
             "touch /var/run/claude/claude-heartbeat",
             # botchat comms surface (operator DM channel) -- reading + replying
@@ -310,6 +313,26 @@ def test_find_with_delete_is_NOT_exempt():
               f"out={out}")
         check(h.read_state().get("count") == 1,
               "find -delete: increments counter",
+              f"state={h.read_state()}")
+    finally:
+        h.cleanup()
+
+
+def test_heartbeat_ack_no_longer_exempt():
+    """`heartbeat-ack` was retired 2026-08-21 (#649 ack-driven redesign --
+    a plain `event-ack ack` already refreshes liveness, so the wrapper's
+    dedicated exemption is gone too). It must now count toward the
+    dispatcher counter like any other ordinary command -- NOT be treated
+    as dispatcher bookkeeping."""
+    h = Harness()
+    try:
+        h.run_cli("reset")
+        rc, out, _ = h.run_hook({"tool_name": "Bash",
+                                 "tool_input": {"command": "heartbeat-ack"}})
+        check(_is_allow(out), "heartbeat-ack first call: allow (under threshold)",
+              f"out={out}")
+        check(h.read_state().get("count") == 1,
+              "heartbeat-ack: increments counter (no longer exempt)",
               f"state={h.read_state()}")
     finally:
         h.cleanup()
@@ -708,6 +731,7 @@ def main() -> int:
         test_read_tool_exempt_no_increment,
         test_baked_bash_exempt_patterns_allow,
         test_find_with_delete_is_NOT_exempt,
+        test_heartbeat_ack_no_longer_exempt,
         test_env_threshold_picked_up_immediately,
         test_bypass_env_var,
         test_disabled_env_var,

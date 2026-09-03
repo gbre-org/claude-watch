@@ -11,6 +11,141 @@ Designed to sit BEHIND an upstream auth proxy (oauth2-proxy, nginx
 control — it trusts the `X-Auth-Request-Email` header for display only.
 Do not expose it to the public internet without a gate.
 
+## Status sections (and why none may be silently dropped)
+
+Items are bucketed into sections from a single table, `STATUS_SECTION` in
+`app.py`. Section order is RUNNING → WEDGED → QUARANTINED → PENDING →
+BLOCKED → OTHER → DONE → ABANDONED.
+
+`WEDGED` and `QUARANTINED` sit directly under RUNNING because they are
+in-flight items that **still hold their scope**: a pending peer in the same
+scope cannot start until one of them ends.
+
+* **wedged** — was running, the owning agent is stuck. Card shows the wedge
+  reason and the two ways out (`queue unwedge`, `queue abandon`).
+* **quarantined** — `queue abandon` was called on a scope-owning item without
+  positive evidence the process is gone, so the scope stays locked and the
+  item waits on a human. Card shows the quarantine reason, the fact that the
+  scope is still held, and the three exits in descending order of evidence
+  (`queue done`, `queue resurrect`, `queue release --reason ...`).
+
+The exits are shown as copyable commands rather than one-click buttons on
+purpose: each is an assertion about whether a process is still alive, and that
+judgement is exactly what the quarantine state exists to stop the system from
+making on an inference.
+
+**OTHER is the structural guarantee.** Bucketing previously used a hardcoded
+if/elif chain with no `else`, so any status it didn't name was dropped —
+no row, no count, no log line. `wedged` and `quarantined` were both invisible
+that way. Anything whose status has no declared section (including a missing
+or null status) now lands in OTHER, which renders the raw status verbatim and
+logs a one-time warning, so a status added to `session-task` tomorrow shows up
+immediately instead of disappearing. Giving it a first-class section means
+adding it to `STATUS_SECTION` plus a section in `templates/index.html` and
+`static/refresh.js` — an upgrade, never a prerequisite for visibility.
+
+Every section must exist in **both** renderers. The 5s morphdom refresh
+rebuilds `#queue-root` from `static/refresh.js`, so a section present only in
+the Jinja template flashes on first paint and vanishes on the first tick.
+`test_status_sections.py` and `test_foldable_sections.py` pin that parity.
+
+## Done view (archive union)
+
+The **Done** section does NOT source solely from the `done` items still
+resident in `queue.json`. It UNIONs those live items with the persistent
+append-only completed-tasks archive (`completed-tasks.jsonl` — the record
+`session-task` writes on every queue done/abandon), deduped by queue id
+(the live `queue.json` entry wins over its archive echo). This makes the
+view **reset-proof**: a `queue.json` corruption/reset wipes the live done
+tail, but the historical record survives in the archive and keeps
+rendering. Only DONE rows are pulled from the archive (abandon / merge /
+block / … lifecycle rows are dropped). The rendered card list is capped at
+`RECENT_DONE_LIMIT` (newest first); the section header's `N / M` count
+reports `M` as the full union total. The archive path defaults to a
+sibling of `QUEUE_JSON` (`COMPLETED_TASKS_JSONL` overrides it) and is
+parsed once per file change (cached on mtime/size), so the growing archive
+adds no per-request cost.
+
+## Agent activity counters (tool calls + tokens)
+
+Every RUNNING row carries a live cell in its item head — `11 calls · 82K tok`
+in comfortable density, `11·82Kt` in compact (the head is the one line
+compact never elides, so the counters stay visible there too; hover for
+output tokens / last tool / last-write age) — and the header shows the
+session totals as ONE outlined rounded pill in the TOP half-row, `● N agents
+· C calls · K tok`, right-aligned within the stack so its right edge lines up
+with the last status pill's; the status pills (running / blocked / pending)
+sit in the row below, left-aligned. The pill is the botchat topbar agent-bar look: a live dot,
+info-blue while at least one agent is live (`.active`), muted when none
+(`.idle`), dashed with an amber dot and `n/a` numerals when the snapshot is
+stale (`.stale`); under 480px the units collapse to `a` / `c` / `t`.
+
+The agent COUNT is always "live right now". The other two numerals are the
+live sums only while something IS running: with no live agent those sums are
+structurally 0, so instead of `0 agents · 0 calls · 0 tok` — which reads as a
+broken sensor rather than an idle minute — the pill shows the last window's
+tool calls and the MAIN loop's context, tagged `main`
+(`0 agents · 37 calls · main 157K tok`). The server picks that
+(`pill_calls_text` / `pill_tok_text` / `pill_tok_pre`); `calls_text` /
+`tok_text` stay the live sums for the popover and API consumers.
+
+Click (pin) or hover (peek) the pill for the per-agent popover — `N live
+agents — C calls · K ctx · O out`, a `last 15m` line covering every agent seen
+in the live window (finished ones included, so a returned agent's work does not
+vanish), one row per live agent (description; type · queue id
+· last tool; calls / ctx / out / age since spawn) and a footer with the main
+loop's own context tokens, the snapshot age and the host (`static/agent-bar.js`,
+painted from the same `/api/queue` payload: `agent_stats.rows` /
+`agent_stats.main`; the template embeds the first paint as a JSON seed). The
+popover's right edge is anchored to the pill's (measured into the `--abp-right`
+CSS property on open / repaint / resize, clamped inside the header on both
+sides); under 480px it pins edge-to-edge instead.
+The two rows are half-size and hard-nowrap at every width, so the header is
+always exactly two rows; `agent_stats.label` still carries the long form
+(`N agents · C calls · K tok`) for API consumers. The liveness dot next to
+the controls is a matching small `live` / `error` pill.
+
+The minisite does NOT fold transcripts itself. It reads a small JSON
+snapshot that the host-side producer in this repo —
+[`tools/cw-agent-stats/cw-agent-stats`](../tools/cw-agent-stats/README.md),
+run from cron (Linux) or the launchd plist beside it (macOS) — rewrites
+atomically every few seconds
+(`QUEUE_MINISITE_AGENT_STATS_FILE`; shape: `{generated_at, main:{context_tokens,…},
+agents:[{agent_id, queue_id, tool_calls, context_tokens, output_tokens,
+last_tool, age_seconds, finished,…}], totals:{agents, agents_spawned,
+tool_calls, context_tokens, output_tokens, window_tool_calls,
+window_context_tokens, window_output_tokens}}` — the bare totals are
+live-only, the `window_*` ones cover the whole live window including agents
+that already returned) and JOINS `agents[].queue_id` onto the
+running rows. The parse is cached on the file's mtime/size and rides along
+in the existing `/api/queue` 5s poll (no second timer); `/api/agent-stats`
+exposes the normalised view (join maps, staleness verdict, totals) for
+debugging.
+
+Degradation rules, in order:
+
+* empty env var → feature off (no read, no pill, no cell);
+* file missing / unreadable / not JSON → hidden (same as off);
+* snapshot older than `QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS` (60s) →
+  **stale**: every cell is blank and the pill's numerals read `n/a` (dashed
+  `.stale` pill, popover shows no rows) — a frozen number is worse than
+  none, so staleness is re-derived on every request even when the file has
+  not changed;
+* a running row with no live agent for its queue id → no cell.
+
+**Mount the snapshot's DIRECTORY, not the file.** The producer replaces the
+file atomically (tmp + rename); a single-file bind mount pins the original
+inode and goes stale on the first rewrite — the same trap the
+`session-task` mount documents. The producer's default `--out` is
+`<claude-watch state dir>/agent-stats.json` (`$CLAUDE_WATCH_STATE_DIR`, else
+`/var/lib/claude-watch` — beside the daemon's `active-agents.json`), and the
+minisite's default path is the SIBLING of `AGENT_STATE_JSON`, so when the
+compose stack bind-mounts that state dir at `/agents-state` (`CW_STATE_PATH`)
+both sides already agree (`/agents-state/agent-stats.json`) with no env var.
+Otherwise mount the producer's output dir elsewhere and point the env var at
+the file inside it (the `CLAUDE_HOST_AGENT_STATS_DIR` pattern in
+`examples/compose/docker-compose.yml`).
+
 ## Layout
 
 | Path | Purpose |
@@ -76,6 +211,8 @@ brand identity lives outside the public image.
 | `SSE_TAIL_MAX_IDLE_SECONDS` | `30` | Idle cap on SSE live-log streams. |
 | `SSE_TAIL_MAX_LIFETIME_SECONDS` | `3600` | Lifetime cap on SSE live-log streams. |
 | `SSE_TAIL_BACKFILL_LINES` | `200` | Historical-context backfill cap when a client first connects. |
+| `QUEUE_MINISITE_AGENT_STATS_FILE` | sibling of `AGENT_STATE_JSON` (`/agents-state/agent-stats.json`) | Per-agent activity snapshot (tool calls + tokens) written by `tools/cw-agent-stats/cw-agent-stats`, joined onto running rows + summed in the header — see "Agent activity counters" below. Empty = feature off. |
+| `QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS` | `60` | Snapshot older than this (by `generated_at` or file mtime) renders as stale: blank cells + `n/a` numerals on the header pill, never a frozen number. |
 | `PINGME_SESSION_TASK` | `0` | Set to `1` to suppress pingme chatter from `session-task` lifecycle. |
 | `CLAUDE_EVENT_SESSION_TASK` | `0` | Set to `1` to suppress claude-event chatter from `session-task` lifecycle. |
 

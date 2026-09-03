@@ -144,14 +144,109 @@ def test_baked_claude_md_documents_tier_model() -> None:
 
 # ---------------------------------------------------------------- 5
 
+BAKED_EVAL_PREFIX = "/usr/local/bin"
+BAKED_EVAL_EVENT_MUST_ACT = f"{BAKED_EVAL_PREFIX}/eval-event-must-act"
+
+
+def _init_dry_run(*extra: str, env: dict | None = None):
+    """Run obligations-init --dry-run and return the CompletedProcess."""
+    if env is None:
+        env = {k: v for k, v in os.environ.items() if k != "CW_EVAL_BIN_DIR"}
+    return subprocess.run(
+        [sys.executable, str(OBLIGATIONS_INIT), "--dry-run", *extra],
+        capture_output=True, text=True, timeout=30, check=False, env=env,
+    )
+
+
+def _only_dry_run_line(proc) -> str:
+    return next((ln for ln in proc.stdout.splitlines()
+                 if ln.startswith("DRY-RUN:")), "")
+
+
 def test_obligations_init_seeds_event_must_act() -> None:
     text = OBLIGATIONS_INIT.read_text()
     expect("event_must_act" in text,
            "obligations-init must still seed event_must_act")
     expect("seed_event_must_act" in text,
            "obligations-init must define seed_event_must_act()")
-    expect("/usr/local/bin/eval-event-must-act" in text,
-           "obligations-init must point at the baked eval script")
+    # The evaluator path is now derived from an install prefix so the
+    # non-container (systemd host) deployment can point it at its own bin
+    # dir. The CONTAINER contract is that the prefix DEFAULTS to the baked
+    # location, i.e. a plain `obligations-init` inside the image still seeds
+    # a row whose cmd is the baked eval script. Assert the RENDERED value,
+    # not the source text -- a grep for the literal passes on an unrelated
+    # docstring mention and proves nothing.
+    expect(f'DEFAULT_EVAL_BIN_DIR = "{BAKED_EVAL_PREFIX}"' in text,
+           "obligations-init must default the eval prefix to the baked dir")
+    proc = _init_dry_run("--only", "event_must_act")
+    expect(proc.returncode == 0,
+           f"--only event_must_act -n rc={proc.returncode}\n{proc.stderr}")
+    expect(BAKED_EVAL_EVENT_MUST_ACT in proc.stdout,
+           "default (container) seed must point at the baked eval script; "
+           f"got:\n{proc.stdout}")
+
+
+def test_obligations_init_only_flag_is_single_row() -> None:
+    """``--only`` must seed EXACTLY the named row. Turning on ONE gate on an
+    already-running host cannot be allowed to drag the other default rows in
+    with it -- they would become live gates on the operator's very next tool
+    call."""
+    proc = _init_dry_run("--only", "event_must_act")
+    expect(proc.returncode == 0,
+           f"--only dry-run rc={proc.returncode}\n{proc.stderr}")
+    lines = [ln for ln in proc.stdout.splitlines()
+             if ln.startswith("DRY-RUN:")]
+    expect(len(lines) == 1,
+           f"--only must emit exactly one add invocation; got {lines}")
+    if lines:
+        expect("[default-seed] event_must_act" in lines[0],
+               f"--only seeded the wrong row: {lines[0]}")
+        for other in ("agent_ack_pending", "queue_ready_unspawned",
+                      "no_grep_watcher_output",
+                      "subagent_queue_item_running"):
+            expect(other not in lines[0],
+                   f"--only event_must_act leaked {other}: {lines[0]}")
+
+
+def test_obligations_init_eval_prefix_is_overridable() -> None:
+    """``$CW_EVAL_BIN_DIR`` must move the evaluator path. A host install
+    symlinks the eval-* scripts into its own bin dir, and a row registered
+    against a nonexistent baked path would default-OPEN forever (the
+    evaluator predicate ALLOWS on spawn error) -- a gate that looks seeded
+    and enforces nothing."""
+    other_prefix = "/opt/cw-test/bin"
+    env = dict(os.environ)
+    env["CW_EVAL_BIN_DIR"] = other_prefix
+    proc = _init_dry_run("--only", "event_must_act", env=env)
+    expect(proc.returncode == 0,
+           f"override dry-run rc={proc.returncode}\n{proc.stderr}")
+    expect(f"{other_prefix}/eval-event-must-act" in proc.stdout,
+           f"CW_EVAL_BIN_DIR must move the evaluator path; got:\n"
+           f"{proc.stdout}")
+    expect(BAKED_EVAL_EVENT_MUST_ACT not in proc.stdout,
+           f"override must not also emit the default path; got:\n"
+           f"{proc.stdout}")
+
+
+def test_obligations_init_only_row_stays_main_loop_scoped() -> None:
+    """The seeded row must stay wrapped in
+    ``all_of [is_main_loop {}, evaluator]`` so it can NEVER fire inside a
+    subagent (which would let a subagent block itself over -- and then
+    clobber -- main-loop-owned event state)."""
+    line = _only_dry_run_line(_init_dry_run("--only", "event_must_act"))
+    expect("--predicate all_of" in line,
+           f"row must use the all_of wrapper; got: {line}")
+    m = re.search(r"--params (\{.*\}) --ttl", line)
+    expect(m is not None, f"could not extract --params from: {line}")
+    if m:
+        params = json.loads(m.group(1))
+        kinds = [c.get("kind") for c in params.get("predicates", [])]
+        expect(kinds == ["is_main_loop", "evaluator"],
+               f"expected [is_main_loop, evaluator]; got {kinds}")
+        guard = params["predicates"][0]
+        expect(guard.get("params") == {},
+               "is_main_loop guard must carry NO negate (main-loop ONLY); "
+               f"got {guard.get('params')}")
 
 
 # ---------------------------------------------------------------- 6
@@ -465,6 +560,9 @@ def main() -> int:
         test_dockerfile_bakes_scripts,
         test_baked_claude_md_documents_tier_model,
         test_obligations_init_seeds_event_must_act,
+        test_obligations_init_only_flag_is_single_row,
+        test_obligations_init_eval_prefix_is_overridable,
+        test_obligations_init_only_row_stays_main_loop_scoped,
         test_generator_injects_ambient_hook,
         test_audit_hooks_knows_new_names,
         test_e2e_actionable_n_counter,

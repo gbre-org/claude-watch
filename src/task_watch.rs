@@ -1211,8 +1211,12 @@ fn setup_notify_watcher(
 /// each entry containing a `pane_id`. Tests can override the path via the
 /// `CLAUDE_WATCH_WORKLOAD_STATE` env var (default:
 /// `/var/run/claude/workload-state/state.json`). The default must stay
-/// in sync with `workload::WORKLOAD_DIR` — the two are read-only mirrors
-/// of the same on-disk file.
+/// in sync with `workload::WORKLOAD_DIR` — the two are mirrors of the
+/// same on-disk file, and `workload::state_file` honours the SAME
+/// override for exactly that reason: `--recreate --force` decides what
+/// to kill through this mirror and then tears it down through the
+/// `workload` side, so a divergence would kill a different set of
+/// workloads than the one it warned about.
 fn workload_state_path() -> PathBuf {
     if let Ok(p) = std::env::var("CLAUDE_WATCH_WORKLOAD_STATE") {
         if !p.is_empty() {
@@ -1267,39 +1271,92 @@ fn load_workload_pane_ids() -> std::collections::HashSet<String> {
 
 /// Get the list of running workloads by reading workload state and intersecting
 /// with the currently alive panes in the tasks session.
+///
+/// The intersection itself is `workload::select_running_labels` — the same
+/// pure selector the teardown iterates, so the labels this warns about are
+/// exactly the labels that get killed. Default-open: a missing or malformed
+/// registry yields an empty list rather than blocking the recreate.
 async fn get_running_workloads(session: &str) -> Vec<String> {
     let path = workload_state_path();
     let content = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let state: serde_json::Value = match serde_json::from_str(&content) {
+    let state: crate::workload::WorkloadState = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let obj = match state.as_object() {
-        Some(o) => o,
-        None => return Vec::new(),
-    };
-    let alive = get_alive_panes(session).await;
-    let mut running = Vec::new();
-    for (label, info) in obj {
-        let pane_id = info
-            .get("pane_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !pane_id.is_empty() && alive.contains(&pane_id) {
-            running.push(label.clone());
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "workload state malformed; treating as empty");
+            return Vec::new();
         }
-    }
-    running
+    };
+    let alive: std::collections::BTreeSet<String> =
+        get_alive_panes(session).await.into_iter().collect();
+    crate::workload::select_running_labels(&state, &alive)
 }
 
 /// Check if claude-watch's task_watch loop is handling the daemon.
 fn claude_watch_handles_daemon() -> bool {
     let config = crate::config::load_config();
     config.task_watch.enabled
+}
+
+/// The keepalive command claude-watch puts in pane 0 of the `tasks` session
+/// when it owns the daemon loop itself (or when the legacy `task-watch` CLI
+/// is not installed).
+///
+/// `sleep infinity` is the load-bearing half: tmux destroys a window once
+/// its last pane's command exits, and the `tasks` session starts life with
+/// exactly one pane, so a pane-0 command that returns immediately takes the
+/// whole session down with it.
+pub const DAEMON_STUB_CMD: &str =
+    "echo 'task-watch daemon handled by claude-watch'; sleep infinity";
+
+/// Name of the legacy (Python) task-watch CLI that pane 0 used to run.
+const LEGACY_TASK_WATCH_BIN: &str = "task-watch";
+
+/// Is the legacy `task-watch` CLI installed?
+///
+/// `CLAUDE_WATCH_LEGACY_TASK_WATCH` overrides the lookup for tests: an
+/// existing path forces "present", the empty string forces "absent".
+fn legacy_task_watch_available() -> bool {
+    if let Some(p) = std::env::var_os("CLAUDE_WATCH_LEGACY_TASK_WATCH") {
+        if p.is_empty() {
+            return false;
+        }
+        return Path::new(&p).is_file();
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join(LEGACY_TASK_WATCH_BIN).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Pick the command pane 0 of the `tasks` session runs.
+///
+/// The stub wins whenever claude-watch owns the daemon loop
+/// (`[task_watch] enabled = true`) — and ALSO whenever the legacy
+/// `task-watch` binary is missing, whatever the config says. That second
+/// clause is a safety net, not a preference: spawning a command that is not
+/// on PATH makes pane 0 exit instantly, which makes tmux tear down the only
+/// pane, which destroys the session microseconds after `task init` printed
+/// "Session 'tasks' created, daemon running in pane 0". The operator is left
+/// with a success line and no session, and `workload run` / `workload kill`
+/// are unusable. A missing binary must degrade to a live-but-idle pane,
+/// never to a vanished session.
+pub fn daemon_pane_command(cw_handling: bool, legacy_available: bool, show_all: bool) -> String {
+    if cw_handling || !legacy_available {
+        DAEMON_STUB_CMD.to_string()
+    } else {
+        format!(
+            "{} daemon{}",
+            LEGACY_TASK_WATCH_BIN,
+            if show_all { " --all" } else { "" }
+        )
+    }
 }
 
 /// CLI handler: create/reinit the tasks tmux session.
@@ -1310,16 +1367,39 @@ fn claude_watch_handles_daemon() -> bool {
 /// - If session exists and `--recreate` is set, require `--force` when there
 ///   are running workloads.
 /// - When claude-watch handles the daemon loop, pane 0 gets a stub command
-///   (`echo ...; sleep infinity`) instead of `task-watch daemon`.
+///   (`echo ...; sleep infinity`) instead of `task-watch daemon` — as does
+///   the case where the legacy `task-watch` CLI simply is not installed. See
+///   [`daemon_pane_command`]: a pane-0 command that is not on PATH exits
+///   instantly and takes the whole session with it.
+///
+/// **`--recreate --force` is TREE-WIDE.** Destroying the session with a
+/// bare `tmux kill-session` only hangs up the pane SHELLS: every running
+/// workload runs its payload under `setsid --wait` (and, on the PTY
+/// path, under `script(1)`, which opens a session again), so the real
+/// command sits two sessions below its pane and used to survive the
+/// recreate as an orphan — still burning CPU, still writing to a
+/// `.output` file nothing was tailing any more, and with no
+/// `workload-done` event ever emitted, so its queue item stayed
+/// `running` forever. Each doomed workload now goes through the same
+/// teardown `workload kill` uses (`workload::kill_workloads`) BEFORE the
+/// session is destroyed: exactly-one `workload-done` with
+/// `killed=true`, snapshot -> SIGTERM pids+pgids -> `grace` ->
+/// re-snapshot -> SIGKILL -> verify.
+///
+/// Returns the process exit code: `1` when `--recreate` is refused for
+/// want of `--force`, [`crate::workload::KILL_SURVIVORS_EXIT`] when the
+/// teardown could not be fully accounted for — something outlived the
+/// SIGKILL sweep, or a workload named by the gate had vanished from the
+/// registry before we could tear it down. The session is recreated
+/// either way; what is refused is calling that outcome clean. Else `0`.
 pub async fn cmd_task_init(
     session: &str,
     show_all: bool,
     detach: bool,
     recreate: bool,
     force: bool,
-) {
-    let all_flag = if show_all { " --all" } else { "" };
-
+    kill_grace_secs: Option<f64>,
+) -> i32 {
     // Clean orphaned grouped sessions (tasks-N from previous inits)
     if let Some(out) = run_cmd(&["tmux", "list-sessions", "-F", "#{session_name}"], 5).await {
         let prefix = format!("{}-", session);
@@ -1331,13 +1411,27 @@ pub async fn cmd_task_init(
     }
 
     let cw_handling = claude_watch_handles_daemon();
-    let stub_cmd = "echo 'task-watch daemon handled by claude-watch'; sleep infinity".to_string();
-    let daemon_cmd = if cw_handling {
-        stub_cmd.clone()
-    } else {
-        format!("task-watch daemon{}", all_flag)
-    };
+    let legacy_available = legacy_task_watch_available();
+    // Either reason to run the stub means pane 0 must NOT be described as
+    // "daemon restarted" — nothing legacy is running in it.
+    let stub_pane = cw_handling || !legacy_available;
+    if !cw_handling && !legacy_available {
+        warn!(
+            session = %session,
+            "[task_watch] enabled = false but the legacy `task-watch` CLI is not \
+             on PATH; using the claude-watch keepalive stub in pane 0"
+        );
+        eprintln!(
+            "WARNING: [task_watch] enabled = false but the legacy `task-watch` CLI \
+             is not installed. Running it in pane 0 would exit immediately and tmux \
+             would destroy the '{}' session. Falling back to the claude-watch \
+             keepalive stub; set [task_watch] enabled = true to silence this.",
+            session
+        );
+    }
+    let daemon_cmd = daemon_pane_command(cw_handling, legacy_available, show_all);
 
+    let mut rc = 0;
     if session_exists(session).await {
         if recreate {
             // --recreate: destroy and rebuild; --force required if workloads are running
@@ -1358,6 +1452,30 @@ pub async fn cmd_task_init(
                     running.len(),
                     running.join(", ")
                 );
+                // TREE-WIDE teardown BEFORE the session goes away. See
+                // this function's doc comment: `tmux kill-session` alone
+                // leaves every payload tree orphaned and emits nothing.
+                // Blocking work (a SIGTERM grace window, /proc walks) so
+                // it runs off the async runtime's worker thread.
+                let grace = crate::workload::resolve_kill_grace(kill_grace_secs);
+                let labels = running.clone();
+                let outcomes =
+                    tokio::task::spawn_blocking(move || crate::workload::kill_workloads(&labels, grace))
+                        .await
+                        .unwrap_or_else(|e| {
+                            // A panic in the teardown must not silently
+                            // become "recreated cleanly" — say so, and
+                            // fail the command.
+                            warn!(error = %e, "workload teardown task failed before recreate");
+                            Vec::new()
+                        });
+                let mut survivors = false;
+                for outcome in &outcomes {
+                    survivors |= crate::workload::report_kill_outcome(outcome);
+                }
+                if outcomes.len() != running.len() || survivors {
+                    rc = crate::workload::KILL_SURVIVORS_EXIT;
+                }
             }
             let _ = run_cmd(&["tmux", "kill-session", "-t", session], 5).await;
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1392,7 +1510,7 @@ pub async fn cmd_task_init(
             )
             .await;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if cw_handling {
+            if stub_pane {
                 println!(
                     "Session '{}' reinited (daemon handled by claude-watch, workload panes preserved)",
                     session
@@ -1444,6 +1562,7 @@ pub async fn cmd_task_init(
             println!("Attach with: tmux attach -t {}", session);
         }
     }
+    rc
 }
 
 // ---- Standalone (state-file-backed) CLI subcommands ----
@@ -2065,5 +2184,75 @@ mod tests {
             workload_state_path(),
             PathBuf::from("/var/run/claude/workload-state/state.json")
         );
+    }
+
+    // --- pane-0 command selection ---
+    //
+    // Regression guard for the container bug (operator report, 2026-08-22):
+    // `claude-watch task init` printed "Session 'tasks' created, daemon
+    // running in pane 0" and the session was gone immediately afterwards.
+    // `[task_watch] enabled = false` selected `task-watch daemon`, the
+    // legacy binary was not in the image, the pane command exited instantly
+    // and tmux destroyed the only pane — taking the session with it.
+
+    static LEGACY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct LegacyEnvGuard;
+    impl Drop for LegacyEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("CLAUDE_WATCH_LEGACY_TASK_WATCH");
+        }
+    }
+
+    #[test]
+    fn test_daemon_pane_command_stub_when_cw_handles() {
+        assert_eq!(daemon_pane_command(true, true, false), DAEMON_STUB_CMD);
+        assert_eq!(daemon_pane_command(true, false, true), DAEMON_STUB_CMD);
+    }
+
+    #[test]
+    fn test_daemon_pane_command_legacy_when_available() {
+        assert_eq!(daemon_pane_command(false, true, false), "task-watch daemon");
+        assert_eq!(
+            daemon_pane_command(false, true, true),
+            "task-watch daemon --all"
+        );
+    }
+
+    #[test]
+    fn test_daemon_pane_command_falls_back_to_stub_when_legacy_missing() {
+        // The bug: config says "legacy daemon", the binary does not exist.
+        // Must NOT emit `task-watch daemon` — that command exits instantly
+        // and tmux tears down the whole session.
+        assert_eq!(daemon_pane_command(false, false, false), DAEMON_STUB_CMD);
+        assert_eq!(daemon_pane_command(false, false, true), DAEMON_STUB_CMD);
+    }
+
+    #[test]
+    fn test_daemon_stub_cmd_blocks_forever() {
+        // `sleep infinity` is what keeps pane 0 (and therefore the session)
+        // alive. Losing it reintroduces the vanishing-session bug.
+        assert!(DAEMON_STUB_CMD.contains("sleep infinity"));
+    }
+
+    #[test]
+    fn test_legacy_task_watch_available_env_override() {
+        let _lock = LEGACY_ENV_LOCK.lock().unwrap();
+        let _guard = LegacyEnvGuard;
+
+        // Empty string forces "absent".
+        std::env::set_var("CLAUDE_WATCH_LEGACY_TASK_WATCH", "");
+        assert!(!legacy_task_watch_available());
+
+        // A path that does not exist is also "absent".
+        std::env::set_var("CLAUDE_WATCH_LEGACY_TASK_WATCH", "/nonexistent/task-watch");
+        assert!(!legacy_task_watch_available());
+
+        // An existing file is "present".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task-watch");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::env::set_var("CLAUDE_WATCH_LEGACY_TASK_WATCH", &path);
+        assert!(legacy_task_watch_available());
     }
 }

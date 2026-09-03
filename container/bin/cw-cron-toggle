@@ -36,6 +36,8 @@ KNOWN_JOBS=(
     stale-ready-check
     queue-check
     watcher-health-check
+    session-rotate
+    hostjob-reconcile
 )
 
 usage() {
@@ -51,6 +53,7 @@ Usage:
 
 Known jobs:
   active-agents  metrics  stale-ready-check  queue-check  watcher-health-check
+  session-rotate  hostjob-reconcile
 
 Disabling takes effect on the next cron tick (~1 min) and persists across
 container redeploys via the claude-watch-state named volume. Flag files live

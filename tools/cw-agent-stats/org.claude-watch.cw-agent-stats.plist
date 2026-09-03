@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  org.claude-watch.cw-agent-stats — host producer for the queue-minisite
+  live agent tool-call + token counters (claude-watch #655; originally botchat
+  #2955/#2956). Writes the agent-stats.json snapshot atomically every ~4s
+  (--loop --duration 58 --interval 4, fired once a minute) by folding the
+  appended tail of ~/.claude/projects/*/*/subagents/agent-*.jsonl transcripts.
+
+  Formerly org.claude-watch.botchat-agent-stats, installed from
+  claude-config and running botchat/bin/botchat-agent-stats. Moved so the
+  producer's install/ownership lives in claude-watch (which now owns this
+  plist + the `install-cw-agent-stats-launchd` Makefile target) instead of
+  botchat. The survey library is vendored beside the script too
+  (tools/cw-agent-stats/agentstats.py), so NO botchat checkout is needed.
+
+  --out: the script's own DEFAULT is now <claude-watch state dir>/agent-stats.json
+  ($CLAUDE_WATCH_STATE_DIR, else /var/lib/claude-watch — beside the daemon's
+  active-agents.json, which the compose stack mounts into the minisite as
+  /agents-state). The explicit --out below is kept UNCHANGED from the prior
+  plist because this Mac's compose stack reads the snapshot through the
+  separate CLAUDE_HOST_AGENT_STATS_DIR mount of that dir; repoint both
+  together (or drop both in favour of the default + CW_STATE_PATH) when
+  convenient.
+
+  Must run on the HOST (not in-container): needs direct read access to
+  ~/.claude/projects and RW access to the --out dir, neither of which the
+  container has writable (~/repos is RO in claude-container).
+
+  CW_AGENT_STATS_PROM_FILE points the Prometheus textfile-collector output
+  (claude_agent_live_count / claude_agent_calls_total / claude_agent_tokens_total)
+  at ~/repos/.claude-watch-textfile/claude_agent_stats.prom -- the SAME host
+  dir the monitoring-node-exporter-1 container bind-mounts read-only at
+  /textfile (--collector.textfile.directory=/textfile). Without this env var
+  cw-agent-stats falls back to /var/lib/node-exporter/textfile/, which is
+  NOT the dir node-exporter actually scrapes on this host -- the metrics
+  would be written but silently never picked up.
+
+  Namespace: org.claude-watch.* is the namespace for claude-watch's own
+  plists (see claude-config launchagents/README.md rule 4 and memory
+  feedback_claude_watch_plist_namespace).
+
+  ProgramArguments[0] points DIRECTLY at the shebang'd
+  (`#!/usr/bin/env python3`), descriptively-named, extension-less
+  cw-agent-stats script -- NEVER a bare `python`/`python3` interpreter
+  fronting it -- so macOS Background Task Management attributes the "can run
+  in the background" notification to the friendly name "cw-agent-stats"
+  instead of the anonymous, unqualified "python" (see launchagents/README.md
+  rule 3 in claude-config for the anti-pattern this avoids).
+
+  TEMPLATE -- NOT installable as-is. launchd resolves no variables and needs
+  absolute paths, but every path here is rooted at the operator's home, so the
+  tracked file carries the `__HOME__` placeholder rather than one account's
+  home dir. Render it (substitute your own home for `__HOME__`) on the way into
+  ~/Library/LaunchAgents; a verbatim `cp` installs a job whose program does not
+  exist, and launchd fails it silently.
+
+  Install (or `make install-cw-agent-stats-launchd` from the repo root, which
+  does exactly this):
+    sed "s|__HOME__|$HOME|g" \
+       tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist \
+       > ~/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
+
+  Run now (test):
+    launchctl kickstart -k gui/$(id -u)/org.claude-watch.cw-agent-stats
+
+  Dismantle:
+    launchctl bootout gui/$(id -u)/org.claude-watch.cw-agent-stats 2>/dev/null || true
+    rm ~/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.claude-watch.cw-agent-stats</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/repos/claude-watch/tools/cw-agent-stats/cw-agent-stats</string>
+        <string>--loop</string>
+        <string>--duration</string>
+        <string>58</string>
+        <string>--interval</string>
+        <string>4</string>
+        <string>--out</string>
+        <string>__HOME__/repos/botchat-data/agent-stats.json</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/bin:/usr/sbin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>CW_AGENT_STATS_PROM_FILE</key>
+        <string>__HOME__/repos/.claude-watch-textfile/claude_agent_stats.prom</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/cw-agent-stats.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/cw-agent-stats.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

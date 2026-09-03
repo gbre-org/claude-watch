@@ -1,12 +1,23 @@
 # personal-mac-mcp-host — DESIGN
 
 > **Status:** implemented — `personal-mcp-host.sh`, `.env.example`,
-> `.gitignore`, `launchd/org.gbre.personal-mcp.host.plist` (bundled),
-> `launchd/org.gbre.personal-mcp.tunnel.plist` (tunnel-only),
+> `.gitignore`, `launchd/org.claude-watch.personal-mcp.host.plist` (bundled),
+> `launchd/org.claude-watch.personal-mcp.tunnel.plist` (tunnel-only),
 > `launchd/README.md`, `README.md`, and embedded test suites under
 > `tests/`. See [`README.md`](README.md) for operator setup; this file
 > is the architectural record (why reverse-SSH, alternatives
 > considered, why the always-on-MCP + on-demand-tunnel split).
+>
+> **Note on the MCP server:** the sketches below predate the host-bash
+> refactor and describe the retired `mcp-proxy` + `cli-mcp-server` +
+> auth-shim chain. The MCP server is now the single self-contained Rust
+> binary `mcp-host-bash-server` (crate
+> [`../../crates/mcp-host-bash-server`](../../crates/mcp-host-bash-server),
+> installed to `~/bin/mcp-host-bash-server` via
+> `make install-mcp-host-bash-server`); it does bearer auth in-process,
+> so there is no separate proxy, allow-list server, or Keychain wrapper.
+> The reverse-SSH tunnel rationale — the actual subject of this doc —
+> is unaffected.
 
 ## Goal
 
@@ -29,14 +40,14 @@ Concretely, the operator wants:
    reaches the MacBook's MCP server.
 4. The MacBook side committable to a public repo (this directory),
    with operator-specific secrets in a `.gitignore`d `.env`.
-5. Reuse of the existing `examples/compose/bin/mcp-host-bash` launcher
-   (already shipped in this repo) for the MCP server itself —
-   `cli-mcp-server` + `mcp-proxy` + bearer-token auth shim. No new MCP
-   server implementation needed.
+5. Reuse of the existing `mcp-host-bash-server` binary (already shipped
+   in this repo, crate `crates/mcp-host-bash-server`) for the MCP server
+   itself — streamable-HTTP with in-process bearer auth + allow-list. No
+   new MCP server implementation needed.
 
 ## Why this is *not* the workbot pattern
 
-The existing `examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist`
+The existing `examples/compose/launchd/org.claude-watch.mcp-host-bash.plist`
 LaunchAgent solves the *local-loopback* case: an in-container Claude
 on the **same** Mac (Docker Desktop) reaches the host's MCP server
 via `host.docker.internal` NAT. No cross-machine networking — the
@@ -58,16 +69,21 @@ the MacBook controls the tunnel lifecycle (`launchctl load` to open it,
 
 The wrapper supports two shapes, with one LaunchAgent template each:
 
-- **Bundled** (`org.gbre.personal-mcp.host.plist`, wrapper invoked with
-  no flag). One unit owns BOTH `mcp-host-bash` and the reverse SSH
-  tunnel. Kickstart it → both come up; bootout → both go down. Fewest
-  moving parts.
+- **Bundled** (`org.claude-watch.personal-mcp.host.plist`, wrapper invoked with
+  `--enable`). One unit owns BOTH `mcp-host-bash` and the reverse SSH
+  tunnel. Kickstart it → both come up. Bootout tears the tunnel down;
+  the MCP server is started detached and keeps listening, so the next
+  kickstart reconnects instead of cold-starting. Fewest moving parts.
+
+  The flag is required, not cosmetic: the wrapper's no-flag default is
+  a status GATE that starts nothing and exits 3 when the server is
+  down, which `KeepAlive` would turn into a restart loop.
 
 - **Recommended split — MCP always-on locally, remote access
-  on-demand** (`org.gbre.personal-mcp.tunnel.plist`, wrapper invoked
+  on-demand** (`org.claude-watch.personal-mcp.tunnel.plist`, wrapper invoked
   with `--tunnel-only` / `PERSONAL_MCP_TUNNEL_ONLY=1`). The MCP server
   runs full-time via the existing compose-stack LaunchAgent
-  [`../compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist`](../compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist)
+  [`../compose/launchd/org.claude-watch.mcp-host-bash.plist`](../compose/launchd/org.claude-watch.mcp-host-bash.plist)
   (`RunAtLoad=true`), listening on `127.0.0.1:$MCP_LOCAL_PORT` at every
   login. This tunnel-only unit then opens ONLY the reverse SSH tunnel
   when the operator wants to grant access. In tunnel-only mode the
@@ -99,7 +115,7 @@ own the whole lifecycle.
 ```
    MacBook (operator's laptop, e.g. behind NAT / coffee shop wifi)
    ────────────────────────────────────────────────────────────────
-       launchctl start org.gbre.personal-mcp.tunnel
+       launchctl start org.claude-watch.personal-mcp.tunnel
                 │
                 ▼
        mcp-host-bash --port $MCP_LOCAL_PORT
@@ -147,19 +163,17 @@ examples/personal-mac-mcp-host/
 ├── personal-mcp-host.sh                      # wrapper: starts mcp-host-bash + ssh tunnel
 ├── tunnel.sh                                 # standalone ssh tunnel wrapper (called by personal-mcp-host.sh)
 └── launchd/
-    ├── org.gbre.personal-mcp.host.plist      # runs personal-mcp-host.sh
+    ├── org.claude-watch.personal-mcp.host.plist      # runs personal-mcp-host.sh
     └── README.md                             # launchctl install walkthrough
 ```
 
-**Naming:** `org.gbre.personal-mcp.*` per the
+**Naming:** `org.claude-watch.personal-mcp.*` per the
 [claude-watch CLAUDE.md naming convention](../../CLAUDE.md) for
 operator-owned launchd Labels and plist filenames.
 
-**Reuse:** the wrapper *exec's* the existing
-`examples/compose/bin/mcp-host-bash` launcher — we don't duplicate the
-MCP-server bootstrapping. Operators who've already run
-`examples/compose/bin/install-host-deps` (puts `mcp-proxy` and
-`cli-mcp-server` into `~/.local/bin/`) are already set up for the
+**Reuse:** the wrapper *exec's* the `mcp-host-bash-server` binary — we
+don't duplicate the MCP-server implementation. Operators who've already
+built it (`make install-mcp-host-bash-server`) are set up for the
 server side; this directory only adds the tunnel.
 
 ## `.env.example` (sketch)
@@ -354,7 +368,7 @@ Key behaviors:
 - `ServerAliveInterval=30 ServerAliveCountMax=3` — detect a dead
   remote within ~90s and exit so launchd respawns.
 
-## launchd plist `org.gbre.personal-mcp.host.plist` (sketch)
+## launchd plist `org.claude-watch.personal-mcp.host.plist` (sketch)
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -363,14 +377,19 @@ Key behaviors:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>org.gbre.personal-mcp.host</string>
+    <string>org.claude-watch.personal-mcp.host</string>
 
-    <!-- ProgramArguments: absolute path to personal-mcp-host.sh.
+    <!-- ProgramArguments: absolute path to personal-mcp-host.sh, plus
+         the enable flag so the wrapper starts the MCP server before
+         opening the tunnel (its no-flag default only status-gates and
+         exits 3). Note XML comments cannot contain a double hyphen,
+         which is why the flag is spelled out in prose here.
          Replace /PATH/TO/REPO. launchd does NOT expand `~` or
          `${HOME}` in plist values. -->
     <key>ProgramArguments</key>
     <array>
         <string>/PATH/TO/REPO/examples/personal-mac-mcp-host/personal-mcp-host.sh</string>
+        <string>--enable</string>
     </array>
 
     <!-- EnvironmentVariables: minimal. PATH is the only thing the
@@ -385,9 +404,9 @@ Key behaviors:
     <!-- RunAtLoad=false: operator runs this "only as needed" — the
          plist registers the unit but does NOT fire it at login.
          Operator triggers manually via:
-             launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
+             launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.host
          or
-             launchctl start org.gbre.personal-mcp.host
+             launchctl start org.claude-watch.personal-mcp.host
          (after `launchctl bootstrap` once). -->
     <key>RunAtLoad</key>
     <false/>
@@ -481,7 +500,7 @@ sshd-level change needed if the operator's existing config is stock.
 | SSH key wrong / revoked | Respawn loop; ssh `Permission denied (publickey)` in stderr log | Check `authorized_keys` on remote; verify key path in `.env`. |
 | Remote port already bound | Respawn loop; ssh `remote port forwarding failed` in stderr log | `ssh remote 'lsof -i :$REMOTE_PORT'`; pick a different `REMOTE_PORT` in `.env`. |
 | Remote DNS / network down | Respawn loop; ssh connection-timeout in stderr log | Verify `REMOTE_HOST` reachability with a plain `ssh` test. |
-| Local `mcp-host-bash` deps missing | Respawn loop; "cannot find required binaries on PATH" in stderr log | Run `../compose/bin/install-host-deps` once. |
+| `mcp-host-bash-server` not installed | Respawn loop; "mcp-host-bash-server not found / not executable" in stderr log | Run `make install-mcp-host-bash-server` from the repo root once. |
 | MacBook sleeps / wifi drops | `ServerAliveInterval` triggers SSH exit within ~90s; launchd respawns | Tunnel reconnects when network is back. No operator action needed. |
 
 `KeepAlive=true` + `ThrottleInterval=30` means any failure surfaces as
@@ -493,9 +512,9 @@ loop is always "tail the err log, look at the most recent stderr".
 
 ```sh
 # One-time install:
-cp examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.host.plist \
+cp examples/personal-mac-mcp-host/launchd/org.claude-watch.personal-mcp.host.plist \
    ~/Library/LaunchAgents/
-$EDITOR ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+$EDITOR ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
 # (replace /PATH/TO/REPO + /PATH/TO/HOME with absolute paths)
 
 cp examples/personal-mac-mcp-host/.env.example \
@@ -509,28 +528,28 @@ ssh-copy-id -i ~/.ssh/id_personal_mcp_tunnel.pub $REMOTE_USER@$REMOTE_HOST
 # (see "SSH key hardening" above).
 
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+    ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
 # Registers the unit. Doesn't fire it (RunAtLoad=false).
 
 # Per-session start:
-launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.host
 
 # Verify:
-launchctl print gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl print gui/$(id -u)/org.claude-watch.personal-mcp.host
 ssh $REMOTE_USER@$REMOTE_HOST "lsof -i :$REMOTE_PORT"   # should show ssh listening
 ssh $REMOTE_USER@$REMOTE_HOST "curl -s http://localhost:$REMOTE_PORT/mcp" \
     # should NOT 404; an MCP server response means the tunnel works
 
 # Per-session stop:
-launchctl kill TERM gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl kill TERM gui/$(id -u)/org.claude-watch.personal-mcp.host
 # launchd's KeepAlive will *not* respawn after a kill within the
 # ThrottleInterval... actually yes it will. To fully stop:
-launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.host
 
 # To re-enable later:
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
-launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
+    ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
+launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.host
 ```
 
 ## Design decisions resolved in this PR
@@ -538,11 +557,11 @@ launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
 The questions surfaced in the original design doc are answered below,
 with pointers to where the choice landed in the shipped code.
 
-1. **Reuse vs. duplicate `mcp-host-bash`** — **Reuse**.
-   `personal-mcp-host.sh` exec's `../compose/bin/mcp-host-bash`
-   (configurable via `MCP_HOST_BASH_BIN` for operators whose launcher
+1. **Reuse vs. duplicate the MCP server** — **Reuse**.
+   `personal-mcp-host.sh` exec's the `mcp-host-bash-server` binary
+   (configurable via `MCP_HOST_BASH_BIN` for operators whose binary
    lives elsewhere). Avoids duplicating the cw-profile / allow-list /
-   bearer-shim surface; operators who've already set up the compose
+   bearer-auth surface; operators who've already set up the compose
    stack are pre-configured for this directory.
 
 2. **`launchctl bootout` vs. soft kill switch** — **Both supported**.
@@ -555,12 +574,11 @@ with pointers to where the choice landed in the shipped code.
 
 3. **Bearer token storage** — **`.env` plaintext (phase 1)**. The
    shipped code reads `MCP_HOST_BASH_BEARER` from the sibling `.env`
-   and exports it for `mcp-host-bash` (which already implements the
-   shim). The Keychain hop modelled on `load-bearer-from-keychain` is
-   deliberately out of scope for this PR — left as future work; a
-   later PR can drop in a Keychain wrapper without changing the
-   wrapper's contract (it reads the env var regardless of how it got
-   there).
+   and exports it for `mcp-host-bash-server` (which validates it
+   in-process). A Keychain-sourced bearer is deliberately out of scope
+   for this PR — left as future work; a later PR can drop in a Keychain
+   wrapper without changing the wrapper's contract (it reads the env
+   var regardless of how it got there).
 
 4. **`tunnel.sh` separate from `personal-mcp-host.sh`** — **No**.
    Single combined wrapper (YAGNI; the design doc anticipated this).
@@ -596,13 +614,11 @@ with pointers to where the choice landed in the shipped code.
 
 ## Future work
 
-- **macOS Keychain bearer hop.** A `load-bearer-from-keychain`-style
-  wrapper for `personal-mcp-host.sh` would let operators keep the
-  bearer out of `.env` entirely. Shape: a small `bin/` script that
-  fetches the bearer via `security find-generic-password -w`,
-  exports it, then exec's `personal-mcp-host.sh`. The compose-stack
-  Keychain wrapper at `../compose/bin/load-bearer-from-keychain` is
-  the model. Out of scope for this PR.
+- **macOS Keychain bearer hop.** A Keychain-sourcing wrapper for
+  `personal-mcp-host.sh` would let operators keep the bearer out of
+  `.env` entirely. Shape: a small `bin/` script that fetches the bearer
+  via `security find-generic-password -w`, exports it, then exec's
+  `personal-mcp-host.sh`. Out of scope for this PR.
 
 - **Split `tunnel.sh` from `personal-mcp-host.sh`.** Would let
   advanced operators run only the tunnel (pointing at a different

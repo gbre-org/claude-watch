@@ -1,6 +1,6 @@
 # claude-watch
 
-Rust daemon that monitors Claude Code health via tmux pane capture. Detects activity states (Thinking, ToolRunning, Writing, Idle), heartbeat stalls, token stalls, zombie sessions, and foreground blocks. Runs as a systemd service (`claude-watch.service`).
+Rust daemon that monitors Claude Code health via tmux pane capture. Detects activity states (Thinking, ToolRunning, Writing, Idle), ack stalls (the main loop has stopped acking events), token stalls, zombie sessions, and foreground blocks. Runs as a systemd service (`claude-watch.service`).
 
 ## Alerting hierarchy
 
@@ -93,19 +93,66 @@ case:
 
 claude-watch provides the surfaces; external alerting wires INTO them.
 
+## Monitor-mode replies must surface the event
+
+A `mode=monitor` watcher delivers each line through the `Monitor` tool, and
+the Claude Code terminal collapses every delivery to the Monitor's **static**
+description (set once at arm time). The operator session's own one-line
+reply is therefore the **only human-visible trace** of what was read — a
+bare "Acknowledged" / "Idle" is indistinguishable from a rubber stamp. So:
+**when you act on an item line (`EVENT[...]` / `BOTCHAT[...]` / `SIGNAL[...]`),
+the visible reply quotes the line's lead (the text after the prefix, ~80
+chars) plus what you did.** The arm text `watcher-ctl run <name>` prints and
+the `[monitor-mode] REPLY RULE:` banner line `claude-event-watch` emits both
+say this; this section is the rule itself.
+
+```
+BAD   Liveness ping — status only. Idle.
+GOOD  EVENT[claude-watch/keepalive] keepalive — ran event-ack ack-batch --override-reason "keepalive, nothing pending"; nothing else pending.
+GOOD  EVENT[cron/pr-status-change] PR #652 CI failure — queued a fix-up agent (q-…).
+```
+
+`[monitor-mode]` status lines (ACTIVE / ALIVE / STOPPED / REPLY RULE) are
+watcher status, not events; a reply to one names it as such.
+
 ## Build & Test
 
 ```bash
+make help              # index of every target, grouped by section — start here
 make test              # all tests in parallel (nextest if available, else cargo test)
 make test-unit         # unit + fixture tests only (~0.1s)
 make test-e2e          # e2e tmux tests only (~10s)
 make test-live         # live e2e tests (spawn real Claude Code, ~1-2 min each)
 make test-verbose      # all tests with stdout/stderr visible
 make build             # release build
-make deploy-systemd    # release build + install skills + systemctl restart (host/systemd; `make deploy` is a deprecated alias)
-make install-skills    # install skills/ as /cw-<name> commands (dep of deploy-systemd; container/skills/ stays container-only)
 make install-hooks     # install git pre-commit hook
 ```
+
+There are TWO deployment shapes and the Makefile is sectioned accordingly;
+`make help` shows which targets belong to which. Do not reach for a target
+from the wrong shape.
+
+Linux host + systemd:
+
+```bash
+make deploy-systemd    # build + install + install-skills + systemctl restart (`make deploy` is a deprecated alias)
+make install           # daemon COPY + tool symlinks into $BIN_DIR (dep of deploy-systemd, so the on-PATH CLI can't go stale)
+make install-skills    # install skills/ as /cw-<name> commands (dep of deploy-systemd; container/skills/ stays container-only)
+make install-cron      # render cron.d/cw-host into /etc/cron.d (needs root; NOT a dep of deploy-systemd)
+```
+
+Container ("workbot" — claude-container under `examples/compose/`, macOS host):
+
+```bash
+make deploy-container  # force-recreate claude-container, then up -d the rest of the stack (`make redeploy` is an alias the baked image still calls)
+make container-build   # build just claude-container:dev
+make compose-build     # build every image in the stack
+make sync-main-clone   # ff-only sync the BIND-MOUNTED source clone — needed before a bind-mounted Python-CLI fix goes live
+```
+
+The macOS host-side helpers for that shape (`install-mcp-host-bash-server`,
+`install-cw-agent-stats-launchd`) are macOS-only by construction; they are
+not dead code just because they no-op on Linux.
 
 Or directly:
 ```bash
@@ -143,9 +190,10 @@ Full test suite (including e2e): `cargo nextest run` (~49s, 292 tests in paralle
 ## Key Files
 
 - `src/tmux.rs` — tmux pane capture, `detect_activity()`, activity state detection
-- `src/daemon.rs` — main monitoring loop, heartbeat/token tracking
+- `src/daemon.rs` — main monitoring loop, ack-age/token tracking
 - `src/config.rs` — configuration loading
 - `src/actions.rs` — recovery actions (inject resume, etc.)
+- `src/bypass_consent.rs` — persists the Bypass-Permissions acceptance into Claude Code's settings so a relaunch never lands on the consent dialog
 - `tests/fixtures/` — saved tmux captures for fixture tests
 
 ## Dashboard Scripts

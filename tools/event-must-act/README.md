@@ -6,10 +6,19 @@ were originally container-only (`container/bin/`); they now live here so BOTH
 deployments use one copy:
 
 - **Container** (`container/Dockerfile`) bakes each via `COPY tools/event-must-act/<name> /usr/local/bin/<name>`.
-- **Non-container / systemd host** symlinks each into the operator's `~/bin`
-  (or any PATH dir). Nothing here is container-specific — all state lives under
-  `~/.config/claude-events/` (override with `$CLAUDE_EVENT_STATE_DIR`), and the
-  one container-pane default in `cw-watcher-health-check` is now env-driven.
+- **Non-container / systemd host** symlinks each into `$BIN_DIR` (default
+  `~/bin`) via `make install`. Nothing here is container-specific — all state
+  lives under `~/.config/claude-events/` (override with
+  `$CLAUDE_EVENT_STATE_DIR`), and the one container-pane default in
+  `cw-watcher-health-check` is now env-driven.
+
+  Because the seeded obligation row stores an ABSOLUTE `cmd`, a host install
+  must also tell `obligations-init` where the `eval-*` scripts landed:
+  `CW_EVAL_BIN_DIR="$HOME/bin" obligations-init --only event_must_act`. Skip
+  that and the row points at the baked `/usr/local/bin` path, which does not
+  exist on a host — and since the `evaluator` predicate is default-open on
+  spawn error, the gate then looks seeded while enforcing nothing. See
+  [docs/event-must-act.md](../../docs/event-must-act.md#non-container-systemd-host-install).
 
 ## Scripts
 
@@ -17,17 +26,32 @@ deployments use one copy:
 
 The claude-event model has three tiers — **ambient** (info-only context),
 **actionable** (demands a response), **excluded** (Signal, owned by its own
-ack-gate). The tier of a `source/tag` pair is DATA, in `event-classify`.
+ack-gate). **The producer owns its own classification**: an event source
+ships its tier in the event's `data.tier`, and that is not duplicated here.
 
-- **`event-classify`** — data-driven `source/tag → tier` classifier. Inspect
-  with `event-classify --list-rules`. Add a new event source = append a row.
-  `heartbeat-tick` is classified **actionable** here (touch the heartbeat file).
+Precedence (highest first): `excluded` consumer policy (absolute, `signal/*`)
+→ **user override** (`~/.config/claude-events/tier-overrides.json`) →
+**producer-shipped `data.tier`** → `CLASSIFICATIONS` table (fallback) →
+fail-LOUD `actionable` default (marked `UNCLASSIFIED`). Details:
+[`docs/event-must-act.md`](../../docs/event-must-act.md).
+
+- **`event-classify`** — the classifier. Inspect every rung with
+  `event-classify --list-rules`. Adding a new event source: prefer stamping
+  `data.tier` in the PRODUCER; append a `CLASSIFICATIONS` row only when you
+  do not control the producer. `heartbeat-tick` is classified **actionable**
+  here; its clear-path is a plain `event-ack ack` (liveness is ack-driven —
+  see `event-ack` below).
 - **`event-ack`** — CLI managing the response surface:
   - `event-ack ingest --source S --tag T --message M` — classify + route an
     event into `pending-actions.json` (actionable) or `ambient-context.json`
     (ambient); Signal-tagged events are no-op.
   - `event-ack ack "<key>" --action "<text>"` — clear a pending entry; resets
-    the N-tool-call counter.
+    the N-tool-call counter **and** refreshes the liveness timestamp (ANY
+    ack does this, not just heartbeat-tick acks — the ack-driven redesign,
+    #649). `heartbeat-tick`'s clear-path is exactly this: `event-ack list` to
+    find the pending key, then `event-ack ack "<key>" --action "..."`. There
+    is no separate wrapper command — a prior `heartbeat-ack` compat shim was
+    retired 2026-08-21 once it became clear a plain ack already covers it.
   - `event-ack list | clear | drain-ambient | reset-counter`.
 - **`eval-event-must-act`** — obligations `evaluator` predicate. While
   `pending-actions.json` is non-empty, it bumps a counter on each non-exempt
@@ -48,11 +72,14 @@ ack-gate). The tier of a `source/tag` pair is DATA, in `event-classify`.
 
 - **`cw-watcher-health-check`** — runs from cron (once/min by default). If
   `*.json` event files have sat unconsumed in the spool dir past
-  `CW_WATCHER_HEALTH_STALE_MIN` (default 2) minutes, the event watcher is dead
+  `CW_WATCHER_HEALTH_STALE_MIN` (default 6) minutes, the event watcher is dead
   or stuck, so it injects a `[CLAUDE-WATCH] WATCHER DOWN…` alert into the
   Claude pane via `claude-watch inject` (the ONE verified type-and-submit
-  path). A per-condition cooldown (`CW_WATCHER_HEALTH_COOLDOWN_SECS`, default
-  600s) prevents re-injecting every tick while a stale window persists.
+  path), deliberately WITHOUT `--escape` — the alert is queued behind the
+  active turn rather than seizing it, matching the daemon's ROUTINE tier for
+  the same condition. A per-condition cooldown
+  (`CW_WATCHER_HEALTH_COOLDOWN_SECS`, default 600s) prevents re-injecting every
+  tick while a stale window persists.
 
   This is the **recovery** path for a dead event *watcher*. It is distinct from
   the claude-watch **daemon's** own heartbeat-stale inject, which fires on a
@@ -61,7 +88,12 @@ ack-gate). The tier of a `source/tag` pair is DATA, in `event-classify`.
 
   Env:
   - `CLAUDE_EVENT_QUEUE` (default `~/claude-events`)
-  - `CW_WATCHER_HEALTH_STALE_MIN` (default 2)
+  - `CW_WATCHER_HEALTH_STALE_MIN` (default 6). If UNSET, read from
+    `[watcher_health] stale_minutes` in the runtime override
+    (`$CLAUDE_WATCH_RUNTIME_CONFIG`, the bind-mounted
+    `~/.config/claude-container/claude-watch.override.toml`) then the baked
+    `$CLAUDE_WATCH_CONFIG`; default 6 = >= 2x the event watcher's ~3min
+    debounce. An explicit env var pins/overrides.
   - `CW_WATCHER_HEALTH_PANE` — pin a tmux pane; UNSET = let `claude-watch
     inject` resolve it (`$CLAUDE_WATCH_PANE` → `[tmux] dashboard_pane` config →
     auto-detect).
@@ -72,7 +104,7 @@ ack-gate). The tier of a `source/tag` pair is DATA, in `event-classify`.
 
 ## Tests
 
-`make test-event-must-act` runs the three Python `--self-test` suites plus
+`make test-event-must-act` runs the four Python `--self-test` suites plus
 `tests/cw-watcher-health-check.test` (stubs `claude-watch` so nothing injects
 into a real pane). Also exercised by `container/tests/event-must-act-wired.test`
 and `container/tests/cron-default-baked.test`.

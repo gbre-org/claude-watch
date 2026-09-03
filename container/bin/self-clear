@@ -64,6 +64,28 @@ def _default_log_file() -> str:
     return "/var/log/claude-watch/self-clear.log"
 
 
+def _default_handoff_file() -> str:
+    """Default handoff-completion marker path. Honors $CLAUDE_SELF_CLEAR_HANDOFF.
+
+    TOUCHED once, right after the resume prompt is delivered, so the
+    claude-watch daemon can suppress its own fresh-session / post-clear resume
+    injects for a grace window while the freshly-cleared session bootstraps
+    (otherwise the daemon's generic "You are a fresh session ..." prompt
+    CLOBBERS this handoff — operator #4799). MUST resolve to the SAME path the
+    daemon computes in src/tmux.rs `resolve_self_clear_handoff_path`:
+      1. $CLAUDE_SELF_CLEAR_HANDOFF, else
+      2. $XDG_RUNTIME_DIR/claude-self-clear-handoff, else
+      3. /var/run/claude/claude-self-clear-handoff.
+    """
+    env = os.environ.get("CLAUDE_SELF_CLEAR_HANDOFF", "").strip()
+    if env:
+        return env
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return str(Path(runtime) / "claude-self-clear-handoff")
+    return "/var/run/claude/claude-self-clear-handoff"
+
+
 def _default_lock_file() -> str:
     """Default lock path. Honors $CLAUDE_SELF_CLEAR_LOCK."""
     env = os.environ.get("CLAUDE_SELF_CLEAR_LOCK", "").strip()
@@ -91,6 +113,7 @@ def _default_resume_prompt() -> str:
 RESUME_PROMPT = _default_resume_prompt()
 LOG_FILE = _default_log_file()
 LOCKFILE = _default_lock_file()
+HANDOFF_FILE = _default_handoff_file()
 
 # After /clear, a fresh session should be well under this token count.
 # Above this means exo-watcher (or the user) already injected resume
@@ -600,7 +623,7 @@ def interrupt_and_wait(pane, timeout=60, poll_interval=0.5):
     return False
 
 
-def inject(pane, text, label="inject", slash_command=False):
+def inject(pane, text, label="inject", slash_command=False, escape=False):
     """Inject text into Claude Code and submit (vim mode).
 
     Delegates the actual tmux send-keys / submit choreography to the
@@ -615,13 +638,31 @@ def inject(pane, text, label="inject", slash_command=False):
     order AND verifies the submission landed (payload cleared from the
     prompt line), exiting non-zero if it didn't.
 
-    `claude-watch inject` reproduces BOTH branches this function used to
-    implement:
+    `claude-watch inject --escape` reproduces BOTH branches this function
+    used to implement:
       - regular text  -> Tab→Escape→Enter submit (the default).
       - slash command  -> `--slash-command`: bare Enter from INSERT mode
         (the Tab+Escape sequence does NOT submit a slash command, because
         Escape goes INSERT→NORMAL and Enter in NORMAL mode doesn't submit
         — the 2026-03-01 `/clear`-sent-as-text bug).
+
+    `escape` mirrors the subcommand's own `--escape` flag and DEFAULTS OFF,
+    exactly as the CLI does since 2026-08-18 — one mental model, no wrapper
+    that quietly re-arms what the CLI disarmed. Each call site states its
+    choice.
+
+    Pass `escape=True` when the caller genuinely needs the Escape→NORMAL
+    blast and the `dd` line-clear. self-clear's own calls do: this flow
+    deliberately SEIZES the pane (it runs its own interrupt-and-wait Escape
+    blast first) and relies on `dd` to wipe the input line before typing.
+    Without it, a `/clear` typed onto leftover prompt text is submitted as
+    ordinary text and the context is never cleared — the exact 2026-03-01
+    failure, back by a different route.
+
+    Leave it off when an Escape would be destructive — most sharply, when a
+    MODAL might be on the pane, because Escape cancels the modal. That is
+    why this helper is shared with self-login rather than copied: self-login
+    drives the login dialog and needs the non-cancelling default.
 
     NOTE: only the per-keystroke type-and-submit step is centralized. The
     HIGHER-LEVEL self-clear flow that wraps this call — interrupt_and_wait,
@@ -635,6 +676,8 @@ def inject(pane, text, label="inject", slash_command=False):
     cmd = ["claude-watch", "inject", "--pane", pane, "--submit", text]
     if slash_command:
         cmd.append("--slash-command")
+    if escape:
+        cmd.append("--escape")
 
     # Generous timeout: the full Escape→type→submit→verify choreography can
     # take ~11s worst case (Escape loop + INSERT retries + 3s verify window),
@@ -652,6 +695,22 @@ def inject(pane, text, label="inject", slash_command=False):
     else:
         log(f"  [{label}] WARNING: claude-watch inject failed (rc={rc}). "
             f"out={out!r} pane: {capture_pane_text(pane)}")
+
+
+def _stamp_handoff_marker():
+    """Touch the handoff-completion marker (see _default_handoff_file).
+
+    Best-effort: a failure here only means the daemon might not suppress its
+    fresh-session inject for the grace window, so we log and continue rather
+    than fail the (already-successful) handoff.
+    """
+    try:
+        Path(HANDOFF_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(HANDOFF_FILE, "w") as f:
+            f.write(str(int(time.time())))
+        log(f"  handoff marker stamped: {HANDOFF_FILE}")
+    except OSError as e:
+        log(f"  WARNING: could not stamp handoff marker {HANDOFF_FILE}: {e}")
 
 
 def child_main(pane, args):
@@ -681,7 +740,12 @@ def child_main(pane, args):
     for attempt in range(1, max_clear_attempts + 1):
         tokens_before = get_token_count()
         log(f"  /clear attempt {attempt}/{max_clear_attempts}: tokens before={tokens_before}")
-        inject(pane, "/clear", label=f"/clear-{attempt}", slash_command=True)
+        # escape=True: `/clear` MUST land on an empty prompt line. This flow
+        # has already seized the pane (interrupt_and_wait above), and the `dd`
+        # line-clear behind --escape is what guarantees the slash command is
+        # not glued onto leftover text and submitted as ordinary text.
+        inject(pane, "/clear", label=f"/clear-{attempt}", slash_command=True,
+               escape=True)
 
         if args.no_resume:
             log("DONE: /clear injected (--no-resume)")
@@ -740,7 +804,16 @@ def child_main(pane, args):
 
     if not wait_for_idle(pane, timeout=30):
         log("  WARNING: idle wait timed out before resume inject")
-    inject(pane, RESUME_PROMPT, label="resume")
+    # escape=True: the resume prompt is the handoff into the fresh session and
+    # must not be corrupted by anything left on the input line. It also submits
+    # via Tab→Escape→Enter (the regular-text sequence), which only the
+    # cancelling path uses.
+    inject(pane, RESUME_PROMPT, label="resume", escape=True)
+    # Stamp the handoff marker so the claude-watch daemon defers its own
+    # fresh-session / post-clear resume injects while this fresh session
+    # bootstraps — otherwise the daemon's generic prompt clobbers this handoff
+    # a few seconds after our lock releases (operator #4799).
+    _stamp_handoff_marker()
     log("SUCCESS: /clear + resume injected")
 
 

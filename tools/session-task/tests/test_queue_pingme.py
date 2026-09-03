@@ -230,8 +230,11 @@ def test_abandon_fires_pingme_with_abandon_payload():
         r1 = _add(env, "abandon-test", ["repo:pingme-abandon"])
         d1 = json.loads(r1.stdout)
         _run(env, "queue", "register", d1["id"], "--json", check=True)
-        _run(env, "queue", "abandon", d1["id"], "--reason",
-             "agent crashed", check=True)
+        # `--confirmed-dead`: a bare abandon of a registered item now
+        # quarantines it (a distinct "queue QUARANTINED" pingme, covered
+        # separately). This test covers the terminal-abandon payload.
+        _run(env, "queue", "abandon", d1["id"], "--confirmed-dead",
+             "--reason", "agent crashed", check=True)
 
         calls = _read_pingme_log(log)
         # register + abandon

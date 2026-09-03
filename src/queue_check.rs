@@ -164,15 +164,26 @@ pub struct QueueItem {
 /// `active-agents.json` (via the injected `agent_lookup` closure). Modeled
 /// as a closure so unit tests can drive every branch without a real state
 /// file, mirroring the existing `pid_alive` injected-closure pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Dead` carries the bound agent id + last-seen staleness (from the
+/// matched `AgentRecord`) so the emitted orphan event can name WHICH
+/// agent went dead and HOW stale it is — not just a bare queue id.
+/// (Not `Copy`: `Dead` owns a `String`.)
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentLiveness {
     /// State loaded and a matching agent record exists AND its transcript
     /// is fresh (`alive=true`). The item is healthy.
     Alive,
     /// State loaded and a matching agent record exists but its transcript
     /// is stale (`alive=false`) — the agent died AFTER spawning. Orphaned
-    /// (died-after-spawn coverage).
-    Dead,
+    /// (died-after-spawn coverage). Carries the bound `agent_id` and the
+    /// seconds since its freshest transcript was last modified
+    /// (`AgentRecord::jsonl_age_seconds`, `None` if unreadable) for the
+    /// enriched event text.
+    Dead {
+        agent_id: String,
+        age_secs: Option<u64>,
+    },
     /// State loaded, but NO matching agent record for this qid — the
     /// never-spawned / agent-died-without-a-transcript case. Orphaned only
     /// once past the no-binding grace window (and only for
@@ -201,6 +212,11 @@ pub struct Qualifying {
     pub summary: String,
     pub condition: Condition,
     pub detail: String,
+    /// The bound agent id, when the condition was decided via the
+    /// active-agents transcript join (the `Dead` orphan path). `None` for
+    /// pid-fast-path, never-spawned (no binding), and stuck conditions —
+    /// there is no single agent to name. Surfaced in the event `data`.
+    pub agent_id: Option<String>,
 }
 
 impl Qualifying {
@@ -240,6 +256,30 @@ pub fn parse_iso_epoch_secs(ts: &str) -> Option<i64> {
         return Some(dt.and_utc().timestamp());
     }
     None
+}
+
+/// Seconds since a `running` item transitioned to `running` (`register`),
+/// falling back to `started_at`. `None` if neither timestamp parses — the
+/// caller then cannot age a grace window and treats the item as "old
+/// enough" (no grace). Never negative (clamped at 0 for clock skew).
+pub fn register_age_secs(it: &QueueItem, now_epoch_secs: i64) -> Option<i64> {
+    it.registered_at
+        .as_deref()
+        .or(it.started_at.as_deref())
+        .and_then(parse_iso_epoch_secs)
+        .map(|reg| (now_epoch_secs - reg).max(0))
+}
+
+/// Format a transcript-staleness age for human-readable event text.
+/// `None` (unreadable metadata) → "age unknown"; else "<N>s ago" under a
+/// minute, "<N>m ago" otherwise. Kept coarse — the reader wants "roughly
+/// how stale", not second precision.
+pub fn fmt_age(age_secs: Option<u64>) -> String {
+    match age_secs {
+        None => "age unknown".to_string(),
+        Some(s) if s < 60 => format!("{s}s ago"),
+        Some(s) => format!("{}m ago", s / 60),
+    }
 }
 
 /// State-file payload: dedup-key -> ISO emit timestamp.
@@ -346,7 +386,7 @@ where
                 .filter(|r| !r.trim().is_empty())
                 .map(|r| format!("wedged: {r}"))
                 .unwrap_or_else(|| "wedged (no reason given)".to_string());
-            push_unique(&mut out, already_emitted, it, &summary, Condition::Stuck, detail);
+            push_unique(&mut out, already_emitted, it, &summary, Condition::Stuck, detail, None);
             continue;
         }
 
@@ -367,6 +407,7 @@ where
                     &summary,
                     Condition::Orphaned,
                     format!("owning pid {pid} not alive"),
+                    None,
                 );
                 continue;
             }
@@ -382,31 +423,45 @@ where
                 // path would false-positive here).
                 continue;
             }
-            AgentLiveness::Dead => {
-                push_unique(
-                    &mut out,
-                    already_emitted,
-                    it,
-                    &summary,
-                    Condition::Orphaned,
-                    "agent transcript stale (died after spawn)".to_string(),
-                );
-                continue;
+            AgentLiveness::Dead { agent_id, age_secs } => {
+                // Grace for a JUST-registered / just-resumed item: a `Dead`
+                // verdict can come from a STALE active-agents snapshot that
+                // predates the resume. The q-bad6 incident: an agent was
+                // resumed via SendMessage (its pid cleared to None), but the
+                // cron snapshot still showed the pre-resume idle transcript,
+                // so the join said "stale". Hold until past the grace window
+                // — a genuinely dead agent still fires on the next tick, but
+                // a fresh resume is no longer a spurious orphan.
+                let within_grace = register_age_secs(it, now_epoch_secs)
+                    .map(|age| age < no_binding_grace_secs)
+                    .unwrap_or(false);
+                if !within_grace {
+                    push_unique(
+                        &mut out,
+                        already_emitted,
+                        it,
+                        &summary,
+                        Condition::Orphaned,
+                        format!(
+                            "agent {agent_id} transcript stale {} (died after spawn)",
+                            fmt_age(age_secs)
+                        ),
+                        Some(agent_id),
+                    );
+                    continue;
+                }
+                // Within grace → too fresh to trust a "dead" snapshot; fall
+                // through to the stuck check (which needs a stale heartbeat,
+                // so a just-registered item stays silent).
             }
             AgentLiveness::NoRecord => {
                 // Never-spawned / no-transcript. Only orphan once past the
                 // grace window AND for non-progress-tracked items
                 // (workload/hostjob items legitimately have no agent).
                 if !is_progress_tracked_scope(&it.scope) {
-                    if let Some(reg) = it
-                        .registered_at
-                        .as_deref()
-                        .or(it.started_at.as_deref())
-                        .and_then(parse_iso_epoch_secs)
-                    {
-                        let age = now_epoch_secs - reg;
+                    if let Some(age) = register_age_secs(it, now_epoch_secs) {
                         if age >= no_binding_grace_secs {
-                            let age_min = (age / 60).max(0);
+                            let age_min = age / 60;
                             push_unique(
                                 &mut out,
                                 already_emitted,
@@ -416,6 +471,7 @@ where
                                 format!(
                                     "no agent binding {age_min} min after register (never spawned?)"
                                 ),
+                                None,
                             );
                             continue;
                         }
@@ -446,6 +502,7 @@ where
                     &summary,
                     Condition::Stuck,
                     format!("heartbeat stale {age_min} min"),
+                    None,
                 );
             }
         }
@@ -467,12 +524,14 @@ fn push_unique(
     summary: &str,
     condition: Condition,
     detail: String,
+    agent_id: Option<String>,
 ) {
     let q = Qualifying {
         id: it.id.clone(),
         summary: summary.to_string(),
         condition,
         detail,
+        agent_id,
     };
     if already_emitted.contains_key(&q.state_key()) {
         return;
@@ -494,20 +553,32 @@ pub fn prune_state(state: &State, current_ids: &HashSet<String>) -> State {
 }
 
 /// Human-readable `message` for a single-condition batch.
+///
+/// This is the ONE line the main loop sees as `EVENT[claude-watch/…]
+/// <message>`, so it must be self-contained: WHICH item, and WHY. A bare
+/// list of queue ids ("1 queue item orphaned: q-bad6") sent the reader to
+/// the wrong item in the q-bad6 incident. Each shown item is rendered as
+/// `<qid> [<summary>] (<detail>)` where `<detail>` already carries the
+/// bound agent id + staleness + reason, e.g. `q-0a54 [Fix the widget]
+/// (agent agent-a7f0 transcript stale 4m ago (died after spawn))`. Capped
+/// at `TOP_N`; a `(+N more)` suffix notes the remainder (the full set is
+/// in `data.items`).
 pub fn build_message(condition: Condition, qualifying: &[Qualifying]) -> String {
     if qualifying.is_empty() {
         return String::new();
     }
     let n = qualifying.len();
     let plural = if n > 1 { "items" } else { "item" };
-    let top_ids: Vec<String> = qualifying.iter().take(TOP_N).map(|q| q.id.clone()).collect();
-    format!(
-        "{} queue {} {}: {}",
-        n,
-        plural,
-        condition.label(),
-        top_ids.join(", ")
-    )
+    let shown: Vec<String> = qualifying
+        .iter()
+        .take(TOP_N)
+        .map(|q| format!("{} [{}] ({})", q.id, q.summary, q.detail))
+        .collect();
+    let mut msg = format!("{} queue {} {}: {}", n, plural, condition.label(), shown.join("; "));
+    if n > TOP_N {
+        msg.push_str(&format!(" (+{} more)", n - TOP_N));
+    }
+    msg
 }
 
 /// Build the full event JSON body for one condition's batch.
@@ -531,6 +602,7 @@ pub fn build_event_json(
                 "id": q.id,
                 "summary": q.summary,
                 "detail": q.detail,
+                "agent_id": q.agent_id,
             })
         })
         .collect();
@@ -698,7 +770,10 @@ fn agent_liveness_for(
     }
     match map.get(qid) {
         Some(rec) if rec.alive => AgentLiveness::Alive,
-        Some(_) => AgentLiveness::Dead,
+        Some(rec) => AgentLiveness::Dead {
+            agent_id: rec.agent_id.clone(),
+            age_secs: rec.jsonl_age_seconds,
+        },
         None => AgentLiveness::NoRecord,
     }
 }
@@ -926,7 +1001,10 @@ mod tests {
         AgentLiveness::Alive
     }
     fn all_agents_dead(_qid: &str) -> AgentLiveness {
-        AgentLiveness::Dead
+        AgentLiveness::Dead {
+            agent_id: "agent-dead01".to_string(),
+            age_secs: Some(240),
+        }
     }
     fn all_agents_no_record(_qid: &str) -> AgentLiveness {
         AgentLiveness::NoRecord
@@ -1001,6 +1079,51 @@ mod tests {
         assert_eq!(q[0].id, "q-died");
         assert_eq!(q[0].condition, Condition::Orphaned);
         assert!(q[0].detail.contains("died after spawn"), "{}", q[0].detail);
+    }
+
+    #[test]
+    fn dead_detail_names_agent_and_staleness() {
+        // #6543: a Dead orphan must name WHICH agent + HOW stale, both in
+        // the per-item detail AND on Qualifying.agent_id (for the event
+        // data), so the reader isn't handed a bare queue id.
+        let it = running_reg("q-died", 30, &[]);
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_dead,
+        );
+        assert_eq!(q.len(), 1);
+        assert!(q[0].detail.contains("agent-dead01"), "{}", q[0].detail);
+        assert!(q[0].detail.contains("4m ago"), "{}", q[0].detail);
+        assert_eq!(q[0].agent_id.as_deref(), Some("agent-dead01"));
+    }
+
+    #[test]
+    fn dead_within_grace_not_orphaned() {
+        // #6543 core fix: a Dead verdict on a JUST-registered / just-resumed
+        // item (register within grace) is held — the active-agents snapshot
+        // may predate a resume (the q-bad6 incident: pid cleared to None by
+        // the resume, snapshot still showed the pre-resume idle transcript).
+        // Fresh heartbeat too → stays completely silent this tick.
+        let mut it = running_reg("q-resumed", 1, &[]); // 1 min < 150s grace
+        it.last_heartbeat_at = Some(iso_n_min_ago(0));
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_dead,
+        );
+        assert!(q.is_empty(), "{:?}", q);
+    }
+
+    #[test]
+    fn dead_past_grace_still_orphaned() {
+        // The grace is a fresh-item guard only: a Dead item registered well
+        // past the window is a genuine died-after-spawn orphan and fires.
+        let it = running_reg("q-old-dead", 10, &[]); // 10 min > 150s grace
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_dead,
+        );
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].condition, Condition::Orphaned);
     }
 
     #[test]
@@ -1223,10 +1346,57 @@ mod tests {
             summary: "s".to_string(),
             condition: Condition::Orphaned,
             detail: "d".to_string(),
+            agent_id: None,
         }];
         let msg = build_message(Condition::Orphaned, &q);
         assert!(msg.contains("1 queue item orphaned"));
         assert!(msg.contains("q-1"));
+        // Enriched: summary + detail are inline, not just the bare id.
+        assert!(msg.contains("[s]"), "{msg}");
+        assert!(msg.contains("(d)"), "{msg}");
+    }
+
+    #[test]
+    fn build_message_enriched_carries_agent_and_reason() {
+        // #6543: the one-line message the main loop reads must name the
+        // item, its summary, and the full detail (agent id + staleness +
+        // reason) — the bare-id message sent the reader to the wrong item.
+        let q = vec![Qualifying {
+            id: "q-0a54".to_string(),
+            summary: "Fix the widget".to_string(),
+            condition: Condition::Orphaned,
+            detail: "agent agent-a7f0 transcript stale 4m ago (died after spawn)".to_string(),
+            agent_id: Some("agent-a7f0".to_string()),
+        }];
+        let msg = build_message(Condition::Orphaned, &q);
+        assert!(msg.contains("q-0a54"), "{msg}");
+        assert!(msg.contains("Fix the widget"), "{msg}");
+        assert!(msg.contains("agent-a7f0"), "{msg}");
+        assert!(msg.contains("stale 4m ago"), "{msg}");
+    }
+
+    #[test]
+    fn build_message_caps_and_counts_remainder() {
+        // More than TOP_N items → show TOP_N inline + a (+N more) suffix.
+        let q: Vec<Qualifying> = (0..TOP_N + 2)
+            .map(|i| Qualifying {
+                id: format!("q-{i}"),
+                summary: format!("s{i}"),
+                condition: Condition::Orphaned,
+                detail: format!("d{i}"),
+                agent_id: None,
+            })
+            .collect();
+        let msg = build_message(Condition::Orphaned, &q);
+        assert!(msg.contains(&format!("{} queue items orphaned", TOP_N + 2)), "{msg}");
+        assert!(msg.contains("(+2 more)"), "{msg}");
+    }
+
+    #[test]
+    fn fmt_age_buckets() {
+        assert_eq!(fmt_age(None), "age unknown");
+        assert_eq!(fmt_age(Some(45)), "45s ago");
+        assert_eq!(fmt_age(Some(240)), "4m ago");
     }
 
     #[test]
@@ -1235,7 +1405,8 @@ mod tests {
             id: "q-a".to_string(),
             summary: "summary-a".to_string(),
             condition: Condition::Orphaned,
-            detail: "owning pid 7 not alive".to_string(),
+            detail: "agent agent-xyz transcript stale 3m ago (died after spawn)".to_string(),
+            agent_id: Some("agent-xyz".to_string()),
         }];
         let v = build_event_json(Condition::Orphaned, &q, "2026-06-03T01:30:00Z", "host", "user", 1234);
         assert_eq!(v["tag"], EVENT_TAG_ORPHANED);
@@ -1245,7 +1416,12 @@ mod tests {
         assert_eq!(v["data"]["condition"], "orphaned");
         assert_eq!(v["data"]["qualifying_count"], 1);
         assert_eq!(v["data"]["all_ids"], serde_json::json!(["q-a"]));
-        assert_eq!(v["data"]["items"][0]["detail"], "owning pid 7 not alive");
+        assert_eq!(
+            v["data"]["items"][0]["detail"],
+            "agent agent-xyz transcript stale 3m ago (died after spawn)"
+        );
+        // #6543: the bound agent id is surfaced structurally too.
+        assert_eq!(v["data"]["items"][0]["agent_id"], "agent-xyz");
     }
 
     #[test]
@@ -1255,6 +1431,7 @@ mod tests {
             summary: "s".to_string(),
             condition: Condition::Stuck,
             detail: "wedged: x".to_string(),
+            agent_id: None,
         }];
         let v = build_event_json(Condition::Stuck, &q, "2026-06-03T01:30:00Z", "h", "u", 1);
         assert_eq!(v["tag"], EVENT_TAG_STUCK);

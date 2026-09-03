@@ -1,0 +1,971 @@
+#!/usr/bin/env python3
+"""On-demand Claude Code re-login, driven from OUTSIDE the session.
+
+`self-clear` injects `/clear` into the running Claude Code TUI. `self-login`
+is the same trick for `/login`: it injects the slash command, drives the
+"Select login method" picker, scrapes the OAuth authorize URL back out of the
+pane, and hands it to the operator. The operator opens the URL, authorizes,
+and pastes the resulting code back via `self-login code <CODE>` — which types
+it into the login dialog and confirms the flow completed.
+
+Why it exists: when Claude Code's credentials lapse, the session cannot fix
+itself — the login screen is a modal that swallows the loop's own keystrokes,
+and nobody is sitting at the terminal. Everything here runs from the outside,
+so the whole flow works over a phone.
+
+Subcommands
+-----------
+  start           Inject `/login`, scrape the OAuth URL, publish it.
+  code <CODE>     Type the authorization code into the login dialog.
+  cancel          Escape out of a login dialog nobody is going to finish.
+  url             Print the OAuth URL currently on the pane (no injection).
+  status          Print the state file as JSON.
+
+Both `start` and `code` are usable programmatically: `--foreground --json`
+makes each one block and emit a single JSON object on stdout, so a supervisor
+(a daemon that notices credentials are about to lapse, say) can drive the
+whole flow without a human typing anything.
+
+Publishing the URL
+------------------
+Three independent sinks, none of which is allowed to swallow a failure:
+  1. State file (always) — machine-readable, `self-login status` reads it.
+  2. `claude-event` (when the binary is on PATH) — surfaces the URL to the
+     main loop, which is what actually messages the operator.
+  3. `$CLAUDE_SELF_LOGIN_NOTIFY_CMD` (when set) — invoked as
+     `<cmd...> <url>` for setups that want the link pushed directly.
+
+FAIL LOUD is the contract. "No URL appeared" can mean the session is already
+authenticated, the dialog never rendered, or the pane is wedged. All three are
+things the operator must see, so a missing URL is a non-zero exit AND a
+high-priority event — never a quiet success.
+
+Configuration (defaults portable; override via CLI flag or env var):
+  --log-file PATH    (env $CLAUDE_SELF_LOGIN_LOG)
+  --lock-file PATH   (env $CLAUDE_SELF_LOGIN_LOCK)
+  --state-file PATH  (env $CLAUDE_SELF_LOGIN_STATE)
+                     (notify cmd: env $CLAUDE_SELF_LOGIN_NOTIFY_CMD)
+
+`cancel` exists because `start` leaves a MODAL on the pane. The login dialog
+swallows the session's keystrokes until somebody pastes the code, so an
+auto-fired login that nobody answers takes the whole loop down for as long as
+it stands there. The OAuth link has a short life of its own, so waiting it out
+overnight buys nothing. `cancel` presses Escape only while the dialog is
+actually up, which makes it a no-op in the normal case where the code was
+entered — safe for a supervisor to call unconditionally on a timer.
+
+Exit codes:
+  0  success (for `cancel`: the pane is not sitting in a login dialog, whether
+     or not this invocation is what got it out of one)
+  1  usage / no Claude Code pane / internal error
+  4  no OAuth URL found (start), login did not complete (code), or the dialog
+     would not close (cancel)
+  5  the login dialog was not on screen when a code was submitted
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+_HOME = os.path.expanduser("~")
+
+# Augment PATH so claude-watch / tmux / claude-event are findable regardless of
+# how the script was launched (cron, tmux-inject, manual). Append-only — the
+# caller's PATH still wins. Mirrors self-clear.
+for _p in (
+    f"{_HOME}/bin",
+    f"{_HOME}/.local/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+):
+    _existing = os.environ.get("PATH", "").split(os.pathsep)
+    if _p not in _existing:
+        _existing.append(_p)
+        os.environ["PATH"] = os.pathsep.join(p for p in _existing if p)
+
+
+# ---------------------------------------------------------------------------
+# Shared tmux/pane primitives come from self-clear.
+#
+# self-clear already owns the hard-won, test-covered versions of pane
+# resolution, FleetView focus-return, interrupt-and-wait, and idle detection.
+# Re-typing them here is exactly the drift that produced FOUR divergent copies
+# of the inject choreography before `claude-watch inject` centralized it (one
+# copy had silently regressed into typing alert text without submitting it).
+# So we IMPORT the sibling instead. The script has no `.py` suffix and runs no
+# top-level work beyond defining helpers, so a SourceFileLoader import is safe
+# — the repo's own self-clear test suite loads it the same way.
+# ---------------------------------------------------------------------------
+
+def _load_self_clear():
+    """Import the sibling `self-clear` script as a module.
+
+    Hard-fails: without it we have no pane resolution, and a silent fallback to
+    a hand-rolled copy is how the two drift apart.
+    """
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "self-clear",
+        here.parent.parent / "container" / "bin" / "self-clear",
+    ]
+    for path in candidates:
+        if path.is_file():
+            loader = importlib.machinery.SourceFileLoader("_cw_self_clear", str(path))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise SystemExit(
+        "ERROR: could not locate the `self-clear` sibling script "
+        f"(looked in: {', '.join(str(c) for c in candidates)}). self-login "
+        "reuses its tmux pane primitives and will not hand-roll a second copy."
+    )
+
+
+sc = _load_self_clear()
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def _state_dir() -> Path:
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg:
+        return Path(xdg) / "claude-watch"
+    home_state = Path(_HOME) / ".local" / "state"
+    if home_state.is_dir() or not Path("/var/log/claude-watch").is_dir():
+        return home_state / "claude-watch"
+    return Path("/var/log/claude-watch")
+
+
+def _default_log_file() -> str:
+    env = os.environ.get("CLAUDE_SELF_LOGIN_LOG", "").strip()
+    if env:
+        return env
+    return str(_state_dir() / "self-login.log")
+
+
+def _default_state_file() -> str:
+    env = os.environ.get("CLAUDE_SELF_LOGIN_STATE", "").strip()
+    if env:
+        return env
+    return str(_state_dir() / "self-login.json")
+
+
+def _default_lock_file() -> str:
+    env = os.environ.get("CLAUDE_SELF_LOGIN_LOCK", "").strip()
+    if env:
+        return env
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return str(Path(runtime) / "claude-self-login.lock")
+    if Path("/var/run/claude").is_dir():
+        return "/var/run/claude/claude-self-login.lock"
+    return "/tmp/claude-self-login.lock"
+
+
+LOG_FILE = _default_log_file()
+STATE_FILE = _default_state_file()
+LOCKFILE = _default_lock_file()
+
+
+def log(msg: str) -> None:
+    """Append a timestamped line to the self-login log (never raises)."""
+    try:
+        Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _bind_shared_log() -> None:
+    """Point self-clear's module-level logger at OUR log file.
+
+    The imported helpers (`interrupt_and_wait`, `ensure_main_loop_focus`, ...)
+    call self-clear's `log()`, which writes to self-clear's own file. Rebinding
+    the global keeps a self-login run's diagnostics in one place instead of
+    scattered across two logs.
+    """
+    try:
+        sc.LOG_FILE = LOG_FILE
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Pane text signatures for the Claude Code login flow.
+#
+# Sourced from the strings the shipped Claude Code build actually renders, not
+# guessed. Kept as pure predicates over captured pane text so they are unit
+# testable without a live tmux.
+# ---------------------------------------------------------------------------
+
+LOGIN_METHOD_MENU = "select login method"
+LOGIN_METHOD_ORDER = ["claudeai", "console", "platform"]
+
+CODE_PROMPT_SIGNATURES = (
+    "paste code here",
+    "browser didn't open",
+    "browser didn’t open",
+)
+
+LOGIN_SUCCESS_SIGNATURES = (
+    "login successful",
+    "logged in as",
+)
+
+LOGIN_FAILURE_SIGNATURES = (
+    "oauth error",
+    "token exchange failed",
+    "failed to exchange authorization",
+)
+
+# Anything that says the login UI is still on screen.
+LOGIN_DIALOG_SIGNATURES = CODE_PROMPT_SIGNATURES + (
+    LOGIN_METHOD_MENU,
+    "claude account with subscription",
+)
+
+# STATUS-BAR signals only. The obvious extra candidate — the `❯` cursor — is
+# NOT usable here: the login-method picker draws its selection with the same
+# glyph, so `❯` would report "the TUI is back" while a modal is still up, and
+# every "did the login finish?" check downstream would read as success.
+TUI_SIGNATURES = ("tokens", "bypass permissi", "auto-compact")
+
+
+def capture(pane: str) -> str:
+    """Capture the visible pane text (never the scrollback).
+
+    Scrollback deliberately excluded: an OAuth URL or a login banner that has
+    scrolled out of view is not the dialog we are driving, and treating it as
+    current is how a stale link gets reported as a fresh one.
+    """
+    out, rc = sc.run(["tmux", "capture-pane", "-t", pane, "-p"])
+    if rc != 0 or not out:
+        return ""
+    return out
+
+
+def _has_any(text: str, needles) -> bool:
+    low = text.lower()
+    return any(n in low for n in needles)
+
+
+def login_menu_visible(text: str) -> bool:
+    return LOGIN_METHOD_MENU in text.lower()
+
+
+def code_prompt_visible(text: str) -> bool:
+    return _has_any(text, CODE_PROMPT_SIGNATURES)
+
+
+def login_dialog_visible(text: str) -> bool:
+    return _has_any(text, LOGIN_DIALOG_SIGNATURES)
+
+
+def login_succeeded(text: str) -> bool:
+    return _has_any(text, LOGIN_SUCCESS_SIGNATURES)
+
+
+def login_failed(text: str) -> bool:
+    return _has_any(text, LOGIN_FAILURE_SIGNATURES)
+
+
+def tui_visible(text: str) -> bool:
+    return _has_any(text, TUI_SIGNATURES)
+
+
+# ---------------------------------------------------------------------------
+# OAuth URL scraping — delegated to `claude-watch login-url`.
+#
+# The wrap-reassembling parser lives in src/tmux.rs (`extract_login_url`) and
+# is shared with the daemon's reactive reauth path. Shelling out to the
+# subcommand keeps exactly ONE copy of it, the same way self-clear shells out
+# to `claude-watch inject` rather than hand-rolling send-keys.
+# ---------------------------------------------------------------------------
+
+def read_login_url(pane: str, wait: int = 0, reject: str = "") -> str:
+    """Return the OAuth URL on the pane, or '' if there isn't one.
+
+    `reject` names a URL that must NOT be reported (a stale link left on
+    screen by an earlier login).
+    """
+    cmd = ["claude-watch", "login-url", "--pane", pane, "--wait", str(wait)]
+    if reject:
+        cmd += ["--not", reject]
+    out, rc = sc.run(cmd, timeout=max(30, wait + 20))
+    if rc != 0:
+        return ""
+    return out.strip()
+
+
+# ---------------------------------------------------------------------------
+# Publishing
+# ---------------------------------------------------------------------------
+
+def write_state(payload: dict) -> None:
+    """Atomically write the state file (tmp + rename)."""
+    payload = dict(payload)
+    payload.setdefault("updated_at", datetime.now().astimezone().isoformat())
+    try:
+        path = Path(STATE_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n")
+        tmp.replace(path)
+    except Exception as exc:
+        log(f"  WARNING: could not write state file {STATE_FILE}: {exc}")
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(Path(STATE_FILE).read_text())
+    except Exception:
+        return {}
+
+
+def emit_event(message: str, tag: str, priority: str = "normal", data=None) -> None:
+    """Emit a claude-event so the main loop can surface this. Best effort.
+
+    Optional by design: claude-event is claude-watch's own event queue, but a
+    bare checkout may not have it on PATH, and its absence must not stop the
+    state file from being written.
+    """
+    if not shutil.which("claude-event"):
+        log(f"  claude-event not on PATH; skipping event emit (tag={tag})")
+        return
+    cmd = [
+        "claude-event", message,
+        "--tag", tag,
+        "--source", "claude-watch",
+        "--source-name", "self-login",
+        "--priority", priority,
+    ]
+    for k, v in (data or {}).items():
+        cmd += ["--data", f"{k}={v}"]
+    out, rc = sc.run(cmd, timeout=20)
+    if rc != 0:
+        log(f"  WARNING: claude-event emit failed (rc={rc}): {out!r}")
+
+
+def run_notify_cmd(url: str) -> None:
+    """Invoke $CLAUDE_SELF_LOGIN_NOTIFY_CMD with the URL, if configured."""
+    raw = os.environ.get("CLAUDE_SELF_LOGIN_NOTIFY_CMD", "").strip()
+    if not raw:
+        return
+    parts = raw.split()
+    if not parts:
+        return
+    out, rc = sc.run(parts + [url], timeout=30)
+    if rc != 0:
+        log(f"  WARNING: notify cmd failed (rc={rc}): {out!r}")
+    else:
+        log("  notify cmd invoked")
+
+
+def publish_url(pane: str, url: str) -> None:
+    """Fan the fresh OAuth URL out to every sink."""
+    write_state({
+        "status": "awaiting-code",
+        "pane": pane,
+        "url": url,
+    })
+    emit_event(
+        f"Claude Code login URL ready. Open it, authorize, then run: "
+        f"self-login code <CODE>. URL: {url}",
+        tag="self-login-url",
+        priority="high",
+        data={"url": url, "pane": pane},
+    )
+    run_notify_cmd(url)
+
+
+def publish_failure(pane: str, reason: str, tag: str = "self-login-failed") -> None:
+    write_state({"status": "failed", "pane": pane, "reason": reason})
+    emit_event(
+        f"self-login FAILED: {reason}",
+        tag=tag,
+        priority="high",
+        data={"pane": pane, "reason": reason},
+    )
+
+
+def emit_result(json_mode: bool, payload: dict) -> None:
+    """Print the machine-readable or human result on stdout."""
+    if json_mode:
+        print(json.dumps(payload))
+        return
+    if payload.get("ok"):
+        if payload.get("url"):
+            print(payload["url"])
+        else:
+            print(payload.get("message", "ok"))
+    else:
+        print(f"ERROR: {payload.get('reason', 'unknown failure')}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# `start` — inject /login and scrape the URL
+# ---------------------------------------------------------------------------
+
+def select_login_method(pane: str, method: str, max_enters: int, settle: float = 1.5) -> bool:
+    """Drive the "Select login method:" picker, if it is showing.
+
+    The picker lists, in order: a Claude subscription account, an Anthropic
+    Console account, a third-party platform. The first entry is preselected, so
+    `claudeai` needs a bare Enter and the others need N Down presses first.
+
+    Raw `tmux send-keys` on purpose: this is a MODAL, not the vim-mode prompt,
+    and these are NAVIGATION keys (Down/Enter through a picker), not typed
+    text. `claude-watch inject` types a payload; it has no keystroke API, so
+    there is nothing here for it to own.
+
+    Returns True if the picker was handled or was never showing.
+    """
+    try:
+        downs = LOGIN_METHOD_ORDER.index(method)
+    except ValueError:
+        downs = 0
+
+    for attempt in range(1, max_enters + 1):
+        text = capture(pane)
+        if not login_menu_visible(text):
+            return True
+        log(f"  login-method picker visible (attempt {attempt}/{max_enters}); "
+            f"selecting '{method}' ({downs} Down + Enter)")
+        for _ in range(downs):
+            sc.run(["tmux", "send-keys", "-t", pane, "Down"])
+            time.sleep(0.2)
+        sc.run(["tmux", "send-keys", "-t", pane, "Enter"])
+        time.sleep(settle)
+
+    still = login_menu_visible(capture(pane))
+    if still:
+        log("  WARNING: login-method picker STILL visible after "
+            f"{max_enters} selection attempts")
+    return not still
+
+
+def do_start(pane: str, args) -> dict:
+    """Inject `/login` and scrape the resulting OAuth URL.
+
+    Returns a result dict: {"ok": bool, "url": str, "reason": str, ...}.
+    """
+    log(f"START: pane={pane} method={args.login_method} "
+        f"url_timeout={args.url_timeout} idle_timeout={args.timeout}")
+    log(f"  pane state: {sc.capture_pane_text(pane)}")
+
+    # Snapshot any URL already on screen. Anything we report later must NOT be
+    # this one — otherwise a leftover link from a previous login gets published
+    # as if `/login` had just produced it, and the operator burns an expired
+    # URL wondering why it doesn't work.
+    stale_url = read_login_url(pane)
+    if stale_url:
+        log(f"  pre-existing OAuth URL on pane (will be rejected as stale): {stale_url}")
+
+    # FleetView-aware focus return, then interrupt to a live prompt — same
+    # preamble self-clear runs, for the same reason: an inject must land on the
+    # main conversation and not on a background agent.
+    if not sc.ensure_main_loop_focus(pane):
+        log("  proceeding despite unconfirmed main-loop focus (see WARNING above)")
+
+    pre_text = capture(pane)
+    if login_dialog_visible(pre_text) and not args.force:
+        # The login UI is ALREADY up (e.g. the daemon's reactive reauth path got
+        # here first). Injecting `/login` into a modal types a literal "/login"
+        # into it. Read the URL that is already there instead.
+        log("  login dialog already on screen; not injecting /login")
+        select_login_method(pane, args.login_method, args.menu_attempts)
+        url = read_login_url(pane, wait=args.url_timeout)
+        if url:
+            return {"ok": True, "url": url, "pane": pane, "injected": False,
+                    "message": "login dialog was already open"}
+        return {"ok": False, "pane": pane, "injected": False,
+                "reason": "login dialog was already on screen but no OAuth URL "
+                          "appeared within the wait window"}
+
+    idle_ok = sc.interrupt_and_wait(pane, timeout=args.timeout)
+    log(f"  interrupt_and_wait: {'idle confirmed' if idle_ok else 'TIMEOUT'}")
+
+    # `/login` is a slash command: bare Enter from INSERT. The Tab->Escape->Enter
+    # regular-text sequence does NOT submit a slash command.
+    #
+    # NO escape (the `claude-watch inject` default since 2026-08-18), stated
+    # explicitly rather than inherited from the shared helper. Two reasons, and
+    # the second is the load-bearing one:
+    #   * It is not needed. `interrupt_and_wait` above has already brought the
+    #     pane to an idle prompt, which is the state the Escape blast exists to
+    #     reach.
+    #   * It is DANGEROUS here. The pre-flight check above bails when a login
+    #     dialog is already on screen, but that check and this inject are not
+    #     atomic. If a dialog arrives in between -- the daemon's reactive reauth
+    #     path getting here first is the realistic case -- an Escape blast would
+    #     cancel it, and the two paths would take turns killing each other's
+    #     dialog. Typing "/login" into a modal is merely a wasted attempt that
+    #     the URL-scrape below reports as a loud failure; cancelling one is the
+    #     failure that hides.
+    sc.inject(pane, "/login", label="/login", slash_command=True, escape=False)
+
+    # The dialog is not painted the instant the command submits, and it may
+    # arrive as the method picker rather than the URL screen. Poll for either,
+    # driving the picker when it shows, until the deadline.
+    deadline = time.time() + args.url_timeout
+    handled_menu = False
+    while True:
+        text = capture(pane)
+        if login_menu_visible(text) and not handled_menu:
+            handled_menu = select_login_method(pane, args.login_method, args.menu_attempts)
+            continue
+        url = read_login_url(pane, reject=stale_url)
+        if url:
+            log(f"  OAuth URL captured: {url}")
+            return {"ok": True, "url": url, "pane": pane, "injected": True}
+        if time.time() >= deadline:
+            break
+        time.sleep(1.0)
+
+    # Fail loud, and say WHICH failure this looks like.
+    final = capture(pane)
+    if stale_url and read_login_url(pane) == stale_url:
+        reason = ("only the pre-existing (stale) OAuth URL is on the pane — "
+                  "/login did not produce a new one")
+    elif login_menu_visible(final):
+        reason = ("the login-method picker is still on screen — the selection "
+                  "keystroke did not take")
+    elif tui_visible(final) and not login_dialog_visible(final):
+        reason = ("the login dialog never appeared; the session is most likely "
+                  "already authenticated (/login was a no-op)")
+    else:
+        reason = ("no OAuth URL appeared within "
+                  f"{args.url_timeout}s of injecting /login")
+    log(f"  FAILED: {reason}")
+    log(f"  pane tail: {sc.capture_pane_text(pane)}")
+    return {"ok": False, "pane": pane, "injected": True, "reason": reason}
+
+
+# ---------------------------------------------------------------------------
+# `code` — type the authorization code into the login dialog
+# ---------------------------------------------------------------------------
+
+# An OAuth PKCE authorization code is URL-safe text, optionally with a `#state`
+# suffix. Allow exactly that: unreserved URL characters plus `#` and `%`.
+#
+# Loose enough to survive Anthropic changing the code's exact shape, strict
+# enough to exclude everything that is not plausibly a code. The exclusions are
+# the point, not pedantry: this string is typed KEYSTROKE BY KEYSTROKE into a
+# modal, so stray characters are input events, not formatting noise.
+_CODE_SAFE = re.compile(r"^[A-Za-z0-9._~%#-]+$")
+
+
+def validate_code(code: str) -> str:
+    """Return an error string if `code` is unsafe to type, else ''."""
+    if not code:
+        return "empty authorization code"
+    if any(c.isspace() for c in code):
+        return ("authorization code contains whitespace — refusing to type it "
+                "into a modal (it would be sent as extra keystrokes)")
+    if len(code) > 512:
+        return f"authorization code is implausibly long ({len(code)} chars)"
+    if not _CODE_SAFE.match(code):
+        return ("authorization code contains characters outside the URL-safe "
+                "set (expected URL-safe text, optionally with a #state suffix)")
+    return ""
+
+
+def dismiss_login_dialog(pane: str, max_attempts: int = 4) -> bool:
+    """Escape out of the finished login dialog back to the TUI.
+
+    After a successful exchange the dialog offers to go back to the login
+    options, so it can take more than one Escape to unwind fully. Bounded, and
+    only ever pressed while the login UI is still up — never blind.
+    """
+    for attempt in range(1, max_attempts + 1):
+        text = capture(pane)
+        if tui_visible(text) and not login_dialog_visible(text):
+            return True
+        log(f"  dismissing login dialog (Escape {attempt}/{max_attempts})")
+        sc.run(["tmux", "send-keys", "-t", pane, "Escape"])
+        time.sleep(1.0)
+    text = capture(pane)
+    ok = tui_visible(text) and not login_dialog_visible(text)
+    if not ok:
+        log("  WARNING: login dialog still on screen after dismissal attempts")
+    return ok
+
+
+def do_code(pane: str, code: str, args) -> dict:
+    """Type the authorization code into the login dialog and verify."""
+    log(f"CODE: pane={pane} code_len={len(code)}")
+
+    err = validate_code(code)
+    if err:
+        log(f"  REJECTED: {err}")
+        return {"ok": False, "pane": pane, "reason": err, "exit_code": 1}
+
+    text = capture(pane)
+    if not code_prompt_visible(text):
+        if not args.force:
+            reason = ("the login dialog's code prompt is not on screen — run "
+                      "`self-login start` first (or pass --force if you are "
+                      "certain the pane is showing it)")
+            log(f"  REFUSED: {reason}")
+            log(f"  pane tail: {sc.capture_pane_text(pane)}")
+            return {"ok": False, "pane": pane, "reason": reason, "exit_code": 5}
+        log("  WARNING: code prompt not detected, proceeding due to --force")
+
+    # Raw send-keys, NOT `claude-watch inject`. This was re-evaluated on
+    # 2026-08-18, when inject stopped leading with an Escape by default and the
+    # original objection (Escape cancels the login modal) went away. It still
+    # cannot be used here, for THREE further reasons, all reproduced against a
+    # real tmux pane in tools/watchers/tests/test_self_login_tmux.sh:
+    #
+    #   1. inject enters INSERT by probing with a literal `i`, and it can only
+    #      un-type that `i` by detecting it on the prompt line. A login modal
+    #      has no `-- INSERT --` indicator and no prompt glyph, so the probe is
+    #      ambiguous, inject fails open, and the `i` stays -- the code arrives
+    #      as `i<code>`.
+    #   2. inject first sends the configured FleetView focus-to-main keys. On a
+    #      deployment that sets any (the-host sends ten Up presses) those arrive
+    #      in the modal's text field as raw escape sequences, ahead of the code.
+    #   3. inject's success check is "the payload cleared from the prompt
+    #      line". A modal has no prompt line, so the check is vacuous and inject
+    #      reports `status: submitted` over a corrupted payload. A wrong answer
+    #      that reports success is worse than no answer.
+    #
+    # Fixing all three would mean a mode in which inject does none of the
+    # things inject does, so the raw path stays. Reuse of the centralized
+    # choreography stops at the `/login` submission above, which IS a
+    # prompt-line inject and does go through it.
+    sc.run(["tmux", "send-keys", "-t", pane, "-l", code])
+    time.sleep(0.6)
+
+    # Best-effort confirmation that the keystrokes landed before we commit with
+    # Enter. The field may mask or truncate the value, so a miss is a warning
+    # rather than an abort — the load-bearing check is the outcome below.
+    tail = code[-12:]
+    typed = capture(pane)
+    if tail and tail in typed:
+        log("  code text confirmed on the pane before submit")
+    else:
+        log("  NOTE: could not confirm the typed code on the pane (field may "
+            "mask or truncate it); submitting anyway and verifying the outcome")
+
+    sc.run(["tmux", "send-keys", "-t", pane, "Enter"])
+    log(f"  code submitted; verifying for up to {args.verify_timeout}s")
+
+    deadline = time.time() + args.verify_timeout
+    while True:
+        text = capture(pane)
+        if login_failed(text):
+            reason = "Claude Code reported an OAuth error after the code was submitted"
+            log(f"  FAILED: {reason}")
+            log(f"  pane tail: {sc.capture_pane_text(pane)}")
+            return {"ok": False, "pane": pane, "reason": reason, "exit_code": 4}
+        if login_succeeded(text):
+            log("  login reported successful")
+            dismissed = dismiss_login_dialog(pane)
+            return {"ok": True, "pane": pane, "dismissed": dismissed,
+                    "message": "login successful"}
+        # Some builds drop straight back to the TUI with no success banner.
+        if tui_visible(text) and not login_dialog_visible(text):
+            log("  login dialog gone and the TUI is back — treating as success")
+            return {"ok": True, "pane": pane, "dismissed": True,
+                    "message": "login dialog closed and the TUI returned"}
+        if time.time() >= deadline:
+            break
+        time.sleep(1.0)
+
+    reason = (f"login did not complete within {args.verify_timeout}s of "
+              "submitting the code (no success banner, no error, dialog still up)")
+    log(f"  FAILED: {reason}")
+    log(f"  pane tail: {sc.capture_pane_text(pane)}")
+    return {"ok": False, "pane": pane, "reason": reason, "exit_code": 4}
+
+
+# ---------------------------------------------------------------------------
+# `cancel` — hand the pane back when nobody is going to finish the login
+# ---------------------------------------------------------------------------
+
+def do_cancel(pane: str) -> dict:
+    """Escape out of a login dialog that is never going to be completed.
+
+    Deliberately conditional and deliberately dull. It presses Escape ONLY
+    while a login dialog is on screen, so calling it on a healthy session does
+    nothing at all — which is the property that lets a supervisor fire it on a
+    timer without first proving the dialog is still up. Racing a human who is
+    mid-paste is the one thing it must not do, and `dismiss_login_dialog`
+    re-checks the pane before every keypress for exactly that reason.
+    """
+    text = capture(pane)
+    if not login_dialog_visible(text):
+        log("CANCEL: no login dialog on the pane; nothing to cancel")
+        return {"ok": True, "pane": pane, "cancelled": False,
+                "message": "no login dialog on the pane"}
+
+    log("CANCEL: login dialog is up and unconsumed; escaping out of it")
+    dismissed = dismiss_login_dialog(pane)
+    if not dismissed:
+        reason = ("the login dialog would not close — the pane is still "
+                  "showing it after the Escape attempts")
+        log(f"  FAILED: {reason}")
+        log(f"  pane tail: {sc.capture_pane_text(pane)}")
+        return {"ok": False, "pane": pane, "cancelled": False,
+                "reason": reason, "exit_code": 4}
+
+    return {"ok": True, "pane": pane, "cancelled": True,
+            "message": "login dialog cancelled; the session has the pane back"}
+
+
+# ---------------------------------------------------------------------------
+# Locking + daemonization
+# ---------------------------------------------------------------------------
+
+def acquire_lock():
+    """Take the exclusive self-login lock, or return None if already held.
+
+    Two processes racing on tmux send-keys corrupt each other's keystrokes.
+    """
+    try:
+        Path(LOCKFILE).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        fd = os.open(LOCKFILE, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (OSError, BlockingIOError):
+        return None
+
+
+def daemonize() -> bool:
+    """Fork into the background. Returns True in the parent.
+
+    Same rationale as self-clear: when the main loop calls this from a tool
+    call, the TUI is BUSY running that very call. Returning immediately lets
+    the turn finish so the pane reaches an idle prompt before we start typing.
+    """
+    pid = os.fork()
+    if pid > 0:
+        print(f"self-login backgrounded (PID {pid}). "
+              f"Result will land in {STATE_FILE}.")
+        return True
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+
+    def handler(signum, frame):
+        log(f"KILLED: received {signal.Signals(signum).name} ({signum})")
+        sys.exit(128 + signum)
+
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGPIPE, signal.SIGALRM):
+        signal.signal(s, handler)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="self-login",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--pane", default=None,
+                   help="Target tmux pane (default: auto-detect the Claude Code pane)")
+    p.add_argument("--log-file", default=None,
+                   help="Override log path (env $CLAUDE_SELF_LOGIN_LOG)")
+    p.add_argument("--state-file", default=None,
+                   help="Override state path (env $CLAUDE_SELF_LOGIN_STATE)")
+    p.add_argument("--lock-file", default=None,
+                   help="Override lockfile path (env $CLAUDE_SELF_LOGIN_LOCK)")
+    p.add_argument("--json", action="store_true",
+                   help="Emit a machine-readable JSON result on stdout "
+                        "(implies --foreground)")
+
+    sub = p.add_subparsers(dest="subcommand")
+
+    s = sub.add_parser("start", help="Inject /login and publish the OAuth URL")
+    s.add_argument("--foreground", action="store_true",
+                   help="Block until the URL is captured instead of forking "
+                        "(use when driving the flow programmatically)")
+    s.add_argument("--url-timeout", type=int, default=90,
+                   help="Max seconds to wait for the OAuth URL (default: 90)")
+    s.add_argument("--timeout", type=int, default=60,
+                   help="Max seconds to wait for an idle prompt (default: 60)")
+    s.add_argument("--login-method", default="claudeai",
+                   choices=LOGIN_METHOD_ORDER,
+                   help="Which entry of the login-method picker to select "
+                        "(default: claudeai, a Claude subscription account)")
+    s.add_argument("--menu-attempts", type=int, default=2,
+                   help="Max selection attempts on the login-method picker "
+                        "(default: 2)")
+    s.add_argument("--force", action="store_true",
+                   help="Inject /login even if a login dialog is already showing")
+
+    c = sub.add_parser("code", help="Type the authorization code into the dialog")
+    c.add_argument("code", help="The authorization code pasted back by the operator")
+    c.add_argument("--verify-timeout", type=int, default=60,
+                   help="Max seconds to wait for the login to complete (default: 60)")
+    c.add_argument("--force", action="store_true",
+                   help="Submit even if the code prompt is not detected on the pane")
+
+    sub.add_parser("url", help="Print the OAuth URL currently on the pane")
+    sub.add_parser("status", help="Print the self-login state file as JSON")
+
+    sub.add_parser(
+        "cancel",
+        help="Escape out of a login dialog nobody is going to finish "
+             "(no-op when no dialog is on the pane)",
+    )
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    global LOG_FILE, STATE_FILE, LOCKFILE
+    if args.log_file:
+        LOG_FILE = args.log_file
+    if args.state_file:
+        STATE_FILE = args.state_file
+    if args.lock_file:
+        LOCKFILE = args.lock_file
+    _bind_shared_log()
+
+    subcommand = args.subcommand or "start"
+
+    if subcommand == "status":
+        print(json.dumps(read_state(), indent=2))
+        return 0
+
+    pane = args.pane or sc.find_claude_pane()
+    if not pane:
+        print("ERROR: could not find the Claude Code tmux pane", file=sys.stderr)
+        return 1
+
+    if subcommand == "url":
+        url = read_login_url(pane)
+        if not url:
+            print("ERROR: no OAuth URL on the pane", file=sys.stderr)
+            return 4
+        print(url)
+        return 0
+
+    if subcommand == "cancel":
+        lock_fd = acquire_lock()
+        if lock_fd is None:
+            # A `start` is mid-flight. It owns the pane, and Escape is the one
+            # keystroke that would cancel the login it is driving.
+            msg = "another self-login is running (lock held); not cancelling"
+            log(f"SKIP: {msg}")
+            emit_result(args.json, {"ok": False, "reason": msg})
+            return 1
+        try:
+            result = do_cancel(pane)
+        finally:
+            os.close(lock_fd)
+        if result.get("ok"):
+            if result.get("cancelled"):
+                write_state({"status": "cancelled", "pane": pane,
+                             "reason": "login dialog was never completed"})
+                emit_event(
+                    "Claude Code self-login was cancelled: the OAuth URL went "
+                    "unused, so the login dialog was dismissed and the session "
+                    "has its pane back. Re-run `self-login start` for a fresh link.",
+                    tag="self-login-cancelled", priority="high",
+                    data={"pane": pane},
+                )
+            emit_result(args.json, result)
+            return 0
+        publish_failure(pane, result.get("reason", "unknown"),
+                        tag="self-login-cancel-failed")
+        emit_result(args.json, result)
+        return int(result.get("exit_code", 4))
+
+    if subcommand == "code":
+        lock_fd = acquire_lock()
+        if lock_fd is None:
+            print("ERROR: another self-login is running (lock held)", file=sys.stderr)
+            return 1
+        try:
+            result = do_code(pane, args.code, args)
+        finally:
+            os.close(lock_fd)
+        if result.get("ok"):
+            write_state({"status": "logged-in", "pane": pane})
+            emit_event("Claude Code login completed via self-login.",
+                       tag="self-login-complete", priority="normal",
+                       data={"pane": pane})
+            emit_result(args.json, result)
+            return 0
+        publish_failure(pane, result.get("reason", "unknown"), tag="self-login-code-failed")
+        emit_result(args.json, result)
+        return int(result.get("exit_code", 4))
+
+    # --- start ---
+    foreground = args.foreground or args.json
+    if not foreground:
+        if daemonize():
+            return 0
+        # Child continues below with stdio detached.
+
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        msg = "another self-login is already running (lock held)"
+        log(f"SKIP: {msg}")
+        if foreground:
+            emit_result(args.json, {"ok": False, "reason": msg})
+        return 1
+
+    try:
+        result = do_start(pane, args)
+    except Exception:
+        log(f"CRASH: {traceback.format_exc()}")
+        publish_failure(pane, "self-login crashed; see the log")
+        if foreground:
+            emit_result(args.json, {"ok": False, "reason": "crashed, see log"})
+        return 1
+    finally:
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+
+    if result.get("ok"):
+        publish_url(pane, result["url"])
+        log("SUCCESS: OAuth URL published")
+        if foreground:
+            emit_result(args.json, result)
+        return 0
+
+    publish_failure(pane, result.get("reason", "unknown"))
+    if foreground:
+        emit_result(args.json, result)
+    return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())

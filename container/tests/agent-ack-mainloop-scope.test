@@ -69,6 +69,12 @@ def _env_with_cli_on_path(base: dict | None = None) -> dict:
     cli_dir = str(OBLIGATIONS_CLI.parent)
     existing = env.get("PATH", "")
     env["PATH"] = f"{cli_dir}{os.pathsep}{existing}" if existing else cli_dir
+    # MAIN_LOOP_ONLY_EVAL_SCRIPTS below asserts the BAKED /usr/local/bin
+    # evaluator paths, which is obligations-init's default. Drop any
+    # inherited $CW_EVAL_BIN_DIR so an operator who exports it for their own
+    # host install (where the eval-* scripts live in ~/bin) doesn't turn this
+    # into a spurious failure.
+    env.pop("CW_EVAL_BIN_DIR", None)
     return env
 
 # The four evaluator-backed rows that are conceptually MAIN-LOOP ONLY and

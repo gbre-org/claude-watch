@@ -81,12 +81,20 @@ pub struct ClaudeWatchAlert<'a> {
     ///   `heartbeat-stale`, `prolonged-thinking`, `watcher-down`,
     ///   `fresh-clear-stuck`, `claude-crashed`, `auto-update-failed`,
     ///   `auto-update-complete`, `reauth-needed`, `wedged-pane`.
+    ///
+    /// NOTE on `heartbeat-stale`: the CONDITION it names is now "the main loop
+    /// has not acked any event in `[ack] stale_minutes`" — see
+    /// `policy::last_ack_timestamp_age`. The string itself is deliberately NOT
+    /// renamed: it is a wire value that out-of-tree consumers (alert-gate
+    /// hooks, host routing tables) match on, and renaming it would silently
+    /// stop those matching with no error anywhere. Read it as the alert's ID,
+    /// not as a description of the mechanism.
     pub alert_type: &'a str,
-    /// Short human-readable reason. For heartbeat-path alerts this is
-    /// the same `stuck_reason` already threaded through `policy.rs`.
+    /// Short human-readable reason. For the liveness path this is the same
+    /// `stuck_reason` already threaded through `policy.rs`.
     pub stuck_reason: &'a str,
-    /// Heartbeat staleness in minutes (only meaningful for
-    /// `heartbeat-stale`; None elsewhere).
+    /// Liveness staleness in minutes (only meaningful for `heartbeat-stale`;
+    /// None elsewhere).
     pub stale_minutes: Option<u64>,
     /// Names of watchers known to be missing (only meaningful for
     /// `watcher-down`; empty elsewhere).
@@ -110,7 +118,7 @@ pub fn build_event_json(alert: &ClaudeWatchAlert<'_>) -> serde_json::Value {
     let user = std::env::var("USER").unwrap_or_default();
     let pid = std::process::id();
 
-    serde_json::json!({
+    let mut event = serde_json::json!({
         "timestamp": now,
         "timestamp_iso": now_iso,
         "hostname": hostname,
@@ -128,7 +136,20 @@ pub fn build_event_json(alert: &ClaudeWatchAlert<'_>) -> serde_json::Value {
         },
         "pid": pid,
         "user": user,
-    })
+    });
+    // Producer-stamped routing tier (rung 2 in the classifier precedence).
+    // The alert-path watcher-down emission ships tag="claude-watch-alert" with
+    // data.alert_type="watcher-down"; without an explicit tier it routes
+    // through the claude-watch-alert NON-FATAL ambient row, so a down watcher
+    // surfaces only as passive context and a busy main loop never relaunches
+    // it (comms watcher down ~4h, incident 2026-08-21). claude-event-watch
+    // forwards data.tier to `event-ack ingest --tier`, so stamping it here
+    // routes watcher-down ACTIONABLE. Other alert_types keep their existing
+    // (conditional-fatal / ambient) classification.
+    if alert.alert_type == "watcher-down" {
+        event["data"]["tier"] = serde_json::Value::from("actionable");
+    }
+    event
 }
 
 /// Resolve the queue dir. Honors `CLAUDE_EVENT_QUEUE` (preferred) and
@@ -201,7 +222,7 @@ pub fn emit(alert: &ClaudeWatchAlert<'_>) {
     );
 }
 
-/// A generic daemon-emitted cadence event (`heartbeat-tick`,
+/// A generic daemon-emitted cadence event (`keepalive`,
 /// `memory-reminder`). Unlike [`ClaudeWatchAlert`], these carry no
 /// alert/stuck semantics — they are plain periodic signals the daemon
 /// produces on its monotonic clock (see [`crate::cadence`]). The body
@@ -209,11 +230,11 @@ pub fn emit(alert: &ClaudeWatchAlert<'_>) {
 /// `claude-event-watch` dispatches purely on `tag`.
 #[derive(Debug, Clone)]
 pub struct CadenceEvent<'a> {
-    /// Event tag (also the dispatch key). E.g. `heartbeat-tick`.
+    /// Event tag (also the dispatch key). E.g. `keepalive`.
     pub tag: &'a str,
     /// `source` / `source_name` fields. `claude-watch` for these.
     pub source: &'a str,
-    /// Human-readable message — for `heartbeat-tick` a short string, for
+    /// Human-readable message — for `keepalive` a short string, for
     /// `memory-reminder` the full action checklist.
     pub message: &'a str,
     /// Priority field (`low|normal|high|urgent`).
@@ -250,20 +271,33 @@ pub fn build_cadence_json(ev: &CadenceEvent<'_>) -> serde_json::Value {
     })
 }
 
-/// Build the `data` body for a `heartbeat-tick` cadence event.
+/// The ONE command the main loop runs after handling an event batch. It acks
+/// every pending actionable entry and stamps the liveness timestamp the
+/// daemon reads, so it is both the gate-clear and the proof-of-life. Kept as
+/// a const because three producers quote it: the keepalive event body, the
+/// ack-stale recovery prompt, and `claude-event-watch`'s per-batch footer.
+pub const ACK_BATCH_COMMAND: &str = "event-ack ack-batch --override-reason \"<why>\"";
+
+/// Build the `data` body for a `keepalive` cadence event.
 ///
-/// Carries the configured host heartbeat-file `path` — the file the main
-/// loop is reminded to touch on each tick — plus the emit `interval_secs`.
-/// The path is sourced from the daemon's existing `[claude].heartbeat_file`
-/// config, which is the SAME path the daemon monitors for staleness, so the
-/// "touch this file" instruction and the "this file went stale" detector can
-/// never drift to different paths. Kept as a named builder so the daemon
-/// call site and the unit tests agree on the body shape.
-pub fn heartbeat_tick_data(heartbeat_path: &str, interval_secs: u64) -> serde_json::Value {
-    serde_json::json!({
-        "path": heartbeat_path,
-        "interval_secs": interval_secs,
-    })
+/// Carries the ONE command the main loop must run to clear it —
+/// [`ACK_BATCH_COMMAND`] — plus the quiet window that triggered the emission
+/// and how old the last ack was. `claude-event-watch` surfaces every scalar
+/// in `data` on the EVENT[...] line, so the loop is TOLD the ritual rather
+/// than having to remember it.
+///
+/// `last_ack_age_secs` is `None` on a host with no ack state yet (fresh boot,
+/// or a deployment without event-must-act) — the field is then omitted rather
+/// than faked with a 0 that would read as "just acked".
+pub fn keepalive_data(interval_secs: u64, last_ack_age_secs: Option<u64>) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "ack_command": ACK_BATCH_COMMAND,
+        "quiet_secs": interval_secs,
+    });
+    if let Some(age) = last_ack_age_secs {
+        data["last_ack_age_secs"] = serde_json::json!(age);
+    }
+    data
 }
 
 /// Emit a cadence event JSON file into the queue dir. Default-open: any
@@ -332,7 +366,11 @@ pub fn emit_cadence(ev: &CadenceEvent<'_>) {
 /// transitions the queue item to done/abandoned in the same step.
 /// Workload completion IS queue completion; no separate respawn-
 /// obligation handshake.
-#[derive(Debug, Clone)]
+///
+/// `Default` is derived so a caller (or a test) can construct the
+/// common shape and `..Default::default()` the optional replace
+/// markers, which only the `workload run` same-label replace path sets.
+#[derive(Debug, Clone, Default)]
 pub struct WorkloadDoneEvent<'a> {
     pub label: &'a str,
     /// Exit code as reported by the wrapper script. Negative values
@@ -349,7 +387,30 @@ pub struct WorkloadDoneEvent<'a> {
     /// --queue-id q-X`). When present, included in the event's
     /// ``data.queue_id`` field so consumers can correlate without
     /// round-tripping through the workload state file.
+    ///
+    /// Deliberately EMPTY when [`Self::carried_over_queue_id`] is set:
+    /// the item is not this run's any more, so presenting it here would
+    /// invite a consumer to read a live item as dead.
     pub queue_id: Option<&'a str>,
+    /// Why this completion exists, when it is not a plain natural exit
+    /// or a plain `workload kill`. Currently only `"replaced"` —
+    /// `workload run` was invoked on a label whose previous run was
+    /// still live, so that run was torn down to make room.
+    ///
+    /// The marker is what keeps a replaced run from masquerading as the
+    /// completion of the run that replaced it: same label, same log
+    /// path, `killed=true`, arriving moments before the new run starts.
+    pub reason: Option<&'a str>,
+    /// For `reason="replaced"`: the `started_at` of the run that took
+    /// this label over (identical to the string in the workload
+    /// registry entry the new run writes), so a consumer can line the
+    /// two up exactly.
+    pub replaced_by: Option<&'a str>,
+    /// For `reason="replaced"`: the queue item the dying run was bound
+    /// to that the REPLACING run re-binds (it was handed the same
+    /// `--queue-id`). It was deliberately NOT transitioned — the item
+    /// is still `running`, now owned by the new run.
+    pub carried_over_queue_id: Option<&'a str>,
 }
 
 /// Build the JSON event body for a workload-done event. Public for
@@ -366,7 +427,14 @@ pub fn build_workload_done_json(ev: &WorkloadDoneEvent<'_>) -> serde_json::Value
 
     // Human-readable message — same string the main loop sees in the
     // `EVENT[workload/workload-done] <preview>` one-liner.
-    let message = if ev.killed {
+    let message = if let Some(replaced_by) = ev.replaced_by {
+        // Say REPLACED, not just "killed": the reader is about to see a
+        // new run of the same label, and the two must not blur.
+        format!(
+            "workload {} replaced (previous run killed rc={}, new run started {}, log={})",
+            ev.label, ev.exit_code, replaced_by, ev.log_path
+        )
+    } else if ev.killed {
         format!(
             "workload {} killed (rc={}, log={})",
             ev.label, ev.exit_code, ev.log_path
@@ -391,6 +459,15 @@ pub fn build_workload_done_json(ev: &WorkloadDoneEvent<'_>) -> serde_json::Value
     });
     if let Some(qid) = ev.queue_id {
         data["queue_id"] = serde_json::Value::String(qid.to_string());
+    }
+    if let Some(reason) = ev.reason {
+        data["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    if let Some(replaced_by) = ev.replaced_by {
+        data["replaced_by"] = serde_json::Value::String(replaced_by.to_string());
+    }
+    if let Some(qid) = ev.carried_over_queue_id {
+        data["carried_over_queue_id"] = serde_json::Value::String(qid.to_string());
     }
 
     serde_json::json!({
@@ -499,7 +576,7 @@ pub(crate) mod test_support {
     /// the var in test A while test B sits between its own set and emit —
     /// B's emission then falls back to the user's LIVE event queue
     /// (`~/claude-events/`). Not hypothetical: fixture events from this
-    /// suite (a "workload translate-book done", a heartbeat-tick with a
+    /// suite (a "workload translate-book done", a keepalive with a
     /// /custom/run path) were observed landing in the live queue and
     /// churning the real event watcher. (nextest is immune — one process
     /// per test — but plain `cargo test` is a supported runner and must
@@ -584,6 +661,10 @@ mod tests {
         assert_eq!(data["severity"], "high");
         assert!(data["affected_watchers"].is_array());
         assert_eq!(data["affected_watchers"].as_array().unwrap().len(), 0);
+        // Only watcher-down is producer-stamped actionable; other alert
+        // types (here heartbeat-stale) carry no data.tier and keep their
+        // existing conditional/ambient classification.
+        assert!(data["tier"].is_null());
     }
 
     #[test]
@@ -606,6 +687,11 @@ mod tests {
         assert_eq!(watchers[0], "alerts-watcher");
         assert_eq!(watchers[1], "torrent-wait");
         assert_eq!(v["priority"], "normal");
+        // Producer-stamped routing tier: watcher-down must ship
+        // data.tier=actionable so it routes to the actionable pending
+        // list, not the claude-watch-alert ambient row (incident
+        // 2026-08-21).
+        assert_eq!(v["data"]["tier"], "actionable");
     }
 
     #[test]
@@ -677,6 +763,7 @@ mod tests {
             killed: false,
             log_path: "/tmp/claude-workloads/ebook-twilight.output",
             queue_id: None,
+            ..Default::default()
         };
         let v = build_workload_done_json(&ev);
 
@@ -709,6 +796,7 @@ mod tests {
             killed: false,
             log_path: "/tmp/claude-workloads/broken-task.output",
             queue_id: None,
+            ..Default::default()
         };
         let v = build_workload_done_json(&ev);
         assert_eq!(v["priority"], "normal"); // non-zero exit → normal
@@ -724,6 +812,7 @@ mod tests {
             killed: true,
             log_path: "/tmp/claude-workloads/dead-task.output",
             queue_id: None,
+            ..Default::default()
         };
         let v = build_workload_done_json(&ev);
         assert_eq!(v["priority"], "normal");
@@ -747,10 +836,90 @@ mod tests {
             killed: false,
             log_path: "/tmp/claude-workloads/stv-promote-Akudama.output",
             queue_id: Some("q-2026-05-03-test"),
+            ..Default::default()
         };
         let v = build_workload_done_json(&ev);
         assert_eq!(v["tag"], "workload-done");
         assert_eq!(v["data"]["queue_id"], "q-2026-05-03-test");
+    }
+
+    /// A run torn down because `workload run` re-used its label must be
+    /// distinguishable from the run that replaced it. Same label, same
+    /// log path, `killed=true`, arriving a moment before the new run
+    /// starts — without the markers the main loop would have no way to
+    /// tell it is not the NEW run's completion.
+    #[test]
+    fn build_workload_done_replaced_carries_the_replace_markers() {
+        let ev = WorkloadDoneEvent {
+            label: "media-promote",
+            exit_code: -15,
+            killed: true,
+            log_path: "/tmp/claude-workloads/media-promote.output",
+            queue_id: Some("q-2026-08-22-old0"),
+            reason: Some("replaced"),
+            replaced_by: Some("2026-08-22T11:04:07"),
+            carried_over_queue_id: None,
+        };
+        let v = build_workload_done_json(&ev);
+
+        assert_eq!(v["data"]["killed"], true);
+        assert_eq!(v["data"]["reason"], "replaced");
+        assert_eq!(v["data"]["replaced_by"], "2026-08-22T11:04:07");
+        // The dying run's own item IS terminal here, so it is named.
+        assert_eq!(v["data"]["queue_id"], "q-2026-08-22-old0");
+        assert!(v["data"].get("carried_over_queue_id").is_none());
+        let msg = v["message"].as_str().unwrap();
+        assert!(
+            msg.contains("replaced") && msg.contains("2026-08-22T11:04:07"),
+            "the one-liner must say REPLACED and name the new run: {msg}"
+        );
+    }
+
+    /// When the replacing run was handed the SAME `--queue-id`, the item
+    /// belongs to the new run: it must NOT be presented as this (dead)
+    /// run's queue item, or a consumer correlating on `data.queue_id`
+    /// would read a live item as abandoned.
+    #[test]
+    fn build_workload_done_replaced_moves_a_carried_over_qid_out_of_queue_id() {
+        let ev = WorkloadDoneEvent {
+            label: "media-promote",
+            exit_code: -15,
+            killed: true,
+            log_path: "/tmp/claude-workloads/media-promote.output",
+            queue_id: None,
+            reason: Some("replaced"),
+            replaced_by: Some("2026-08-22T11:04:07"),
+            carried_over_queue_id: Some("q-2026-08-22-same"),
+        };
+        let v = build_workload_done_json(&ev);
+
+        assert!(
+            v["data"].get("queue_id").is_none(),
+            "a carried-over item must never appear as the dead run's queue_id"
+        );
+        assert_eq!(v["data"]["carried_over_queue_id"], "q-2026-08-22-same");
+    }
+
+    /// Nothing changes for the paths that are not a replace: no stray
+    /// keys in `data`, no reworded message.
+    #[test]
+    fn build_workload_done_plain_paths_carry_no_replace_keys() {
+        for (killed, rc) in [(false, 0), (true, -15)] {
+            let ev = WorkloadDoneEvent {
+                label: "plain",
+                exit_code: rc,
+                killed,
+                log_path: "/tmp/claude-workloads/plain.output",
+                ..Default::default()
+            };
+            let v = build_workload_done_json(&ev);
+            for key in ["reason", "replaced_by", "carried_over_queue_id"] {
+                assert!(
+                    v["data"].get(key).is_none(),
+                    "{key} must be absent on a non-replace completion"
+                );
+            }
+        }
     }
 
     #[test]
@@ -764,6 +933,7 @@ mod tests {
             killed: false,
             log_path: "/tmp/claude-workloads/translate-book.output",
             queue_id: None,
+            ..Default::default()
         };
         emit_workload_done(&ev);
 
@@ -796,18 +966,18 @@ mod tests {
     #[test]
     fn build_cadence_json_has_required_fields() {
         let ev = CadenceEvent {
-            tag: "heartbeat-tick",
+            tag: "keepalive",
             source: "claude-watch",
-            message: "heartbeat tick",
+            message: "keepalive tick",
             priority: "low",
             data: serde_json::json!({"interval_secs": 60}),
         };
         let v = build_cadence_json(&ev);
-        assert_eq!(v["tag"], "heartbeat-tick");
+        assert_eq!(v["tag"], "keepalive");
         assert_eq!(v["source"], "claude-watch");
         assert_eq!(v["source_name"], "claude-watch");
         assert_eq!(v["priority"], "low");
-        assert_eq!(v["message"], "heartbeat tick");
+        assert_eq!(v["message"], "keepalive tick");
         assert_eq!(v["data"]["interval_secs"], 60);
         assert!(v["timestamp"].is_number());
         assert!(v["timestamp_iso"].is_string());
@@ -847,71 +1017,78 @@ mod tests {
         assert_eq!(parsed["data"]["interval_secs"], 900);
     }
 
-    /// Regression guard: heartbeat-tick must reach the event queue.
+    /// Regression guard: keepalive must reach the event queue.
     ///
-    /// An earlier change made the daemon's heartbeat-tick a no-op (logged
-    /// only, never delivered), so the main loop stopped getting its 5-min
-    /// reminder to touch the host heartbeat file → the heartbeat went stale
-    /// and the daemon fired spurious "heartbeat stale" alerts. This test
-    /// builds the heartbeat-tick cadence event exactly as `run_daemon` does
-    /// (using the `cadence` constants) and asserts an event file lands in the
-    /// queue with the right tag/source/priority.
+    /// An earlier change made the daemon's cadence tick a no-op (logged only,
+    /// never delivered), so the main loop stopped getting its quiet-period
+    /// poke → liveness went stale and the daemon fired spurious stale alerts.
+    /// This test builds the keepalive cadence event exactly as `run_daemon`
+    /// does (using the `cadence` constants) and asserts an event file lands in
+    /// the queue with the right tag/source/priority.
     #[test]
-    fn emit_cadence_heartbeat_tick_writes_event() {
+    fn emit_cadence_keepalive_writes_event() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _env = super::test_support::EventQueueGuard::set(tmp.path());
 
-        // Mirror the production call site in `main::run_daemon`, including a
-        // NON-default configured heartbeat path so we prove the configured
-        // value flows into the event body (not a hardcoded constant).
-        let configured_path = "/custom/run/claude/heartbeat";
+        // Mirror the production call site in `main::run_daemon`.
         let ev = CadenceEvent {
-            tag: crate::cadence::HEARTBEAT_TICK_TAG,
+            tag: crate::cadence::KEEPALIVE_TAG,
             source: crate::cadence::CADENCE_SOURCE,
-            message: "heartbeat tick",
+            message: "keepalive: no event acked recently",
             priority: "low",
-            data: heartbeat_tick_data(configured_path, 300),
+            data: keepalive_data(300, Some(612)),
         };
         emit_cadence(&ev);
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
             .filter_map(Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with("_heartbeat-tick.json")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with("_keepalive.json"))
             .collect();
         assert_eq!(
             entries.len(),
             1,
-            "heartbeat-tick must produce exactly one event-queue file"
+            "keepalive must produce exactly one event-queue file"
         );
 
         let content = std::fs::read_to_string(entries[0].path()).expect("read event");
         let parsed: serde_json::Value =
             serde_json::from_str(&content).expect("event is valid JSON");
-        assert_eq!(parsed["tag"], "heartbeat-tick");
+        assert_eq!(parsed["tag"], "keepalive");
         assert_eq!(parsed["source"], "claude-watch");
         assert_eq!(parsed["priority"], "low");
-        assert_eq!(parsed["data"]["interval_secs"], 300);
-        // The configured heartbeat-file path must be carried in the body and
-        // must reflect the configured (non-default) value.
-        assert_eq!(parsed["data"]["path"], configured_path);
+        assert_eq!(parsed["data"]["quiet_secs"], 300);
+        assert_eq!(parsed["data"]["last_ack_age_secs"], 612);
+        // The body must TELL the loop the ritual, not assume it remembers.
+        // claude-event-watch renders every scalar in `data` on the EVENT line,
+        // so this is what makes the instruction visible.
+        assert_eq!(parsed["data"]["ack_command"], "event-ack ack-batch --override-reason \"<why>\"");
     }
 
     #[test]
-    fn heartbeat_tick_data_carries_configured_path() {
-        // Default-shaped path.
-        let data = heartbeat_tick_data("/var/run/claude/heartbeat", 300);
-        assert_eq!(data["path"], "/var/run/claude/heartbeat");
-        assert_eq!(data["interval_secs"], 300);
+    fn keepalive_data_carries_the_ack_command_and_quiet_window() {
+        let data = keepalive_data(300, Some(900));
+        assert_eq!(data["ack_command"], ACK_BATCH_COMMAND);
+        assert_eq!(data["quiet_secs"], 300);
+        assert_eq!(data["last_ack_age_secs"], 900);
 
-        // A user-configured override must surface verbatim in the body — the
-        // path is NOT hardcoded.
-        let data = heartbeat_tick_data("/tmp/claude-heartbeat", 60);
-        assert_eq!(data["path"], "/tmp/claude-heartbeat");
-        assert_eq!(data["interval_secs"], 60);
+        // A configured override surfaces verbatim — the window is NOT
+        // hardcoded in the body.
+        let data = keepalive_data(60, Some(61));
+        assert_eq!(data["quiet_secs"], 60);
+    }
+
+    #[test]
+    fn keepalive_data_omits_age_when_no_ack_recorded() {
+        // No ack state at all (fresh boot / no event-must-act). Omitting the
+        // field is deliberate: a 0 would render on the EVENT line as
+        // `last_ack_age_secs=0`, i.e. "just acked" — the exact opposite of
+        // what triggered the emission.
+        let data = keepalive_data(300, None);
+        assert!(
+            data.get("last_ack_age_secs").is_none(),
+            "unknown ack age must be omitted, never faked as 0; got: {data}"
+        );
+        assert_eq!(data["ack_command"], ACK_BATCH_COMMAND);
     }
 }

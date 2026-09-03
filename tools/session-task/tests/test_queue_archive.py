@@ -151,8 +151,17 @@ def test_done_archives_transcript_and_stamps_path():
         assert archive.read_bytes() == src.read_bytes()
 
 
-def test_abandon_archives_transcript_when_agent_state_present():
-    """queue abandon also archives — covers the Stop-button code path."""
+def test_abandon_defers_archive_until_the_quarantine_is_released():
+    """queue abandon also archives — covers the Stop-button code path.
+
+    Abandoning a running item quarantines it rather than going terminal (the
+    caller is inferring that the agent died, and that inference has been
+    wrong). Archiving is a terminal act — a quarantined agent may still be
+    writing to its transcript — so it is deferred to the release, which is
+    where we actually know. `--force` is required here because the fixture's
+    active-agents state reports the agent as alive, and the release guard
+    correctly refuses to free a scope out from under a live agent.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
 
@@ -169,6 +178,40 @@ def test_abandon_archives_transcript_when_agent_state_present():
 
         _run(env, "queue", "register", qid)
         _run(env, "queue", "abandon", qid, "--reason", "test")
+
+        shown = _show(env, qid)
+        assert shown["status"] == "quarantined"
+        assert "log_archive_path" not in shown
+
+        _run(env, "queue", "release", qid, "--force", "--reason", "confirmed gone")
+
+        shown = _show(env, qid)
+        assert shown["status"] == "abandoned"
+        assert shown.get("log_archive_path") == f"{qid}.jsonl"
+        archive = Path(env["QUEUE_LOG_ARCHIVE_DIR"]) / shown["log_archive_path"]
+        assert archive.is_file()
+
+
+def test_confirmed_dead_abandon_archives_immediately():
+    """A caller with positive evidence of exit goes terminal, and archives."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        item = _add(env, "reaped mid-flight", ["repo:abandon-cd"],
+                    "--summary", "abdn-cd")
+        qid = item["id"]
+
+        agent_id = "abadidea0deadbeef"
+        _stamp_agent_state(env, qid, agent_id, alive=False)
+        _stamp_jsonl(
+            env,
+            agent_id,
+            [json.dumps({"type": "user", "message": {"role": "user", "content": "x"}})],
+        )
+
+        _run(env, "queue", "register", qid)
+        _run(env, "queue", "abandon", qid, "--confirmed-dead",
+             "--reason", "rc=7")
 
         shown = _show(env, qid)
         assert shown["status"] == "abandoned"

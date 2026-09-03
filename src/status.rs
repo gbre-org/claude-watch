@@ -12,6 +12,12 @@ pub struct ClaudeStatus {
     pub pane: String,
     pub tokens: u64,
     pub bashes: u64,
+    /// True when the pane showed active-work UI markers (thinking indicator,
+    /// agent-roster rows, or the Background-tasks overlay) at capture time.
+    /// Positive proof the session is alive even when the bare context total
+    /// could not be parsed (`tokens == 0` is then a parse MISS, not a fresh
+    /// session). See `pane_shows_active_ui`. (operator #5620)
+    pub active_ui: bool,
     pub compact_remaining: Option<u32>,
     pub version: Option<String>,
     pub latest: Option<String>,
@@ -32,8 +38,54 @@ pub struct VersionInfo {
     pub installed: Option<String>,
 }
 
-/// Watcher config entry parsed from watchers.conf.
-#[derive(Debug, Clone)]
+/// How a watcher is launched and how its output reaches the main loop.
+///
+/// * `Oneshot` (the default, the historical contract): `watcher-ctl run
+///   <name>` is spawned as a background Bash task; the watcher blocks, prints
+///   one batch, EXITS, and the task-completion notification delivers the
+///   captured stdout. Every batch costs a restart.
+/// * `Monitor`: the watcher is armed ONCE, from the main loop, through a
+///   line-streaming launcher (Claude Code's `Monitor` tool) and stays alive
+///   across batches; each stdout line is its own notification. `watcher-ctl
+///   run <name>` then does NOT exec the one-shot — it prints the exact command
+///   to arm and records the intent — while `status`/`list` keep treating a
+///   live pid as healthy via the same pidfile model as any other watcher.
+///
+/// Flipping between them is ONE config edit + re-arm; nothing is rebuilt or
+/// reverted and no session restart is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WatcherMode {
+    #[default]
+    Oneshot,
+    Monitor,
+}
+
+impl WatcherMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WatcherMode::Oneshot => "oneshot",
+            WatcherMode::Monitor => "monitor",
+        }
+    }
+
+    /// Parse a config value. Accepts the canonical `oneshot` / `monitor` plus
+    /// the spellings a human is likely to type (`one-shot`, `exit` — the
+    /// watcher script's own name for the block-print-exit shape). `None` for
+    /// anything else, which callers treat as "unset" (default Oneshot) so a
+    /// typo degrades to today's behaviour rather than to a blackholed watcher.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "oneshot" | "one-shot" | "exit" | "block-print-exit" => Some(WatcherMode::Oneshot),
+            "monitor" => Some(WatcherMode::Monitor),
+            _ => None,
+        }
+    }
+}
+
+/// Watcher config entry parsed from watchers.conf (base layer + optional
+/// override layer; see [`load_watchers_config`]).
+#[derive(Debug, Clone, Default)]
 pub struct WatcherEntry {
     pub name: String,
     pub pattern: String,
@@ -48,7 +100,46 @@ pub struct WatcherEntry {
     /// of message history) without baking integration names into the
     /// daemon.
     pub on_restart_cmd: Option<String>,
+    /// Delivery mode — see [`WatcherMode`]. Field 7 (`mode`) of a conf line.
+    pub mode: WatcherMode,
+    /// Command the main loop arms under the line-streaming launcher when
+    /// `mode=monitor`. Field 8 (`monitor_cmd`). When unset, the effective
+    /// command is `<start_cmd> --mode monitor` — the convention the reference
+    /// watcher (`claude-event-watch`) implements; a watcher with a different
+    /// monitor flag sets this explicitly.
+    pub monitor_cmd: Option<String>,
+    /// Which config layer INTRODUCED this entry: `"base"` or `"override"`.
+    /// Purely informational (shown by `watcher-ctl list`).
+    pub layer: String,
+    /// Field names the override layer CHANGED on a base entry (e.g.
+    /// `["mode", "enabled"]`). Empty when the entry is exactly what the base
+    /// file says. Shown by `watcher-ctl list` so "which layer won" is visible.
+    pub overridden: Vec<String>,
 }
+
+impl WatcherEntry {
+    /// The command to arm under a line-streaming launcher when this watcher
+    /// is in monitor mode: the explicit `monitor_cmd` if set, else
+    /// `<start_cmd> --mode monitor`. `None` when neither is derivable.
+    pub fn effective_monitor_cmd(&self) -> Option<String> {
+        if let Some(m) = self.monitor_cmd.as_deref() {
+            let m = m.trim();
+            if !m.is_empty() {
+                return Some(m.to_string());
+            }
+        }
+        self.start_cmd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("{} --mode monitor", s))
+    }
+}
+
+/// Layer label for entries that come from the primary watchers.conf.
+pub const WATCHER_LAYER_BASE: &str = "base";
+/// Layer label for entries introduced (not merely modified) by the override file.
+pub const WATCHER_LAYER_OVERRIDE: &str = "override";
 
 /// Pure function: parse status bar fields from pane capture text.
 ///
@@ -70,12 +161,100 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     parse_status_bar_with_diag(pane_text).0
 }
 
+/// Is this line one of the agent-roster rows Claude Code draws below the
+/// status bar, one per running subagent?
+///
+/// Shape (real capture, 2026-08-20):
+/// ```text
+///   ● main
+///   ◯ general-purpose    Scanning claude-w… 3m 14s · ↓ 102.8k tokens
+/// ```
+/// The trailing count belongs to THAT AGENT, not to the session, so the
+/// token parser must never mistake it for the session context size.
+///
+/// The thinking indicator uses the same bullet glyph in some Claude Code
+/// versions (`● Zigzagging… (37s · ↓ 1.3k tokens · thought for 13s)`) but
+/// always parenthesises its counters, while a roster row never does — so
+/// the `(` test separates them without depending on which glyph is in
+/// fashion.
+pub(crate) fn is_agent_roster_row(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let starts_with_bullet = trimmed.starts_with('\u{25ef}') // ◯ — idle/running agent
+        || trimmed.starts_with('\u{25cf}'); // ● — selected / main row
+    starts_with_bullet
+        && !trimmed.contains('(')
+        && (trimmed.contains('\u{2191}') || trimmed.contains('\u{2193}'))
+        && trimmed.contains("tok")
+}
+
+/// Pure predicate: does the pane show ACTIVE-WORK UI markers — a thinking
+/// indicator (`↑/↓ N tokens`), one or more agent-roster rows, or the
+/// "Background tasks" overlay?
+///
+/// These markers are drawn ONLY while the session is actively generating or
+/// has live subagents / background tasks; they NEVER appear on a genuinely
+/// fresh, idle session sitting at an empty `❯` prompt. So when the status
+/// parser cannot read the bare context total (it has scrolled out of the
+/// capture window behind these very markers) and returns `tokens == 0`, this
+/// predicate is the positive-liveness signal that separates a live session
+/// with an off-screen total (a parse MISS) from a genuinely fresh/empty one.
+/// The dead-process / fresh-external-session inject path consults it so a
+/// long, active session is never misread as fresh and spuriously handed the
+/// resume-checklist prompt (recurring false-positive, operator #5620).
+///
+/// Scans the WHOLE pane (markers can sit well above the bottom-10 window when
+/// an overlay panel pushes the tail up), mirroring the whole-pane marker scan
+/// in `parse_status_bar_with_diag`.
+///
+/// Also recognizes the completion-tail line Claude Code prints after a
+/// thinking burst ends while background work (shells, background tasks, or
+/// Monitor-tool watches) is still outstanding — e.g. `✻ Brewed for 47m 32s ·
+/// 2 monitors still running` — and the bare `· N monitors ·` status-bar
+/// counter. Both are positive proof of a live, non-fresh session even when
+/// the bare context total is off-screen (2026-08-27 regression: Andrew's
+/// screenshot showed the "fresh session" resume prompt fire mid-session on
+/// exactly this line, because neither the completion-tail phrasing nor the
+/// "monitors" counter word were recognized as active-work markers).
+pub(crate) fn pane_shows_active_ui(pane_text: &str) -> bool {
+    let thinking_re =
+        Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
+    // Bare status-bar concurrent-task counters that are NOT already covered
+    // by a more specific check below (`monitor(?:s)?` mirrors the
+    // `bash_re` alternation added to `parse_status_bar_with_diag`'s
+    // token/task parser for the same underlying regression).
+    let counter_re = Regex::new(r"\d+\s+(?:active\s+)?monitors?\b").unwrap();
+    pane_text.lines().any(|line| {
+        is_agent_roster_row(line)
+            || thinking_re.is_match(line)
+            || counter_re.is_match(line)
+            || line.contains("Background tasks")
+            || line.contains("active shells")
+            || line.contains("active shell")
+            || line.contains("active agents")
+            || line.contains("active agent")
+            || line.contains("Local agents")
+            || line.contains(" Shells (")
+            // Completion-tail "N <shells|background tasks|monitors> still
+            // running" (or the pane-width-truncated "still…" form) — printed
+            // whenever background work outlives the thinking burst that
+            // preceded it, regardless of which noun names the work.
+            || line.contains("still running")
+            || line.contains("still\u{2026}")
+    })
+}
+
 /// Like `parse_status_bar` but also returns whether a status-bar marker was
 /// detected in the tail. The marker flag lets `is_parse_miss` suppress
 /// warnings for legitimately-idle status bars (which carry neither tokens
 /// nor a shell count).
 pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, bool) {
     let mut result = ParsedStatusBar::default();
+    // Seen-but-not-trusted markers: a thinking-indicator or agent-roster
+    // line proves *some* Claude Code status UI was on screen (so
+    // `is_parse_miss` shouldn't complain), but per the fix below neither
+    // one's number is ever allowed into `result.tokens`.
+    let mut saw_thinking_indicator = false;
+    let mut saw_agent_roster = false;
 
     let lines: Vec<&str> = pane_text.lines().collect();
     let start = if lines.len() > 10 {
@@ -102,6 +281,36 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
     // has been clobbered by an overlay panel or extreme wrap.
     let token_thinking_re =
         Regex::new(r"[\u{2191}\u{2193}]\s*([\d]+(?:\.[\d]+)?)\s*([kKmM]?)\s*tok").unwrap();
+    // ARROW-PREFIXED counters are NOT the session context total.
+    //
+    // Two different UI elements render `<arrow> N tokens`:
+    //   * the thinking indicator — output tokens streamed in the CURRENT turn;
+    //   * the agent-roster rows Claude Code draws BELOW the status bar, one
+    //     per running subagent (`◯ general-purpose  Scanning… 3m 14s · ↓ 102.8k
+    //     tokens`) — that agent's own token count.
+    // Neither is the session's context size, which the status bar prints
+    // bare (`224598 tokens`) with no arrow.
+    //
+    // The generic `token_re` above has no arrow anchor, so it happily matches
+    // those counters too, and the per-line loop below keeps the LAST match in
+    // the bottom-10 window. Roster rows are drawn AFTER the status bar, so a
+    // roster row inside the window overwrites the real total with an agent's
+    // count. It only bites while an agent's count is under 1000: at 1000+ the
+    // roster prints `1.2k tokens`, which `token_re` cannot match (the `.`
+    // breaks `(\d[\d,]*)\s+tok`), so the total silently comes back.
+    //
+    // Observed 2026-08-20: three times in seven minutes the session total
+    // (169233, 178465, …) was replaced by a just-spawned agent's row
+    // (119, 21, 39, 74 tokens). Downstream that reads as "tokens collapsed
+    // from 169k to 119" — i.e. a context clear — and the daemon injected a
+    // post-clear resume prompt into a session that had never been cleared.
+    //
+    // Fix: blank out arrow-prefixed counter segments before running the
+    // generic status-bar match. The dedicated `token_thinking_re` pass below
+    // still recovers a thinking-indicator count when the status bar carries
+    // no total of its own, so no coverage is lost.
+    let arrow_counter_re =
+        Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
     // Claude Code has used multiple names for the concurrent-task counter:
     // `bashes` (old), `background tasks` (mid), and `shells` (2.1.94+). Match
     // all of them — including the singular forms (status bar shows
@@ -115,8 +324,17 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
     // / `(?:s)?` for it to behave correctly. Same trap applies to `tasks?`
     // and `shells?` — write them as `task(?:s)?` and `shell(?:s)?` to be
     // safe.
+    //
+    // `monitor(?:s)?` covers the Monitor-tool background-watch counter
+    // Claude Code's status bar renders as `· 2 monitors ·` (2026-08-27
+    // corruption-detector regression): it is a concurrent-task count exactly
+    // like bashes/background-tasks/shells, but was missing from this
+    // alternation, so a pane with live Monitor-tool watches and no other
+    // running shell/task parsed `bashes == 0` — the FIRST domino in the
+    // "tokens==0 && bashes==0 -> dead process" misfire (see
+    // `pane_shows_active_ui` below for the second line of defense).
     let bash_re = Regex::new(
-        r"(\d+)\s+(?:active\s+)?(?:bash(?:es)?|background\s+task(?:s)?|shell(?:s)?)\b",
+        r"(\d+)\s+(?:active\s+)?(?:bash(?:es)?|background\s+task(?:s)?|shell(?:s)?|monitor(?:s)?)\b",
     )
     .unwrap();
     let compact_re = Regex::new(r"Context left until auto-compact:\s*(\d+)%").unwrap();
@@ -157,7 +375,10 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
 
     for line in &lines[start..] {
         if has_status_bar {
-            if let Some(caps) = token_re.captures(line) {
+            // Strip arrow-prefixed counters (thinking indicator, agent-roster
+            // rows) so they cannot overwrite the status bar's bare total.
+            let bare = arrow_counter_re.replace_all(line, " ");
+            if let Some(caps) = token_re.captures(&bare) {
                 if let Some(m) = caps.get(1) {
                     let cleaned = m.as_str().replace(',', "");
                     if let Ok(v) = cleaned.parse::<u64>() {
@@ -166,22 +387,37 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
                 }
             }
         }
-        // Thinking-indicator tokens (with k/M suffix) — match regardless of
-        // status_bar flag. The arrow prefix is itself a strong anchor.
-        if result.tokens.is_none() {
-            if let Some(caps) = token_thinking_re.captures(line) {
-                if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
-                    if let Ok(base) = num.as_str().parse::<f64>() {
-                        let mult: f64 = match suffix.as_str() {
-                            "k" | "K" => 1_000.0,
-                            "m" | "M" => 1_000_000.0,
-                            _ => 1.0,
-                        };
-                        let v = (base * mult).round() as u64;
-                        result.tokens = Some(v);
-                    }
-                }
-            }
+        // Thinking-indicator lines (`↑/↓ N tokens`) and agent-roster rows
+        // both carry a "N tokens" number, but NEITHER is the session
+        // context total:
+        //   * the thinking indicator's number is the CURRENT TURN's own
+        //     streamed/output token count — it starts near zero and climbs
+        //     for as long as that turn is generating;
+        //   * a roster row's number belongs to ONE SUBAGENT.
+        //
+        // ROOT CAUSE (2026-08 recurring false "fresh session" fires): this
+        // function used to fall back to whichever of those two numbers it
+        // could find whenever the bare total wasn't on screen — reasoning
+        // that a wrong-but-plausible number was "better than nothing" for
+        // the rare case where an overlay panel had pushed the real total
+        // off screen (PR #646, 2026-04-27). But the bare total is ALSO
+        // absent every time the main loop is simply mid-turn — which is
+        // routine, not rare — so on every such poll the fallback handed a
+        // tiny, climbing "current turn" count to callers as if it were the
+        // session's context size. Downstream consumers that watch for a
+        // huge-to-tiny drop (context-clear / fresh-session detection) read
+        // that as the context collapsing and injected a bogus "fresh
+        // session, run the resume checklist" prompt every few minutes,
+        // even though the real context was untouched.
+        //
+        // Fix: never let either number populate `result.tokens`. Still
+        // record that we *saw* one, purely so `is_parse_miss` (below)
+        // continues to treat a thinking/roster-only pane as a recognized
+        // UI state rather than a suspicious miss.
+        if is_agent_roster_row(line) {
+            saw_agent_roster = true;
+        } else if token_thinking_re.is_match(line) {
+            saw_thinking_indicator = true;
         }
         if let Some(caps) = bash_re.captures(line) {
             if let Some(m) = caps.get(1) {
@@ -243,32 +479,26 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
         }
     }
 
-    // Whole-pane scan for thinking-indicator tokens (always safe because
-    // the ↑/↓ + tok anchor never appears in chat prose). Catches cases
-    // where a thinking line is more than 10 lines above the bottom.
-    if result.tokens.is_none() {
+    // Whole-pane scan: a thinking-indicator or roster line can sit more
+    // than 10 lines above the bottom (overlay panels push the tail up).
+    // Same rule as the bottom-10 pass above: this only ever updates the
+    // "did we see one" markers, never `result.tokens` — see the fix note
+    // on the bottom-10 pass for why.
+    if !saw_thinking_indicator || !saw_agent_roster {
         for line in &lines {
-            if let Some(caps) = token_thinking_re.captures(line) {
-                if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
-                    if let Ok(base) = num.as_str().parse::<f64>() {
-                        let mult: f64 = match suffix.as_str() {
-                            "k" | "K" => 1_000.0,
-                            "m" | "M" => 1_000_000.0,
-                            _ => 1.0,
-                        };
-                        let v = (base * mult).round() as u64;
-                        result.tokens = Some(v);
-                        break;
-                    }
-                }
+            if is_agent_roster_row(line) {
+                saw_agent_roster = true;
+            } else if token_thinking_re.is_match(line) {
+                saw_thinking_indicator = true;
             }
         }
     }
 
-    // Treat the overlay as a status-bar marker: even though it visually
-    // replaces the bar, it's a known UI state with a count present, and
-    // we don't want is_parse_miss to flag it.
-    let saw_status_bar = has_status_bar || overlay_visible;
+    // Treat the overlay, and a thinking-indicator/roster sighting, as a
+    // status-bar marker: even though none of them carries a trustworthy
+    // token total, they're all known UI states, and we don't want
+    // `is_parse_miss` to flag a pane that's simply mid-turn.
+    let saw_status_bar = has_status_bar || overlay_visible || saw_thinking_indicator || saw_agent_roster;
 
     (result, saw_status_bar)
 }
@@ -540,8 +770,22 @@ pub fn get_version_info() -> VersionInfo {
     }
 
     // Running version: iterate claude PIDs, take the first that resolves.
+    //
+    // Match on the FULL command line (`pgrep -af`), NOT the process name
+    // (`pgrep -a`, which matches `comm`). The claude-code NATIVE installer runs
+    // the inner claude as `~/.local/share/claude/versions/<X.Y.Z>`, so on those
+    // builds the process `comm` is the bare VERSION STRING (e.g. `2.1.235`), not
+    // `claude` — the documented native-installer gotcha that already broke pane
+    // detection (see `find_claude_pane` / `is_version_string_comm`). A
+    // comm-based `pgrep claude` MISSES that PID entirely (it matches only
+    // `claude-watch`, which never resolves to a running version), so `running`
+    // came back `None` and the version panel reported `current=unknown` while
+    // `latest`/`installed` (sourced from the versions-dir symlink) resolved
+    // fine. The binary PATH always contains `claude`
+    // (`.local/bin/claude` or `.local/share/claude/versions/...`), so a
+    // full-cmdline match finds the PID regardless of how it retitled its `comm`.
     if let Ok(output) = std::process::Command::new("pgrep")
-        .args(["-a", "claude"])
+        .args(["-af", "claude"])
         .output()
     {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -557,6 +801,164 @@ pub fn get_version_info() -> VersionInfo {
                 }
             }
         }
+    }
+
+    info
+}
+
+/// Resolve a tmux pane's foreground PID — the process tmux forked for the pane.
+/// In the main-loop pane that is the claude TUI itself (launched as
+/// `exec claude`), so its `/proc/<pid>/exe` points straight at the running
+/// versioned binary.
+async fn resolve_pane_pid(pane: &str) -> Option<String> {
+    let (out, ok) = run_cmd_any(
+        &["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+        5,
+    )
+    .await;
+    if !ok {
+        return None;
+    }
+    let pid = out.trim();
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(pid.to_string())
+}
+
+/// True iff an exe path looks like a REAL claude TUI binary — the native
+/// versioned layout (under a `/versions/` dir), the `~/.local/bin/claude`
+/// launcher, or an npm-global `@anthropic-ai/claude-code` binary — as opposed
+/// to tmux, `claude-watch`, or a bash watcher that merely matched
+/// `pgrep -af claude` on its command line. Used to filter the fallback
+/// candidate set so a non-claude PID can never contribute a bogus version.
+pub(crate) fn is_claude_tui_exe(exe_path: &str) -> bool {
+    exe_path.contains("/versions/")
+        || exe_path.ends_with("/.local/bin/claude")
+        || exe_path.contains("@anthropic-ai/claude-code")
+}
+
+/// Compare two dotted numeric version strings (`"2.1.245"` vs `"2.1.243"`).
+/// Components parse as integers (non-numeric / missing components sort as 0),
+/// so `2.1.245 > 2.1.99` (numeric, not lexical).
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(s: &str) -> Vec<u64> {
+        s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect()
+    }
+    parts(a).cmp(&parts(b))
+}
+
+/// A resolved running-claude candidate: a PID and the version it loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningCandidate {
+    pub pid: String,
+    pub version: String,
+}
+
+/// Pure selection core for pane-scoped running-version detection.
+///
+/// Given the resolved running-claude candidates and the main-loop pane's PID,
+/// pick the running version: PREFER the candidate whose PID is the pane PID
+/// (the live main-loop TUI); otherwise fall back to the HIGHEST version among
+/// candidates. The highest-wins fallback guarantees that a dying OLDER
+/// versioned process — a native/npm atomic-install overlap, or a
+/// SIGKILL-orphaned old build still executable on disk — can NEVER mask the
+/// live newer one, which is exactly the false `running < installed` mismatch
+/// that drove the self-sustaining auto-update relaunch loop.
+pub(crate) fn select_running_version(
+    candidates: &[RunningCandidate],
+    pane_pid: Option<&str>,
+) -> Option<String> {
+    if let Some(pp) = pane_pid {
+        if let Some(c) = candidates.iter().find(|c| c.pid == pp) {
+            return Some(c.version.clone());
+        }
+    }
+    candidates
+        .iter()
+        .max_by(|a, b| compare_versions(&a.version, &b.version))
+        .map(|c| c.version.clone())
+}
+
+/// Gather resolved running-claude candidates for the fallback path: every
+/// `pgrep -af claude` PID whose `/proc/<pid>/exe` is a real claude TUI binary
+/// (see [`is_claude_tui_exe`]) and that resolves to a version. Non-claude
+/// matches (tmux/`claude-watch`/bash watchers) are filtered out so they cannot
+/// contribute a bogus version.
+async fn scan_running_candidates() -> Vec<RunningCandidate> {
+    let (stdout, _) = run_cmd_any(&["pgrep", "-af", "claude"], 5).await;
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(pid) = line.split_whitespace().next() else {
+            continue;
+        };
+        // Filter to real claude TUI processes by their exe target.
+        let exe_ok = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|t| is_claude_tui_exe(&t.to_string_lossy()))
+            .unwrap_or(false);
+        if !exe_ok {
+            continue;
+        }
+        if let Some(version) = resolve_running_version(pid) {
+            out.push(RunningCandidate {
+                pid: pid.to_string(),
+                version,
+            });
+        }
+    }
+    out
+}
+
+/// Pane-scoped variant of [`get_version_info`]: resolve the RUNNING version
+/// from the main-loop pane's own PID rather than the global `pgrep -af claude`
+/// first-match.
+///
+/// ## Why (the auto-update version-detection loop)
+///
+/// [`get_version_info`] takes the FIRST `pgrep -af claude` match that resolves
+/// to a version. In a container that pattern matches ~10+ PIDs (the tmux
+/// launcher, `tmux attach`, `claude-watch`, bash watchers) and — critically —
+/// any SIGKILL-orphaned OLD versioned claude processes that briefly coexist
+/// with the live one during a respawn-pane `-k` overlap (the versions dir keeps
+/// several builds all executable). When an older PID sorts first, `running`
+/// comes back OLDER than `installed` (the symlink, always newest), so
+/// `check_auto_update` sees a false `running != installed`, fires
+/// `cwsr --no-upgrade` (which swaps nothing on disk), and re-fires next cycle —
+/// self-sustaining. Pane DETECTION already dodges this exact first-match hazard
+/// via [`find_claude_pane_with_config`]; version detection never did.
+///
+/// Resolution:
+///   1. Resolve the pane's `#{pane_pid}` (the live claude TUI) and read the
+///      running version from THAT PID only.
+///   2. If the pane PID can't be resolved or yields no version, fall back to a
+///      FILTERED scan (real claude TUI exes only) and pick the HIGHEST version
+///      (see [`select_running_version`]) so a dying old PID can't win.
+///
+/// `installed` is sourced identically to [`get_version_info`].
+pub async fn get_version_info_for_pane(pane: &str) -> VersionInfo {
+    let mut info = VersionInfo::default();
+
+    // Installed (on-disk) version — identical source to get_version_info.
+    if let Some(bin) = find_claude_launcher() {
+        info.installed = resolve_installed_version(&bin);
+    }
+
+    let pane_pid = resolve_pane_pid(pane).await;
+
+    // Primary: the version loaded by the pane's own PID.
+    if let Some(pid) = pane_pid.as_deref() {
+        info.running = resolve_running_version(pid);
+    }
+
+    // Fallback (pane PID unresolved, or it carried no version): filtered scan,
+    // preferring the pane PID, else the highest version among real claude TUIs.
+    if info.running.is_none() {
+        let candidates = scan_running_candidates().await;
+        info.running = select_running_version(&candidates, pane_pid.as_deref());
     }
 
     info
@@ -815,6 +1217,7 @@ async fn get_claude_status_inner(
                 pane,
                 tokens: parsed.tokens.unwrap_or(0),
                 bashes: parsed.bashes.unwrap_or(0),
+                active_ui: pane_shows_active_ui(&capture),
                 compact_remaining: parsed.compact_remaining,
                 version: version_info.running,
                 latest: version_info.installed,
@@ -850,6 +1253,7 @@ async fn get_claude_status_fallback() -> Option<ClaudeStatus> {
         pane: data["pane"].as_str().unwrap_or("").to_string(),
         tokens: data["tokens"].as_u64().unwrap_or(0),
         bashes: data["bashes"].as_u64().unwrap_or(0),
+        active_ui: data["active_ui"].as_bool().unwrap_or(false),
         compact_remaining: data["compact_remaining"].as_u64().map(|v| v as u32),
         version: data["version"].as_str().map(|s| s.to_string()),
         latest: data["latest"].as_str().map(|s| s.to_string()),
@@ -909,38 +1313,193 @@ pub fn parse_watchers_config(path: &str) -> Vec<WatcherEntry> {
     parse_watchers_config_str(&content)
 }
 
-/// Pure function: parse watchers config from a string.
-pub(crate) fn parse_watchers_config_str(content: &str) -> Vec<WatcherEntry> {
+/// The per-watcher fields a conf line may set, in POSITIONAL order (the
+/// pipe-separated slot after `name`) — and the key each accepts in the
+/// `key=value` form. Index = positional slot.
+pub const WATCHER_FIELD_KEYS: [&str; 7] = [
+    "pattern",
+    "min_count",
+    "enabled",
+    "start_cmd",
+    "on_restart_cmd",
+    "mode",
+    "monitor_cmd",
+];
+
+/// One conf line, parsed but not yet resolved: `fields[i]` is `Some(text)`
+/// when the line SET slot `i` (see [`WATCHER_FIELD_KEYS`]) and `None` when
+/// it left it blank / omitted it. Keeping "unset" distinct from "default" is
+/// what lets the same line grammar serve both layers: in the base file an
+/// unset field takes the documented default, in the override file it means
+/// "inherit from base".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawWatcherLine {
+    pub name: String,
+    pub fields: [Option<String>; 7],
+}
+
+/// Parse one non-comment conf line. Grammar (both forms may mix on a line):
+///
+/// ```text
+/// name|pattern|min_count|enabled|start_cmd|on_restart_cmd|mode|monitor_cmd   (positional)
+/// name|mode=monitor|enabled=false                                          (keyed)
+/// ```
+///
+/// A field whose text is `<known-key>=<value>` is KEYED and sets that key
+/// regardless of its position; any other field is positional by its slot.
+/// Blank positional fields are "unset". Lines with only a name (no `|`) are
+/// rejected, as before.
+pub(crate) fn parse_watcher_line(line: &str) -> Option<RawWatcherLine> {
+    let parts: Vec<&str> = line.split('|').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let name = parts[0].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut fields: [Option<String>; 7] = Default::default();
+    for (slot, part) in parts[1..].iter().enumerate() {
+        let text = part.trim();
+        if let Some((k, v)) = text.split_once('=') {
+            if let Some(idx) = WATCHER_FIELD_KEYS.iter().position(|key| *key == k.trim()) {
+                fields[idx] = Some(v.trim().to_string());
+                continue;
+            }
+        }
+        if slot < WATCHER_FIELD_KEYS.len() && !text.is_empty() {
+            fields[slot] = Some(text.to_string());
+        }
+    }
+    Some(RawWatcherLine { name, fields })
+}
+
+/// Parse every non-comment, non-blank line of a conf file into raw lines.
+pub(crate) fn parse_watcher_lines(content: &str) -> Vec<RawWatcherLine> {
     content
         .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('|').collect();
-            if parts.len() < 2 {
-                return None;
-            }
-            let name = parts[0].to_string();
-            let pattern = parts[1].to_string();
-            let min_count = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-            let enabled = parts.get(3).map(|s| *s == "true").unwrap_or(true);
-            let start_cmd = parts
-                .get(4)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let on_restart_cmd = parts
-                .get(5)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            Some(WatcherEntry {
-                name,
-                pattern,
-                min_count,
-                enabled,
-                start_cmd,
-                on_restart_cmd,
-            })
-        })
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .filter_map(parse_watcher_line)
         .collect()
+}
+
+/// Resolve a raw BASE-layer line into an entry, applying the documented
+/// defaults for every unset field (`min_count` 1, `enabled` true, `mode`
+/// oneshot, everything else empty).
+pub(crate) fn entry_from_raw(raw: &RawWatcherLine, layer: &str) -> WatcherEntry {
+    let f = &raw.fields;
+    let nonempty = |i: usize| {
+        f[i].as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    WatcherEntry {
+        name: raw.name.clone(),
+        pattern: f[0].clone().unwrap_or_default(),
+        min_count: f[1]
+            .as_deref()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(1),
+        enabled: f[2].as_deref().map(|s| s.trim() == "true").unwrap_or(true),
+        start_cmd: nonempty(3),
+        on_restart_cmd: nonempty(4),
+        mode: f[5]
+            .as_deref()
+            .and_then(WatcherMode::parse)
+            .unwrap_or_default(),
+        monitor_cmd: nonempty(6),
+        layer: layer.to_string(),
+        overridden: Vec::new(),
+    }
+}
+
+/// Apply one override line to an existing entry: only the fields the line
+/// SET are changed; each changed field's key is recorded in `overridden`.
+pub(crate) fn apply_override(entry: &mut WatcherEntry, raw: &RawWatcherLine) {
+    fn note(entry: &mut WatcherEntry, key: &str) {
+        if !entry.overridden.iter().any(|k| k == key) {
+            entry.overridden.push(key.to_string());
+        }
+    }
+    if let Some(v) = raw.fields[0].as_deref() {
+        entry.pattern = v.to_string();
+        note(entry, "pattern");
+    }
+    if let Some(v) = raw.fields[1].as_deref() {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            entry.min_count = n;
+            note(entry, "min_count");
+        }
+    }
+    if let Some(v) = raw.fields[2].as_deref() {
+        entry.enabled = v.trim() == "true";
+        note(entry, "enabled");
+    }
+    if let Some(v) = raw.fields[3].as_deref() {
+        entry.start_cmd = Some(v.to_string()).filter(|s| !s.is_empty());
+        note(entry, "start_cmd");
+    }
+    if let Some(v) = raw.fields[4].as_deref() {
+        entry.on_restart_cmd = Some(v.to_string()).filter(|s| !s.is_empty());
+        note(entry, "on_restart_cmd");
+    }
+    if let Some(v) = raw.fields[5].as_deref() {
+        if let Some(m) = WatcherMode::parse(v) {
+            entry.mode = m;
+            note(entry, "mode");
+        }
+    }
+    if let Some(v) = raw.fields[6].as_deref() {
+        entry.monitor_cmd = Some(v.to_string()).filter(|s| !s.is_empty());
+        note(entry, "monitor_cmd");
+    }
+}
+
+/// Pure function: parse a BASE-layer watchers config from a string.
+pub(crate) fn parse_watchers_config_str(content: &str) -> Vec<WatcherEntry> {
+    parse_watcher_lines(content)
+        .iter()
+        .map(|raw| entry_from_raw(raw, WATCHER_LAYER_BASE))
+        .collect()
+}
+
+/// Pure function: merge an OVERRIDE-layer config string onto already-parsed
+/// base entries. A line naming an existing watcher changes only the fields
+/// it sets (blank = inherit); a line naming an unknown watcher is appended
+/// as a new entry (layer `"override"`). Later lines win over earlier ones.
+pub(crate) fn merge_watchers_override_str(
+    mut base: Vec<WatcherEntry>,
+    override_content: &str,
+) -> Vec<WatcherEntry> {
+    for raw in parse_watcher_lines(override_content) {
+        if let Some(existing) = base.iter_mut().find(|e| e.name == raw.name) {
+            apply_override(existing, &raw);
+        } else {
+            base.push(entry_from_raw(&raw, WATCHER_LAYER_OVERRIDE));
+        }
+    }
+    base
+}
+
+/// Load the LAYERED watcher config: the base file plus an optional override
+/// file (a user-dir file, typically a symlink into a dotfiles/config repo).
+/// A missing base yields no entries (as before); a missing / unreadable
+/// override is silently a no-op, so the committed default always loads on
+/// its own. Symlinks are followed (`std::fs::read_to_string`), which is what
+/// lets the override file be a symlink into a repo — with the caveat that
+/// inside a container the symlink's TARGET must also be inside a mounted
+/// tree, or the link dangles and the override is treated as absent.
+///
+/// This is THE loader both the CLI (`watcher-ctl`) and the daemon's
+/// `watcher_monitor` use, so "what is enabled / which mode" can never
+/// disagree between the two.
+pub fn load_watchers_config(base_path: &str, override_path: Option<&str>) -> Vec<WatcherEntry> {
+    let base = parse_watchers_config(base_path);
+    match override_path.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(content) => merge_watchers_override_str(base, &content),
+        None => base,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,14 +1609,25 @@ pub(crate) fn watcher_pid_dir() -> String {
 }
 
 /// Pure candidate-directory resolver: given the (optional) values of
-/// `$CLAUDE_WATCH_PID_DIR` and `$XDG_RUNTIME_DIR`, return the ORDERED,
-/// de-duplicated list of directories that may hold a watcher's liveness files,
-/// always ending with the `/var/run/claude` fallback.
+/// `$CLAUDE_WATCH_PID_DIR` and `$XDG_RUNTIME_DIR` plus the uid-derived
+/// per-user runtime dir (`/run/user/<uid>`, see [`uid_runtime_dir`]), return
+/// the ORDERED, de-duplicated list of directories that may hold a watcher's
+/// liveness files, always ending with the `/var/run/claude` fallback.
+///
+/// The uid-derived dir is the ENV-INDEPENDENT spelling of the per-user
+/// runtime dir. It exists because the READER'S environment must not decide
+/// what it can see: `claude-watch metrics` runs from cron, which does not set
+/// `$XDG_RUNTIME_DIR`, while the monitor-mode watchers it is counting write
+/// their `<name>.lock` to `/run/user/<uid>` (THEIR `$XDG_RUNTIME_DIR`). With
+/// only the env value, the cron reader scanned `/var/run/claude` alone and
+/// reported 1 live watcher of 4 while `claude-watch status` (interactive,
+/// env set) and the daemon (unit sets the var) both said 4/4.
 ///
 /// Kept pure (params, not `std::env`) so it is hermetically testable.
 pub(crate) fn pid_dir_candidates(
     claude_watch_pid_dir: Option<&str>,
     xdg_runtime_dir: Option<&str>,
+    uid_runtime_dir: Option<&str>,
 ) -> Vec<String> {
     let mut dirs: Vec<String> = Vec::new();
     let mut push = |d: &str| {
@@ -1072,8 +1642,21 @@ pub(crate) fn pid_dir_candidates(
     if let Some(p) = xdg_runtime_dir {
         push(p);
     }
+    if let Some(p) = uid_runtime_dir {
+        push(p);
+    }
     push("/var/run/claude");
     dirs
+}
+
+/// The per-user runtime directory derived from the REAL uid
+/// (`/run/user/<uid>`), independent of whether the caller's environment
+/// carries `$XDG_RUNTIME_DIR`. Linux-only convention (systemd-logind); on
+/// other platforms the dir simply does not exist and scanning it is a no-op.
+pub(crate) fn uid_runtime_dir() -> String {
+    // SAFETY: getuid(2) has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    format!("/run/user/{}", uid)
 }
 
 /// Every candidate directory that may hold a watcher's liveness files.
@@ -1094,11 +1677,17 @@ pub(crate) fn pid_dir_candidates(
 /// misses the `botchat-wait`/`claude-event-watch` `.lock` in
 /// `/run/user/<uid>`). Scanning ALL candidates makes liveness detection
 /// independent of which dir a given watcher wrote to and of the reader's own
-/// environment.
+/// environment. The per-user runtime dir is therefore ALSO derived from the
+/// uid (`/run/user/<uid>`, [`uid_runtime_dir`]) rather than trusted to
+/// `$XDG_RUNTIME_DIR` alone: the cron-run `claude-watch metrics` has no such
+/// var and previously saw only `/var/run/claude`, under-counting
+/// `claude_code_live_watchers` (1 of 4 live) while every env-carrying reader
+/// agreed on 4/4.
 pub(crate) fn watcher_pid_dirs() -> Vec<String> {
     pid_dir_candidates(
         std::env::var("CLAUDE_WATCH_PID_DIR").ok().as_deref(),
         std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        Some(&uid_runtime_dir()),
     )
 }
 
@@ -1480,6 +2069,91 @@ pub(crate) fn watcher_cleanly_exited_recently(
     }
 }
 
+/// Age (seconds) of the freshest `<name>.monitor-intent` for `name` across
+/// ALL candidate dirs, or `None` if no intent file exists.
+///
+/// `watcher-ctl run <name>` writes this file for a `mode=monitor` watcher
+/// instead of exec'ing it (`epoch=<secs>\ncommand=<monitor_cmd>\n`) and
+/// prints the Monitor-tool command for the main loop to arm. The `epoch=`
+/// line is the authoritative timestamp (it is what the writer meant); the
+/// file mtime is the fallback for a hand-written or truncated file. A
+/// future-dated value (clock skew) clamps to 0 so skew can never
+/// manufacture a stale reading (mirrors `watcher_runtime_file_age_secs`).
+///
+/// Pure-ish: filesystem reads only, no `pgrep` / `/proc`.
+pub(crate) fn watcher_monitor_intent_age_secs_multi(dirs: &[String], name: &str) -> Option<f64> {
+    let now = SystemTime::now();
+    let now_epoch = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    dirs.iter()
+        .filter_map(|d| {
+            let path = format!("{}/{}.monitor-intent", d, name);
+            let meta = std::fs::metadata(&path).ok()?;
+            let from_epoch = std::fs::read_to_string(&path).ok().and_then(|body| {
+                body.lines()
+                    .find_map(|l| l.strip_prefix("epoch="))
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .map(|e| (now_epoch - e).max(0.0))
+            });
+            from_epoch.or_else(|| {
+                meta.modified().ok().map(|mtime| {
+                    now.duration_since(mtime)
+                        .map(|x| x.as_secs_f64())
+                        .unwrap_or(0.0)
+                })
+            })
+        })
+        .fold(None, |acc, age| Some(acc.map_or(age, |cur: f64| cur.min(age))))
+}
+
+/// Pure decision: is a `mode=monitor` watcher that currently has NO live pid
+/// in its ARMING window (healthy-pending, not DOWN)?
+///
+/// ARMING iff an arm intent exists (`intent_age`), it is younger than
+/// `arming_grace_secs`, AND no runtime file (`.lock`/`.pid`/`.runlock`,
+/// `pidfile_age`) has been written SINCE the intent. The last clause is what
+/// keeps a real outage visible: the monitor's flock guard rewrites
+/// `<name>.lock` when it goes live, so a runtime file YOUNGER than the intent
+/// proves the arm was consumed — if the watcher is down after that, it DIED
+/// and must read DOWN at once, not ride out the rest of the window. A runtime
+/// file OLDER than the intent (left over from the one-shot era, or a stale
+/// lock `watcher-restart` did not clean) does not consume it.
+///
+/// `arming_grace_secs <= 0` disables the state entirely (an un-armed monitor
+/// reads DOWN immediately, the pre-ARMING behaviour).
+pub(crate) fn watcher_is_arming(
+    intent_age: Option<f64>,
+    pidfile_age: Option<f64>,
+    arming_grace_secs: f64,
+) -> bool {
+    if arming_grace_secs <= 0.0 {
+        return false;
+    }
+    match intent_age {
+        Some(ia) if ia < arming_grace_secs => pidfile_age.is_none_or(|pf| pf > ia),
+        _ => false,
+    }
+}
+
+/// Resolve the monitor-mode ARMING grace for a ONE-SHOT CLI call
+/// (`watcher-ctl status` / `watcher-status --unhealthy-only`, which do not
+/// carry the daemon's `Config`). Order: `$CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS`
+/// (non-empty, parseable) → `[watcher_monitor].monitor_arming_grace_secs`
+/// from the layered config if one loads → the code default. The daemon
+/// passes its own config value directly and never calls this.
+pub(crate) fn resolve_monitor_arming_grace_secs() -> f64 {
+    if let Ok(v) = std::env::var("CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            return n as f64;
+        }
+    }
+    crate::config::try_load_config()
+        .map(|c| c.watcher_monitor.monitor_arming_grace_secs)
+        .unwrap_or(crate::config::DEFAULT_MONITOR_ARMING_GRACE_SECS) as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1549,6 +2223,68 @@ mod tests {
             ..Default::default()
         };
         assert!(!prefer_configured_pane(&cfg));
+    }
+
+    #[test]
+    fn active_ui_true_for_agent_roster_row() {
+        let pane = "\u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{b7} \u{2193} 102.8k tokens\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_thinking_indicator() {
+        let pane = "\u{25cf} Zigzagging\u{2026} (37s \u{b7} \u{2193} 1.3k tokens \u{b7} thought for 13s)\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_background_tasks_overlay() {
+        let pane = "Background tasks\n  Shells (2)\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_false_for_fresh_idle_pane() {
+        // A genuinely fresh/idle session: permission-mode status bar + empty
+        // prompt, no thinking indicator, no roster, no overlay.
+        let pane = "\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt\n\u{276f} ";
+        assert!(!pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_false_for_bare_status_bar_total() {
+        // Status bar showing the bare context total but no active-work markers.
+        let pane = "224598 tokens\n\u{23f5}\u{23f5} bypass permissions on\n\u{276f} ";
+        assert!(!pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_monitors_still_running_completion_tail() {
+        // 2026-08-27 regression, confirmed from Andrew's screenshot: the
+        // "fresh session" resume prompt fired while the pane showed exactly
+        // this completion-tail line -- 47 minutes into an active session with
+        // two live Monitor-tool watches, not a fresh/idle pane.
+        let pane = "\u{273b} Brewed for 47m 32s \u{00b7} 2 monitors still running\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_background_tasks_still_running_completion_tail() {
+        let pane = "\u{273b} Cogitated for 2m 11s \u{00b7} 6 background tasks still running\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_truncated_still_running_completion_tail() {
+        // Narrow-pane truncation renders "still…" instead of "still running".
+        let pane = "\u{273b} Cogitated for 2m 11s \u{00b7} 6 tasks still\u{2026}\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_bare_monitors_status_bar_counter() {
+        let pane = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 2 monitors \u{00b7} \u{2190} for agents \u{00b7} \u{2193} to manage\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
     }
 
     #[test]
@@ -1623,6 +2359,95 @@ mod tests {
         assert!(watcher_in_grace(Some(10.0), None, grace));
         // Fresh pidfile alone keeps it in grace (the new anchor).
         assert!(watcher_in_grace(None, Some(10.0), grace));
+    }
+
+    // --- monitor-mode ARMING grace tests ---
+
+    #[test]
+    fn arming_true_for_fresh_unconsumed_intent() {
+        // Intent written 5s ago, no runtime file at all: the main loop just
+        // ran `watcher-ctl run` and has not armed the Monitor yet.
+        assert!(watcher_is_arming(Some(5.0), None, 120.0));
+        // A runtime file OLDER than the intent (stale one-shot lock) does not
+        // consume the intent.
+        assert!(watcher_is_arming(Some(5.0), Some(3600.0), 120.0));
+    }
+
+    #[test]
+    fn arming_false_when_intent_stale_or_missing() {
+        // Past the grace window with nothing live -> DOWN again.
+        assert!(!watcher_is_arming(Some(121.0), None, 120.0));
+        assert!(!watcher_is_arming(Some(120.0), None, 120.0));
+        // No intent was ever recorded -> plain DOWN.
+        assert!(!watcher_is_arming(None, None, 120.0));
+        assert!(!watcher_is_arming(None, Some(1.0), 120.0));
+    }
+
+    #[test]
+    fn arming_false_when_runtime_file_is_younger_than_intent() {
+        // The monitor went live AFTER the intent (its flock guard rewrote
+        // <name>.lock) and is now dead: that is a real outage, not an arm in
+        // progress — must NOT ride out the rest of the window as ARMING.
+        assert!(!watcher_is_arming(Some(60.0), Some(10.0), 120.0));
+        // Equal ages are treated as consumed too (not strictly older).
+        assert!(!watcher_is_arming(Some(10.0), Some(10.0), 120.0));
+    }
+
+    #[test]
+    fn arming_disabled_when_grace_is_zero() {
+        assert!(!watcher_is_arming(Some(1.0), None, 0.0));
+        assert!(!watcher_is_arming(Some(0.0), None, 0.0));
+    }
+
+    #[test]
+    fn monitor_intent_age_prefers_epoch_line_and_takes_freshest_across_dirs() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Dir 1: intent stamped 500s ago (epoch line wins over the fresh mtime).
+        std::fs::write(
+            d1.path().join("evw.monitor-intent"),
+            format!("epoch={}\ncommand=evw --mode monitor\n", now - 500),
+        )
+        .unwrap();
+        // Dir 2: intent stamped 30s ago.
+        std::fs::write(
+            d2.path().join("evw.monitor-intent"),
+            format!("epoch={}\ncommand=evw --mode monitor\n", now - 30),
+        )
+        .unwrap();
+        let dirs = vec![
+            d1.path().to_str().unwrap().to_string(),
+            d2.path().to_str().unwrap().to_string(),
+        ];
+        let age = watcher_monitor_intent_age_secs_multi(&dirs, "evw").expect("intent present");
+        assert!((29.0..35.0).contains(&age), "freshest intent wins: {}", age);
+        // Single stale dir alone reads ~500.
+        let age1 = watcher_monitor_intent_age_secs_multi(&dirs[..1], "evw").unwrap();
+        assert!((499.0..505.0).contains(&age1), "{}", age1);
+        // Unknown watcher / no file -> None.
+        assert!(watcher_monitor_intent_age_secs_multi(&dirs, "nope").is_none());
+    }
+
+    #[test]
+    fn monitor_intent_age_falls_back_to_mtime_without_epoch_line() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("evw.monitor-intent"), "command=evw --mode monitor\n")
+            .unwrap();
+        let dirs = vec![d.path().to_str().unwrap().to_string()];
+        let age = watcher_monitor_intent_age_secs_multi(&dirs, "evw").expect("intent present");
+        assert!(age < 5.0, "just-written file reads fresh via mtime: {}", age);
+        // A future-dated epoch clamps to 0, never negative.
+        let far = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 10_000;
+        std::fs::write(d.path().join("evw.monitor-intent"), format!("epoch={}\n", far)).unwrap();
+        assert_eq!(watcher_monitor_intent_age_secs_multi(&dirs, "evw"), Some(0.0));
     }
 
     // --- clean-exit grace (block-print-exit flap fix) tests ---
@@ -1712,6 +2537,135 @@ mod tests {
         assert_eq!(parsed.tokens, Some(5000));
     }
 
+    /// Real pane capture, 2026-08-20 — the agent-roster rows Claude Code
+    /// draws BELOW the status bar carry each subagent's own token count.
+    /// A just-spawned agent's count is a plain sub-1000 integer, which the
+    /// generic `N tok` match happily consumed; being the LAST match in the
+    /// bottom-10 window it overwrote the session total.
+    ///
+    /// Downstream that reads as the token count collapsing from 169233 to
+    /// 119 — indistinguishable from a context clear — and the daemon
+    /// injected a post-clear resume prompt into a session that had never
+    /// been cleared. Three fires in seven minutes.
+    #[test]
+    fn test_agent_roster_row_does_not_clobber_session_total_2026_08_20() {
+        let input = "\
+\u{25cf} Read agent output bbow3km6m\n\
+  \u{239d}  Read 7 lines\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} esc to interrupt\n\
+                                                     169233 tokens\n\
+\n\
+  \u{25cf} main\n\
+  \u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens\n\
+  \u{25ef} grafana-dashboard  Listing panels in\u{2026} 1m 28s \u{00b7} \u{2193} 90.6k tokens\n\
+  \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(
+            parsed.tokens,
+            Some(169233),
+            "the status bar's bare total must win over a freshly-spawned \
+             agent's roster row (↓ 119 tokens) — reading 119 as the session \
+             context size is what manufactured a phantom context clear"
+        );
+        assert_eq!(parsed.bashes, Some(5));
+    }
+
+    /// The same shape, but with EVERY roster count already past 1000 so it
+    /// renders with a `k` suffix. This case never broke (the `.` in `1.2k`
+    /// defeats the generic match), and must keep working.
+    #[test]
+    fn test_agent_roster_rows_with_k_suffix_still_yield_session_total() {
+        let input = "\
+  \u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} esc to interrupt\n\
+                                                     224598 tokens\n\
+\n\
+  \u{25cf} main\n\
+  \u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(224598));
+    }
+
+    /// With no bare context total on the status bar, NEITHER a thinking
+    /// indicator (`↓ 26000 tokens`, current-turn output) NOR a subagent's
+    /// roster row (`↓ 119 tokens`) is trusted as the session total: both are
+    /// refused and `tokens` stays None (2026-08 hardening). The pane is still a
+    /// recognized UI state, so it is not a parse miss.
+    #[test]
+    fn test_thinking_indicator_and_roster_both_refused_in_fallback() {
+        let input = "\
+\u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt\n\
+  \u{25cf} main\n\
+  \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(
+            parsed.tokens, None,
+            "neither a thinking indicator nor a roster row may stand in for the \
+             session context total — reading either manufactured phantom \
+             context clears"
+        );
+        assert!(saw_bar);
+    }
+
+    /// A roster row alone yields NO session total. Its `↓ 119 tokens` is one
+    /// subagent's count; adopting it as the session context size is exactly the
+    /// misparse that manufactured phantom context clears (it collapses a
+    /// six-figure context to 119). `tokens` must be None -- the downstream
+    /// carry-forward guard (`policy::carry_forward_token_misparse`) holds the
+    /// prior real value rather than trusting this 0, so "no better than 0" no
+    /// longer applies.
+    #[test]
+    fn test_agent_roster_row_alone_yields_no_session_total() {
+        let input = "\
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt\n\
+  \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
+    }
+
+    #[test]
+    fn test_is_agent_roster_row_discriminates_from_thinking_indicator() {
+        assert!(is_agent_roster_row(
+            "  \u{25ef} general-purpose    Scanning\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens"
+        ));
+        // Thinking indicator: same bullet in some versions, but it always
+        // parenthesises its counters.
+        assert!(!is_agent_roster_row(
+            "\u{25cf} Zigzagging\u{2026} (37s \u{00b7} \u{2193} 1.3k tokens \u{00b7} thought for 13s)"
+        ));
+        // A roster row with no token count yet is not a token source.
+        assert!(!is_agent_roster_row("  \u{25cf} main"));
+        // Ordinary tool-call output lines share the bullet.
+        assert!(!is_agent_roster_row(
+            "\u{25cf} Read agent output bbow3km6m"
+        ));
+    }
+
+    /// The PRIMARY per-line (bottom-10) pass must refuse both kinds of
+    /// arrow-token line just as the whole-pane fallback does: neither a roster
+    /// row (`↓ 102.8k tokens`) nor a real thinking indicator (`↓ 26000
+    /// tokens`) is the session total, so `tokens` stays None even though both
+    /// match `token_thinking_re`.
+    #[test]
+    fn test_thinking_indicator_and_roster_both_refused_in_primary_pass() {
+        let input = "\
+  \u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens\n\
+\u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(
+            parsed.tokens, None,
+            "no arrow-prefixed token count in the bottom-10 window may become \
+             the session total"
+        );
+        assert!(saw_bar);
+    }
+
     #[test]
     fn test_parse_status_bar_large_tokens() {
         let input = "bypass permissions on · 1,234,567 tokens";
@@ -1739,6 +2693,26 @@ mod tests {
         let input = "7 shells";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.bashes, Some(7));
+    }
+
+    #[test]
+    fn test_parse_status_bar_monitors() {
+        // 2026-08-27 regression: Claude Code's status bar renders live
+        // Monitor-tool background watches as `· N monitors ·`, exactly like
+        // shells/background-tasks/bashes. Before this fix `monitor(s)?` was
+        // missing from the alternation, so a pane with 0 bashes but 2 live
+        // monitors parsed `bashes == 0` -- the first domino in the
+        // "tokens==0 && bashes==0 -> dead process" misfire.
+        let input = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 2 monitors \u{00b7} \u{2190} for agents \u{00b7} \u{2193} to manage";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(2));
+    }
+
+    #[test]
+    fn test_parse_status_bar_singular_monitor() {
+        let input = "1 monitor";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(1));
     }
 
     #[test]
@@ -1959,10 +2933,13 @@ mod tests {
                          watcher-ctl run memory-remind (running)\n\
                        \u{276f} watcher-ctl run events-watcher (running)\n\
                        \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
-        let parsed = parse_status_bar(input);
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
         assert_eq!(parsed.bashes, Some(4));
-        // Thinking-indicator token recovery: "↑ 286 tokens".
-        assert_eq!(parsed.tokens, Some(286));
+        // 2026-08 hardening: the "↑ 286 tokens" thinking count is NOT the
+        // session total, so `tokens` stays None; the overlay + thinking
+        // indicator still register as a status bar (no parse miss).
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
@@ -2039,15 +3016,17 @@ mod tests {
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
         let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // 2026-08 hardening: the whole-pane fallback still RECOGNIZES a
+        // thinking indicator above the 10-line window (so it is not a parse
+        // miss), but no longer TRUSTS its count as the session total.
         assert_eq!(
-            parsed.tokens,
-            Some(1300),
-            "thinking-indicator above the 10-line window must be recovered \
-             by the whole-pane fallback scan"
+            parsed.tokens, None,
+            "a thinking indicator above the window is a recognized UI state, \
+             but its count is the current turn's, not the session total"
         );
         assert!(
             saw_bar,
-            "⏵⏵ icon at bottom must register as status bar"
+            "thinking indicator / ⏵⏵ icon must register as status bar"
         );
     }
 
@@ -2107,32 +3086,71 @@ mod tests {
         // status bar is partly obscured but a thinking line is visible, we
         // can still extract a token count from "↑ 2.3k tokens".
         let input = "\u{25cf} Honking\u{2026} (1m 9s \u{00b7} \u{2191} 2.3k tokens)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(2300));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // 2026-08 hardening: a thinking indicator's token count is the CURRENT
+        // TURN's own output, never the session context total, so it must NOT
+        // populate `tokens` (a `2.3k` reading here is exactly the tiny misparse
+        // that manufactured phantom context clears). It IS a recognized UI
+        // state, so it still suppresses `is_parse_miss`.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_down_arrow() {
         // Some thinking lines use ↓ instead of ↑.
         let input = "\u{25cf} Zigzagging\u{2026} (37s \u{00b7} \u{2193} 1.3k tokens \u{00b7} thought for 13s)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(1300));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // Down-arrow thinking indicator: still the current turn's count, not
+        // the session total -- refused (see k-suffix test).
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_no_suffix() {
         // ↑ N tokens (no suffix) — N is a literal integer.
         let input = "\u{25cf} Newspapering\u{2026} (21s \u{00b7} \u{2191} 286 tokens \u{00b7} thought for 1s)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(286));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // A bare-integer (`286`) thinking count is the classic sub-1000 tiny
+        // misparse; it must not become the session total.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_m_suffix() {
         // Defensive: M-suffix support for huge contexts (1.4M tokens).
         let input = "\u{25cf} Cooking\u{2026} (5m \u{00b7} \u{2191} 1.4M tokens)";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // Even a huge M-suffixed thinking count is the current turn's, not the
+        // session context total -- refused all the same.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
+    }
+
+    /// A genuine low-token fresh session (a real BARE context total, no arrow
+    /// prefix) MUST still be detected -- the hardening only refuses
+    /// thinking-indicator / roster numbers, never a real bare total, so
+    /// fresh-/clear detection in the low-token window is preserved.
+    #[test]
+    fn test_genuine_low_token_fresh_session_still_detected() {
+        let input = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 0 shells \u{00b7} 1,200 tokens";
         let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(1_400_000));
+        assert_eq!(parsed.tokens, Some(1200));
+    }
+
+    /// Companion to the "both refused" tests: when a real bare context total
+    /// AND a thinking indicator are both on screen, the bare total wins and the
+    /// thinking count is ignored.
+    #[test]
+    fn test_bare_total_wins_over_thinking_indicator() {
+        let input = "\
+\u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)\n\
+\u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} 224598 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(224598));
+        assert_eq!(parsed.bashes, Some(5));
     }
 
     #[test]
@@ -2408,6 +3426,95 @@ mod tests {
         )));
     }
 
+    // --- pane-scoped running-version selection tests ---
+
+    #[test]
+    fn test_compare_versions_numeric_not_lexical() {
+        use std::cmp::Ordering;
+        // Lexical compare would call "2.1.99" > "2.1.245"; numeric must not.
+        assert_eq!(compare_versions("2.1.245", "2.1.99"), Ordering::Greater);
+        assert_eq!(compare_versions("2.1.243", "2.1.245"), Ordering::Less);
+        assert_eq!(compare_versions("2.1.245", "2.1.245"), Ordering::Equal);
+        assert_eq!(compare_versions("2.2.0", "2.1.999"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_is_claude_tui_exe() {
+        // Native versioned layout, launcher symlink, npm-global binary.
+        assert!(is_claude_tui_exe(
+            "/home/u/.local/share/claude/versions/2.1.245/node_modules/.bin/claude"
+        ));
+        assert!(is_claude_tui_exe("/home/u/.local/bin/claude"));
+        assert!(is_claude_tui_exe(
+            "/home/u/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+        ));
+        // A deleted-inode exe target keeps the /versions/ segment.
+        assert!(is_claude_tui_exe(
+            "/home/u/.local/share/claude/versions/2.1.245/cli.js (deleted)"
+        ));
+        // NOT claude TUIs — these merely match `pgrep -af claude`.
+        assert!(!is_claude_tui_exe("/usr/local/bin/claude-watch"));
+        assert!(!is_claude_tui_exe("/usr/bin/tmux"));
+        assert!(!is_claude_tui_exe("/usr/bin/bash"));
+    }
+
+    #[test]
+    fn test_select_running_version_prefers_pane_pid() {
+        // The live main-loop TUI is pid 143 on 2.1.245; an orphaned OLD build
+        // (pid 99 on 2.1.241) is still executable and also resolved. The pane
+        // PID must win regardless of scan order.
+        let candidates = vec![
+            RunningCandidate { pid: "99".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "143".into(), version: "2.1.245".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, Some("143")),
+            Some("2.1.245".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_pane_pid_even_if_lower() {
+        // Truthfulness: if the pane's OWN pid loaded an older build (genuinely
+        // running behind installed), report THAT — a real mismatch the updater
+        // should act on — not some other process's newer version.
+        let candidates = vec![
+            RunningCandidate { pid: "143".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "200".into(), version: "2.1.245".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, Some("143")),
+            Some("2.1.241".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_fallback_highest_when_pane_pid_absent() {
+        // Pane PID unresolved / not among candidates: a dying OLD process
+        // (2.1.241) must NOT mask the live NEW one (2.1.245). Highest wins —
+        // the exact orphan-masks-live failure mode of the global first-match.
+        let candidates = vec![
+            RunningCandidate { pid: "99".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "143".into(), version: "2.1.245".into() },
+            RunningCandidate { pid: "150".into(), version: "2.1.243".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, None),
+            Some("2.1.245".to_string())
+        );
+        // Pane PID given but not in the candidate set -> same highest-wins path.
+        assert_eq!(
+            select_running_version(&candidates, Some("777")),
+            Some("2.1.245".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_empty_is_none() {
+        assert_eq!(select_running_version(&[], Some("143")), None);
+        assert_eq!(select_running_version(&[], None), None);
+    }
+
     // --- resolve_installed_version tests ---
 
     #[test]
@@ -2586,6 +3693,146 @@ mod tests {
         assert_eq!(entries.len(), 0);
     }
 
+    // --- mode field + layered override ------------------------------------
+
+    #[test]
+    fn test_parse_watchers_mode_defaults_to_oneshot() {
+        let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw --quiet 10");
+        assert_eq!(entries[0].mode, WatcherMode::Oneshot);
+        assert_eq!(entries[0].layer, WATCHER_LAYER_BASE);
+        assert!(entries[0].overridden.is_empty());
+        assert_eq!(
+            entries[0].effective_monitor_cmd().as_deref(),
+            Some("evw --quiet 10 --mode monitor")
+        );
+    }
+
+    #[test]
+    fn test_parse_watchers_mode_positional_seventh_field() {
+        let entries =
+            parse_watchers_config_str("evw|bin/evw|1|true|evw --quiet 10|hist|monitor|evw --stream");
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert_eq!(entries[0].on_restart_cmd.as_deref(), Some("hist"));
+        assert_eq!(entries[0].monitor_cmd.as_deref(), Some("evw --stream"));
+        assert_eq!(entries[0].effective_monitor_cmd().as_deref(), Some("evw --stream"));
+        // Blank on_restart_cmd slot still lets mode land in slot 7.
+        let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw||monitor");
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert!(entries[0].on_restart_cmd.is_none());
+    }
+
+    #[test]
+    fn test_parse_watchers_mode_keyed_form() {
+        let entries = parse_watchers_config_str("evw|bin/evw|mode=monitor|enabled=false");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pattern, "bin/evw");
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert!(!entries[0].enabled);
+        // Keyed fields do not consume positional slots: min_count stays default.
+        assert_eq!(entries[0].min_count, 1);
+        // A start_cmd that happens to contain `=` is NOT mistaken for a key.
+        let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw --debounce=60");
+        assert_eq!(entries[0].start_cmd.as_deref(), Some("evw --debounce=60"));
+    }
+
+    #[test]
+    fn test_parse_watchers_mode_unknown_value_falls_back_to_oneshot() {
+        let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw||streamy");
+        assert_eq!(entries[0].mode, WatcherMode::Oneshot);
+        assert_eq!(WatcherMode::parse("exit"), Some(WatcherMode::Oneshot));
+        assert_eq!(WatcherMode::parse("one-shot"), Some(WatcherMode::Oneshot));
+        assert_eq!(WatcherMode::parse(" Monitor "), Some(WatcherMode::Monitor));
+        assert_eq!(WatcherMode::parse("bogus"), None);
+    }
+
+    #[test]
+    fn test_merge_override_changes_only_set_fields() {
+        let base = parse_watchers_config_str(
+            "evw|bin/evw|1|true|evw --quiet 10\nsig|--tag dm|1|true|signal-wait --dm\n",
+        );
+        let merged = merge_watchers_override_str(base, "# flip evw to monitor\nevw|mode=monitor\n");
+        assert_eq!(merged.len(), 2);
+        let evw = &merged[0];
+        assert_eq!(evw.mode, WatcherMode::Monitor);
+        // Everything the override did not mention is inherited verbatim.
+        assert_eq!(evw.pattern, "bin/evw");
+        assert!(evw.enabled);
+        assert_eq!(evw.start_cmd.as_deref(), Some("evw --quiet 10"));
+        assert_eq!(evw.layer, WATCHER_LAYER_BASE);
+        assert_eq!(evw.overridden, vec!["mode".to_string()]);
+        // Untouched sibling is pristine.
+        assert!(merged[1].overridden.is_empty());
+        assert_eq!(merged[1].mode, WatcherMode::Oneshot);
+    }
+
+    #[test]
+    fn test_merge_override_positional_blank_means_inherit() {
+        let base = parse_watchers_config_str("evw|bin/evw|1|true|evw --quiet 10|hist\n");
+        // Positional override: blank pattern/min_count/start_cmd/on_restart
+        // inherit; only enabled (slot 3) + mode (slot 6) are set.
+        let merged = merge_watchers_override_str(base, "evw||| false|||monitor\n");
+        let evw = &merged[0];
+        assert_eq!(evw.pattern, "bin/evw");
+        assert_eq!(evw.min_count, 1);
+        assert!(!evw.enabled);
+        assert_eq!(evw.start_cmd.as_deref(), Some("evw --quiet 10"));
+        assert_eq!(evw.on_restart_cmd.as_deref(), Some("hist"));
+        assert_eq!(evw.mode, WatcherMode::Monitor);
+        let mut ov = evw.overridden.clone();
+        ov.sort();
+        assert_eq!(ov, vec!["enabled".to_string(), "mode".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_override_appends_unknown_watcher_and_later_lines_win() {
+        let base = parse_watchers_config_str("evw|bin/evw|1|true|evw\n");
+        let merged = merge_watchers_override_str(
+            base,
+            "extra|bin/extra|1|true|extra-watch||monitor\nevw|mode=monitor\nevw|mode=oneshot\n",
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].name, "extra");
+        assert_eq!(merged[1].layer, WATCHER_LAYER_OVERRIDE);
+        assert_eq!(merged[1].mode, WatcherMode::Monitor);
+        // Last line naming evw wins.
+        assert_eq!(merged[0].mode, WatcherMode::Oneshot);
+        assert_eq!(merged[0].overridden, vec!["mode".to_string()]);
+    }
+
+    #[test]
+    fn test_load_watchers_config_layers_and_absent_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("watchers.conf");
+        std::fs::write(&base, "evw|bin/evw|1|true|evw --quiet 10\n").unwrap();
+        let ov = dir.path().join("watchers.override.conf");
+
+        // Override absent: the committed default loads on its own.
+        let entries = load_watchers_config(base.to_str().unwrap(), Some(ov.to_str().unwrap()));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].mode, WatcherMode::Oneshot);
+
+        // Override present: it wins on the fields it sets.
+        std::fs::write(&ov, "evw|mode=monitor|enabled=false\n").unwrap();
+        let entries = load_watchers_config(base.to_str().unwrap(), Some(ov.to_str().unwrap()));
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert!(!entries[0].enabled);
+
+        // Override reached THROUGH A SYMLINK (the "linked in from a repo" shape).
+        let repo_file = dir.path().join("repo-watchers.override.conf");
+        std::fs::write(&repo_file, "evw|mode=monitor\n").unwrap();
+        let link = dir.path().join("linked.override.conf");
+        std::os::unix::fs::symlink(&repo_file, &link).unwrap();
+        let entries = load_watchers_config(base.to_str().unwrap(), Some(link.to_str().unwrap()));
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert!(entries[0].enabled, "symlinked override set only mode");
+
+        // Dangling symlink (target outside the mounted tree) == absent.
+        let dangling = dir.path().join("dangling.override.conf");
+        std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
+        let entries = load_watchers_config(base.to_str().unwrap(), Some(dangling.to_str().unwrap()));
+        assert_eq!(entries[0].mode, WatcherMode::Oneshot);
+    }
+
     // --- shared watcher-liveness helpers (hoisted from policy.rs) -----------
 
     #[test]
@@ -2676,34 +3923,70 @@ mod tests {
     fn pid_dir_candidates_orders_and_dedups() {
         // Both env vars distinct → both, then the fallback.
         assert_eq!(
-            pid_dir_candidates(Some("/a"), Some("/b")),
+            pid_dir_candidates(Some("/a"), Some("/b"), None),
             vec!["/a".to_string(), "/b".to_string(), "/var/run/claude".to_string()]
         );
         // XDG only → XDG then fallback.
         assert_eq!(
-            pid_dir_candidates(None, Some("/run/user/1000")),
+            pid_dir_candidates(None, Some("/run/user/1000"), None),
             vec!["/run/user/1000".to_string(), "/var/run/claude".to_string()]
         );
         // A value equal to the fallback is de-duplicated, not repeated.
         assert_eq!(
-            pid_dir_candidates(Some("/var/run/claude"), None),
+            pid_dir_candidates(Some("/var/run/claude"), None, None),
             vec!["/var/run/claude".to_string()]
         );
         // Identical env values collapse to one entry.
         assert_eq!(
-            pid_dir_candidates(Some("/x"), Some("/x")),
+            pid_dir_candidates(Some("/x"), Some("/x"), None),
             vec!["/x".to_string(), "/var/run/claude".to_string()]
         );
         // Empty / whitespace values are skipped.
         assert_eq!(
-            pid_dir_candidates(Some(""), Some("   ")),
+            pid_dir_candidates(Some(""), Some("   "), None),
             vec!["/var/run/claude".to_string()]
         );
         // Neither set → just the fallback.
         assert_eq!(
-            pid_dir_candidates(None, None),
+            pid_dir_candidates(None, None, None),
             vec!["/var/run/claude".to_string()]
         );
+    }
+
+    /// The cron regression: `claude-watch metrics` runs with NO
+    /// `$XDG_RUNTIME_DIR`, but the monitor-mode watchers' `.lock` files live in
+    /// `/run/user/<uid>`. The uid-derived dir must be scanned regardless of the
+    /// reader's env — and must de-dup against an equal `$XDG_RUNTIME_DIR`.
+    #[test]
+    fn pid_dir_candidates_includes_uid_runtime_dir_without_xdg_env() {
+        // No env at all → uid dir, then the fallback.
+        assert_eq!(
+            pid_dir_candidates(None, None, Some("/run/user/1000")),
+            vec!["/run/user/1000".to_string(), "/var/run/claude".to_string()]
+        );
+        // XDG set to the same dir → one entry, not two.
+        assert_eq!(
+            pid_dir_candidates(None, Some("/run/user/1000"), Some("/run/user/1000")),
+            vec!["/run/user/1000".to_string(), "/var/run/claude".to_string()]
+        );
+        // XDG pointing elsewhere (a test harness, a container) → env dir
+        // first, uid dir still scanned, fallback last.
+        assert_eq!(
+            pid_dir_candidates(Some("/pids"), Some("/xdg"), Some("/run/user/1000")),
+            vec![
+                "/pids".to_string(),
+                "/xdg".to_string(),
+                "/run/user/1000".to_string(),
+                "/var/run/claude".to_string()
+            ]
+        );
+        // The live resolver itself always carries the uid dir.
+        assert!(
+            watcher_pid_dirs().iter().any(|d| d == &uid_runtime_dir()),
+            "watcher_pid_dirs() must include {}",
+            uid_runtime_dir()
+        );
+        assert!(uid_runtime_dir().starts_with("/run/user/"));
     }
 
     #[test]

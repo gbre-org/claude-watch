@@ -3,7 +3,8 @@
 //!
 //! Straight Rust port of the Python `workload` script. State lives under
 //! `/var/run/claude/workload-state/` (state.json, <label>.output,
-//! <label>.exit, <label>.sh, <label>.heartbeat, <label>.script.json).
+//! <label>.exit, <label>.sh, <label>.heartbeat, <label>.script.json,
+//! <label>.pgid).
 //! `/var/run` is a tmpfs (Debian symlink to `/run`) and
 //! `/var/run/claude/` is provisioned at boot by
 //! `/etc/tmpfiles.d/claude.conf` (`d /var/run/claude 0755 hndrewaall
@@ -32,11 +33,37 @@
 //! task. Idempotency: the wrapper script writes an exit-code marker file
 //! BEFORE invoking the emitter; `cmd_kill` consults that marker and
 //! skips its own emit if the wrapper already finished naturally.
+//!
+//! `workload kill` is TREE-WIDE: it snapshots the pane's descendants
+//! from `/proc` first, then SIGTERMs (and after a grace period SIGKILLs)
+//! both those pids AND the payload's process group — recorded in
+//! `<label>.pgid` by the wrapper, since `setsid --wait` forks and the
+//! wrapper is the only thing that can observe the resulting sid. It then
+//! verifies nothing survived. Killing just the tmux pane left the
+//! payload running: see `cmd_kill`.
+//!
+//! `task init --recreate --force` destroys the whole `tasks` session and
+//! therefore has the SAME blind spot — a bare `tmux kill-session` only
+//! hangs up the pane shells. It runs the same teardown, once per
+//! workload pane, before it kills the session: `kill_workloads` ->
+//! `kill_one_workload` -> `kill_workload_tree`. `cmd_kill` is the
+//! single-label entry point to the same routine, so the two cannot
+//! drift.
+//!
+//! `workload run` on a label whose previous run is STILL LIVE had the
+//! same blind spot for the same reason (a bare `tmux kill-pane`), with
+//! an extra hazard: the orphaned payload keeps appending to the very
+//! `<label>.output` the new run is about to publish, and overwrites the
+//! `<label>.pgid` the next kill will aim at. It now runs the same
+//! teardown — see `cmd_run` and [`Teardown`] for the replace semantics
+//! (the old run's completion is marked `reason="replaced"`, the new
+//! run's queue binding happens only after the teardown returns, and a
+//! survivor REFUSES the new run rather than doubling up on the label).
 
 use crate::event_bus::{emit_workload_done, WorkloadDoneEvent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -108,7 +135,21 @@ const LEGACY_WORKLOAD_DIR: &str = "/tmp/claude-workloads";
 /// from a crashed wrapper don't outlive the host.
 const RUNTIME_HEARTBEAT_DIR: &str = "/run/claude/workloads";
 
+/// Env override for the registry path, shared with `task_watch`'s
+/// read-only mirror of the same file (`workload_state_path`). Both sides
+/// MUST resolve it the same way: `task init --recreate --force` reads
+/// the registry through the mirror to decide what it is about to kill
+/// and then hands those labels to `kill_workloads`, which reads it
+/// again. If only one side honoured the override the recreate would warn
+/// about one set of workloads and tear down another.
+const WORKLOAD_STATE_ENV: &str = "CLAUDE_WATCH_WORKLOAD_STATE";
+
 fn state_file() -> PathBuf {
+    if let Ok(p) = std::env::var(WORKLOAD_STATE_ENV) {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     PathBuf::from(WORKLOAD_DIR).join("state.json")
 }
 
@@ -148,6 +189,114 @@ fn heartbeat_file(label: &str) -> PathBuf {
 /// real stuck state surfaces.
 fn runtime_heartbeat_file(label: &str) -> PathBuf {
     PathBuf::from(RUNTIME_HEARTBEAT_DIR).join(format!("{label}.heartbeat"))
+}
+
+/// Per-workload process-group sidecar: `<label>.pgid` holds the pgid
+/// (== sid == pid) of the `setsid` payload leader the wrapper script
+/// launched.
+///
+/// **Why a sidecar and not a `WorkloadEntry` field.** The pgid only
+/// becomes knowable INSIDE the pane, after `setsid` has forked — the
+/// `workload run` process that writes `state.json` has already returned
+/// by then, and `setsid --wait`'s own pid is useless (its child lives in
+/// a different session). So the wrapper writes this file itself, atomically
+/// (tmp + `mv -f`), and removes it on exit.
+///
+/// `workload kill` reads it to signal the whole process GROUP rather than
+/// chasing a ppid chain that the first kill has already broken.
+fn pgid_file(label: &str) -> PathBuf {
+    PathBuf::from(WORKLOAD_DIR).join(format!("{label}.pgid"))
+}
+
+/// Parse a `.pgid` sidecar body. Pure. Rejects empty / non-numeric /
+/// nonsensical values (`<= 1` would mean "signal pid 1 or every process
+/// we may signal" — never a legitimate workload pgid).
+pub fn parse_pgid(raw: &str) -> Option<i32> {
+    match raw.trim().parse::<i32>() {
+        Ok(v) if v > 1 => Some(v),
+        _ => None,
+    }
+}
+
+/// Read + parse the `.pgid` sidecar for `label`. `None` when the file is
+/// absent (wrapper too old, wrapper already exited, or the workload never
+/// got far enough to write it) — callers then fall back to the pane
+/// descendant walk alone.
+fn read_recorded_pgid(label: &str) -> Option<i32> {
+    parse_pgid(&fs::read_to_string(pgid_file(label)).ok()?)
+}
+
+/// Per-workload "the killer already emitted this run's `workload-done`"
+/// sentinel: `<label>.kill-emitted`.
+///
+/// **Why it exists.** A kill writes the `.exit` marker and emits
+/// `workload-done` with `killed=true` BEFORE it tears the pane down, so
+/// the completion carries the kill code even if the teardown itself goes
+/// sideways. But the wrapper script is the pane's own process: the
+/// instant the payload dies it returns from `setsid --wait`, writes its
+/// own `.exit` and shells out to `workload emit-done` — and that can win
+/// the race against the `tmux kill-pane` (or `tmux kill-session`) that
+/// was supposed to stop it. Two `workload-done` events for one run reads
+/// to the main loop as two separate completions.
+///
+/// The killer drops this sentinel; [`cmd_emit_done`] consumes it and
+/// declines to emit a *non-kill* completion for that label. `cmd_run`
+/// clears it when the label starts again, so a leftover can suppress at
+/// most the wrapper emit of the run that was killed.
+fn kill_emitted_file(label: &str) -> PathBuf {
+    PathBuf::from(WORKLOAD_DIR).join(format!("{label}.kill-emitted"))
+}
+
+/// Drop the kill-emitted sentinel at `path`. Best-effort: a failed write
+/// costs at most the pre-existing double-emit race, never the kill.
+fn mark_kill_emitted_at(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, b"1\n");
+}
+
+/// Consume the kill-emitted sentinel at `path`. `true` means it was
+/// there — i.e. the killer already emitted this run's completion.
+/// `remove_file` is the claim: exactly one caller can get `Ok(())`.
+fn take_kill_emitted_at(path: &Path) -> bool {
+    fs::remove_file(path).is_ok()
+}
+
+/// Default SIGTERM -> SIGKILL grace period for `workload kill`, in
+/// seconds. Long enough for a driver script's own trap handler to stop
+/// its children (ffmpeg flushing a muxer, rsync finishing a file), short
+/// enough that an interactive `workload kill` still feels instant.
+const KILL_GRACE_SECS_DEFAULT: f64 = 5.0;
+
+/// Env override for the grace period (the `--grace` flag wins over it).
+const KILL_GRACE_ENV: &str = "WORKLOAD_KILL_GRACE_SECS";
+
+/// Upper bound on the grace period. A typo'd `--grace 100000` must not
+/// wedge the caller for a day.
+const KILL_GRACE_SECS_MAX: f64 = 600.0;
+
+/// Resolve the grace period from (flag, env). Pure — the env read is the
+/// caller's job so this stays unit-testable without mutating process
+/// state from parallel tests.
+fn resolve_kill_grace_from(explicit: Option<f64>, env_value: Option<&str>) -> Duration {
+    let raw = explicit.or_else(|| env_value.and_then(|v| v.trim().parse::<f64>().ok()));
+    let secs = match raw {
+        Some(v) if v.is_finite() && v >= 0.0 => v.min(KILL_GRACE_SECS_MAX),
+        // Negative / NaN / unparseable env garbage falls back to the
+        // default rather than failing the kill — the kill is the
+        // important part.
+        _ => KILL_GRACE_SECS_DEFAULT,
+    };
+    Duration::from_secs_f64(secs)
+}
+
+/// `resolve_kill_grace_from` bound to the live environment. Public
+/// because the recreate path (`task init --recreate --force`) resolves
+/// the same grace budget for the teardown it runs before it destroys the
+/// tmux session.
+pub fn resolve_kill_grace(explicit: Option<f64>) -> Duration {
+    resolve_kill_grace_from(explicit, std::env::var(KILL_GRACE_ENV).ok().as_deref())
 }
 
 /// Per-workload captured-script sidecar. Written by `cmd_run` at
@@ -398,9 +547,14 @@ pub fn load_state() -> WorkloadState {
 }
 
 pub fn save_state(state: &WorkloadState) -> std::io::Result<()> {
-    fs::create_dir_all(WORKLOAD_DIR)?;
+    let path = state_file();
+    // The parent, not the const: under `WORKLOAD_STATE_ENV` the registry
+    // does not live in `WORKLOAD_DIR` at all.
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let json = serde_json::to_string_pretty(state).unwrap_or_else(|_| "{}".to_string());
-    fs::write(state_file(), json)
+    fs::write(path, json)
 }
 
 /// Best-effort: ensure `/tmp/claude-workloads -> /var/run/claude/workload-state`
@@ -760,90 +914,426 @@ fn print_tail(path: &Path, n: usize) {
     }
 }
 
-/// Kill only the setsid child process group of a pane — never the wrapper
-/// shell's PGID (which may be shared with the tmux session). Mirrors the
-/// Python `_kill_pane_tree`.
-fn kill_pane_tree(pane_id: &str) {
-    // Pane shell PID
-    let out = Command::new("tmux")
-        .args(["list-panes", "-t", pane_id, "-F", "#{pane_pid}"])
-        .output();
-    let shell_pid = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => return,
-    };
-    if shell_pid.is_empty() {
-        return;
+/// One row of a `/proc` snapshot: the process-hierarchy facts
+/// `workload kill` reasons over.
+///
+/// `sid` is carried alongside `pgid` because the wrapper's payload is
+/// launched under `setsid`, so the payload's process-group leader is
+/// also a SESSION leader (`pid == pgid == sid`). That triple-equality is
+/// the cheap sanity check that a recorded `.pgid` sidecar still refers
+/// to *our* process group and not to a recycled pid (see
+/// `recorded_pgid_is_plausible`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcRow {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    pub sid: i32,
+}
+
+/// Parse one `/proc/<pid>/stat` line into a `ProcRow`. Pure (no I/O) so
+/// the field-offset arithmetic is unit-testable.
+///
+/// Layout is `pid (comm) state ppid pgrp session ...`. `comm` is
+/// process-controlled and may contain spaces AND parentheses
+/// (`sleep (evil) x`), so the split point is the LAST `)` in the line,
+/// never the first — a naive `split_whitespace()` mis-indexes every
+/// field for any process whose name has a space in it.
+pub fn parse_proc_stat(content: &str) -> Option<ProcRow> {
+    let open = content.find('(')?;
+    let close = content.rfind(')')?;
+    if close < open {
+        return None;
     }
+    let pid: i32 = content[..open].trim().parse().ok()?;
+    let rest: Vec<&str> = content[close + 1..].split_whitespace().collect();
+    // rest[0] = state, rest[1] = ppid, rest[2] = pgrp, rest[3] = session
+    let ppid: i32 = rest.get(1)?.parse().ok()?;
+    let pgid: i32 = rest.get(2)?.parse().ok()?;
+    let sid: i32 = rest.get(3)?.parse().ok()?;
+    Some(ProcRow {
+        pid,
+        ppid,
+        pgid,
+        sid,
+    })
+}
 
-    // Shell's own PGID — skip this one
-    let shell_pgid = Command::new("ps")
-        .args(["-o", "pgid=", "-p", &shell_pid])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    // Direct children
-    let children: Vec<String> = Command::new("pgrep")
-        .args(["-P", &shell_pid])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut killed_pgids = std::collections::HashSet::new();
-    for pid in &children {
-        let pgid = Command::new("ps")
-            .args(["-o", "pgid=", "-p", pid])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        if pgid.is_empty() || pgid == "1" || pgid == shell_pgid {
-            // Kill the PID directly (not the pgroup)
-            let _ = Command::new("kill").args(["-9", pid]).output();
+/// Snapshot every process visible in `/proc`.
+///
+/// Taken ONCE, up front, before any signal is sent: as soon as the first
+/// process in the tree dies its children are reparented to pid 1, so a
+/// ppid walk performed *after* the kill loses exactly the grandchildren
+/// we are trying to reap. Snapshot first, then kill, then sweep the
+/// snapshot — the ordering is the whole point.
+pub fn snapshot_procs() -> Vec<ProcRow> {
+    let dir = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        if killed_pgids.insert(pgid.clone()) {
-            // setsid group — safe to kill entirely
-            let _ = Command::new("kill")
-                .args(["-9", "--", &format!("-{pgid}")])
-                .output();
+        // Racy by nature: a process can exit between readdir and read.
+        // A missing file just means it is already gone.
+        if let Ok(content) = fs::read_to_string(format!("/proc/{name}/stat")) {
+            if let Some(row) = parse_proc_stat(&content) {
+                rows.push(row);
+            }
         }
     }
+    rows
+}
 
-    // Kill any remaining descendants by PID
-    let remaining = get_descendants(&shell_pid);
-    if !remaining.is_empty() {
-        let mut args = vec!["-9".to_string()];
-        args.extend(remaining);
-        let _ = Command::new("kill").args(&args).output();
+/// Transitive children of `roots` (the roots themselves are NOT
+/// included). Pure + cycle-safe. Order is breadth-first, which is also
+/// parent-before-child — callers that want to signal bottom-up can
+/// reverse it.
+pub fn descendants_of(procs: &[ProcRow], roots: &[i32]) -> Vec<i32> {
+    let mut by_parent: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    for row in procs {
+        by_parent.entry(row.ppid).or_default().push(row.pid);
+    }
+    let mut seen: BTreeSet<i32> = roots.iter().copied().collect();
+    let mut queue: VecDeque<i32> = roots.iter().copied().collect();
+    let mut out = Vec::new();
+    while let Some(pid) = queue.pop_front() {
+        if let Some(children) = by_parent.get(&pid) {
+            for child in children {
+                if seen.insert(*child) {
+                    out.push(*child);
+                    queue.push_back(*child);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every pid in the snapshot belonging to one of `pgids`. Pure.
+///
+/// This is what catches a **double fork**: a process that detached from
+/// the ppid chain but stayed in the process group is invisible to
+/// `descendants_of` and visible here.
+pub fn members_of_pgids(procs: &[ProcRow], pgids: &[i32]) -> Vec<i32> {
+    let wanted: BTreeSet<i32> = pgids.iter().copied().collect();
+    procs
+        .iter()
+        .filter(|r| wanted.contains(&r.pgid))
+        .map(|r| r.pid)
+        .collect()
+}
+
+/// Distinct process groups spanned by `pids`, minus `protected`. Pure.
+///
+/// Signalling the GROUP rather than the pids is what makes the teardown
+/// race-free: anything the doomed tree forks between the snapshot and
+/// the signal inherits its parent's pgid and dies with the group.
+pub fn pgids_of(procs: &[ProcRow], pids: &[i32], protected: &BTreeSet<i32>) -> Vec<i32> {
+    let wanted: BTreeSet<i32> = pids.iter().copied().collect();
+    let mut out: BTreeSet<i32> = BTreeSet::new();
+    for row in procs {
+        if wanted.contains(&row.pid) && row.pgid > 1 && !protected.contains(&row.pgid) {
+            out.insert(row.pgid);
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Is a recorded `.pgid` sidecar still trustworthy?
+///
+/// The sidecar is written by the wrapper and removed on wrapper exit,
+/// but a crashed wrapper can leave one behind and pids DO get recycled —
+/// signalling a stale group would kill an innocent bystander's tree. The
+/// wrapper's payload leader is created under `setsid`, so it satisfies
+/// `pid == pgid == sid`; a recycled pid almost never does. Pure.
+pub fn recorded_pgid_is_plausible(procs: &[ProcRow], pgid: i32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    procs
+        .iter()
+        .any(|r| r.pid == pgid && r.pgid == pgid && r.sid == pgid)
+}
+
+/// What `kill_tree` did, so the caller can report it and set an exit code.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct KillTreeReport {
+    /// Process groups that were signalled.
+    pub pgids: Vec<i32>,
+    /// Individual pids that were signalled (a superset of the group
+    /// members known at snapshot time).
+    pub pids: Vec<i32>,
+    /// Targets confirmed gone after the SIGKILL sweep.
+    pub killed: Vec<i32>,
+    /// Targets STILL ALIVE after the SIGKILL sweep (unkillable D-state,
+    /// or something we lacked permission to signal). Non-empty means
+    /// `workload kill` reports failure.
+    pub survived: Vec<i32>,
+}
+
+/// State character (field 3) of a `/proc/<pid>/stat` line. Pure.
+pub fn parse_proc_state(content: &str) -> Option<char> {
+    let close = content.rfind(')')?;
+    content[close + 1..].split_whitespace().next()?.chars().next()
+}
+
+/// Is this pid still RUNNING?
+///
+/// A zombie counts as dead: it holds no CPU, no files and no locks, it
+/// is just a exit-status slot its parent has not read yet. Treating `Z`
+/// as alive would make every killed direct child of the caller look like
+/// a survivor and turn `workload kill` permanently red.
+fn proc_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Unparseable but present: assume alive (fail safe — we would
+        // rather re-signal than under-report a survivor).
+        Ok(s) => parse_proc_state(&s).map(|st| st != 'Z').unwrap_or(true),
+        Err(_) => false,
     }
 }
 
-fn get_descendants(pid: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let children: Vec<String> = Command::new("pgrep")
-        .args(["-P", pid])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    for c in children {
-        let sub = get_descendants(&c);
-        out.push(c);
-        out.extend(sub);
+/// TERM -> grace -> KILL a whole process tree, then VERIFY.
+///
+/// Contract (the thing the 2026-08-22 incident needed and the old
+/// `kill_pane_tree` did not provide):
+///
+///   1. **Snapshot first.** `descendants_of` is computed BEFORE any
+///      signal, because the first kill reparents everything below it.
+///   2. **Signal the process GROUP**, not just the pids — that sweeps up
+///      double-forked children and anything spawned mid-teardown.
+///   3. **Grace, then SIGKILL.** A driver script gets a chance to shut
+///      its own children down cleanly before we escalate.
+///   4. **Re-snapshot before escalating**, so children spawned during
+///      the grace window (a respawning driver loop — exactly the
+///      incident's failure mode) land in the SIGKILL set.
+///   5. **Verify and report.** Survivors are returned, not swallowed.
+///
+/// `protected` is a hard denylist of pids/pgids that must never be
+/// signalled (this process, its group and session, the tmux pane shell
+/// and its group, pid 1).
+pub fn kill_tree(
+    roots: &[i32],
+    recorded_pgid: Option<i32>,
+    protected: &BTreeSet<i32>,
+    grace: Duration,
+) -> KillTreeReport {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let procs = snapshot_procs();
+
+    // --- Target set: ppid-chain descendants + process-group members ---
+    let mut targets: BTreeSet<i32> = descendants_of(&procs, roots).into_iter().collect();
+    if let Some(pg) = recorded_pgid {
+        targets.extend(members_of_pgids(&procs, &[pg]));
     }
-    out
+    // Roots that are themselves part of the workload (the payload's
+    // session leader) must die too; the pane shell is passed as a root
+    // for the descendant walk but is listed in `protected` because tmux
+    // `kill-pane` owns its teardown.
+    for root in roots {
+        targets.insert(*root);
+    }
+    targets.retain(|p| *p > 1 && !protected.contains(p));
+
+    let target_vec: Vec<i32> = targets.iter().copied().collect();
+    let mut pgids: BTreeSet<i32> = pgids_of(&procs, &target_vec, protected).into_iter().collect();
+    if let Some(pg) = recorded_pgid {
+        if pg > 1 && !protected.contains(&pg) {
+            pgids.insert(pg);
+        }
+    }
+
+    // Everything else already sharing a doomed group is a target too —
+    // that is how a double-forked child (ppid reparented to 1, group
+    // kept) gets both signalled AND reported instead of silently
+    // outliving the kill.
+    let pgid_vec_pre: Vec<i32> = pgids.iter().copied().collect();
+    for pid in members_of_pgids(&procs, &pgid_vec_pre) {
+        if pid > 1 && !protected.contains(&pid) {
+            targets.insert(pid);
+        }
+    }
+
+    let signal_all = |pgids: &BTreeSet<i32>, pids: &BTreeSet<i32>, sig: Signal| {
+        for pg in pgids {
+            let _ = killpg(Pid::from_raw(*pg), sig);
+        }
+        // Bottom-up for the individual pids so a parent doesn't get a
+        // chance to notice a child died and respawn it.
+        for pid in pids.iter().rev() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(*pid), sig);
+        }
+    };
+
+    signal_all(&pgids, &targets, Signal::SIGTERM);
+
+    // --- Grace window: poll instead of sleeping the whole budget ---
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !targets.iter().any(|p| proc_alive(*p)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // --- Re-snapshot: a respawning driver may have forked new children
+    // during the grace window. They inherit the doomed pgid (or hang off
+    // a doomed pid), so pick them up before escalating.
+    let procs2 = snapshot_procs();
+    let pgid_vec: Vec<i32> = pgids.iter().copied().collect();
+    for pid in members_of_pgids(&procs2, &pgid_vec) {
+        if pid > 1 && !protected.contains(&pid) {
+            targets.insert(pid);
+        }
+    }
+    for pid in descendants_of(&procs2, &target_vec) {
+        if pid > 1 && !protected.contains(&pid) {
+            targets.insert(pid);
+        }
+    }
+
+    signal_all(&pgids, &targets, Signal::SIGKILL);
+
+    // SIGKILL delivery is immediate but reaping is not; give the kernel
+    // a moment before declaring anything a survivor.
+    for _ in 0..20 {
+        if !targets.iter().any(|p| proc_alive(*p)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (survived, killed): (Vec<i32>, Vec<i32>) =
+        targets.iter().copied().partition(|p| proc_alive(*p));
+
+    KillTreeReport {
+        pgids: pgids.into_iter().collect(),
+        pids: targets.into_iter().collect(),
+        killed,
+        survived,
+    }
+}
+
+/// Tear down everything the workload `label` (running in tmux pane
+/// `pane_id`) spawned: the wrapper's sidecars, the `setsid` payload
+/// group recorded in the `.pgid` sidecar, and every descendant of both.
+///
+/// Replaces the old `kill_pane_tree`, which walked only the pane shell's
+/// DIRECT children and computed the remaining descendants AFTER killing
+/// them — so the payload (launched via `setsid --wait`, hence in its own
+/// session, and under `script(1)`, which puts the real command in a
+/// SECOND session again) was reparented to pid 1 and survived. On
+/// 2026-08-22 a killed render workload's driver script kept running and
+/// eleven of its children had to be reaped by hand.
+fn kill_workload_tree(label: &str, pane_id: &str, grace: Duration) -> KillTreeReport {
+    let shell_pid: Option<i32> = Command::new("tmux")
+        .args(["list-panes", "-t", pane_id, "-F", "#{pane_pid}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<i32>()
+                .ok()
+        });
+
+    kill_workload_tree_with(label, shell_pid, read_recorded_pgid(label), grace)
+}
+
+/// The signal-denylist half of a workload teardown: pids/pgids that must
+/// NEVER be signalled — this process, its group, session and parent,
+/// pid 1, and the tmux pane shell plus the group it may share with the
+/// tmux session.
+///
+/// Extracted from `kill_workload_tree` so every teardown caller
+/// (`workload kill` and `task init --recreate --force`) gets a byte-
+/// identical denylist, and so a test can build the REAL one rather than
+/// an approximation of it.
+pub fn kill_protected_set(procs: &[ProcRow], pane_shell_pid: Option<i32>) -> BTreeSet<i32> {
+    let self_pid = std::process::id() as i32;
+    let self_row = procs.iter().find(|r| r.pid == self_pid).copied();
+
+    let mut protected: BTreeSet<i32> = BTreeSet::new();
+    protected.insert(0);
+    protected.insert(1);
+    protected.insert(self_pid);
+    if let Some(row) = self_row {
+        // Never signal our own group/session — that would kill the
+        // caller (and, when invoked from the daemon, the daemon).
+        protected.insert(row.pgid);
+        protected.insert(row.sid);
+        protected.insert(row.ppid);
+    }
+    if let Some(pid) = pane_shell_pid {
+        // The pane shell is a descendant ROOT (we want its children) but
+        // tmux `kill-pane` / `kill-session` owns its own teardown, and
+        // its pgid may be shared with the tmux session — signalling that
+        // group would take out unrelated panes.
+        protected.insert(pid);
+        if let Some(row) = procs.iter().find(|r| r.pid == pid) {
+            protected.insert(row.pgid);
+        }
+    }
+    protected
+}
+
+/// Tear down the process tree of workload `label` given an already-known
+/// pane shell pid and an already-read `.pgid` sidecar value.
+///
+/// This is THE shared teardown routine. `workload kill` reaches it via
+/// [`kill_workload_tree`] (which resolves the pane shell pid from tmux
+/// and reads the sidecar off disk); `task init --recreate --force`
+/// reaches it through the same path, once per workload pane it is about
+/// to destroy, so a recreate can no longer leave a payload tree running
+/// after the tmux session is gone. Taking the two inputs as parameters
+/// also lets a behavioural test drive the real routine against a
+/// tempdir-backed wrapper instead of the production workload-state dir.
+///
+/// `recorded_pgid` is the RAW sidecar value; staleness is checked here
+/// (a recycled pid is only trusted while it is still a live session
+/// leader) so no caller can forget to.
+pub fn kill_workload_tree_with(
+    label: &str,
+    pane_shell_pid: Option<i32>,
+    recorded_pgid: Option<i32>,
+    grace: Duration,
+) -> KillTreeReport {
+    let procs = snapshot_procs();
+    let protected = kill_protected_set(&procs, pane_shell_pid);
+
+    let recorded = recorded_pgid.filter(|pg| {
+        let ok = recorded_pgid_is_plausible(&procs, *pg);
+        if !ok {
+            eprintln!(
+                "warning: recorded pgid {pg} for workload '{label}' is stale or not a \
+                 session leader — falling back to the pane descendant walk"
+            );
+        }
+        ok
+    });
+
+    let mut roots: Vec<i32> = Vec::new();
+    if let Some(pid) = pane_shell_pid {
+        roots.push(pid);
+    }
+    if let Some(pg) = recorded {
+        roots.push(pg);
+    }
+    if roots.is_empty() {
+        return KillTreeReport::default();
+    }
+
+    kill_tree(&roots, recorded, &protected, grace)
 }
 
 /// Build the wrapper bash script that runs the workload command in the
@@ -873,9 +1363,22 @@ fn get_descendants(pid: &str) -> Vec<String> {
 ///     that genuinely needs a non-tty stdout (CI scripts that test
 ///     tty-aware branches).
 ///   * Echoes a header (`=== workload: <label> ===` etc.), runs the
-///     command via `setsid --wait script ...`, captures the exit code,
-///     writes `<label>.exit`, and emits the `workload-done` claude-event
-///     via the embedded `claude-watch workload emit-done` subcommand.
+///     command via `setsid --wait bash -c '<record pgid>; exec script ...'`,
+///     captures the exit code, writes `<label>.exit`, and emits the
+///     `workload-done` claude-event via the embedded `claude-watch
+///     workload emit-done` subcommand.
+///   * Records the payload's process-group id in `<label>.pgid` (written
+///     by the setsid'd bash itself, since `setsid --wait` forks and the
+///     wrapper therefore cannot see the new sid) and removes it again on
+///     exit. `workload kill` needs it to signal the whole GROUP.
+///
+/// **Editing hazard — the EXIT trap.** Its body is one single-quoted
+/// bash word and the interpolated paths inside it are themselves
+/// single-quoted, so the quoting is only balanced as long as nothing
+/// else in that body contains an apostrophe or a backtick. A comment
+/// with a possessive in it turns the trap into a syntax error and every
+/// workload exits 2. `wrapper_script_runtime_pets_and_cleans_runtime_heartbeat`
+/// (which actually RUNS the generated wrapper) is the test that catches it.
 fn build_wrapper_script(
     label: &str,
     command: &str,
@@ -883,12 +1386,14 @@ fn build_wrapper_script(
     exit_path: &Path,
     heartbeat_path: &Path,
     runtime_heartbeat_path: &Path,
+    pgid_path: &Path,
     exe_path: &str,
     queue_id: Option<&str>,
 ) -> String {
     let out_q = shell_quote(&out_path.to_string_lossy());
     let exit_q = shell_quote(&exit_path.to_string_lossy());
     let hb_q = shell_quote(&heartbeat_path.to_string_lossy());
+    let pgid_q = shell_quote(&pgid_path.to_string_lossy());
     let rt_hb_q = shell_quote(&runtime_heartbeat_path.to_string_lossy());
     let rt_hb_dir_q = shell_quote(
         &runtime_heartbeat_path
@@ -1078,6 +1583,7 @@ fn build_wrapper_script(
            if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            if [ -n \"$RUNTIME_HEARTBEAT_PID\" ]; then kill -TERM -\"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || kill \"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            rm -f {rt_hb_q} {rt_hb_q}.tmp 2>/dev/null || true\n\
+           rm -f {pgid_q} {pgid_q}.tmp 2>/dev/null || true\n\
          ' EXIT\n\
          # Force line-buffered stdio for the workload command's stdout+stderr.\n\
          # Without this, programs whose stdout is a pipe (everything here, since\n\
@@ -1132,10 +1638,35 @@ fn build_wrapper_script(
          else\n\
              INNER_CMD={inner_cmd_raw_q}\n\
          fi\n\
+         # Record the payload's process-group id so `workload kill` can\n\
+         # tear down the WHOLE tree instead of just this pane.\n\
+         #\n\
+         # `setsid --wait` FORKS, so the new session/pgid it creates is\n\
+         # not knowable from this shell — `$!` would be setsid's own pid,\n\
+         # whose child lives in a different session entirely. So we hand\n\
+         # the inner bash the job: after setsid() it IS the session\n\
+         # leader, so its own `$$` is simultaneously its pid, its pgid\n\
+         # and its sid. It writes that id (tmp + atomic mv, same as the\n\
+         # heartbeats, so a concurrent reader never sees a half-written\n\
+         # file) and then `exec`s the real payload — exec preserves the\n\
+         # pid, so the recorded id stays correct for the whole run.\n\
+         #\n\
+         # Note `script(1)` puts the wrapped command in a SECOND session\n\
+         # of its own (it needs a controlling tty for the pty). The\n\
+         # recorded pgid is `script`'s; the killer walks descendants from\n\
+         # it to reach the inner session, which is why it records the\n\
+         # leader pid rather than only the group.\n\
+         #\n\
+         # Paths go through the environment so the single-quoted inner\n\
+         # body needs no nested shell-escaping (same trick as the\n\
+         # heartbeat sidecars above).\n\
+         export WORKLOAD_PGID_FILE={pgid_q}\n\
+         export WORKLOAD_INNER_CMD=\"$INNER_CMD\"\n\
+         WORKLOAD_RECORD_PGID='echo $$ > \"$WORKLOAD_PGID_FILE.tmp\" 2>/dev/null && mv -f \"$WORKLOAD_PGID_FILE.tmp\" \"$WORKLOAD_PGID_FILE\" 2>/dev/null || true'\n\
          if [ \"${{WORKLOAD_PTY:-1}}\" != \"0\" ] && command -v script >/dev/null 2>&1; then\n\
-             setsid --wait script -q -f -e -c \"$INNER_CMD\" /dev/null\n\
+             setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec script -q -f -e -c \"$WORKLOAD_INNER_CMD\" /dev/null'\n\
          else\n\
-             setsid --wait bash -c \"$INNER_CMD\"\n\
+             setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec bash -c \"$WORKLOAD_INNER_CMD\"'\n\
          fi\n\
          EC=$?\n\
          echo ''\n\
@@ -1187,6 +1718,44 @@ fn build_wrapper_script(
 /// skipped. Suppression knob: `WORKLOAD_QUEUE_AUTO_CREATE=0` (env)
 /// disables auto-create globally without touching CLI args. Used by
 /// tests + by environments without `session-task` installed.
+///
+/// # Replacing a live run of the same label
+///
+/// Re-running a label whose previous run is still going REPLACES it, as
+/// it always has. What changed (2026-08-22) is that the previous run is
+/// now actually torn down — the same TREE-WIDE teardown `workload kill`
+/// and `task init --recreate --force` use, not a bare `tmux kill-pane`
+/// that hung up the pane shell and left the payload running as an
+/// orphan, appending to the `.output` file the new run was about to
+/// publish under and clobbering the `.pgid` sidecar the next kill would
+/// aim at.
+///
+/// Three ordering rules keep the replaced run from masquerading as the
+/// run that replaced it:
+///
+///   1. **The old run's completion is marked.** It gets its usual
+///      exactly-once `workload-done` with `killed=true`, plus
+///      `data.reason="replaced"` and `data.replaced_by=<the new run's
+///      `started_at`>` — byte-identical to the `started_at` the new
+///      registry entry gets, so the two correlate exactly. Without the
+///      marker it is a `killed=true` event on the same label with the
+///      same log path arriving moments before the new run starts, i.e.
+///      indistinguishable from the new run dying instantly.
+///   2. **The new run's queue binding happens AFTER the teardown
+///      returns.** Auto-create + `register` used to run first, which
+///      left a window where the item being abandoned by the teardown
+///      was the item the new run had just claimed. When the caller
+///      supplies the SAME `--queue-id` the dying run was bound to, that
+///      item is CARRIED OVER instead: left `running` for the new run
+///      and reported as `data.carried_over_queue_id`, never abandoned.
+///   3. **Survivors refuse the new run.** If anything outlived the
+///      SIGKILL sweep, `cmd_run` returns [`KILL_SURVIVORS_EXIT`] with
+///      the pids named rather than starting a second payload on a label
+///      the first one is still writing to.
+///
+/// The teardown uses the standard kill grace ([`KILL_GRACE_SECS_DEFAULT`],
+/// env [`KILL_GRACE_ENV`]); `workload run` has no `--grace` flag of its
+/// own.
 pub fn cmd_run(
     label: &str,
     cmd_args: &[String],
@@ -1207,6 +1776,117 @@ pub fn cmd_run(
         eprintln!("No '{SESSION}' tmux session. Run: claude-watch task init");
         return 1;
     }
+
+    if let Err(e) = fs::create_dir_all(WORKLOAD_DIR) {
+        eprintln!("Failed to create {WORKLOAD_DIR}: {e}");
+        return 1;
+    }
+    // Best-effort: maintain the legacy `/tmp/claude-workloads` path as
+    // a symlink so out-of-tree consumers (docker bind-mount,
+    // cron-workload-stale-check) keep working without a coordinated
+    // multi-repo deploy. Lazy + idempotent — see helper docs.
+    ensure_legacy_compat_symlink();
+
+    let out_path = output_file(label);
+    let exit_path = exit_file(label);
+    let heartbeat_path = heartbeat_file(label);
+    let runtime_heartbeat_path = runtime_heartbeat_file(label);
+    let pgid_path = pgid_file(label);
+    let script_path = script_file(label);
+    let script_capture_path = script_capture_file(label);
+
+    // The new run's identity, minted BEFORE the teardown so the
+    // replaced run's completion event can name the run that displaced
+    // it (`data.replaced_by`) with the exact string the new registry
+    // entry gets.
+    let started_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+
+    // --- Replace a live run of the same label -------------------------
+    //
+    // TREE-WIDE, like `workload kill` and the recreate teardown. This
+    // used to be a bare `tmux kill-pane`, which hangs up the pane shell
+    // and leaves the payload — which lives two sessions below it
+    // (`setsid --wait`, then `script(1)`) — reparented to pid 1 and
+    // still running, now racing the NEW run for the same `.output` and
+    // `.pgid` sidecars, with no completion event ever emitted for it and
+    // its queue item stranded in `running`.
+    let mut state = load_state();
+    if let Some(entry) = state.get(label).cloned() {
+        if pane_alive(&entry.pane_id) {
+            // Carry the queue item over instead of abandoning it when
+            // the replacing run was handed the SAME qid: that item is
+            // about to be the NEW run's, and abandoning it here would
+            // abandon live work.
+            let carry_over = match (queue_id, entry.queue_id.as_deref()) {
+                (Some(new), Some(old)) => new == old,
+                _ => false,
+            };
+            println!(
+                "Replacing running workload '{label}' — tearing down the \
+                 previous run's process tree first"
+            );
+            let outcome = kill_one_workload(
+                label,
+                &entry,
+                resolve_kill_grace(None),
+                &Teardown::replaced(started_at.clone(), carry_over),
+            );
+            let survivors = report_kill_outcome(&outcome);
+            // Drop the label either way: its pane is gone, and the
+            // registry tracks panes.
+            state.remove(label);
+            let _ = save_state(&state);
+            if survivors {
+                // Starting now would put two payloads on one label:
+                // both appending to `<label>.output`, both overwriting
+                // `<label>.pgid`, so the NEXT kill would target the
+                // wrong process group. Refuse instead — the survivor
+                // pids are named above.
+                eprintln!(
+                    "Refusing to start a new run of '{label}': the previous run's \
+                     process tree survived SIGKILL. Reap the pids above, then re-run."
+                );
+                rebalance();
+                return KILL_SURVIVORS_EXIT;
+            }
+        } else {
+            state.remove(label);
+            let _ = save_state(&state);
+        }
+    }
+
+    // Clean up previous run's exit marker + output + heartbeats. The
+    // heartbeats MUST be removed up-front so neither the cron-stale
+    // detector nor the daemon's stuck-suppression check can get a
+    // false-positive on a stale leftover from a prior run that pet the
+    // watchdog and then crashed.
+    // Also remove any prior script-capture sidecar so a re-run that no
+    // longer matches the interpreter pattern doesn't surface a stale
+    // capture from the previous invocation.
+    let _ = fs::remove_file(&exit_path);
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&heartbeat_path);
+    let _ = fs::remove_file(&runtime_heartbeat_path);
+    // Stale process-group sidecar from a previous run would point a
+    // later `workload kill` at a recycled pid.
+    let _ = fs::remove_file(&pgid_path);
+    // Stale kill-emitted sentinel from a previous run that was killed
+    // would swallow THIS run's completion event.
+    let _ = fs::remove_file(kill_emitted_file(label));
+    let _ = fs::remove_file(&script_capture_path);
+
+    // Try to capture the script content NOW (before the workload
+    // starts) so a later modify/delete of the script doesn't affect
+    // what the modal shows. Fail-soft: no capture means the modal
+    // omits the "Script contents" section.
+    if let Some(cap) = try_capture_script(cmd_args) {
+        write_script_capture(label, &cap);
+    }
+    // Also clear the cron-workload-stale-check single-emit sentinel so
+    // a freshly-started workload that legitimately stalls again will
+    // re-fire workload-stale instead of being silently swallowed.
+    let alerted_path = PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat.alerted"));
+    let _ = fs::remove_file(&alerted_path);
 
     // Resolve effective queue id. Precedence:
     //   1. Caller-supplied --queue-id wins (existing behaviour).
@@ -1265,62 +1945,6 @@ pub fn cmd_run(
         }
     }
 
-    if let Err(e) = fs::create_dir_all(WORKLOAD_DIR) {
-        eprintln!("Failed to create {WORKLOAD_DIR}: {e}");
-        return 1;
-    }
-    // Best-effort: maintain the legacy `/tmp/claude-workloads` path as
-    // a symlink so out-of-tree consumers (docker bind-mount,
-    // cron-workload-stale-check) keep working without a coordinated
-    // multi-repo deploy. Lazy + idempotent — see helper docs.
-    ensure_legacy_compat_symlink();
-
-    let out_path = output_file(label);
-    let exit_path = exit_file(label);
-    let heartbeat_path = heartbeat_file(label);
-    let runtime_heartbeat_path = runtime_heartbeat_file(label);
-    let script_path = script_file(label);
-    let script_capture_path = script_capture_file(label);
-
-    // Clean up previous run's exit marker + output + heartbeats. The
-    // heartbeats MUST be removed up-front so neither the cron-stale
-    // detector nor the daemon's stuck-suppression check can get a
-    // false-positive on a stale leftover from a prior run that pet the
-    // watchdog and then crashed.
-    // Also remove any prior script-capture sidecar so a re-run that no
-    // longer matches the interpreter pattern doesn't surface a stale
-    // capture from the previous invocation.
-    let _ = fs::remove_file(&exit_path);
-    let _ = fs::remove_file(&out_path);
-    let _ = fs::remove_file(&heartbeat_path);
-    let _ = fs::remove_file(&runtime_heartbeat_path);
-    let _ = fs::remove_file(&script_capture_path);
-
-    // Try to capture the script content NOW (before the workload
-    // starts) so a later modify/delete of the script doesn't affect
-    // what the modal shows. Fail-soft: no capture means the modal
-    // omits the "Script contents" section.
-    if let Some(cap) = try_capture_script(cmd_args) {
-        write_script_capture(label, &cap);
-    }
-    // Also clear the cron-workload-stale-check single-emit sentinel so
-    // a freshly-started workload that legitimately stalls again will
-    // re-fire workload-stale instead of being silently swallowed.
-    let alerted_path = PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat.alerted"));
-    let _ = fs::remove_file(&alerted_path);
-
-    // Kill existing workload with same label
-    let mut state = load_state();
-    if let Some(entry) = state.get(label) {
-        if pane_alive(&entry.pane_id) {
-            let _ = Command::new("tmux")
-                .args(["kill-pane", "-t", &entry.pane_id])
-                .output();
-        }
-        state.remove(label);
-        let _ = save_state(&state);
-    }
-
     // Wrapper script — identical layout to Python version, plus a
     // claude-event emit step after the exit-code is written so the main
     // loop's `claude-event-watch` learns about the completion without
@@ -1341,6 +1965,7 @@ pub fn cmd_run(
         &exit_path,
         &heartbeat_path,
         &runtime_heartbeat_path,
+        &pgid_path,
         &exe_path,
         effective_queue_id.as_deref(),
     );
@@ -1392,7 +2017,6 @@ pub fn cmd_run(
 
     rebalance();
 
-    let started_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     state.insert(
         label.to_string(),
         WorkloadEntry {
@@ -1833,8 +2457,36 @@ pub fn cmd_log(label: &str, lines: usize, follow: bool) -> i32 {
     }
 }
 
-/// CLI: `workload kill <label>`
-pub fn cmd_kill(label: &str) -> i32 {
+/// Exit code for "the pane is gone but something it spawned is still
+/// alive". Distinct from 1 (`no such workload`) so a caller can tell
+/// "nothing to kill" from "the kill did not fully take".
+pub const KILL_SURVIVORS_EXIT: i32 = 3;
+
+/// CLI: `workload kill <label> [--grace SECS]`
+///
+/// **Kill is TREE-WIDE.** It is not `tmux kill-pane`: the pane's wrapper
+/// script, the `setsid` payload group recorded in `<label>.pgid`, and
+/// every descendant of both get SIGTERM, then SIGKILL after `--grace`
+/// seconds (default [`KILL_GRACE_SECS_DEFAULT`], env override
+/// [`KILL_GRACE_ENV`]). Survivors are then VERIFIED and reported.
+///
+/// Killing only the pane was the 2026-08-22 incident: a render workload
+/// was killed during a CPU-temperature alert, its driver script kept
+/// running under the reparented payload session, and eleven render
+/// drivers had to be `pkill`ed by hand.
+///
+/// Unchanged from before: the pane still closes, and the `workload-done`
+/// event with `killed=true` is still emitted EXACTLY ONCE (skipped here
+/// when the wrapper already wrote its `.exit` marker, because it emits
+/// its own; and suppressed on the wrapper side via the kill-emitted
+/// sentinel when the wrapper wakes up mid-teardown).
+///
+/// The per-workload work lives in [`kill_one_workload`], shared with the
+/// `task init --recreate --force` path via [`kill_workloads`].
+///
+/// Exit codes: 0 = killed (or already dead), 1 = no such workload,
+/// [`KILL_SURVIVORS_EXIT`] = something survived SIGKILL.
+pub fn cmd_kill(label: &str, grace_secs: Option<f64>) -> i32 {
     let mut state = load_state();
     let info = match state.get(label) {
         Some(i) => i.clone(),
@@ -1844,48 +2496,286 @@ pub fn cmd_kill(label: &str) -> i32 {
         }
     };
 
-    // If the wrapper script already wrote its exit file, it also
-    // already emitted (or will emit before its 30s sleep ends). Skip
-    // our kill-event emit to keep the contract "exactly one event per
-    // workload run". Only synthesise a kill event when we're racing
-    // ahead of a still-alive wrapper.
-    let exit_path = exit_file(label);
-    let already_exited = exit_path.exists();
-
-    if pane_alive(&info.pane_id) {
-        if !already_exited {
-            // Synthesise the exit marker so subsequent `workload wait`
-            // calls return cleanly with the kill code, and emit the
-            // claude-event before tearing down the pane. We route this
-            // through `cmd_emit_done` — NOT a bare `emit_workload_done` —
-            // so a queue-bound workload also gets its queue item
-            // transitioned to `abandoned` here. The wrapper would
-            // normally do that itself on natural exit, but `cmd_kill`
-            // SIGKILLs the wrapper before its `emit-done` step runs, so
-            // without this the queue item gets stranded in `running`
-            // forever (Andrew DM 2026-05-13: rc=-15 event arrived but
-            // the queue UI still showed `running`).
-            let _ = fs::write(&exit_path, "-15\n");
-            cmd_emit_done(
-                label,
-                -15,
-                &info.output,
-                true,
-                info.queue_id.as_deref(),
-            );
-        }
-        kill_pane_tree(&info.pane_id);
-        let _ = Command::new("tmux")
-            .args(["kill-pane", "-t", &info.pane_id])
-            .output();
-        println!("Killed workload '{label}' (pane {})", info.pane_id);
+    let outcome = kill_one_workload(
+        label,
+        &info,
+        resolve_kill_grace(grace_secs),
+        &Teardown::plain(),
+    );
+    let rc = if report_kill_outcome(&outcome) {
+        KILL_SURVIVORS_EXIT
     } else {
-        println!("Workload '{label}' already dead");
-    }
+        0
+    };
+
     state.remove(label);
     let _ = save_state(&state);
     rebalance();
-    0
+    rc
+}
+
+/// What one workload teardown did, so every caller reports it the same
+/// way and derives the same exit code.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkloadKillOutcome {
+    pub label: String,
+    pub pane_id: String,
+    /// The pane was still alive, so there was actually something to tear
+    /// down. `false` = "already dead".
+    pub was_alive: bool,
+    /// This call synthesised the `workload-done` (`killed=true`) event.
+    /// `false` when the wrapper had already written its `.exit` marker
+    /// and therefore emits its own completion.
+    pub emitted_done: bool,
+    pub report: KillTreeReport,
+}
+
+impl WorkloadKillOutcome {
+    /// Did anything outlive the SIGKILL sweep?
+    pub fn has_survivors(&self) -> bool {
+        !self.report.survived.is_empty()
+    }
+}
+
+/// Why a run is being torn down, and what that means for the queue item
+/// it was bound to.
+///
+/// Two teardown reasons exist, and they must not produce the same event:
+///
+///   * [`Teardown::plain`] — `workload kill`, or the teardown
+///     `task init --recreate --force` runs before it destroys the
+///     session. The run is over and nothing takes its place: the
+///     completion is a plain `killed=true` and the queue item goes
+///     terminal (`abandoned`).
+///   * [`Teardown::replaced`] — `workload run` was invoked on a label
+///     whose previous run is still live. That run also dies, but a NEW
+///     run of the same label is about to start with the same log path
+///     and the same registry key. Its completion therefore carries
+///     `reason="replaced"` + `replaced_by=<the new run's started_at>`
+///     so the main loop can never read it as the new run's completion.
+///
+/// `carry_over_queue_item` covers the one case where the queue item
+/// must NOT be transitioned: `workload run --queue-id q-X` on a label
+/// whose dying run was already bound to `q-X`. Abandoning it there
+/// would abandon the item the replacing run is about to work under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Teardown {
+    /// `None` = a plain kill. `Some(started_at)` = replaced by a new run
+    /// of the same label starting at `started_at` (byte-identical to the
+    /// `started_at` the new registry entry gets, so the two correlate).
+    pub replaced_by: Option<String>,
+    /// The replacing run re-binds the SAME queue item, so this teardown
+    /// must leave it `running` and report it as
+    /// `data.carried_over_queue_id` rather than `data.queue_id`.
+    pub carry_over_queue_item: bool,
+}
+
+impl Teardown {
+    /// `workload kill` / recreate: the run is over, its queue item is
+    /// terminal.
+    pub fn plain() -> Self {
+        Teardown::default()
+    }
+
+    /// `workload run` reusing a live label. `carry_over_queue_item` is
+    /// true iff the new run was handed the qid the dying run owns.
+    pub fn replaced(started_at: impl Into<String>, carry_over_queue_item: bool) -> Self {
+        Teardown {
+            replaced_by: Some(started_at.into()),
+            carry_over_queue_item,
+        }
+    }
+
+    /// `"replaced"` for a replace, `None` otherwise — the `data.reason`
+    /// wire value.
+    fn reason(&self) -> Option<&'static str> {
+        self.replaced_by.as_ref().map(|_| "replaced")
+    }
+}
+
+/// Emit this run's `workload-done` with `killed=true` — exactly once.
+///
+/// Two guards, because the wrapper is a live racer, not a passive file:
+///
+///   * `exit_path` already present -> the wrapper finished on its own
+///     (naturally or mid-teardown) and emits its own completion. We stay
+///     out of the way and return `false`.
+///   * otherwise we synthesise the `-15` exit marker (so a later
+///     `workload wait` returns the kill code instead of blocking), drop
+///     the kill-emitted sentinel so a wrapper that wakes up DURING the
+///     teardown does not emit a second completion, and emit.
+///
+/// Routed through [`cmd_emit_done`] rather than a bare
+/// `emit_workload_done` so a queue-bound workload also gets its queue
+/// item transitioned to `abandoned` here — the wrapper would normally do
+/// that itself, but it is about to be killed before its `emit-done` step
+/// runs, and without this the item is stranded in `running` forever
+/// (Andrew DM 2026-05-13: rc=-15 event arrived but the queue UI still
+/// showed `running`).
+///
+/// `teardown` says whether this is a plain kill or a same-label
+/// REPLACE; on a replace the emitted event carries the replace markers
+/// and, when the queue item is being carried over to the replacing run,
+/// the queue transition is skipped.
+///
+/// Paths are parameters so a test can drive the real routine against a
+/// tempdir instead of the production workload-state dir.
+fn ensure_kill_done_event(
+    label: &str,
+    exit_path: &Path,
+    sentinel_path: &Path,
+    log_path: &str,
+    queue_id: Option<&str>,
+    teardown: &Teardown,
+) -> bool {
+    if exit_path.exists() {
+        return false;
+    }
+    let _ = fs::write(exit_path, "-15\n");
+    mark_kill_emitted_at(sentinel_path);
+    emit_done_with_sentinel(label, -15, log_path, true, queue_id, sentinel_path, teardown);
+    true
+}
+
+/// Tear ONE workload down: exactly-once completion event, then the
+/// TREE-WIDE process kill, then the pane.
+///
+/// Shared by `workload kill` (one label) and `task init --recreate
+/// --force` (every workload pane it is about to destroy) so the two can
+/// never drift — same ordering, same grace, same verification, same
+/// sidecar cleanup. Deliberately does NOT touch `state.json` and does
+/// not re-layout the session: the callers do that once, at the end.
+fn kill_one_workload(
+    label: &str,
+    info: &WorkloadEntry,
+    grace: Duration,
+    teardown: &Teardown,
+) -> WorkloadKillOutcome {
+    let mut outcome = WorkloadKillOutcome {
+        label: label.to_string(),
+        pane_id: info.pane_id.clone(),
+        ..Default::default()
+    };
+
+    if pane_alive(&info.pane_id) {
+        outcome.was_alive = true;
+        outcome.emitted_done = ensure_kill_done_event(
+            label,
+            &exit_file(label),
+            &kill_emitted_file(label),
+            &info.output,
+            info.queue_id.as_deref(),
+            teardown,
+        );
+        outcome.report = kill_workload_tree(label, &info.pane_id, grace);
+        let _ = Command::new("tmux")
+            .args(["kill-pane", "-t", &info.pane_id])
+            .output();
+    }
+
+    // The wrapper's EXIT trap removes this itself on a natural exit, but
+    // a SIGKILLed wrapper never runs its trap.
+    let _ = fs::remove_file(pgid_file(label));
+    outcome
+}
+
+/// Print one teardown result the way `workload kill` always has.
+/// Returns `true` when something survived SIGKILL, which the caller
+/// turns into [`KILL_SURVIVORS_EXIT`].
+///
+/// Silence here would be the old bug all over again: the pane closes,
+/// the status flips to KILLED, and something is still burning CPU.
+pub fn report_kill_outcome(outcome: &WorkloadKillOutcome) -> bool {
+    if !outcome.was_alive {
+        println!("Workload '{}' already dead", outcome.label);
+        return false;
+    }
+
+    let report = &outcome.report;
+    println!(
+        "Killed workload '{}' (pane {}) — {} process(es) in {} process group(s)",
+        outcome.label,
+        outcome.pane_id,
+        report.killed.len(),
+        report.pgids.len()
+    );
+    if !report.pgids.is_empty() {
+        println!(
+            "  process groups: {}",
+            report
+                .pgids
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if outcome.has_survivors() {
+        eprintln!(
+            "WARNING: {} process(es) SURVIVED the kill: {}",
+            report.survived.len(),
+            report
+                .survived
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        eprintln!("  inspect with: ps -o pid,ppid,pgid,stat,args -p <pid>");
+        return true;
+    }
+    false
+}
+
+/// Every label in `state` whose pane is in `alive_panes`. Pure, so the
+/// set of workloads a recreate is about to destroy is unit-testable
+/// without tmux. Ordering is `state`'s (a `BTreeMap`, i.e. sorted by
+/// label) so both the warning line and the teardown order are
+/// deterministic.
+pub fn select_running_labels(state: &WorkloadState, alive_panes: &BTreeSet<String>) -> Vec<String> {
+    state
+        .iter()
+        .filter(|(_, info)| !info.pane_id.is_empty() && alive_panes.contains(&info.pane_id))
+        .map(|(label, _)| label.clone())
+        .collect()
+}
+
+/// Tear down every workload in `labels`, then drop them all from the
+/// registry in one write.
+///
+/// This is what `task init --recreate --force` calls BEFORE
+/// `tmux kill-session`. A bare `kill-session` only hangs up the pane
+/// shells; the payload of every running workload lives two sessions
+/// below its pane (`setsid --wait`, then `script(1)`), so it outlived
+/// the recreate as an orphan — still burning CPU, still appending to a
+/// `.output` file nothing was watching any more, and with its queue item
+/// stranded in `running` because no `workload-done` was ever emitted.
+/// Same routine, same grace, same verification as `workload kill`.
+///
+/// Returns one outcome per label, in the order given, for the caller to
+/// report. Unknown labels are named on stderr and skipped.
+pub fn kill_workloads(labels: &[String], grace: Duration) -> Vec<WorkloadKillOutcome> {
+    let mut state = load_state();
+    let mut outcomes = Vec::with_capacity(labels.len());
+    let mut touched = false;
+
+    for label in labels {
+        let info = match state.get(label) {
+            Some(i) => i.clone(),
+            None => {
+                eprintln!("No workload '{label}' in the registry — nothing to tear down");
+                continue;
+            }
+        };
+        outcomes.push(kill_one_workload(label, &info, grace, &Teardown::plain()));
+        state.remove(label);
+        touched = true;
+    }
+
+    if touched {
+        let _ = save_state(&state);
+    }
+    outcomes
 }
 
 /// CLI (hidden): `workload emit-done --label X --exit-code N --log-path P [--killed] [--queue-id q-X]`.
@@ -1915,15 +2805,74 @@ pub fn cmd_emit_done(
     killed: bool,
     queue_id: Option<&str>,
 ) -> i32 {
+    emit_done_with_sentinel(
+        label,
+        exit_code,
+        log_path,
+        killed,
+        queue_id,
+        &kill_emitted_file(label),
+        // The wrapper's own emit is never a replace: only a teardown
+        // knows it is making room for another run.
+        &Teardown::plain(),
+    )
+}
+
+/// [`cmd_emit_done`] with the kill-emitted sentinel path and the
+/// [`Teardown`] passed in, so a test can exercise the suppression (and
+/// the replace markers) against a tempdir instead of the production
+/// workload-state dir.
+fn emit_done_with_sentinel(
+    label: &str,
+    exit_code: i32,
+    log_path: &str,
+    killed: bool,
+    queue_id: Option<&str>,
+    sentinel_path: &Path,
+    teardown: &Teardown,
+) -> i32 {
+    // Exactly-once guard for the KILL race. The killer emits this run's
+    // completion (with `killed=true`) before it tears the pane down; the
+    // wrapper wakes up from `setsid --wait` the moment the payload dies
+    // and can reach its own `emit-done` before the `tmux kill-pane` /
+    // `kill-session` that was supposed to stop it. Without this the main
+    // loop would see two completions for one run — and the second would
+    // transition the queue item a second time. Only a NON-kill emit is
+    // suppressed, and only when the sentinel is actually there.
+    if !killed && take_kill_emitted_at(sentinel_path) {
+        tracing::info!(
+            label,
+            "workload-done already emitted by the killer; skipping the wrapper emit"
+        );
+        return 0;
+    }
+    // A carried-over queue item belongs to the run that is REPLACING
+    // this one. It must not be named as this run's item (a consumer
+    // correlating on `data.queue_id` would read a live item as dead) and
+    // it must not be transitioned.
+    let carried = teardown.carry_over_queue_item.then_some(queue_id).flatten();
     emit_workload_done(&WorkloadDoneEvent {
         label,
         exit_code,
         killed,
         log_path,
-        queue_id,
+        queue_id: if carried.is_some() { None } else { queue_id },
+        reason: teardown.reason(),
+        replaced_by: teardown.replaced_by.as_deref(),
+        carried_over_queue_id: carried,
     });
-    if let Some(qid) = queue_id {
-        transition_queue_item_for_workload(qid, label, exit_code, killed, log_path);
+    match (queue_id, carried) {
+        (Some(qid), None) => {
+            transition_queue_item_for_workload(qid, label, exit_code, killed, log_path, teardown);
+        }
+        (Some(qid), Some(_)) => {
+            tracing::info!(
+                label,
+                queue_id = %qid,
+                "queue item carried over to the replacing run; leaving it running"
+            );
+        }
+        _ => {}
     }
     0
 }
@@ -1935,8 +2884,18 @@ pub fn cmd_emit_done(
 ///
 /// Mapping rationale:
 ///   * rc==0 && !killed → `session-task queue done <qid>` (success)
-///   * killed           → `session-task queue abandon <qid> --reason ...`
-///   * other rc != 0    → `session-task queue abandon <qid> --reason ...`
+///   * killed           → `session-task queue abandon <qid> --confirmed-dead --reason ...`
+///   * other rc != 0    → `session-task queue abandon <qid> --confirmed-dead --reason ...`
+///
+/// `--confirmed-dead` is load-bearing. `session-task queue abandon` on an
+/// item that still owns its scope normally QUARANTINES it (keeps the scope
+/// locked) rather than going terminal, because callers usually abandon on an
+/// inference — "no output", "stale mtime", "looks dead" — and those
+/// inferences have been wrong in ways that produced duplicate work. This
+/// reaper is one of the few callers that is not inferring: it has the
+/// wrapped command's actual exit code, so the process demonstrably
+/// terminated. That is positive evidence of death and it earns the terminal
+/// transition. Do not copy this flag to a caller that only *suspects* death.
 ///
 /// `session-task queue done` already emits the `queue-done` claude-
 /// event; `queue abandon` emits `queue-abandoned`. Either way the main
@@ -1948,6 +2907,7 @@ fn transition_queue_item_for_workload(
     exit_code: i32,
     killed: bool,
     log_path: &str,
+    teardown: &Teardown,
 ) {
     if std::env::var("WORKLOAD_QUEUE_TRANSITION")
         .ok()
@@ -1976,7 +2936,14 @@ fn transition_queue_item_for_workload(
             "--silent".to_string(),
         ]
     } else {
-        let reason = if killed {
+        let reason = if let Some(replaced_by) = teardown.replaced_by.as_deref() {
+            // Say WHY it died: a bare "killed" on a label that is
+            // running again reads like the live run is the dead one.
+            format!(
+                "workload {label} replaced by a new run started {replaced_by} \
+                 (previous run killed, rc={exit_code}, log={log_path})"
+            )
+        } else if killed {
             format!("workload {label} killed (rc={exit_code}, log={log_path})")
         } else {
             format!(
@@ -1987,6 +2954,9 @@ fn transition_queue_item_for_workload(
             "queue".to_string(),
             "abandon".to_string(),
             queue_id.to_string(),
+            // We observed the process exit (we have its rc), so this is a
+            // confirmed death, not a guess. Skips the quarantine state.
+            "--confirmed-dead".to_string(),
             "--reason".to_string(),
             reason,
             "--silent".to_string(),
@@ -2555,6 +3525,15 @@ mod tests {
         assert!(
             recorded.contains("rc=7"),
             "abandon reason must mention exit code: {recorded}"
+        );
+        // The reaper holds the wrapped command's exit code, so it is one of
+        // the few callers with POSITIVE evidence the process died. Without
+        // this flag `session-task` quarantines the item (keeps the scope
+        // locked) instead of releasing it, and every finished-with-error
+        // workload would leave its scope wedged.
+        assert!(
+            recorded.contains("--confirmed-dead"),
+            "reaper abandon must pass --confirmed-dead: {recorded}"
         );
     }
 
@@ -3275,6 +4254,7 @@ mod tests {
             Path::new("/tmp/claude-workloads/demo.exit"),
             Path::new("/tmp/claude-workloads/demo.heartbeat"),
             Path::new("/tmp/claude-wl-rt/demo.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -3308,13 +4288,21 @@ mod tests {
             Path::new("/tmp/pty.exit"),
             Path::new("/tmp/pty.heartbeat"),
             Path::new("/tmp/claude-wl-rt/pty.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
             None,
         );
         assert!(
-            script.contains("setsid --wait script -q -f -e -c"),
+            script.contains(r#"exec script -q -f -e -c "$WORKLOAD_INNER_CMD" /dev/null"#),
             "wrapper must wrap user command in `script -q -f -e -c` for PTY allocation \
              with exit-code propagation:\n{script}"
+        );
+        // The `script` invocation is `exec`ed from the setsid'd bash
+        // that records the pgid — exec preserves the pid, so the
+        // recorded id stays valid for the whole run.
+        assert!(
+            script.contains("setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec script"),
+            "PTY path must go through the pgid-recording setsid bash:\n{script}"
         );
         assert!(
             script.contains("WORKLOAD_PTY"),
@@ -3343,6 +4331,7 @@ mod tests {
             Path::new("/tmp/g.exit"),
             Path::new("/tmp/g.heartbeat"),
             Path::new("/tmp/claude-wl-rt/guard.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/bin/claude-watch",
             None,
         );
@@ -3372,6 +4361,7 @@ mod tests {
             Path::new("/tmp/wp.exit"),
             Path::new("/tmp/wp.heartbeat"),
             Path::new("/tmp/claude-wl-rt/wp.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
             Some("q-2026-05-05-test"),
         );
@@ -3400,6 +4390,7 @@ mod tests {
             Path::new("/tmp/lb.exit"),
             Path::new("/tmp/lb.heartbeat"),
             Path::new("/tmp/claude-wl-rt/lb.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
             None,
         );
@@ -3434,6 +4425,7 @@ mod tests {
             Path::new("/tmp/wnq.exit"),
             Path::new("/tmp/wnq.heartbeat"),
             Path::new("/tmp/claude-wl-rt/wnq.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
             None,
         );
@@ -3475,6 +4467,7 @@ mod tests {
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -3597,6 +4590,7 @@ mod tests {
                 &exit_path,
                 &hb_path,
                 &rt_hb_path,
+                &out_path.with_extension("pgid"),
                 "/bin/true",
                 None,
             );
@@ -3714,6 +4708,7 @@ mod tests {
                 &exit_path,
                 &hb_path,
                 &rt_hb_path,
+                &out_path.with_extension("pgid"),
                 "/bin/true",
                 None,
             );
@@ -3827,6 +4822,7 @@ mod tests {
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -3934,6 +4930,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4005,6 +5002,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             Path::new("/tmp/claude-workloads/hb.exit"),
             Path::new("/tmp/claude-workloads/hb.heartbeat"),
             Path::new("/run/claude/workloads/hb.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -4069,6 +5067,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             Path::new("/tmp/hbo.exit"),
             Path::new("/tmp/hbo.heartbeat"),
             Path::new("/run/claude/workloads/hbo.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/bin/claude-watch",
             None,
         );
@@ -4111,6 +5110,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             Path::new("/tmp/rt.exit"),
             Path::new("/tmp/rt.heartbeat"),
             Path::new("/run/claude/workloads/rt.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -4226,6 +5226,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             Path::new("/tmp/rt2.exit"),
             Path::new("/tmp/rt2.heartbeat"),
             Path::new("/run/claude/workloads/rt2.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -4282,6 +5283,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4379,6 +5381,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4469,6 +5472,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4528,6 +5532,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4893,5 +5898,1484 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         );
         assert!(meta.is_dir(), "legacy must still be a directory");
         assert!(canary.exists(), "canary inside legacy must survive");
+    }
+
+    // ----- kill: pgid bookkeeping -------------------------------------------
+
+    #[test]
+    fn pgid_file_lives_beside_the_other_workload_artifacts() {
+        let p = pgid_file("furiosity-render");
+        assert_eq!(
+            p,
+            PathBuf::from(WORKLOAD_DIR).join("furiosity-render.pgid")
+        );
+    }
+
+    #[test]
+    fn parse_pgid_accepts_a_plain_id_with_trailing_newline() {
+        assert_eq!(parse_pgid("12345\n"), Some(12345));
+        assert_eq!(parse_pgid("  12345  "), Some(12345));
+    }
+
+    #[test]
+    fn parse_pgid_rejects_empty_garbage_and_degenerate_ids() {
+        // Empty / partial write / non-numeric: no pgid, fall back to the
+        // descendant walk rather than signalling something arbitrary.
+        assert_eq!(parse_pgid(""), None);
+        assert_eq!(parse_pgid("\n"), None);
+        assert_eq!(parse_pgid("not-a-pid"), None);
+        assert_eq!(parse_pgid("12 34"), None);
+        // 0 = "every process in MY group", -1 = "every process we may
+        // signal", 1 = init. Each of these would be catastrophic.
+        assert_eq!(parse_pgid("0"), None);
+        assert_eq!(parse_pgid("1"), None);
+        assert_eq!(parse_pgid("-1"), None);
+    }
+
+    #[test]
+    fn parse_proc_stat_reads_ppid_pgid_and_sid() {
+        let row = parse_proc_stat("4242 (bash) S 4000 4242 4242 34816 4242 4194304 ...")
+            .expect("parse");
+        assert_eq!(
+            row,
+            ProcRow {
+                pid: 4242,
+                ppid: 4000,
+                pgid: 4242,
+                sid: 4242
+            }
+        );
+    }
+
+    #[test]
+    fn parse_proc_stat_survives_a_comm_containing_spaces_and_parens() {
+        // `comm` is process-controlled. Splitting on the FIRST `)` (or
+        // on whitespace) mis-indexes every field after it, which would
+        // hand the killer someone else's pgid.
+        let row = parse_proc_stat("77 (my (weird) proc) S 5 66 9 0 -1 0")
+            .expect("parse");
+        assert_eq!(
+            row,
+            ProcRow {
+                pid: 77,
+                ppid: 5,
+                pgid: 66,
+                sid: 9
+            }
+        );
+    }
+
+    #[test]
+    fn parse_proc_state_reads_the_state_char() {
+        assert_eq!(
+            parse_proc_state("4242 (bash) S 4000 4242 4242 0"),
+            Some('S')
+        );
+        // A killed child of the caller sits in Z until it is waited on —
+        // it must not read as a survivor.
+        assert_eq!(
+            parse_proc_state("4242 (my (weird) proc) Z 1 1 1 0"),
+            Some('Z')
+        );
+        assert_eq!(parse_proc_state("garbage"), None);
+    }
+
+    #[test]
+    fn parse_proc_stat_rejects_truncated_lines() {
+        assert!(parse_proc_stat("").is_none());
+        assert!(parse_proc_stat("4242 (bash)").is_none());
+        assert!(parse_proc_stat("4242 (bash) S 4000").is_none());
+        assert!(parse_proc_stat("not-a-pid (bash) S 1 1 1").is_none());
+    }
+
+    /// Snapshot fixture:
+    ///
+    /// ```text
+    /// 100 pane shell   (pgid 100)
+    ///  └─ 200 setsid   (pgid 100)
+    ///      └─ 300 payload leader (pgid 300, sid 300)   <- recorded
+    ///          └─ 400 driver (pgid 300)
+    ///              └─ 500 ffmpeg (pgid 300)
+    /// 600 double-forked ffmpeg, ppid 1 but STILL pgid 300
+    /// 900 innocent bystander (pgid 900)
+    /// ```
+    fn fixture_procs() -> Vec<ProcRow> {
+        vec![
+            ProcRow { pid: 1, ppid: 0, pgid: 1, sid: 1 },
+            ProcRow { pid: 100, ppid: 50, pgid: 100, sid: 50 },
+            ProcRow { pid: 200, ppid: 100, pgid: 100, sid: 50 },
+            ProcRow { pid: 300, ppid: 200, pgid: 300, sid: 300 },
+            ProcRow { pid: 400, ppid: 300, pgid: 300, sid: 300 },
+            ProcRow { pid: 500, ppid: 400, pgid: 300, sid: 300 },
+            ProcRow { pid: 600, ppid: 1, pgid: 300, sid: 300 },
+            ProcRow { pid: 900, ppid: 1, pgid: 900, sid: 900 },
+        ]
+    }
+
+    #[test]
+    fn descendants_of_walks_the_whole_chain_not_just_direct_children() {
+        let procs = fixture_procs();
+        let mut d = descendants_of(&procs, &[100]);
+        d.sort_unstable();
+        // 600 double-forked out of the ppid chain, so it is NOT here —
+        // that is what `members_of_pgids` is for.
+        assert_eq!(d, vec![200, 300, 400, 500]);
+        // Roots are not included in their own descendant list.
+        assert!(!d.contains(&100));
+    }
+
+    #[test]
+    fn descendants_of_is_cycle_safe_and_handles_missing_roots() {
+        // A ppid loop cannot happen on a sane kernel, but a snapshot is
+        // racy and this must terminate regardless.
+        let procs = vec![
+            ProcRow { pid: 10, ppid: 11, pgid: 10, sid: 10 },
+            ProcRow { pid: 11, ppid: 10, pgid: 10, sid: 10 },
+        ];
+        let d = descendants_of(&procs, &[10]);
+        assert_eq!(d, vec![11]);
+        assert!(descendants_of(&procs, &[9999]).is_empty());
+        assert!(descendants_of(&[], &[10]).is_empty());
+    }
+
+    #[test]
+    fn members_of_pgids_catches_the_double_forked_orphan() {
+        let procs = fixture_procs();
+        let mut m = members_of_pgids(&procs, &[300]);
+        m.sort_unstable();
+        // 600 reparented to init but kept the group — invisible to a
+        // ppid walk, visible here. This is the process that outlived
+        // the old `workload kill`.
+        assert_eq!(m, vec![300, 400, 500, 600]);
+        assert!(members_of_pgids(&procs, &[]).is_empty());
+    }
+
+    #[test]
+    fn pgids_of_collects_groups_and_honours_the_protected_denylist() {
+        let procs = fixture_procs();
+        let protected: BTreeSet<i32> = [100].into_iter().collect();
+        // 200 is in the pane shell's group (protected — it may be shared
+        // with the tmux session); 400 is in the payload group.
+        let pgids = pgids_of(&procs, &[200, 400], &protected);
+        assert_eq!(pgids, vec![300]);
+        // Nothing protected ever comes back, even when asked directly.
+        assert!(pgids_of(&procs, &[100], &protected).is_empty());
+        // pgid 1 is never a target.
+        assert!(pgids_of(&procs, &[1], &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn recorded_pgid_is_plausible_only_for_a_live_session_leader() {
+        let procs = fixture_procs();
+        // The payload leader: pid == pgid == sid (created under setsid).
+        assert!(recorded_pgid_is_plausible(&procs, 300));
+        // A recycled pid that happens to exist but leads nothing.
+        assert!(!recorded_pgid_is_plausible(&procs, 400));
+        // Not in the snapshot at all (wrapper died, pid gone).
+        assert!(!recorded_pgid_is_plausible(&procs, 12345));
+        // Degenerate ids.
+        assert!(!recorded_pgid_is_plausible(&procs, 1));
+        assert!(!recorded_pgid_is_plausible(&procs, 0));
+        assert!(!recorded_pgid_is_plausible(&procs, -300));
+    }
+
+    #[test]
+    fn resolve_kill_grace_prefers_flag_then_env_then_default() {
+        assert_eq!(
+            resolve_kill_grace_from(None, None),
+            Duration::from_secs_f64(KILL_GRACE_SECS_DEFAULT)
+        );
+        assert_eq!(
+            resolve_kill_grace_from(None, Some("2.5")),
+            Duration::from_secs_f64(2.5)
+        );
+        // The flag wins over the env.
+        assert_eq!(
+            resolve_kill_grace_from(Some(1.0), Some("30")),
+            Duration::from_secs_f64(1.0)
+        );
+        // 0 is legitimate: "escalate to SIGKILL immediately".
+        assert_eq!(resolve_kill_grace_from(Some(0.0), None), Duration::ZERO);
+    }
+
+    #[test]
+    fn resolve_kill_grace_clamps_and_falls_back_on_garbage() {
+        // A typo must not wedge the caller for a day.
+        assert_eq!(
+            resolve_kill_grace_from(Some(100_000.0), None),
+            Duration::from_secs_f64(KILL_GRACE_SECS_MAX)
+        );
+        for bad in ["", "abc", "-1", "NaN"] {
+            assert_eq!(
+                resolve_kill_grace_from(None, Some(bad)),
+                Duration::from_secs_f64(KILL_GRACE_SECS_DEFAULT),
+                "env value {bad:?} should fall back to the default"
+            );
+        }
+        assert_eq!(
+            resolve_kill_grace_from(Some(-5.0), None),
+            Duration::from_secs_f64(KILL_GRACE_SECS_DEFAULT)
+        );
+    }
+
+    #[test]
+    fn wrapper_script_records_and_cleans_the_pgid_sidecar() {
+        let script = build_wrapper_script(
+            "pg",
+            "echo hi",
+            Path::new("/tmp/claude-workloads/pg.output"),
+            Path::new("/tmp/claude-workloads/pg.exit"),
+            Path::new("/tmp/claude-workloads/pg.heartbeat"),
+            Path::new("/tmp/claude-wl-rt/pg.heartbeat"),
+            Path::new("/tmp/claude-workloads/pg.pgid"),
+            "/usr/bin/claude-watch",
+            None,
+        );
+        assert!(
+            script.contains("export WORKLOAD_PGID_FILE='/tmp/claude-workloads/pg.pgid'"),
+            "wrapper must export the pgid sidecar path:\n{script}"
+        );
+        assert!(
+            script.contains(r#"echo $$ > "$WORKLOAD_PGID_FILE.tmp""#)
+                && script.contains(r#"mv -f "$WORKLOAD_PGID_FILE.tmp" "$WORKLOAD_PGID_FILE""#),
+            "pgid must be written atomically (tmp + mv) so a racing \
+             `workload kill` never reads a half-written file:\n{script}"
+        );
+        assert!(
+            script.contains("rm -f '/tmp/claude-workloads/pg.pgid' '/tmp/claude-workloads/pg.pgid'.tmp"),
+            "the EXIT trap must remove the sidecar — a stale one names a \
+             pid the kernel may have recycled:\n{script}"
+        );
+    }
+
+    // ----- kill: behavioural ------------------------------------------------
+
+    /// Read this process's own `/proc/self/stat`-derived row, for the
+    /// protected denylist in the behavioural tests below. Without it a
+    /// test would happily SIGKILL its own runner.
+    fn self_protected() -> BTreeSet<i32> {
+        // The production denylist with no pane shell in play — using the
+        // real builder rather than a copy of it keeps the tests honest
+        // about what a teardown actually refuses to signal.
+        kill_protected_set(&snapshot_procs(), None)
+    }
+
+    /// Poll until `f` is true or `budget` elapses. Returns whether it
+    /// became true — never `sleep`s a fixed budget, so the tests stay
+    /// fast on a healthy box and still tolerate a loaded CI runner.
+    fn wait_until(budget: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if f() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn read_pid_file(p: &Path) -> Option<i32> {
+        parse_pgid(&std::fs::read_to_string(p).ok()?)
+    }
+
+    /// THE regression test for the 2026-08-22 incident.
+    ///
+    /// Launches a real wrapper whose payload is a shell that spawns a
+    /// `sleep` grandchild AND a double-forked (ppid 1) great-grandchild,
+    /// then tears the workload down the way `workload kill` does and
+    /// asserts NOTHING is left running.
+    ///
+    /// Under the old `kill_pane_tree` the payload lived in a session of
+    /// its own (`setsid --wait`, then `script(1)`'s own session), the
+    /// descendant walk ran AFTER the first kill had already reparented
+    /// everything, and both sleepers survived — the shape of the real
+    /// failure, where a killed render workload's driver kept spawning
+    /// work until eleven processes were reaped by hand.
+    #[test]
+    fn kill_tree_reaps_grandchildren_and_double_forked_orphans() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("kt.output");
+        let exit_path = tmp.path().join("kt.exit");
+        let hb_path = tmp.path().join("kt.heartbeat");
+        let rt_hb_path = tmp.path().join("kt.runtime.heartbeat");
+        let pgid_path = tmp.path().join("kt.pgid");
+        let script_path = tmp.path().join("kt.sh");
+
+        let drv_pid_f = tmp.path().join("drv.pid");
+        let child_pid_f = tmp.path().join("child.pid");
+        let orphan_pid_f = tmp.path().join("orphan.pid");
+
+        // The payload: a driver shell (grandchild of the wrapper), a
+        // plain background sleep under it, and a sleep double-forked out
+        // of the ppid chain (subshell exits immediately, so it is
+        // reparented to pid 1 while KEEPING the process group).
+        let command = format!(
+            "echo $$ > {drv}; sleep 600 & echo $! > {child}; \
+             ( sleep 600 & echo $! > {orphan} ) ; sleep 600",
+            drv = drv_pid_f.display(),
+            child = child_pid_f.display(),
+            orphan = orphan_pid_f.display(),
+        );
+
+        let script = build_wrapper_script(
+            "kt",
+            &command,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            &pgid_path,
+            "/bin/true",
+            None,
+        );
+        std::fs::write(&script_path, &script).expect("write script");
+
+        let mut wrapper = Command::new("bash")
+            .arg(&script_path)
+            // Heartbeat sidecars are orthogonal here and would only add
+            // noise to the survivor report.
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn wrapper");
+        let wrapper_pid = wrapper.id() as i32;
+
+        // Wait for the whole tree to exist before killing anything —
+        // otherwise the test could pass by killing a process that had
+        // not spawned its children yet.
+        let ready = wait_until(Duration::from_secs(20), || {
+            read_pid_file(&pgid_path).is_some()
+                && read_pid_file(&drv_pid_f).is_some()
+                && read_pid_file(&child_pid_f).is_some()
+                && read_pid_file(&orphan_pid_f).is_some()
+        });
+        let recorded = read_pid_file(&pgid_path);
+        let drv = read_pid_file(&drv_pid_f);
+        let child = read_pid_file(&child_pid_f);
+        let orphan = read_pid_file(&orphan_pid_f);
+
+        if !ready {
+            // Never leave the tree running if the setup failed.
+            let _ = kill_tree(
+                &[wrapper_pid],
+                recorded,
+                &self_protected(),
+                Duration::from_millis(200),
+            );
+            let _ = wrapper.wait();
+            panic!(
+                "workload tree never fully started: pgid={recorded:?} drv={drv:?} \
+                 child={child:?} orphan={orphan:?}\noutput:\n{}",
+                std::fs::read_to_string(&out_path).unwrap_or_default()
+            );
+        }
+
+        let recorded = recorded.expect("pgid recorded");
+        let child = child.expect("child pid");
+        let orphan = orphan.expect("orphan pid");
+        let drv = drv.expect("driver pid");
+
+        // The recorded id must be the payload's SESSION LEADER, which is
+        // what makes the `killpg` safe (and what the staleness check in
+        // `kill_workload_tree` relies on).
+        let procs = snapshot_procs();
+        assert!(
+            recorded_pgid_is_plausible(&procs, recorded),
+            "recorded pgid {recorded} is not a live session leader"
+        );
+        // Sanity: the double-forked sleeper really did leave the ppid
+        // chain but stayed in the group, so the test is exercising the
+        // pgid sweep and not just the descendant walk.
+        let orphan_row = procs.iter().find(|r| r.pid == orphan).copied();
+        assert!(
+            orphan_row.is_some(),
+            "double-forked sleeper {orphan} vanished before the kill"
+        );
+
+        let report = kill_tree(
+            &[wrapper_pid, recorded],
+            Some(recorded),
+            &self_protected(),
+            Duration::from_millis(500),
+        );
+        let _ = wrapper.wait();
+
+        for (name, pid) in [
+            ("wrapper", wrapper_pid),
+            ("payload leader", recorded),
+            ("driver", drv),
+            ("grandchild sleep", child),
+            ("double-forked sleep", orphan),
+        ] {
+            let gone = wait_until(Duration::from_secs(5), || !proc_alive(pid));
+            assert!(
+                gone,
+                "{name} (pid {pid}) survived the kill; report: {report:?}"
+            );
+        }
+        assert!(
+            report.survived.is_empty(),
+            "kill_tree reported survivors: {report:?}"
+        );
+        assert!(
+            report.pgids.contains(&recorded),
+            "the payload process group must have been signalled: {report:?}"
+        );
+        // The report must NAME what it reaped — "silence is not success"
+        // is exactly how the incident stayed invisible.
+        assert!(
+            report.killed.contains(&child)
+                && report.killed.contains(&orphan)
+                && report.killed.contains(&drv),
+            "every member of the tree must be accounted for as killed: {report:?}"
+        );
+    }
+
+    // ----- recreate: shared teardown ----------------------------------------
+
+    /// RAII guard pointing `WORKLOAD_STATE_ENV` at a test registry and
+    /// restoring the previous value on drop (including on panic). Holds
+    /// a process-global mutex for its whole lifetime so a threaded
+    /// `cargo test` run can never interleave one test's set/restore
+    /// window with another's read — without it a test could fall
+    /// through to the LIVE registry. (nextest is immune, one process per
+    /// test, but plain `cargo test` is a supported runner too.)
+    struct WorkloadStateGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl WorkloadStateGuard {
+        fn set(path: &Path) -> Self {
+            static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+            let lock = LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os(WORKLOAD_STATE_ENV);
+            // SAFETY: process-global env mutation, serialized by the
+            // lock held for the guard's whole lifetime.
+            unsafe {
+                std::env::set_var(WORKLOAD_STATE_ENV, path);
+            }
+            WorkloadStateGuard { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for WorkloadStateGuard {
+        fn drop(&mut self) {
+            // SAFETY: the lock field drops after this body, so we still
+            // hold it while restoring.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(WORKLOAD_STATE_ENV, v),
+                    None => std::env::remove_var(WORKLOAD_STATE_ENV),
+                }
+            }
+        }
+    }
+
+    /// The registry bookkeeping the recreate depends on: every label it
+    /// was handed leaves the registry in ONE write, an unknown label is
+    /// skipped rather than aborting the batch, and a bystander workload
+    /// (not named for teardown) is left alone.
+    ///
+    /// Pane ids are deliberately ones no tmux server has, so every entry
+    /// reads as already-dead — this exercises the batch's bookkeeping,
+    /// not the signalling (that is
+    /// `recreate_teardown_reaps_the_whole_tree_and_emits_one_kill_event`).
+    #[test]
+    fn kill_workloads_prunes_every_named_label_in_one_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = tmp.path().join("state.json");
+        let _guard = WorkloadStateGuard::set(&registry);
+
+        let mut state = WorkloadState::new();
+        state.insert("cw-test-recreate-a".to_string(), entry("%no-such-pane-a"));
+        state.insert("cw-test-recreate-b".to_string(), entry("%no-such-pane-b"));
+        state.insert("cw-test-bystander".to_string(), entry("%no-such-pane-c"));
+        save_state(&state).expect("seed registry");
+
+        let outcomes = kill_workloads(
+            &[
+                "cw-test-recreate-a".to_string(),
+                "cw-test-recreate-b".to_string(),
+                "cw-test-not-in-registry".to_string(),
+            ],
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "an unknown label is skipped, not turned into a phantom teardown"
+        );
+        for outcome in &outcomes {
+            assert!(!outcome.was_alive, "no pane, nothing to tear down");
+            assert!(!outcome.emitted_done, "a dead pane emits no kill event");
+            assert!(!outcome.has_survivors());
+        }
+
+        let after = load_state();
+        assert_eq!(
+            after.keys().cloned().collect::<Vec<_>>(),
+            vec!["cw-test-bystander".to_string()],
+            "only the labels handed to the teardown leave the registry"
+        );
+    }
+
+
+    fn entry(pane: &str) -> WorkloadEntry {
+        WorkloadEntry {
+            pane_id: pane.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn alive(panes: &[&str]) -> BTreeSet<String> {
+        panes.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// The recreate path must tear down exactly the workloads whose pane
+    /// is still in the session — no more (a stale registry entry is not
+    /// a running workload) and no fewer.
+    #[test]
+    fn select_running_labels_takes_only_workloads_with_a_live_pane() {
+        let mut state = WorkloadState::new();
+        state.insert("render".to_string(), entry("%7"));
+        state.insert("promote".to_string(), entry("%9"));
+        state.insert("stale".to_string(), entry("%3"));
+
+        assert_eq!(
+            select_running_labels(&state, &alive(&["%7", "%9"])),
+            vec!["promote".to_string(), "render".to_string()],
+            "labels must be the live-pane intersection, in sorted order"
+        );
+    }
+
+    /// A registry entry with no pane id can never be matched against a
+    /// live pane — and must not be matched against an empty-string pane
+    /// either, which is what a naive `contains` on a defaulted field
+    /// would do.
+    #[test]
+    fn select_running_labels_ignores_entries_without_a_pane_id() {
+        let mut state = WorkloadState::new();
+        state.insert("no-pane".to_string(), entry(""));
+        state.insert("render".to_string(), entry("%7"));
+
+        let mut alive_set = alive(&["%7"]);
+        alive_set.insert(String::new());
+
+        assert_eq!(
+            select_running_labels(&state, &alive_set),
+            vec!["render".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_running_labels_is_empty_when_the_session_has_no_workload_panes() {
+        let mut state = WorkloadState::new();
+        state.insert("render".to_string(), entry("%7"));
+        assert!(select_running_labels(&state, &alive(&["%0"])).is_empty());
+    }
+
+    #[test]
+    fn kill_emitted_sentinel_lives_beside_the_other_workload_artifacts() {
+        assert_eq!(
+            kill_emitted_file("furiosity-render"),
+            PathBuf::from(WORKLOAD_DIR).join("furiosity-render.kill-emitted")
+        );
+    }
+
+    /// The sentinel is a CLAIM: whoever removes it wins. A second reader
+    /// must see nothing, or the suppression would apply to a later run's
+    /// completion too.
+    #[test]
+    fn taking_the_kill_emitted_sentinel_is_a_one_shot_claim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sentinel = tmp.path().join("kt.kill-emitted");
+
+        assert!(
+            !take_kill_emitted_at(&sentinel),
+            "an absent sentinel must not read as a claim"
+        );
+        mark_kill_emitted_at(&sentinel);
+        assert!(take_kill_emitted_at(&sentinel), "first taker wins");
+        assert!(
+            !take_kill_emitted_at(&sentinel),
+            "the sentinel must be consumed by the first taker"
+        );
+        assert!(!sentinel.exists());
+    }
+
+    /// The kill half of the exactly-once contract: one `workload-done`
+    /// with `killed=true`, an exit marker a later `workload wait` can
+    /// read, and the sentinel that stops the wrapper emitting a second
+    /// completion.
+    #[test]
+    fn kill_done_event_emits_once_with_killed_true() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let exit_path = tmp.path().join("kt.exit");
+        let sentinel = tmp.path().join("kt.kill-emitted");
+        let _guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
+
+        assert!(ensure_kill_done_event(
+            "kt",
+            &exit_path,
+            &sentinel,
+            "/tmp/kt.output",
+            None,
+            &Teardown::plain()
+        ));
+
+        assert_eq!(
+            std::fs::read_to_string(&exit_path).expect("exit marker written"),
+            "-15\n"
+        );
+        assert!(sentinel.exists(), "sentinel must be dropped for the wrapper");
+
+        let ev = one_done_event(&events);
+        assert_eq!(ev["data"]["killed"], true);
+        assert_eq!(ev["data"]["exit_code"], -15);
+        assert_eq!(ev["data"]["label"], "kt");
+    }
+
+    /// A wrapper that already wrote its `.exit` marker emits its own
+    /// completion. The killer must stay out of the way — and must NOT
+    /// leave a sentinel behind, which would swallow that completion.
+    #[test]
+    fn kill_done_event_defers_to_a_wrapper_that_already_exited() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let exit_path = tmp.path().join("kt.exit");
+        let sentinel = tmp.path().join("kt.kill-emitted");
+        std::fs::write(&exit_path, "0\n").expect("pre-existing exit marker");
+        let _guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
+
+        assert!(!ensure_kill_done_event(
+            "kt",
+            &exit_path,
+            &sentinel,
+            "/tmp/kt.output",
+            None,
+            &Teardown::plain()
+        ));
+
+        assert!(!sentinel.exists(), "no sentinel when we did not emit");
+        assert_eq!(done_events(&events).len(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&exit_path).expect("read"),
+            "0\n",
+            "the wrapper's own exit code must not be overwritten"
+        );
+    }
+
+    /// Tearing the same workload down twice (a retried recreate, a
+    /// `workload kill` racing the batch) must still be one completion.
+    #[test]
+    fn kill_done_event_is_idempotent_within_one_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let exit_path = tmp.path().join("kt.exit");
+        let sentinel = tmp.path().join("kt.kill-emitted");
+        let _guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
+
+        assert!(ensure_kill_done_event(
+            "kt",
+            &exit_path,
+            &sentinel,
+            "/tmp/kt.output",
+            None,
+            &Teardown::plain()
+        ));
+        assert!(!ensure_kill_done_event(
+            "kt",
+            &exit_path,
+            &sentinel,
+            "/tmp/kt.output",
+            None,
+            &Teardown::plain()
+        ));
+        assert_eq!(done_events(&events).len(), 1);
+    }
+
+    /// THE race the sentinel exists for: the wrapper wakes up from
+    /// `setsid --wait` mid-teardown and reaches its own `emit-done`
+    /// before the pane is destroyed. Its completion must be swallowed —
+    /// the killer already emitted one for this run.
+    #[test]
+    fn a_wrapper_emit_after_the_kill_is_suppressed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let exit_path = tmp.path().join("kt.exit");
+        let sentinel = tmp.path().join("kt.kill-emitted");
+        let _guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
+
+        ensure_kill_done_event(
+            "kt",
+            &exit_path,
+            &sentinel,
+            "/tmp/kt.output",
+            None,
+            &Teardown::plain(),
+        );
+        // The wrapper's own emit, with the payload's real signal rc.
+        emit_done_with_sentinel(
+            "kt",
+            143,
+            "/tmp/kt.output",
+            false,
+            None,
+            &sentinel,
+            &Teardown::plain(),
+        );
+
+        let ev = one_done_event(&events);
+        assert_eq!(
+            ev["data"]["killed"], true,
+            "the surviving completion must be the killer's"
+        );
+        assert!(
+            !sentinel.exists(),
+            "the wrapper must consume the sentinel, not leave it for the next run"
+        );
+    }
+
+    /// The suppression is scoped to the race it was built for: a normal
+    /// completion with no sentinel present emits, and a KILL emit is
+    /// never suppressed by a stray sentinel.
+    #[test]
+    fn emit_done_is_only_suppressed_by_a_sentinel_on_a_non_kill_emit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let sentinel = tmp.path().join("kt.kill-emitted");
+        let _guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
+
+        // No sentinel: a natural completion emits as always.
+        emit_done_with_sentinel("kt", 0, "/tmp/kt.output", false, None, &sentinel, &Teardown::plain());
+        assert_eq!(done_events(&events).len(), 1);
+
+        // Sentinel present but this IS a kill emit: not suppressed.
+        mark_kill_emitted_at(&sentinel);
+        emit_done_with_sentinel(
+            "kt",
+            -15,
+            "/tmp/kt.output",
+            true,
+            None,
+            &sentinel,
+            &Teardown::plain(),
+        );
+        assert_eq!(done_events(&events).len(), 2);
+        assert!(
+            sentinel.exists(),
+            "a kill emit must not consume the sentinel"
+        );
+    }
+
+    /// The denylist must cover the caller AND, when a pane shell is
+    /// known, the pane shell and the group it may share with the tmux
+    /// session.
+    #[test]
+    fn kill_protected_set_covers_the_caller_and_the_pane_shell() {
+        let procs = snapshot_procs();
+        let self_pid = std::process::id() as i32;
+        let self_row = procs
+            .iter()
+            .find(|r| r.pid == self_pid)
+            .copied()
+            .expect("self in snapshot");
+
+        let bare = kill_protected_set(&procs, None);
+        for guarded in [0, 1, self_pid, self_row.pgid, self_row.sid, self_row.ppid] {
+            assert!(
+                bare.contains(&guarded),
+                "{guarded} must never be signalled"
+            );
+        }
+
+        // A pane shell (stand-in: our own parent) adds itself and its
+        // group; tmux owns that teardown.
+        let shell = self_row.ppid;
+        let with_shell = kill_protected_set(&procs, Some(shell));
+        assert!(with_shell.contains(&shell));
+        if let Some(row) = procs.iter().find(|r| r.pid == shell) {
+            assert!(with_shell.contains(&row.pgid));
+        }
+    }
+
+    /// No pane shell and no recorded pgid = nothing identifiable to
+    /// kill. The teardown must report an empty set rather than fall
+    /// through to a signal set built from nothing.
+    #[test]
+    fn kill_workload_tree_with_no_roots_is_a_no_op() {
+        let report = kill_workload_tree_with("kt", None, None, Duration::from_millis(10));
+        assert_eq!(report, KillTreeReport::default());
+    }
+
+    /// A stale `.pgid` sidecar (recycled pid that is no longer a session
+    /// leader) must be dropped, not signalled.
+    #[test]
+    fn kill_workload_tree_with_ignores_an_implausible_recorded_pgid() {
+        // Our own pid: alive, but not a session leader, so it fails the
+        // pid == pgid == sid check. With no pane shell either, that
+        // leaves no roots at all.
+        let self_pid = std::process::id() as i32;
+        let procs = snapshot_procs();
+        let row = procs
+            .iter()
+            .find(|r| r.pid == self_pid)
+            .copied()
+            .expect("self in snapshot");
+        assert!(
+            row.pgid != self_pid || row.sid != self_pid,
+            "test precondition: the test process must not be a session leader"
+        );
+
+        let report = kill_workload_tree_with("kt", None, Some(self_pid), Duration::from_millis(10));
+        assert_eq!(report, KillTreeReport::default());
+        assert!(proc_alive(self_pid), "we must still be here");
+    }
+
+    fn done_events(dir: &Path) -> Vec<serde_json::Value> {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for e in rd.filter_map(Result::ok) {
+            if !e
+                .file_name()
+                .to_string_lossy()
+                .ends_with("_workload-done.json")
+            {
+                continue;
+            }
+            let body = std::fs::read_to_string(e.path()).expect("read event");
+            out.push(serde_json::from_str(&body).expect("event is valid JSON"));
+        }
+        out
+    }
+
+    fn one_done_event(dir: &Path) -> serde_json::Value {
+        let mut evs = done_events(dir);
+        assert_eq!(
+            evs.len(),
+            1,
+            "expected exactly one workload-done event, got {}",
+            evs.len()
+        );
+        evs.remove(0)
+    }
+
+    /// THE regression test for the recreate blind spot, mirroring
+    /// `kill_tree_reaps_grandchildren_and_double_forked_orphans` one
+    /// layer up: it drives the SHARED teardown
+    /// (`ensure_kill_done_event` + `kill_workload_tree_with`) that
+    /// `task init --recreate --force` now runs for every workload pane
+    /// it is about to destroy, against a REAL generated wrapper.
+    ///
+    /// Before this, recreate ran a bare `tmux kill-session`: the pane
+    /// shells were hung up and everything below them — the payload's
+    /// `setsid` session, its `script(1)` session, the grandchildren and
+    /// anything double-forked out of the ppid chain — was reparented to
+    /// pid 1 and kept running, with no `workload-done` ever emitted, so
+    /// the queue item stayed `running` forever.
+    ///
+    /// Deliberately tempdir-only: no production workload-state dir, no
+    /// tmux, no live `workload run`.
+    #[test]
+    fn recreate_teardown_reaps_the_whole_tree_and_emits_one_kill_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let out_path = tmp.path().join("rt.output");
+        let exit_path = tmp.path().join("rt.exit");
+        let hb_path = tmp.path().join("rt.heartbeat");
+        let rt_hb_path = tmp.path().join("rt.runtime.heartbeat");
+        let pgid_path = tmp.path().join("rt.pgid");
+        let sentinel_path = tmp.path().join("rt.kill-emitted");
+        let script_path = tmp.path().join("rt.sh");
+
+        let drv_pid_f = tmp.path().join("drv.pid");
+        let child_pid_f = tmp.path().join("child.pid");
+        let orphan_pid_f = tmp.path().join("orphan.pid");
+
+        let command = format!(
+            "echo $$ > {drv}; sleep 600 & echo $! > {child}; \
+             ( sleep 600 & echo $! > {orphan} ) ; sleep 600",
+            drv = drv_pid_f.display(),
+            child = child_pid_f.display(),
+            orphan = orphan_pid_f.display(),
+        );
+
+        let script = build_wrapper_script(
+            "rt",
+            &command,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            &pgid_path,
+            "/bin/true",
+            None,
+        );
+        std::fs::write(&script_path, &script).expect("write script");
+
+        let mut wrapper = Command::new("bash")
+            .arg(&script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn wrapper");
+        let wrapper_pid = wrapper.id() as i32;
+
+        let ready = wait_until(Duration::from_secs(20), || {
+            read_pid_file(&pgid_path).is_some()
+                && read_pid_file(&drv_pid_f).is_some()
+                && read_pid_file(&child_pid_f).is_some()
+                && read_pid_file(&orphan_pid_f).is_some()
+        });
+        let recorded = read_pid_file(&pgid_path);
+        let drv = read_pid_file(&drv_pid_f);
+        let child = read_pid_file(&child_pid_f);
+        let orphan = read_pid_file(&orphan_pid_f);
+
+        if !ready {
+            // Never leave the tree running if the setup failed.
+            let _ = kill_tree(
+                &[wrapper_pid],
+                recorded,
+                &self_protected(),
+                Duration::from_millis(200),
+            );
+            let _ = wrapper.wait();
+            panic!(
+                "workload tree never fully started: pgid={recorded:?} drv={drv:?} \
+                 child={child:?} orphan={orphan:?}\noutput:\n{}",
+                std::fs::read_to_string(&out_path).unwrap_or_default()
+            );
+        }
+
+        let recorded = recorded.expect("pgid recorded");
+        let drv = drv.expect("driver pid");
+        let child = child.expect("child pid");
+        let orphan = orphan.expect("orphan pid");
+
+        // --- exactly what the recreate path does, in order --------------
+        let guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
+        let emitted = ensure_kill_done_event(
+            "rt",
+            &exit_path,
+            &sentinel_path,
+            &out_path.to_string_lossy(),
+            None,
+            &Teardown::plain(),
+        );
+        // `wrapper_pid` stands in for the tmux pane shell: it is a
+        // protected ROOT (tmux owns the pane teardown) whose descendants
+        // are the target set.
+        let report = kill_workload_tree_with(
+            "rt",
+            Some(wrapper_pid),
+            Some(recorded),
+            Duration::from_millis(500),
+        );
+        // ...and then the session goes away, taking the pane shell with
+        // it. `tmux kill-session` is not available here, so signal the
+        // stand-in directly.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(wrapper_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = wrapper.wait();
+
+        assert!(emitted, "the recreate must synthesise the completion event");
+        for (name, pid) in [
+            ("payload leader", recorded),
+            ("driver", drv),
+            ("grandchild sleep", child),
+            ("double-forked sleep", orphan),
+            ("wrapper", wrapper_pid),
+        ] {
+            let gone = wait_until(Duration::from_secs(5), || !proc_alive(pid));
+            assert!(
+                gone,
+                "{name} (pid {pid}) survived the recreate teardown; report: {report:?}"
+            );
+        }
+        assert!(
+            report.survived.is_empty(),
+            "recreate teardown reported survivors: {report:?}"
+        );
+        assert!(
+            report.pgids.contains(&recorded),
+            "the payload process group must have been signalled: {report:?}"
+        );
+        assert!(
+            report.killed.contains(&drv)
+                && report.killed.contains(&child)
+                && report.killed.contains(&orphan),
+            "every member of the tree must be accounted for as killed: {report:?}"
+        );
+
+        // One completion, carrying killed=true — the thing a bare
+        // `tmux kill-session` never emitted at all.
+        let ev = one_done_event(&events);
+        assert_eq!(ev["data"]["killed"], true);
+        assert_eq!(ev["data"]["label"], "rt");
+        drop(guard);
+    }
+
+
+    // ----- `workload run` replacing a live same-label run --------------------
+
+    /// The plain teardowns (`workload kill`, recreate) must stay exactly
+    /// what they were: no reason, no `replaced_by`, no carry-over.
+    #[test]
+    fn plain_teardown_carries_no_replace_marker() {
+        let t = Teardown::plain();
+        assert_eq!(t.reason(), None);
+        assert_eq!(t.replaced_by, None);
+        assert!(!t.carry_over_queue_item);
+
+        let r = Teardown::replaced("2026-08-22T11:04:07", false);
+        assert_eq!(r.reason(), Some("replaced"));
+        assert_eq!(r.replaced_by.as_deref(), Some("2026-08-22T11:04:07"));
+        assert!(!r.carry_over_queue_item);
+    }
+
+    /// A replaced run's completion must be TELLABLE from the completion
+    /// of the run that replaced it: same label, same log path,
+    /// `killed=true`, emitted moments before the new run starts. The
+    /// markers (`reason=replaced`, `replaced_by=<the new run's
+    /// started_at>`) are what stop the main loop from reading it as the
+    /// new run finishing instantly.
+    ///
+    /// The dying run's own queue item still goes terminal here — it is
+    /// a different item from whatever the new run binds to — and the
+    /// abandon reason must say REPLACED, not just "killed", because the
+    /// label is running again by the time anyone reads it.
+    #[test]
+    fn replace_teardown_marks_the_event_and_abandons_the_old_runs_item() {
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(&events);
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
+        }
+
+        let exit_path = tmp.path().join("rep.exit");
+        let sentinel_path = tmp.path().join("rep.kill-emitted");
+        let emitted = ensure_kill_done_event(
+            "rep",
+            &exit_path,
+            &sentinel_path,
+            "/tmp/claude-workloads/rep.output",
+            Some("q-2026-08-22-old0"),
+            &Teardown::replaced("2026-08-22T11:04:07", false),
+        );
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        assert!(emitted, "the replaced run's completion must be synthesised");
+        let ev = one_done_event(&events);
+        assert_eq!(ev["data"]["killed"], true);
+        assert_eq!(ev["data"]["exit_code"], -15);
+        assert_eq!(ev["data"]["reason"], "replaced");
+        assert_eq!(ev["data"]["replaced_by"], "2026-08-22T11:04:07");
+        assert_eq!(ev["data"]["queue_id"], "q-2026-08-22-old0");
+
+        let recorded = std::fs::read_to_string(&recording).expect("stub was invoked");
+        assert!(
+            recorded.contains("queue\nabandon\nq-2026-08-22-old0"),
+            "the dying run's own item must go terminal: {recorded}"
+        );
+        assert!(
+            recorded.contains("replaced by a new run started 2026-08-22T11:04:07"),
+            "the abandon reason must say it was replaced, not just killed: {recorded}"
+        );
+    }
+
+    /// `workload run --queue-id q-X` on a label whose live run is
+    /// ALREADY bound to `q-X`: the item belongs to the replacing run, so
+    /// the teardown must leave it `running` and must not present it as
+    /// the dead run's item. Abandoning it here would abandon the work
+    /// that is about to start.
+    #[test]
+    fn replace_teardown_carries_a_shared_queue_item_over_untouched() {
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(&events);
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
+        }
+
+        let exit_path = tmp.path().join("carry.exit");
+        let sentinel_path = tmp.path().join("carry.kill-emitted");
+        let emitted = ensure_kill_done_event(
+            "carry",
+            &exit_path,
+            &sentinel_path,
+            "/tmp/claude-workloads/carry.output",
+            Some("q-2026-08-22-same"),
+            &Teardown::replaced("2026-08-22T11:04:07", true),
+        );
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        assert!(emitted);
+        assert!(
+            !recording.exists(),
+            "a carried-over item must NOT be transitioned: {}",
+            std::fs::read_to_string(&recording).unwrap_or_default()
+        );
+        let ev = one_done_event(&events);
+        assert_eq!(ev["data"]["reason"], "replaced");
+        assert_eq!(ev["data"]["carried_over_queue_id"], "q-2026-08-22-same");
+        assert!(
+            ev["data"].get("queue_id").is_none(),
+            "the item is the NEW run's; naming it as this run's invites \
+             a consumer to read live work as dead: {ev}"
+        );
+    }
+
+    /// THE regression test for the `workload run` replace blind spot,
+    /// mirroring `kill_tree_reaps_grandchildren_and_double_forked_orphans`
+    /// and `recreate_teardown_reaps_the_whole_tree_and_emits_one_kill_event`.
+    ///
+    /// `workload run <label>` on a label whose previous run was still
+    /// live used to be a bare `tmux kill-pane`: the pane shell was hung
+    /// up and the payload — two sessions below it (`setsid --wait`, then
+    /// `script(1)`) — was reparented to pid 1 and kept running, racing
+    /// the NEW run for the same `.output` and `.pgid` sidecars, with no
+    /// `workload-done` ever emitted for it.
+    ///
+    /// Drives the REAL routines `cmd_run` now calls, in its order,
+    /// against a real generated wrapper: teardown, then the sidecar
+    /// reset, then the new run. Tempdir-only: no production
+    /// workload-state dir, no tmux, no live `workload run`.
+    #[test]
+    fn replace_teardown_reaps_the_whole_tree_and_lets_the_new_run_start_clean() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let out_path = tmp.path().join("rp.output");
+        let exit_path = tmp.path().join("rp.exit");
+        let hb_path = tmp.path().join("rp.heartbeat");
+        let rt_hb_path = tmp.path().join("rp.runtime.heartbeat");
+        let pgid_path = tmp.path().join("rp.pgid");
+        let sentinel_path = tmp.path().join("rp.kill-emitted");
+        let script_path = tmp.path().join("rp.sh");
+
+        let drv_pid_f = tmp.path().join("drv.pid");
+        let child_pid_f = tmp.path().join("child.pid");
+        let orphan_pid_f = tmp.path().join("orphan.pid");
+
+        let command = format!(
+            "echo $$ > {drv}; sleep 600 & echo $! > {child}; \
+             ( sleep 600 & echo $! > {orphan} ) ; sleep 600",
+            drv = drv_pid_f.display(),
+            child = child_pid_f.display(),
+            orphan = orphan_pid_f.display(),
+        );
+
+        let script = build_wrapper_script(
+            "rp",
+            &command,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            &pgid_path,
+            "/bin/true",
+            None,
+        );
+        std::fs::write(&script_path, &script).expect("write script");
+
+        let mut wrapper = Command::new("bash")
+            .arg(&script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn wrapper");
+        let wrapper_pid = wrapper.id() as i32;
+
+        let ready = wait_until(Duration::from_secs(20), || {
+            read_pid_file(&pgid_path).is_some()
+                && read_pid_file(&drv_pid_f).is_some()
+                && read_pid_file(&child_pid_f).is_some()
+                && read_pid_file(&orphan_pid_f).is_some()
+        });
+        let recorded = read_pid_file(&pgid_path);
+        let drv = read_pid_file(&drv_pid_f);
+        let child = read_pid_file(&child_pid_f);
+        let orphan = read_pid_file(&orphan_pid_f);
+
+        if !ready {
+            // Never leave the tree running if the setup failed.
+            let _ = kill_tree(
+                &[wrapper_pid],
+                recorded,
+                &self_protected(),
+                Duration::from_millis(200),
+            );
+            let _ = wrapper.wait();
+            panic!(
+                "workload tree never fully started: pgid={recorded:?} drv={drv:?} \
+                 child={child:?} orphan={orphan:?}\noutput:\n{}",
+                std::fs::read_to_string(&out_path).unwrap_or_default()
+            );
+        }
+
+        let recorded = recorded.expect("pgid recorded");
+        let drv = drv.expect("driver pid");
+        let child = child.expect("child pid");
+        let orphan = orphan.expect("orphan pid");
+
+        // --- exactly what the replace path does, in order ---------------
+        let guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
+        let replaced_by = "2026-08-22T11:04:07";
+        let emitted = ensure_kill_done_event(
+            "rp",
+            &exit_path,
+            &sentinel_path,
+            &out_path.to_string_lossy(),
+            None,
+            &Teardown::replaced(replaced_by, false),
+        );
+        // `wrapper_pid` stands in for the tmux pane shell: a protected
+        // ROOT (tmux owns the pane teardown) whose descendants are the
+        // target set.
+        let report = kill_workload_tree_with(
+            "rp",
+            Some(wrapper_pid),
+            Some(recorded),
+            Duration::from_millis(500),
+        );
+        // ...and then `tmux kill-pane` takes the pane shell itself,
+        // which is not available here — signal the stand-in directly.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(wrapper_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = wrapper.wait();
+
+        assert!(emitted, "the replace must synthesise the old run's completion");
+        for (name, pid) in [
+            ("payload leader", recorded),
+            ("driver", drv),
+            ("grandchild sleep", child),
+            ("double-forked sleep", orphan),
+            ("wrapper", wrapper_pid),
+        ] {
+            let gone = wait_until(Duration::from_secs(5), || !proc_alive(pid));
+            assert!(
+                gone,
+                "{name} (pid {pid}) survived the replace teardown; report: {report:?}"
+            );
+        }
+        assert!(
+            report.survived.is_empty(),
+            "replace teardown reported survivors: {report:?}"
+        );
+        assert!(
+            report.pgids.contains(&recorded),
+            "the payload process group must have been signalled: {report:?}"
+        );
+        assert!(
+            report.killed.contains(&drv)
+                && report.killed.contains(&child)
+                && report.killed.contains(&orphan),
+            "every member of the old tree must be accounted for as killed: {report:?}"
+        );
+
+        // Exactly ONE completion for the replaced run, and it says
+        // REPLACED — the new run is about to publish under the same
+        // label and log path, so a bare killed=true would be
+        // indistinguishable from the new run dying on the spot.
+        let ev = one_done_event(&events);
+        assert_eq!(ev["data"]["killed"], true);
+        assert_eq!(ev["data"]["label"], "rp");
+        assert_eq!(ev["data"]["reason"], "replaced");
+        assert_eq!(ev["data"]["replaced_by"], replaced_by);
+
+        // --- the new run: same label, clean sidecars, healthy ----------
+        for p in [&exit_path, &out_path, &pgid_path, &sentinel_path] {
+            let _ = std::fs::remove_file(p);
+        }
+        let new_script_path = tmp.path().join("rp-new.sh");
+        let new_script = build_wrapper_script(
+            "rp",
+            "echo replaced-run-ok",
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            &pgid_path,
+            "/bin/true",
+            None,
+        );
+        std::fs::write(&new_script_path, &new_script).expect("write new script");
+        let mut new_wrapper = Command::new("bash")
+            .arg(&new_script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn the replacing wrapper");
+        let new_wrapper_pid = new_wrapper.id() as i32;
+        // The wrapper lingers on a `sleep 30` after its payload so the
+        // pane stays readable; wait on the ARTIFACTS, not on the
+        // process, then reap it.
+        let finished = wait_until(Duration::from_secs(30), || {
+            std::fs::read_to_string(&exit_path)
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false)
+        });
+        let exit_marker = std::fs::read_to_string(&exit_path).unwrap_or_default();
+        let new_out = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let _ = kill_tree(
+            &[new_wrapper_pid],
+            read_pid_file(&pgid_path),
+            &self_protected(),
+            Duration::from_millis(200),
+        );
+        let _ = new_wrapper.wait();
+
+        assert!(
+            finished,
+            "the new run never wrote an exit marker; output:\n{new_out}"
+        );
+        assert_eq!(
+            exit_marker.trim(),
+            "0",
+            "the new run must write its OWN exit marker, not inherit the -15"
+        );
+        assert!(
+            new_out.contains("replaced-run-ok"),
+            "the new run's output must be its own: {new_out}"
+        );
+
+        // The replaced run's kill-emitted sentinel must not swallow the
+        // NEW run's completion — that would be the replace masquerading
+        // as the new run in the other direction: no event at all.
+        assert!(
+            !sentinel_path.exists(),
+            "the replace reset must clear the kill-emitted sentinel"
+        );
+        emit_done_with_sentinel(
+            "rp",
+            0,
+            &out_path.to_string_lossy(),
+            false,
+            None,
+            &sentinel_path,
+            &Teardown::plain(),
+        );
+        let evs = done_events(&events);
+        assert_eq!(
+            evs.len(),
+            2,
+            "the new run's completion must be emitted, not suppressed: {evs:?}"
+        );
+        // readdir order is not time order — find the new run's event.
+        let fresh = evs
+            .iter()
+            .find(|e| e["data"]["killed"] == false)
+            .unwrap_or_else(|| panic!("no killed=false completion among {evs:?}"));
+        assert!(
+            fresh["data"].get("reason").is_none(),
+            "the new run's completion is not a replace: {fresh}"
+        );
+        drop(guard);
+    }
+
+    /// `kill_tree` must never signal the caller: a protected pgid stays
+    /// untouched even when a target sits inside it.
+    #[test]
+    fn kill_tree_never_signals_a_protected_group() {
+        // A bystander in OUR OWN process group. If the protection
+        // failed, this (and the test runner) would die.
+        let mut bystander = Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn bystander");
+        let bystander_pid = bystander.id() as i32;
+
+        let protected = self_protected();
+        let procs = snapshot_procs();
+        let row = procs
+            .iter()
+            .find(|r| r.pid == bystander_pid)
+            .copied()
+            .expect("bystander in snapshot");
+        assert!(
+            protected.contains(&row.pgid),
+            "test precondition: the bystander should share our protected group"
+        );
+
+        // Roots empty of anything real: nothing to kill, and crucially
+        // the protected group must not be signalled.
+        let report = kill_tree(&[], None, &protected, Duration::from_millis(50));
+        assert!(
+            !report.pgids.contains(&row.pgid),
+            "protected group {} was targeted: {report:?}",
+            row.pgid
+        );
+        assert!(
+            proc_alive(bystander_pid),
+            "bystander in a protected group was killed"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(bystander_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = bystander.wait();
     }
 }

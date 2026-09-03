@@ -63,8 +63,22 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 # Shared loader / dedup logic — see claude_agents.py alongside this file.
 from claude_agents import agents_by_queue_id as _agents_by_qid
 from claude_agents import load_agent_state as _load_state
+from claude_agents import load_agent_queue_bindings as _agents_bindings_by_qid
 
 QUEUE_PATH = os.environ.get("QUEUE_JSON", "/queue/queue.json")
+# Persistent completed-tasks archive (append-only history log). session-task
+# appends one JSON line per queue done/abandon here (see `log_completed` in
+# tools/session-task/session-task). The DONE view UNIONs this archive with the
+# done items still resident in queue.json, so the view (a) survives a
+# queue.json reset — which wipes the live done tail, the root cause of the
+# empty "DONE 0/0" section — and (b) reflects the FULL completion history, not
+# just whatever items happen to still be in queue.json. Default: sibling of
+# QUEUE_PATH (both live under ~/.config/session, already bind-mounted rw), so
+# no new mount is required; override via COMPLETED_TASKS_JSONL.
+COMPLETED_TASKS_PATH = os.environ.get(
+    "COMPLETED_TASKS_JSONL",
+    os.path.join(os.path.dirname(QUEUE_PATH), "completed-tasks.jsonl"),
+)
 AGENT_STATE_PATH = os.environ.get(
     "AGENT_STATE_JSON", "/agents-state/active-agents.json"
 )
@@ -94,6 +108,50 @@ AGENTS_JSONL_ROOT = os.environ.get(
 AGENT_QUEUE_BINDINGS_PATH = os.environ.get(
     "AGENT_QUEUE_BINDINGS_JSON",
     "/queue-home/.config/claude/agent-queue-bindings.json",
+)
+# Live per-agent activity counters (tool calls + tokens) for RUNNING queue
+# items + session totals in the header (botchat #2967). Source: an atomic JSON
+# snapshot a host-side cron rewrites every minute (producer: this repo's
+# ``tools/cw-agent-stats/cw-agent-stats``, library ``agentstats.py`` beside
+# it — the whole feature left botchat 2026-08-22), shape::
+#
+#     {"version": 2, "generated_at": <epoch>, "live_window_seconds": 900,
+#      "main": {"session_id", "context_tokens", "last_write_at", "age_seconds"},
+#      "agents": [{"agent_id", "queue_id", "tool_calls", "context_tokens",
+#                  "output_tokens", "last_tool", "started_at",
+#                  "last_write_at", "age_seconds", "finished", ...}],
+#      "totals": {"agents", "tool_calls", "context_tokens", "output_tokens"}}
+#
+# We JOIN ``agents[].queue_id`` onto the running rows; we never re-fold
+# transcripts ourselves. Empty env var = feature OFF (no read at all). A
+# missing / unreadable / unparseable file = feature HIDDEN (no pill, no
+# cell). A snapshot older than AGENT_STATS_STALE_SECONDS (by ``generated_at``
+# OR file mtime, whichever is older) is STALE: the header pill reads "n/a"
+# and every per-row cell is BLANK — a frozen number is worse than no number.
+#
+# The producer replaces the file atomically (tmp + rename), so a deployment
+# must bind-mount its DIRECTORY (or mirror the host path), not the single
+# file: a single-file bind mount pins the original inode and goes stale on
+# the first rewrite — the same trap documented for SESSION_TASK_BIN.
+#
+# DEFAULT PATH = a SIBLING of ``AGENT_STATE_PATH`` (active-agents.json). The
+# producer's own default is ``<claude-watch state dir>/agent-stats.json``
+# (``$CLAUDE_WATCH_STATE_DIR``, else ``/var/lib/claude-watch`` — the same dir
+# the daemon writes ``active-agents.json`` into), and that dir is what the
+# compose stack already bind-mounts here as ``/agents-state`` (CW_STATE_PATH).
+# Deriving the default from AGENT_STATE_JSON keeps producer and consumer in
+# agreement with ZERO extra config wherever the state dir is shared: in the
+# container it resolves to ``/agents-state/agent-stats.json``; run bare on the
+# host it resolves to ``/var/lib/claude-watch/agent-stats.json`` if
+# AGENT_STATE_JSON points there. Set the env var to override (e.g. a
+# named-volume state dir the host cron cannot write into: mount the
+# producer's output dir separately and point this at it).
+AGENT_STATS_PATH = os.environ.get(
+    "QUEUE_MINISITE_AGENT_STATS_FILE",
+    os.path.join(os.path.dirname(AGENT_STATE_PATH), "agent-stats.json"),
+)
+AGENT_STATS_STALE_SECONDS = float(
+    os.environ.get("QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS", "60")
 )
 # Persistent archive directory for spawning-subagent transcripts. The
 # vendored session-task `_archive_agent_transcript` copies the active
@@ -164,6 +222,91 @@ RECENT_ABANDONED_LIMIT = int(os.environ.get("RECENT_ABANDONED_LIMIT", "20"))
 # bug-detection signal we don't want to swallow.
 STARTING_WINDOW_SECONDS = float(os.environ.get("STARTING_WINDOW_SECONDS", "60"))
 
+# ---------------------------------------------------------------------------
+# Status -> section registry (the "no status may go invisible" rule)
+# ---------------------------------------------------------------------------
+#
+# The render pass used to bucket items with a hardcoded if/elif chain and
+# SILENTLY DROP anything that matched no branch. That is a bug factory, not a
+# bug: every status added to the queue after the chain was written became
+# invisible in the UI the moment it shipped, with no error, no count, and no
+# empty-section placeholder to hint that rows were being eaten.
+#
+# Two statuses were already being eaten this way:
+#
+#   * ``wedged``      — an in-flight item whose owning agent is stuck. It
+#                       still OWNS ITS SCOPE.
+#   * ``quarantined`` — ``queue abandon`` was called on a scope-owning item
+#                       without positive evidence the process is gone. It
+#                       still OWNS ITS SCOPE and is waiting on a human to
+#                       pick one of three exits.
+#
+# Both are exactly the rows an operator must see: the work looks like it
+# vanished while the scope stays locked and the next spawn on that scope is
+# refused for a reason the UI never explains.
+#
+# The fix is structural rather than two more hardcoded branches. Bucketing is
+# table-driven from ``STATUS_SECTION`` and anything unrecognised falls into
+# ``SECTION_UNKNOWN_KEY`` — a section that always renders (and logs a warning
+# once per unseen status) — so a status added tomorrow shows up as an
+# unstyled-but-VISIBLE row instead of disappearing. Adding a first-class
+# section for a new status then becomes a presentation upgrade, never a
+# prerequisite for it being visible at all.
+SECTION_UNKNOWN_KEY = "other"
+
+# status (as written by session-task) -> payload/section key. Every value here
+# must have a matching section in templates/index.html AND in
+# static/refresh.js' buildQueueDOM — see the mirroring note in refresh.js.
+STATUS_SECTION: dict[str, str] = {
+    "running": "running",
+    "wedged": "wedged",
+    "quarantined": "quarantined",
+    "pending": "pending",
+    "blocked": "blocked",
+    "done": "done",
+    "abandoned": "abandoned",
+}
+
+# Payload keys for the live (non-capped) sections, in render order. Kept as a
+# tuple so the payload, the totals map and the tests all read from one list.
+SECTION_KEYS: tuple[str, ...] = (
+    "running",
+    "wedged",
+    "quarantined",
+    "pending",
+    "blocked",
+    "done",
+    "abandoned",
+    SECTION_UNKNOWN_KEY,
+)
+
+# Statuses we've already warned about, so an unrecognised status logs once per
+# process rather than once per render tick (the page refreshes every 5s).
+_warned_unknown_statuses: set[str] = set()
+
+
+def _note_unknown_status(status: str) -> None:
+    """Log (once per process) that a queue status has no declared section.
+
+    Deliberately non-fatal: the row still renders in the fallback section.
+    The log line is the second half of the guarantee — the operator sees the
+    row, and whoever maintains this file sees that a section is missing.
+    """
+    if status in _warned_unknown_statuses:
+        return
+    _warned_unknown_statuses.add(status)
+    try:
+        app.logger.warning(
+            "queue item has unrecognised status %r — rendering it in the "
+            "'%s' fallback section. Add it to STATUS_SECTION (app.py) plus a "
+            "section in templates/index.html and static/refresh.js to give "
+            "it a first-class view.",
+            status,
+            SECTION_UNKNOWN_KEY,
+        )
+    except Exception:  # pragma: no cover — logging must never break a render
+        pass
+
 # Path to the vendored session-task script inside the container. Same
 # Python-stdlib-only implementation as the in-repo
 # tools/session-task/session-task; copied in at Docker build time. See Dockerfile.
@@ -185,6 +328,54 @@ _QUEUE_MARKER_RE = re.compile(r"Queue item:\s*(q-[a-z0-9-]{4,64})")
 # Reason length cap — the value is stored verbatim in queue.json; no
 # need to allow paragraphs.
 _MAX_REASON_LEN = 500
+
+
+def _session_task_preflight() -> "tuple[Any, int] | None":
+    """Verify ``SESSION_TASK_BIN`` is actually OPENABLE before shelling out.
+
+    The script reaches the container via a docker-compose bind mount. A
+    SINGLE-FILE bind mount binds the source *inode* at container start; when
+    the host file is later replaced via atomic rename — which is exactly how
+    ``tools/session-task/session-task`` is edited, deployed, and how a git
+    checkout lands it — the container's mount keeps pointing at the now-
+    UNLINKED inode. The path still lists via ``ls`` (the mount dentry
+    survives) but ``open()`` fails with ENOENT, so ``python3
+    /app/session-task ...`` dies with rc=2 and every write endpoint
+    (force-start, abandon, depend) fails opaquely as "session-task <op>
+    failed". This preflight converts that into an actionable diagnostic.
+
+    The DURABLE fix is bind-mounting the containing DIRECTORY rather than the
+    file (a directory mount resolves the filename fresh on each ``open()``,
+    so atomic-rename replacement is picked up transparently) — see the
+    queue-minisite service in ``examples/compose/docker-compose.yml``. This
+    preflight is defense-in-depth so a future stale mount is diagnosable
+    instead of silent.
+
+    Returns ``None`` when the binary is readable, else an
+    ``(json_response, status_code)`` tuple the caller returns directly.
+    """
+    try:
+        with open(SESSION_TASK_BIN, "rb"):
+            pass
+    except OSError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": (
+                        f"session-task binary is not readable at "
+                        f"{SESSION_TASK_BIN!r}: {exc}. This usually means the "
+                        f"bind-mounted script went stale (host file replaced "
+                        f"via atomic rename after the container started) — "
+                        f"recreate the queue-minisite container to refresh "
+                        f"the mount."
+                    ),
+                    "session_task_bin": SESSION_TASK_BIN,
+                }
+            ),
+            500,
+        )
+    return None
 
 # Errored-hostjob detection. The `hostjob` runner (`examples/compose/bin/hostjob`) flips
 # its queue item to `abandoned` with `abandon_reason = "hostjob exit <N>"`
@@ -306,6 +497,149 @@ class _Cache:
 _cache = _Cache()
 
 
+@dataclass
+class _ArchiveCache:
+    # DONE entries parsed from completed-tasks.jsonl, newest-first + deduped.
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    mtime: float = -1.0
+    size: int = -1
+
+
+_archive_cache = _ArchiveCache()
+
+
+@dataclass
+class _AgentStatsCache:
+    # Parsed agent-stats snapshot, keyed on the file's (mtime, size) so the
+    # 5s poll re-reads only when the producer actually rewrote it. Staleness
+    # is NOT cached — it is re-derived from ``generated_at`` / mtime against
+    # the wall clock on every call, so a producer that stops writing flips
+    # the view to "n/a" within the stale window even though nothing on disk
+    # changed.
+    data: dict[str, Any] | None = None
+    mtime: float = -1.0
+    size: int = -1
+
+
+_agent_stats_cache = _AgentStatsCache()
+
+# Strips the `[queue <id>]` / `[queue <id> abandoned]` layer prefix that
+# session-task prepends to the archived task string, so we render the bare
+# task text (matching session-task's own `_entry_display_task`).
+_QUEUE_LAYER_PREFIX_RE = re.compile(r"^\[queue [^\]]+\]\s*")
+
+
+def _load_completed_done_entries() -> list[dict[str, Any]]:
+    """Parse the completed-tasks archive, returning DONE rows newest-first.
+
+    Each returned dict: ``{"id", "completed_at", "task", "group_id"}`` with
+    ``task`` already stripped of the ``[queue <id>]`` prefix. Only DONE rows
+    are returned — abandon / merge / block / resurrect / etc. rows (which
+    carry a non-``done`` ``event`` field) and legacy abandon rows (whose
+    ``[queue <id> abandoned]`` marker lives inside the prefix) are dropped;
+    this feeds the DONE section only.
+
+    Cached on the file's ``(mtime, size)``: a ~4600-line (and growing)
+    archive is parsed once per change, not once per request. Newest-first by
+    ``completed_at`` and deduped by id (last-writer-wins — an id can recur if
+    a q-id is re-created + re-completed). Fail-soft: any stat/read/parse error
+    yields the last good cache (or an empty list).
+    """
+    try:
+        st = os.stat(COMPLETED_TASKS_PATH)
+    except OSError:
+        return []
+    if _archive_cache.mtime == st.st_mtime and _archive_cache.size == st.st_size:
+        return _archive_cache.entries
+
+    entries: list[dict[str, Any]] = []
+    try:
+        with open(
+            COMPLETED_TASKS_PATH, "r", encoding="utf-8", errors="replace"
+        ) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                # DONE only. A structured `event` other than "done" marks a
+                # non-completion lifecycle row (abandon/merge/block/…).
+                event = row.get("event")
+                if event and event != "done":
+                    continue
+                task = row.get("task", "") or ""
+                # Legacy abandon rows predate the `event` field: the marker
+                # lives INSIDE the `[queue <id> abandoned]` prefix (before the
+                # first "]"), so we only look there — never in the free-text
+                # body, which could legitimately contain the word "abandoned".
+                head = task.split("]", 1)[0]
+                if "abandoned" in head:
+                    continue
+                qid = row.get("id")
+                if not isinstance(qid, str) or not qid:
+                    continue
+                entries.append(
+                    {
+                        "id": qid,
+                        "completed_at": row.get("completed_at")
+                        or row.get("abandoned_at")
+                        or "",
+                        "task": _QUEUE_LAYER_PREFIX_RE.sub("", task),
+                        "group_id": row.get("group_id", "") or "",
+                    }
+                )
+    except OSError:
+        return _archive_cache.entries
+
+    # Newest-first (uniform `+00:00`-suffixed ISO strings compare correctly).
+    entries.sort(key=lambda e: e.get("completed_at") or "", reverse=True)
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for e in entries:
+        if e["id"] in seen:
+            continue
+        seen.add(e["id"])
+        deduped.append(e)
+
+    _archive_cache.entries = deduped
+    _archive_cache.mtime = st.st_mtime
+    _archive_cache.size = st.st_size
+    return deduped
+
+
+def _shape_archived_done(entry: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """Shape an archive-only completed task into a DONE card dict.
+
+    The archive row is sparse (id, completed_at, task, group_id). We
+    synthesize a minimal queue-item and run it through the shared ``_shape``
+    so every field the template / refresh.js reads for a done item exists and
+    the card renders identically to a live queue.json done item. Marked
+    ``from_archive=True`` (sourced from history, no live queue entry); no
+    transcript path survives in the archive, so ``has_archive`` is False and
+    the View-log button is simply absent.
+    """
+    completed_at = entry.get("completed_at") or ""
+    synthetic = {
+        "id": entry.get("id", ""),
+        "status": "done",
+        "completed_at": completed_at,
+        # No created/registered timestamp survives in the archive; anchor
+        # created_at on completion so age math + created_at_iso stay sane.
+        "created_at": completed_at,
+        "group_id": entry.get("group_id", ""),
+        "description": entry.get("task", "") or "",
+        "summary": entry.get("task", "") or "",
+    }
+    shaped = _shape(synthetic, now, {}, items=None)
+    shaped["from_archive"] = True
+    return shaped
+
+
 def _empty_queue() -> dict[str, Any]:
     """Canonical empty queue.json skeleton.
 
@@ -395,6 +729,449 @@ def _load_agent_state() -> dict[str, dict[str, Any]]:
     return _agents_by_qid(_load_state(AGENT_STATE_PATH))
 
 
+def _fmt_count(n: Any) -> str:
+    """Abbreviate a counter for a narrow cell: 820, 8.2K, 82K, 1.2M.
+
+    Non-numeric / negative input renders as ``?`` so a producer hiccup can
+    never throw the whole card render.
+    """
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    if v < 0:
+        return "?"
+    if v < 1000:
+        return str(int(v))
+    if v < 10_000:
+        return f"{v / 1000:.1f}K".replace(".0K", "K")
+    if v < 1_000_000:
+        return f"{int(v // 1000)}K"
+    if v < 10_000_000:
+        return f"{v / 1_000_000:.1f}M".replace(".0M", "M")
+    return f"{int(v // 1_000_000)}M"
+
+
+def _agent_stats_empty(enabled: bool) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "available": False,
+        "stale": False,
+        "age_seconds": None,
+        "generated_at": None,
+        "by_queue_id": {},
+        "by_agent_id": {},
+        "totals": None,
+        "main": None,
+    }
+
+
+def _read_agent_stats_file() -> dict[str, Any] | None:
+    """Read + parse the snapshot, cached on (mtime, size). None = absent."""
+    if not AGENT_STATS_PATH:
+        return None
+    try:
+        st = os.stat(AGENT_STATS_PATH)
+    except OSError:
+        _agent_stats_cache.data = None
+        _agent_stats_cache.mtime = -1.0
+        _agent_stats_cache.size = -1
+        return None
+    if (
+        _agent_stats_cache.data is not None
+        and _agent_stats_cache.mtime == st.st_mtime
+        and _agent_stats_cache.size == st.st_size
+    ):
+        return _agent_stats_cache.data
+    try:
+        with open(AGENT_STATS_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    parsed = {"raw": raw, "file_mtime": st.st_mtime}
+    _agent_stats_cache.data = parsed
+    _agent_stats_cache.mtime = st.st_mtime
+    _agent_stats_cache.size = st.st_size
+    return parsed
+
+
+def _fmt_dur(secs: Any) -> str:
+    """Compact duration for the agent popover: ``48s``, ``5m12s``, ``12m``,
+    ``1h5m``. Mirrors the botchat badge's fmtSecs (the look being ported).
+    ``?`` for non-numeric / negative input."""
+    try:
+        s = float(secs)
+    except (TypeError, ValueError):
+        return "?"
+    if s < 0:
+        return "?"
+    if s < 60:
+        return f"{int(round(s))}s"
+    if s < 3600:
+        m = int(s // 60)
+        return f"{m}m{int(round(s % 60))}s" if s < 600 else f"{m}m"
+    h, rem = divmod(int(s), 3600)
+    return f"{h}h{rem // 60}m"
+
+
+def _iso_to_epoch(ts: Any) -> float | None:
+    """Parse the producer's ISO-8601 stamps (``2026-08-22T04:48:35.946Z``)
+    to an epoch; None when absent / unparseable."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+# The subset of a shaped agent record the header popover prints (one row per
+# live agent) — projected so /api/queue does not ship every per-row label
+# twice (the running-row cell already carries the full shape).
+_POPOVER_ROW_KEYS = (
+    "agent_id", "queue_id", "description", "agent_type", "last_tool",
+    "tool_calls", "context_tokens", "output_tokens", "running_seconds", "finished",
+    "calls_text", "ctx_text", "out_text", "age_text", "last_write_text",
+)
+
+
+def _shape_agent_stat(rec: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
+    """Per-agent counters + the display strings both renderers print.
+
+    Labels are built HERE (not in JS) so the Jinja first paint and the 5s
+    refresh.js rebuild are byte-identical and the formatting has one home.
+    The same record feeds the running-row cell AND one row of the header
+    pill's per-agent popover (description / type / queue id / last tool /
+    calls / ctx / out / age since spawn).
+    """
+    calls = rec.get("tool_calls")
+    ctx = rec.get("context_tokens")
+    out = rec.get("output_tokens")
+    age = rec.get("age_seconds")
+    last_tool = rec.get("last_tool") or ""
+    calls_s = _fmt_count(calls)
+    ctx_s = _fmt_count(ctx)
+    title_bits = [f"{calls_s} tool calls", f"{ctx_s} context tokens"]
+    if out is not None:
+        title_bits.append(f"{_fmt_count(out)} output tokens")
+    if last_tool:
+        title_bits.append(f"last tool {last_tool}")
+    if isinstance(age, (int, float)):
+        title_bits.append(f"last write {_humanize_age(float(age))}")
+    if rec.get("finished"):
+        title_bits.append("finished")
+    # Age since the agent's FIRST transcript entry (its spawn), not its last
+    # write — that is what the popover's "age" column shows.
+    started_epoch = _iso_to_epoch(rec.get("started_at"))
+    since_start = None
+    if started_epoch is not None:
+        now_ts = time.time() if now_ts is None else now_ts
+        since_start = max(0.0, now_ts - started_epoch)
+    return {
+        "agent_id": rec.get("agent_id") or "",
+        "queue_id": rec.get("queue_id") if isinstance(rec.get("queue_id"), str) else "",
+        "description": rec.get("description") if isinstance(rec.get("description"), str) else "",
+        "agent_type": rec.get("agent_type") if isinstance(rec.get("agent_type"), str) else "",
+        "tool_calls": calls,
+        "context_tokens": ctx,
+        "output_tokens": out,
+        "last_tool": last_tool,
+        "started_at": rec.get("started_at") if isinstance(rec.get("started_at"), str) else "",
+        "running_seconds": round(since_start, 1) if since_start is not None else None,
+        # Popover cell strings (one formatter: here).
+        "calls_text": calls_s,
+        "ctx_text": ctx_s,
+        "out_text": _fmt_count(out) if out is not None else "–",
+        "age_text": _fmt_dur(since_start) if since_start is not None else "?",
+        "last_write_text": _fmt_dur(age) if isinstance(age, (int, float)) else "",
+        "age_seconds": age,
+        "finished": bool(rec.get("finished")),
+        # Comfortable: ``11 calls · 82K tok``. Compact: ``11·82Kt``.
+        "full_label": f"{calls_s} calls · {ctx_s} tok",
+        "short_label": f"{calls_s}·{ctx_s}t",
+        "title": " · ".join(title_bits),
+    }
+
+
+def _agent_stats_window(totals_raw: dict[str, Any], window_mins: int) -> dict[str, Any] | None:
+    """The snapshot's ``totals.window_*`` block (producer v4+), or None.
+
+    ``totals.agents`` / ``tool_calls`` / ``context_tokens`` / ``output_tokens``
+    are LIVE-only sums: they are 0 whenever no subagent happens to be running
+    this instant, however busy the last quarter-hour was. The producer also
+    publishes the same figures over the whole live window — finished agents
+    included (``agents_spawned`` + ``window_tool_calls`` /
+    ``window_context_tokens`` / ``window_output_tokens``) — and that is what
+    the header pill falls back to when nothing is live, so an idle moment
+    reads "no agents running, here is what just happened" instead of a row of
+    zeros that looks like a dead sensor.
+
+    None when every window key is missing (a producer older than snapshot v4);
+    callers then keep the live-only numbers.
+    """
+    keys = ("window_tool_calls", "window_context_tokens", "window_output_tokens")
+    if not any(k in totals_raw for k in keys):
+        return None
+    n = totals_raw.get("agents_spawned")
+    calls = totals_raw.get("window_tool_calls")
+    ctx = totals_raw.get("window_context_tokens")
+    out = totals_raw.get("window_output_tokens")
+    return {
+        "minutes": window_mins,
+        "agents": n,
+        "tool_calls": calls,
+        "context_tokens": ctx,
+        "output_tokens": out,
+        "agents_text": _fmt_count(n),
+        "calls_text": _fmt_count(calls),
+        "ctx_text": _fmt_count(ctx),
+        "out_text": _fmt_count(out) if out is not None else "–",
+    }
+
+
+def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
+    """Normalised agent-stats view for the render pass + /api/agent-stats.
+
+    Returns::
+
+        {"enabled", "available", "stale", "age_seconds", "generated_at",
+         "by_queue_id": {qid: shaped}, "by_agent_id": {aid: shaped},
+         "totals": {"agents", "tool_calls", "context_tokens",
+                    "output_tokens", "main_context_tokens", "label"} | None,
+         "main": {...} | None}
+
+    ``available`` is False when the feature is off or the file is missing /
+    unreadable (render NOTHING). ``stale`` is True when the snapshot is
+    older than AGENT_STATS_STALE_SECONDS — ``by_queue_id`` is then EMPTY and
+    ``totals`` is None so no consumer can paint a frozen number; the header
+    shows an explicit "n/a" instead. Dedup when several agents carry the
+    same queue_id (a retry): unfinished beats finished, then the most
+    recently written (smallest age_seconds) wins.
+    """
+    enabled = bool(AGENT_STATS_PATH)
+    parsed = _read_agent_stats_file() if enabled else None
+    if parsed is None:
+        return _agent_stats_empty(enabled)
+    raw = parsed["raw"]
+    now_ts = time.time() if now_ts is None else now_ts
+    gen = raw.get("generated_at")
+    ages: list[float] = []
+    if isinstance(gen, (int, float)):
+        ages.append(max(0.0, now_ts - float(gen)))
+    ages.append(max(0.0, now_ts - float(parsed["file_mtime"])))
+    age = max(ages)
+    view = _agent_stats_empty(enabled)
+    view["available"] = True
+    view["age_seconds"] = round(age, 1)
+    view["generated_at"] = gen if isinstance(gen, (int, float)) else None
+    if age > AGENT_STATS_STALE_SECONDS:
+        view["stale"] = True
+        return view
+    by_qid: dict[str, dict[str, Any]] = {}
+    by_aid: dict[str, dict[str, Any]] = {}
+    # Popover rows: one per distinct agent, in the producer's order (the
+    # producer already restricts the list to the live window).
+    rows: list[dict[str, Any]] = []
+    for rec in raw.get("agents") or []:
+        if not isinstance(rec, dict):
+            continue
+        shaped = _shape_agent_stat(rec, now_ts)
+        aid = shaped["agent_id"]
+        if aid and aid not in by_aid:
+            by_aid[aid] = shaped
+            rows.append({k: shaped.get(k) for k in _POPOVER_ROW_KEYS})
+        qid = rec.get("queue_id")
+        if not isinstance(qid, str) or not qid:
+            continue
+        prev = by_qid.get(qid)
+        if prev is None:
+            by_qid[qid] = shaped
+            continue
+        if prev["finished"] and not shaped["finished"]:
+            by_qid[qid] = shaped
+            continue
+        if prev["finished"] == shaped["finished"]:
+            p_age = prev.get("age_seconds")
+            n_age = shaped.get("age_seconds")
+            if isinstance(n_age, (int, float)) and (
+                not isinstance(p_age, (int, float)) or n_age < p_age
+            ):
+                by_qid[qid] = shaped
+    view["by_queue_id"] = by_qid
+    view["by_agent_id"] = by_aid
+    totals_raw = raw.get("totals") if isinstance(raw.get("totals"), dict) else {}
+    main_raw = raw.get("main") if isinstance(raw.get("main"), dict) else {}
+    n_agents = totals_raw.get("agents")
+    if n_agents is None:
+        n_agents = len(by_aid)
+    calls = totals_raw.get("tool_calls")
+    ctx = totals_raw.get("context_tokens")
+    out = totals_raw.get("output_tokens")
+    main_ctx = main_raw.get("context_tokens")
+    window_mins = int(raw.get("live_window_seconds") or 0) // 60
+    # The WINDOW figures (producer v4+): every agent seen in the live window,
+    # FINISHED ONES INCLUDED. ``calls``/``ctx``/``out`` above cover only the
+    # still-running agents, so they collapse to 0 the instant the last one
+    # returns — which is exactly what made the pill read "0 agents · 0 calls ·
+    # 0 tok" through a quiet quarter-hour and look broken. ``None`` when the
+    # producer predates v4; every consumer below degrades to the live sums.
+    window = _agent_stats_window(totals_raw, window_mins)
+    label = f"{_fmt_count(n_agents)} agents · {_fmt_count(calls)} calls · {_fmt_count(ctx)} tok"
+    title_bits = [
+        f"{_fmt_count(n_agents)} live agents (last {window_mins}m window)",
+        f"{_fmt_count(calls)} tool calls",
+        f"{_fmt_count(ctx)} context tokens",
+    ]
+    if out is not None:
+        title_bits.append(f"{_fmt_count(out)} output tokens")
+    if window is not None:
+        title_bits.append(
+            f"last {window_mins}m: {window['agents_text']} agents · "
+            f"{window['calls_text']} calls · {window['out_text']} out"
+        )
+    if main_ctx is not None:
+        title_bits.append(f"main loop context {_fmt_count(main_ctx)} tokens")
+    title_bits.append(f"snapshot {_humanize_age(age)}")
+    main_label = f"main {_fmt_count(main_ctx)}" if main_ctx is not None else ""
+    main_age = main_raw.get("age_seconds")
+    host = raw.get("host") if isinstance(raw.get("host"), str) else ""
+    view["totals"] = {
+        "agents": n_agents,
+        "tool_calls": calls,
+        "context_tokens": ctx,
+        "output_tokens": out,
+        "main_context_tokens": main_ctx,
+        "label": label,
+        "main_label": main_label,
+        "title": " · ".join(title_bits),
+        # Header pill numerals + popover strings (one formatter: here).
+        # calls_text / tok_text / out_text are the LIVE-agent sums the popover
+        # head prints; the pill's own two numerals are chosen in
+        # ``_agent_stats_header`` (pill_calls_text / pill_tok_text) because
+        # they fall back to the window / main loop when nothing is live. The
+        # footer prints main_text / main_age_text / age_text.
+        "agents_text": _fmt_count(n_agents),
+        "calls_text": _fmt_count(calls),
+        "tok_text": _fmt_count(ctx),
+        "out_text": _fmt_count(out) if out is not None else "–",
+        "main_text": _fmt_count(main_ctx) if main_ctx is not None else "",
+        "main_age_text": _fmt_dur(main_age) if isinstance(main_age, (int, float)) else "",
+        "age_text": _fmt_dur(age),
+        "host": host,
+        "rows": rows,
+        "window": window,
+        "window_minutes": window_mins,
+    }
+    view["main"] = {
+        "session_id": main_raw.get("session_id"),
+        "context_tokens": main_ctx,
+        "age_seconds": main_age,
+    }
+    return view
+
+
+def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
+    """The header agent-bar payload: None = render no pill (off / absent).
+
+    One outlined pill — ``● N agents · C calls · K tok`` (botchat's topbar
+    badge look, botchat #3066) — plus everything its click-to-open popover
+    prints: per-agent ``rows`` (description / type / queue id / last tool /
+    calls / ctx / out / age), the main loop's context size and the snapshot
+    freshness footer. ``label`` / ``main_label`` stay for API consumers
+    (same numbers, the long form). Stale: every numeral reads ``n/a``,
+    ``rows`` is empty and ``main`` is None — never a frozen number.
+
+    The three numerals the PILL prints are ``agents_text`` /
+    ``pill_calls_text`` / ``pill_tok_text`` (+ ``pill_tok_pre``, a "main"
+    qualifier), NOT the plain ``calls_text`` / ``tok_text`` — those stay the
+    live-agent sums the popover head and API consumers read. With at least one
+    live agent the pill is the live sums, unchanged. With none it falls back
+    to the last-window figures (``window``) for calls and to the MAIN LOOP's
+    context for tokens, because the live sums are structurally 0 then and a
+    header reading "0 agents · 0 calls · 0 tok" reads as a broken sensor
+    rather than as an idle minute (claude-watch #676)."""
+    if not view.get("available"):
+        return None
+    if view.get("stale"):
+        age = view.get("age_seconds")
+        age_txt = _humanize_age(age) if isinstance(age, (int, float)) else "?"
+        return {
+            "stale": True,
+            "agents": None,
+            "tool_calls": None,
+            "context_tokens": None,
+            "output_tokens": None,
+            "agents_text": "n/a",
+            "calls_text": "n/a",
+            "tok_text": "n/a",
+            "out_text": "n/a",
+            "pill_calls_text": "n/a",
+            "pill_tok_text": "n/a",
+            "pill_tok_pre": "",
+            "main": None,
+            "window": None,
+            "rows": [],
+            "host": "",
+            "age_seconds": age,
+            "age_text": _fmt_dur(age) if isinstance(age, (int, float)) else "?",
+            "label": "agents n/a",
+            "main_label": "",
+            "title": f"agent-stats snapshot is stale (written {age_txt}) — counters withheld rather than frozen",
+        }
+    t = view.get("totals") or {}
+    m = view.get("main") or {}
+    main = None
+    if m.get("context_tokens") is not None:
+        main = {
+            "context_tokens": m.get("context_tokens"),
+            "text": t.get("main_text", ""),
+            "age_seconds": m.get("age_seconds"),
+            "age_text": t.get("main_age_text", ""),
+        }
+    window = t.get("window")
+    # Pill numerals. Live agents => the live sums (unchanged). None live =>
+    # what the window did (calls) + the main loop's context (tokens), so the
+    # pill still carries information instead of three zeros.
+    live_now = bool(t.get("agents"))
+    if live_now:
+        pill_calls = t.get("calls_text", "?")
+        pill_tok = t.get("tok_text", "?")
+        pill_tok_pre = ""
+    else:
+        pill_calls = (window or {}).get("calls_text") or t.get("calls_text", "?")
+        if main is not None:
+            pill_tok = main["text"] or "?"
+            pill_tok_pre = "main"
+        else:
+            pill_tok = (window or {}).get("ctx_text") or t.get("tok_text", "?")
+            pill_tok_pre = ""
+    return {
+        "stale": False,
+        "agents": t.get("agents"),
+        "tool_calls": t.get("tool_calls"),
+        "context_tokens": t.get("context_tokens"),
+        "output_tokens": t.get("output_tokens"),
+        "agents_text": t.get("agents_text", "?"),
+        "calls_text": t.get("calls_text", "?"),
+        "tok_text": t.get("tok_text", "?"),
+        "out_text": t.get("out_text", "–"),
+        "pill_calls_text": pill_calls,
+        "pill_tok_text": pill_tok,
+        "pill_tok_pre": pill_tok_pre,
+        "main": main,
+        "window": window,
+        "rows": list(t.get("rows") or []),
+        "host": t.get("host", ""),
+        "age_seconds": view.get("age_seconds"),
+        "age_text": t.get("age_text", "?"),
+        "label": t.get("label", ""),
+        "main_label": t.get("main_label", ""),
+        "title": t.get("title", ""),
+    }
+
+
 def _load_agent_queue_bindings() -> dict[str, str]:
     """Map ``agent_id -> queue_id`` from the arm-hook bindings file.
 
@@ -438,10 +1215,24 @@ def _load_agent_queue_bindings() -> dict[str, str]:
     return out
 
 
+def _load_owner_bindings_by_qid() -> dict[str, str]:
+    """queue_id -> agent_id from the arm-hook bindings file (newest wins).
+
+    Inverse of ``_load_agent_queue_bindings`` (which returns agent_id ->
+    queue_id for the subagent tree). Used by ``_classify_owner`` to attribute
+    an owner to a running item the instant it is spawned -- before
+    claude-watch's active-agents poller keys a transcript record under its
+    queue id. Fail-soft (delegates to the shared helper, which returns {} on
+    any read/parse error).
+    """
+    return _agents_bindings_by_qid(AGENT_QUEUE_BINDINGS_PATH)
+
+
 def _classify_owner(
     item: dict[str, Any],
     now: datetime,
     agent_by_qid: dict[str, dict[str, Any]],
+    owner_bindings: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Compute owner liveness for a running item — mirrors work-queue-exporter.
 
@@ -528,6 +1319,52 @@ def _classify_owner(
             "is_starting": False,
         }
 
+    # Still unresolved via active-agents (by qid) and the register-time
+    # stamp. Consult the arm-hook bindings (queue_id -> agent_id): a bound
+    # qid was DEFINITIVELY spawned by the main loop's Agent tool -- the
+    # PostToolUse arm-hook wrote the binding synchronously at spawn -- so it
+    # is OWNED even while claude-watch's active-agents poller (60s) has not
+    # yet keyed a transcript record under this qid. That spawn-to-poll gap is
+    # exactly what previously surfaced as a spurious "owner unknown". Recover
+    # liveness from any active-agents record carrying that agent_id (the same
+    # join the stamped-owner path uses above); when none resolves, surface the
+    # KNOWN owner with alive=None (owner attributed, liveness ambiguous -- no
+    # orphan badge).
+    if owner_bindings is None:
+        owner_bindings = _load_owner_bindings_by_qid()
+    bound_aid = owner_bindings.get(iid)
+    if bound_aid:
+        rec = next(
+            (
+                r
+                for r in agent_by_qid.values()
+                if isinstance(r, dict) and r.get("agent_id") == bound_aid
+            ),
+            None,
+        )
+        if rec is not None:
+            age = rec.get("jsonl_age_seconds")
+            return {
+                "mode": "agent",
+                "alive": bool(rec.get("alive")),
+                "agent_id": bound_aid,
+                "jsonl_age_seconds": age,
+                "jsonl_age": _humanize_age(age),
+                "jsonl_age_epoch": (now.timestamp() - age)
+                if age is not None
+                else None,
+                "is_starting": False,
+            }
+        return {
+            "mode": "agent",
+            "alive": None,
+            "agent_id": bound_aid,
+            "jsonl_age_seconds": None,
+            "jsonl_age": "?",
+            "jsonl_age_epoch": None,
+            "is_starting": False,
+        }
+
     # No agent record yet — could be (a) spawn race (STARTING) or
     # (b) genuinely orphaned / agent-state-stale (owner unknown).
     # Disambiguate via registered_at recency.
@@ -568,6 +1405,111 @@ def _task_token_target(tok: Any) -> str | None:
         return None
     target = tok[len(_TASK_TOKEN_PREFIX):]
     return target or None
+
+
+# ---- Scope-token overlap + manual-lock detection --------------------------
+# Ported byte-for-byte from ``_tokens_overlap`` / ``_locked_tokens_blocking_item``
+# in ``~/repos/claude-watch/tools/session-task/session-task``. The minisite
+# mirrors session-task's readiness logic in-process (rather than shelling out
+# per item every render), so it must also mirror the manual-lock gate: a
+# pending item whose scope overlaps an operator-declared locked scope is PARKED
+# (``queue lock`` was used) and is NOT ready — even though it is a group head
+# with all deps done. Without this, the SPA rendered such an item as READY +
+# FORCE START while the dispatcher's spawn-gate (``_item_is_ready``) correctly
+# refused it: a mislabel that made a locked-parked item look like a ready item
+# nothing was forcing (Andrew #4430/#4432).
+_PATH_TOKEN_PREFIX = "path:"
+
+
+def _is_task_token(tok: Any) -> bool:
+    return isinstance(tok, str) and tok.startswith(_TASK_TOKEN_PREFIX)
+
+
+def _is_path_token(tok: Any) -> bool:
+    return isinstance(tok, str) and tok.startswith(_PATH_TOKEN_PREFIX)
+
+
+def _path_token_segments(tok: str) -> list[str]:
+    """Segment list of a normalized ``path:<repo>/<a>/<b>`` token.
+
+    First element is the repo; remainder is the within-repo path. Mirrors
+    session-task's helper of the same name.
+    """
+    body = tok[len(_PATH_TOKEN_PREFIX):]
+    return body.split("/")
+
+
+def _path_token_repo(tok: str) -> str:
+    """Repo name embedded in a ``path:`` token."""
+    return _path_token_segments(tok)[0]
+
+
+def _tokens_overlap(a: Any, b: Any) -> bool:
+    """Return True if two normalized scope tokens overlap.
+
+    Byte-for-byte mirror of session-task's ``_tokens_overlap`` — the same
+    overlap semantics the lock machinery uses to decide which pending items a
+    ``queue lock <scope>`` parks. See that function for the full contract:
+    ``*`` overlaps everything; ``file:`` prefix match; ``path:`` same-repo
+    segment-prefix; ``repo:X`` covers any ``path:X/...``; ``task:`` and other
+    typed tokens overlap only on exact match.
+    """
+    if a == "*" or b == "*":
+        return True
+    a_is_file = isinstance(a, str) and a.startswith("file:")
+    b_is_file = isinstance(b, str) and b.startswith("file:")
+    if a_is_file and b_is_file:
+        pa = a[len("file:"):]
+        pb = b[len("file:"):]
+
+        def with_sep(p: str) -> str:
+            return p if p.endswith("/") else p + "/"
+
+        if pa == pb:
+            return True
+        wa = with_sep(pa)
+        wb = with_sep(pb)
+        return wa.startswith(wb) or wb.startswith(wa)
+    a_is_path = _is_path_token(a)
+    b_is_path = _is_path_token(b)
+    if a_is_path and b_is_path:
+        sa = _path_token_segments(a)
+        sb = _path_token_segments(b)
+        if sa[0] != sb[0]:
+            return False
+        ra = sa[1:]
+        rb = sb[1:]
+        if len(ra) <= len(rb):
+            return rb[: len(ra)] == ra
+        return ra[: len(rb)] == rb
+    a_is_repo = isinstance(a, str) and a.startswith("repo:")
+    b_is_repo = isinstance(b, str) and b.startswith("repo:")
+    if a_is_repo and b_is_path:
+        return a[len("repo:"):] == _path_token_repo(b)
+    if b_is_repo and a_is_path:
+        return b[len("repo:"):] == _path_token_repo(a)
+    return a == b
+
+
+def _locked_tokens_blocking_item(
+    item: dict[str, Any], locked_scopes: dict[str, Any] | None
+) -> list[str]:
+    """Locked-scope tokens that overlap this item's scope (empty if none).
+
+    Mirrors session-task's helper. A "lock" is a token key in queue.json's
+    ``locked_scopes`` map; an item is parked when ANY of its scope tokens
+    overlaps ANY locked token, using ``_tokens_overlap`` semantics.
+    """
+    if not locked_scopes:
+        return []
+    item_scope = item.get("scope") or []
+    blockers: list[str] = []
+    for tok in locked_scopes.keys():
+        for it_tok in item_scope:
+            if _tokens_overlap(it_tok, tok):
+                blockers.append(tok)
+                break
+    return blockers
 
 
 def _iter_dep_ids(item: dict[str, Any]) -> list[str]:
@@ -640,7 +1582,11 @@ def _has_dep_cycle(items: list[dict[str, Any]], root_id: str) -> bool:
     return False
 
 
-def _compute_ready_now(items: list[dict[str, Any]], item: dict[str, Any]) -> bool:
+def _compute_ready_now(
+    items: list[dict[str, Any]],
+    item: dict[str, Any],
+    locked_scopes: dict[str, Any] | None = None,
+) -> bool:
     """Backend-authoritative ``ready_now`` for a queue item.
 
     Mirrors ``_item_is_ready`` in
@@ -651,12 +1597,20 @@ def _compute_ready_now(items: list[dict[str, Any]], item: dict[str, Any]) -> boo
 
     Predicate:
       1. status == "pending"
-      2. item is the head of its serialization group (oldest pending in
+      2. no operator scope lock (``queue lock``) overlaps the item's scope
+      3. item is the head of its serialization group (oldest pending in
          the group, no running peers)
-      3. every entry in ``depends_on`` resolves to an item with
+      4. every entry in ``depends_on`` resolves to an item with
          status == "done"; missing/abandoned/cycle = permanent block
     """
     if item.get("status") != "pending":
+        return False
+    # Manual scope lock (operator ``queue lock <scope>``). A pending item whose
+    # scope overlaps a locked token is PARKED and NOT ready — mirrors the
+    # first gate in session-task's ``_item_is_ready``. Must precede the
+    # group-head / deps checks so a locked item never reports ready even when
+    # it is otherwise spawnable.
+    if _locked_tokens_blocking_item(item, locked_scopes):
         return False
     group_id = item.get("group_id")
     members = [
@@ -711,8 +1665,17 @@ def _shape(
     agent_by_qid: dict[str, dict[str, Any]],
     items: list[dict[str, Any]] | None = None,
     bindings: dict[str, str] | None = None,
+    owner_bindings: dict[str, str] | None = None,
+    locked_scopes: dict[str, Any] | None = None,
+    agent_stats_by_qid: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     status = item.get("status", "unknown")
+    # Normalize to a non-empty string. A missing / null / non-string status is
+    # itself an "unrecognised status" and must route to the fallback section
+    # rather than silently comparing unequal to every branch below and
+    # vanishing (that is the exact failure this file is being fixed for).
+    if not isinstance(status, str) or not status.strip():
+        status = "unknown"
     # Hostjob status reconciliation. A hostjob-bound item stuck `running` in
     # queue.json (the reaper's fail-soft done/abandon flip never landed, or a
     # later `hostjob clean` removed the terminal state dir) must render by its
@@ -745,11 +1708,23 @@ def _shape(
     abandoned = _parse_iso(item.get("abandoned_at"))
 
     blocked_at = _parse_iso(item.get("blocked_at"))
+    # `wedged_at` / `quarantined_at` are stamped by `session-task queue wedge`
+    # and by the quarantining branch of `queue abandon`. Both are PRESERVED on
+    # the row after recovery (unwedge / quarantine release) for post-mortem, so
+    # they are only ever read while the item is actually in that status.
+    wedged_at = _parse_iso(item.get("wedged_at"))
+    quarantined_at = _parse_iso(item.get("quarantined_at"))
 
     # Pick the most-relevant "age anchor" for the visible age string.
     if status == "running" and started:
         age_anchor = started
         age_label = "running"
+    elif status == "wedged" and wedged_at:
+        age_anchor = wedged_at
+        age_label = "wedged"
+    elif status == "quarantined" and quarantined_at:
+        age_anchor = quarantined_at
+        age_label = "quarantined"
     elif status == "blocked" and blocked_at:
         age_anchor = blocked_at
         age_label = "blocked"
@@ -824,6 +1799,33 @@ def _shape(
         except OSError:
             has_archive = False
 
+    # Manual scope-lock state. A pending item whose scope overlaps an
+    # operator-declared locked scope (``session-task queue lock <scope>``) is
+    # PARKED, not ready — the dispatcher's spawn-gate refuses it. We surface
+    # that as a distinct LOCKED state so the card stops mislabeling it READY +
+    # FORCE START (Andrew #4430/#4432). ``lock_blockers`` are the locked tokens
+    # that overlap; ``lock_reason`` joins the operator's per-lock reasons;
+    # ``unlock_commands`` are the copyable ``queue unlock`` commands (one per
+    # blocking token) — consistent with the copy-not-click treatment the
+    # WEDGED / QUARANTINED exits use for state transitions.
+    lock_blockers = (
+        _locked_tokens_blocking_item(item, locked_scopes)
+        if status == "pending"
+        else []
+    )
+    locked = bool(lock_blockers)
+    lock_reasons: list[str] = []
+    unlock_commands: list[str] = []
+    for tok in lock_blockers:
+        meta = (locked_scopes or {}).get(tok) or {}
+        reason = ""
+        if isinstance(meta, dict):
+            reason = (meta.get("reason") or "").strip()
+        if reason:
+            lock_reasons.append(f"{tok}: {reason}")
+        unlock_commands.append(f"session-task queue unlock {tok}")
+    lock_reason = " · ".join(lock_reasons)
+
     shaped = {
         "id": item.get("id", ""),
         "summary": summary,
@@ -840,12 +1842,32 @@ def _shape(
         # no peer is running. Computed here (not read off queue.json)
         # because session-task only persists `group_head` — the
         # dependency check is read-time / lazy.
-        "ready_now": _compute_ready_now(items, item) if items is not None else False,
+        "ready_now": _compute_ready_now(items, item, locked_scopes) if items is not None else False,
         "status": status,
         "priority": item.get("priority", ""),
         "created_by": item.get("created_by", ""),
         "abandon_reason": item.get("abandon_reason", ""),
         "block_reason": item.get("block_reason", ""),
+        # Manual scope-lock (``queue lock``) state. ``locked`` gates the
+        # LOCKED badge + suppresses the READY badge / demotes FORCE START in
+        # the pending card. ``lock_blockers`` are the overlapping locked
+        # tokens, ``lock_reason`` the operator's joined reasons, and
+        # ``unlock_commands`` the copyable ``queue unlock`` commands. Empty /
+        # False for any non-pending or non-locked item.
+        "locked": locked,
+        "lock_blockers": lock_blockers,
+        "lock_reason": lock_reason,
+        "unlock_commands": unlock_commands,
+        # Why the item is wedged / quarantined. Both are operator- (or
+        # reaper-) supplied free text and are the ONLY record of why the row
+        # is parked in a scope-holding state, so they render on the card the
+        # same way `blocker:` / `reason:` already do.
+        "wedged_reason": item.get("wedged_reason", "") or "",
+        "quarantine_reason": item.get("quarantine_reason", "") or "",
+        # The status the item held when it was quarantined ("running" or
+        # "wedged"). Surfaced so the operator can tell a quarantined healthy
+        # runner from a quarantined wedge without opening the CLI.
+        "quarantined_from": item.get("quarantined_from", "") or "",
         "depends_on": depends_on,
         "depends_on_status": depends_on_status,
         "created_at_iso": item.get("created_at", ""),
@@ -853,6 +1875,8 @@ def _shape(
         "completed_at_iso": item.get("completed_at", ""),
         "abandoned_at_iso": item.get("abandoned_at", ""),
         "blocked_at_iso": item.get("blocked_at", ""),
+        "wedged_at_iso": item.get("wedged_at", "") or "",
+        "quarantined_at_iso": item.get("quarantined_at", "") or "",
         "age": _humanize_age(age_secs),
         "age_label": age_label,
         "age_seconds": age_secs,
@@ -863,24 +1887,34 @@ def _shape(
         # rewrites it in place from (now - age_epoch). Mirrors _humanize_age.
         "age_epoch": age_anchor.timestamp() if age_anchor else None,
         "has_archive": has_archive,
+        # True only for done cards synthesized from the completed-tasks
+        # archive (no live queue.json entry). Live items are always False.
+        "from_archive": False,
     }
 
     if status == "running":
-        owner = _classify_owner(item, now, agent_by_qid)
+        owner = _classify_owner(item, now, agent_by_qid, owner_bindings)
         shaped["owner"] = owner
         # Surface STARTING as a top-level boolean for the template +
         # API consumers. STARTING items count as running for the
         # totals (queue.json says they're running), but render with
         # a distinct pill + suppress orphan badging during the window.
         shaped["is_starting"] = bool(owner.get("is_starting"))
+        # Live per-agent counters (tool calls / tokens) joined by queue id from
+        # the agent-stats snapshot. None when the feature is off, the file is
+        # absent or STALE, or no live agent carries this queue id — the
+        # template / refresh.js render nothing in all four cases.
+        shaped["agent_stats"] = (agent_stats_by_qid or {}).get(
+            item.get("id", "")
+        )
         # Nested subagent tree -- for running items with a known owner
         # agent, resolve the owner's parent main-loop session, enumerate
         # the session's subagent transcripts, then build the REAL tree via
         # the authoritative agent_id -> queue_id bindings. See
         # ``_build_subagent_tree`` for the attribution rules (drop the
-        # self-nested owner, collapse retry-attempts, surface genuine
-        # children). The dir walk is cheap (running items are few) and
-        # fail-soft.
+        # self-nested owner, nest genuine spawn descendants, render NOTHING
+        # for agents we cannot attribute rather than guessing). The dir walk
+        # is cheap (running items are few) and fail-soft.
         session_subagents: list[dict[str, Any]] = []
         parent_map: dict[str, str] = {}
         owner_agent_id = owner.get("agent_id") or ""
@@ -1016,15 +2050,38 @@ def _hostjob_effective_terminal(
         with open(sp, "r", encoding="utf-8", errors="replace") as f:
             st = json.load(f)
     except FileNotFoundError:
-        # No state dir. Either the job finished and `hostjob clean` removed it
-        # (clean REFUSES to remove a still-running job, so an absent dir means
-        # it had reached a terminal state), or we're inside the launch race
-        # where the runner registers the queue row a beat before writing
-        # status.json. Gate on the starting window to exclude that race; beyond
-        # it, treat the job as finished-and-cleaned. The rc is unrecoverable, so
-        # present it as a plain done (no evidence of failure to justify errored).
+        # No status.json for this label. TWO very different causes we MUST
+        # distinguish before fabricating a terminal state:
+        #   (a) the job finished and `hostjob clean` removed its dir (clean
+        #       REFUSES to remove a still-running job), or we're inside the
+        #       launch race where the runner registers the queue row a beat
+        #       before status.json lands; OR
+        #   (b) the minisite simply CANNOT SEE the hostjob state surface at all
+        #       -- the host ~/.cache/hostjob bind mount is missing / points at
+        #       the wrong path (e.g. HOSTJOB_LOG_DIR unset so it defaults under
+        #       $HOME to a dir that does not exist in this container), so EVERY
+        #       hostjob's status.json reads absent regardless of whether the job
+        #       is actually live.
+        # Fabricating `done` in case (b) demotes EVERY genuinely-running hostjob
+        # out of the running column into the time-capped done window, where it
+        # effectively disappears -- exactly the "hostjob items don't appear in
+        # the UI" deployment fault (main-loop items, never reconciled, still
+        # show, which is why the failure looks hostjob-specific). So only infer
+        # finished-and-cleaned when we have POSITIVE evidence the state surface
+        # is visible AND populated: the base HOSTJOB_LOG_DIR exists and holds at
+        # least one entry. Otherwise trust the queue's AUTHORITATIVE `running`
+        # status and keep the item visible. Mirrors the work-queue-exporter's
+        # `have_owner_signal` guard, which likewise stays silent when its input
+        # dir is unreadable rather than flagging the whole queue on a mount fault.
+        surface_visible = False
+        try:
+            with os.scandir(HOSTJOB_LOG_DIR) as _entries:
+                surface_visible = any(True for _ in _entries)
+        except OSError:
+            surface_visible = False
         if (
-            running_age_seconds is not None
+            surface_visible
+            and running_age_seconds is not None
             and running_age_seconds > STARTING_WINDOW_SECONDS
         ):
             return {"status": "done", "exit_code": ""}
@@ -1151,30 +2208,60 @@ def _load_hostjob_command(label: str) -> dict[str, Any] | None:
 def _render_payload() -> dict[str, Any]:
     data, err = _cached_queue()
     items = data.get("items", []) if isinstance(data, dict) else []
+    # Operator-declared manual scope locks (``session-task queue lock``),
+    # stored at the top level of queue.json. Threaded into ``_shape`` so a
+    # pending item whose scope overlaps a locked token renders LOCKED (parked)
+    # instead of READY + FORCE START.
+    locked_scopes = (
+        data.get("locked_scopes") or {} if isinstance(data, dict) else {}
+    )
     now = datetime.now(timezone.utc)
     agent_by_qid = _load_agent_state()
     # Authoritative agent_id -> queue_id bindings, loaded ONCE per render
     # pass (not per item) and threaded into _shape so the subagent-tree
     # builder doesn't re-stat the bindings file for every running item.
     bindings = _load_agent_queue_bindings()
+    # queue_id -> agent_id (arm-hook), so _classify_owner can attribute an
+    # owner to a just-spawned running item before active-agents publishes it.
+    owner_bindings = _load_owner_bindings_by_qid()
+    # Live per-agent tool-call / token counters (botchat #2967), loaded ONCE
+    # per render pass (mtime-cached) and joined onto running rows by queue id.
+    agent_stats_view = _load_agent_stats()
+    agent_stats_by_qid = agent_stats_view["by_queue_id"]
 
-    running, pending, blocked, done, abandoned = [], [], [], [], []
+    # Table-driven bucketing. EVERY shaped item lands in exactly one bucket:
+    # a declared status goes to its section, anything else goes to the
+    # always-rendered fallback. The previous if/elif chain had no else, so an
+    # undeclared status was dropped on the floor — see the STATUS_SECTION
+    # block at the top of this file for why that class of bug matters more
+    # than the two instances that motivated the fix.
+    buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in SECTION_KEYS}
+    unknown_statuses: set[str] = set()
     for it in items:
         # Pass the full items list so _shape can compute ready_now
         # (depends_on resolution requires the full graph) and decorate
         # depends_on_status per-edge.
-        s = _shape(it, now, agent_by_qid, items=items, bindings=bindings)
+        s = _shape(
+            it, now, agent_by_qid, items=items, bindings=bindings,
+            owner_bindings=owner_bindings, locked_scopes=locked_scopes,
+            agent_stats_by_qid=agent_stats_by_qid,
+        )
         st = s["status"]
-        if st == "running":
-            running.append(s)
-        elif st == "blocked":
-            blocked.append(s)
-        elif st == "pending":
-            pending.append(s)
-        elif st == "done":
-            done.append(s)
-        elif st == "abandoned":
-            abandoned.append(s)
+        key = STATUS_SECTION.get(st)
+        if key is None:
+            key = SECTION_UNKNOWN_KEY
+            unknown_statuses.add(st)
+            _note_unknown_status(st)
+        buckets[key].append(s)
+
+    running = buckets["running"]
+    wedged = buckets["wedged"]
+    quarantined = buckets["quarantined"]
+    pending = buckets["pending"]
+    blocked = buckets["blocked"]
+    done = buckets["done"]
+    abandoned = buckets["abandoned"]
+    other = buckets[SECTION_UNKNOWN_KEY]
 
     # Order:
     #   running   — oldest-running first (most concerning)
@@ -1199,6 +2286,18 @@ def _render_payload() -> dict[str, Any]:
     # `+00:00`-suffixed timestamps) and matches how the done / abandoned
     # sections already sort. Items missing `created_at` sort last.
     blocked.sort(key=lambda a: a.get("created_at_iso") or "", reverse=True)
+    # Wedged / quarantined: newest event first. Both are attention-required
+    # states that still hold their scope, and the freshest one is the one the
+    # operator is most likely reasoning about right now. Items missing the
+    # stamp sort last, same convention as every other section here.
+    wedged.sort(key=lambda a: a.get("wedged_at_iso") or "", reverse=True)
+    quarantined.sort(
+        key=lambda a: a.get("quarantined_at_iso") or "", reverse=True
+    )
+    # Fallback bucket: newest-added first. No status-specific stamp exists by
+    # definition (we don't know what the status means), so `created_at` is the
+    # only field guaranteed to be there.
+    other.sort(key=lambda a: a.get("created_at_iso") or "", reverse=True)
     # Pending order:
     #   1. ready_now=True items first (operator can spawn now)
     #   2. then non-ready group-heads (FIFO leader, blocked by deps)
@@ -1225,7 +2324,39 @@ def _render_payload() -> dict[str, Any]:
         reverse=True,
     )
 
-    done_recent = done[:RECENT_DONE_LIMIT]
+    # Merge the DONE section with the persistent completed-tasks archive so
+    # the view survives a queue.json reset (which wipes the live done tail —
+    # the root cause of the empty "DONE 0/0" section) and reflects the FULL
+    # completion history. Dedup by queue id: a queue.json done item WINS over
+    # its archive echo (the live item carries richer state — scope, owner,
+    # log_archive_path/View-log). The archive supplies everything ELSE, incl.
+    # everything from before the reset.
+    queue_ids = {
+        it.get("id")
+        for it in items
+        if isinstance(it, dict) and isinstance(it.get("id"), str)
+    }
+    archive_only = [
+        e for e in _load_completed_done_entries() if e["id"] not in queue_ids
+    ]
+    done_total = len(done) + len(archive_only)
+
+    # Build the capped recent window by interleaving the (already sorted)
+    # queue-done and archive-only streams by completion time, newest-first.
+    # Only the archive rows that actually make the window are shaped — the
+    # archive is large, so shaping every historical row would be wasteful.
+    # The sort key is (iso, kind) — it never touches the payload objects, so
+    # identical timestamps can't trigger a dict comparison.
+    merged: list[tuple[str, int, Any]] = []
+    for s in done:
+        merged.append((s.get("completed_at_iso") or "", 0, s))
+    for e in archive_only:
+        merged.append((e.get("completed_at") or "", 1, e))
+    merged.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    done_recent = [
+        payload if kind == 0 else _shape_archived_done(payload, now)
+        for _iso, kind, payload in merged[:RECENT_DONE_LIMIT]
+    ]
     abandoned_recent = abandoned[:RECENT_ABANDONED_LIMIT]
 
     # Orphan tally drives the header pill. STARTING items (no agent
@@ -1263,20 +2394,36 @@ def _render_payload() -> dict[str, Any]:
 
     return {
         "running": running,
+        "wedged": wedged,
+        "quarantined": quarantined,
         "blocked": blocked,
         "pending": pending,
         "done_recent": done_recent,
         "abandoned_recent": abandoned_recent,
+        # Fallback bucket — every item whose status has no declared section.
+        # Always present in the payload (empty list when there are none) so a
+        # consumer can tell "nothing unrecognised" from "key missing".
+        SECTION_UNKNOWN_KEY: other,
+        # The distinct unrecognised statuses seen this render, for consumers
+        # (and tests) that want the names without walking the rows.
+        "unknown_statuses": sorted(unknown_statuses),
         "sources": sources,
         "totals": {
             "running": len(running),
+            "wedged": len(wedged),
+            "quarantined": len(quarantined),
             "blocked": len(blocked),
             "pending": len(pending),
-            "done": len(done),
+            # Union of live queue.json done items + archive-only history.
+            "done": done_total,
             "abandoned": len(abandoned),
+            SECTION_UNKNOWN_KEY: len(other),
         },
         "orphan_count": orphan_count,
         "starting_count": starting_count,
+        # Header agent-activity pill (botchat #2967). None = render no pill
+        # (feature off / snapshot absent); ``stale`` True = "n/a" pill.
+        "agent_stats": _agent_stats_header(agent_stats_view),
         "fetched_at": datetime.fromtimestamp(_cache.fetched_at, timezone.utc).isoformat()
         if _cache.fetched_at
         else "",
@@ -1308,6 +2455,22 @@ def api_queue() -> Any:
     payload = _render_payload()
     payload.pop("user", None)
     return jsonify(payload)
+
+
+@app.route("/api/agent-stats")
+def api_agent_stats() -> Any:
+    """Normalised agent-stats snapshot (see ``_load_agent_stats``).
+
+    The queue page itself does NOT call this — the per-row cells and the
+    header pill ride along in ``/api/queue`` so the existing 5s poll is the
+    only timer. This endpoint is for debugging / other consumers: it exposes
+    the join maps (``by_queue_id`` / ``by_agent_id``), the staleness verdict
+    and the raw-ish totals.
+    """
+    view = _load_agent_stats()
+    view["path"] = AGENT_STATS_PATH
+    view["stale_after_seconds"] = AGENT_STATS_STALE_SECONDS
+    return jsonify(view)
 
 
 def _ids_by_status(*statuses: str) -> dict[str, str]:
@@ -1403,6 +2566,10 @@ def _do_abandon(
             ),
             404,
         )
+
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
 
     try:
         proc = subprocess.run(
@@ -1512,8 +2679,9 @@ def api_queue_force_start(queue_id: str) -> Any:
     """Manually promote a PENDING queue item to running, bypassing scope-
     conflict serialization.
 
-    Body: ``{"reason": "..."}``. Reason is required and is auditable —
-    every successful force-start appends a row to
+    Body: ``{"reason": "...", "co_run": <bool>, "new_scope": <bool|str>}``.
+    Reason is required and is
+    auditable — every successful force-start appends a row to
     ``~/.config/claude/queue-force-start.log`` (host) /
     ``$QUEUE_FORCE_START_LOG`` (container). The id must match
     ``_QUEUE_ID_RE`` and currently be in ``pending`` status.
@@ -1560,6 +2728,26 @@ def api_queue_force_start(queue_id: str) -> Any:
     user = request.headers.get("X-Auth-Request-Email", "ui")
     annotated_reason = f"{reason} (via UI by {user})"
 
+    # Co-run (Andrew #4529): opt-in flag to force-start ALONGSIDE overlapping
+    # same-scope RUNNING peers WITHOUT autostopping them (operator asserts the
+    # scopes are safe to overlap). Accept either `co_run` or `no_interrupt` in
+    # the JSON body; default False preserves the autostop-the-peer behavior.
+    co_run = bool(payload.get("co_run") or payload.get("no_interrupt"))
+
+    # Re-scope (Andrew #4713): opt-in flag from the modal checkbox "force
+    # start with a new scope". When set, session-task reassigns the item a
+    # DISTINCT scope so it no longer overlaps the running peer -- both run in
+    # parallel and the peer is NOT autostopped (re-scope implies co-run).
+    # Accept ``new_scope`` as a bool (auto-derive a distinct scope) or a
+    # non-empty string (the operator-typed scope, passed verbatim).
+    new_scope_val = payload.get("new_scope")
+    rescope = bool(new_scope_val)
+    new_scope_explicit = (
+        new_scope_val.strip()
+        if isinstance(new_scope_val, str) and new_scope_val.strip()
+        else None
+    )
+
     eligible = _ids_by_status("pending")
     if queue_id not in eligible:
         return (
@@ -1574,17 +2762,29 @@ def api_queue_force_start(queue_id: str) -> Any:
             404,
         )
 
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
+
     try:
+        fs_argv = [
+            "python3",
+            SESSION_TASK_BIN,
+            "queue",
+            "force-start",
+            queue_id,
+            "--reason",
+            annotated_reason,
+        ]
+        if co_run:
+            fs_argv.append("--no-interrupt")
+        if rescope:
+            if new_scope_explicit is not None:
+                fs_argv.extend(["--new-scope", new_scope_explicit])
+            else:
+                fs_argv.append("--new-scope")
         proc = subprocess.run(
-            [
-                "python3",
-                SESSION_TASK_BIN,
-                "queue",
-                "force-start",
-                queue_id,
-                "--reason",
-                annotated_reason,
-            ],
+            fs_argv,
             capture_output=True,
             text=True,
             timeout=STOP_TIMEOUT_SECONDS,
@@ -1639,6 +2839,8 @@ def api_queue_force_start(queue_id: str) -> Any:
             "ok": True,
             "id": queue_id,
             "action": "force-start",
+            "co_run": co_run,
+            "rescope": rescope,
             "reason": annotated_reason,
             "stdout": proc.stdout,
             "stderr": proc.stderr,
@@ -1749,6 +2951,10 @@ def api_queue_depend() -> Any:
     # Shell out to session-task — the canonical writer holds the
     # fcntl.flock on queue.json, so we never race with concurrent
     # writes from the host CLI or other endpoint hits.
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
+
     try:
         proc = subprocess.run(
             [
@@ -1849,6 +3055,10 @@ def api_queue_depend_remove(queue_id: str) -> Any:
             jsonify({"ok": False, "error": "invalid or missing 'target_id'"}),
             400,
         )
+
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
 
     try:
         proc = subprocess.run(
@@ -1967,7 +3177,7 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
 
     Supports BOTH deployment shapes of ``AGENTS_JSONL_ROOT``:
 
-      1. One-level (gomorrah-style) — mount lands inside a project slug::
+      1. One-level (the-host-style) — mount lands inside a project slug::
 
             <root>/<session-uuid>/subagents/agent-<agent_id>.jsonl
 
@@ -1983,9 +3193,9 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
     The container's queue-minisite has no way to know which shape the
     operator wired up — both are legitimate bind-mount conventions and
     the public example compose uses (2). We try (1) first (matching the
-    historical gomorrah resolver behavior), then fall back to (2). The
+    historical the-host resolver behavior), then fall back to (2). The
     one-level probe is just an ``is_file`` stat per session-dir so the
-    fast path stays fast on gomorrah, and (2) only kicks in when (1)
+    fast path stays fast on the-host, and (2) only kicks in when (1)
     misses entirely.
 
     Returns the most-recently-modified match (handles agent_id reuse
@@ -2025,7 +3235,7 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
 
     # Shape (2): <root>/<project-slug>/<session-uuid>/subagents/agent-<id>.jsonl.
     # Only walked when shape (1) found nothing — keeps the fast path
-    # fast on the gomorrah deployment while still letting workbot's
+    # fast on the-host deployment while still letting workbot's
     # ${HOME}/.claude/projects mount resolve.
     for project in top_dirs:
         if not project.is_dir():
@@ -2037,6 +3247,68 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
         for session in session_dirs:
             _consider(session / "subagents" / needle)
     return best[1] if best else None
+
+
+def _agent_transcripts(agent_id: str) -> list[Path]:
+    """Every on-disk transcript for ``agent_id``, oldest-modified FIRST.
+
+    ``_find_agent_jsonl`` returns only the most-recently-modified match,
+    which is the right answer for "tail this agent's live log". It is the
+    WRONG answer for "what was this agent asked to do", because ONE agent
+    can own SEVERAL ``agent-<id>.jsonl`` files: when the parent main-loop
+    session is cleared/restarted while a subagent is still running, the
+    agent keeps writing under the NEW session id, so its transcript
+    CONTINUES as a fresh file that starts MID-STREAM — no ``role: user``
+    first message, and therefore no ``Queue item: q-XXXX`` spawn marker.
+    The marker (and the spawn records that reconstruct the parent->child
+    graph) live in the PRE-clear file.
+
+    So this returns ALL matches across every session dir of the mount,
+    sorted oldest-first, and callers that need the spawn prompt walk them
+    in that order (the original spawn is in the oldest file).
+
+    Same one-level vs two-level shape tolerance as ``_find_agent_jsonl``
+    — see that docstring; shape (2) is only walked when shape (1) matched
+    nothing, so the-host fast path stays fast. Returns ``[]`` on a
+    bad id (path-traversal guard) or when nothing matches.
+    """
+    if not re.match(r"^[a-z0-9-]{4,64}$", agent_id):
+        return []
+    root = Path(AGENTS_JSONL_ROOT)
+    if not root.is_dir():
+        return []
+    needle = f"agent-{agent_id}.jsonl"
+    found: list[tuple[float, Path]] = []
+
+    def _consider(candidate: Path) -> None:
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            return
+        found.append((mtime, candidate))
+
+    try:
+        top_dirs = list(root.iterdir())
+    except OSError:
+        return []
+
+    # Shape (1): <root>/<session-uuid>/subagents/agent-<id>.jsonl.
+    for entry in top_dirs:
+        _consider(entry / "subagents" / needle)
+    if not found:
+        # Shape (2): <root>/<project-slug>/<session-uuid>/subagents/...
+        for project in top_dirs:
+            if not project.is_dir():
+                continue
+            try:
+                session_dirs = list(project.iterdir())
+            except OSError:
+                continue
+            for session in session_dirs:
+                _consider(session / "subagents" / needle)
+
+    found.sort(key=lambda t: t[0])  # oldest first — the spawn prompt is there
+    return [path for _mtime, path in found]
 
 
 def _find_parent_session_jsonl(session_id: str) -> Path | None:
@@ -2198,6 +3470,51 @@ def _first_user_text(path: Path) -> str:
     return ""
 
 
+def _agent_first_user_text(agent_id: str, primary: Path) -> str:
+    """First-user text for ``agent_id``, looking ACROSS its transcripts.
+
+    ``primary`` is the transcript found in the session dir being rendered.
+    Usually that file starts with the agent's spawn prompt and this is just
+    ``_first_user_text(primary)``.
+
+    It is NOT when the main-loop session was cleared/restarted while the
+    agent was still running: the agent's transcript then CONTINUES as a new
+    ``agent-<id>.jsonl`` under the NEW session id, beginning mid-stream with
+    tool records — no ``role: user`` message, so no ``Queue item: q-XXXX``
+    marker. Reading only that file loses the agent's attribution, which is
+    exactly how three unrelated running items each rendered the other two
+    items' owner agents as their children (2026-08-22).
+
+    So when ``primary`` yields no marker we walk the agent's OTHER
+    transcripts oldest-first (``_agent_transcripts``) and take the first one
+    that DOES carry a marker. Falling back, in order: ``primary``'s own text
+    (a label without a marker is still a good label), then the oldest
+    non-empty text we saw. Returns "" when no transcript has a user message.
+    """
+    text = _first_user_text(primary)
+    if _QUEUE_MARKER_RE.search(text):
+        return text
+    try:
+        primary_key = primary.resolve()
+    except OSError:
+        primary_key = primary
+    fallback = text
+    for path in _agent_transcripts(agent_id):
+        try:
+            if path.resolve() == primary_key:
+                continue
+        except OSError:
+            continue
+        other = _first_user_text(path)
+        if not other:
+            continue
+        if _QUEUE_MARKER_RE.search(other):
+            return other
+        if not fallback:
+            fallback = other
+    return fallback
+
+
 def _session_subagent_dirs(session_id: str) -> list[Path]:
     """Resolve a session's ``subagents/`` dir(s) across both mount shapes.
 
@@ -2262,10 +3579,17 @@ def _session_subagent_parent_map(session_id: str) -> dict[str, str]:
             if not m:
                 continue
             parent_id = m.group(1)
-            for child_id in _launched_children(entry):
-                if child_id == parent_id:
-                    continue  # never self-parent
-                out.setdefault(child_id, parent_id)
+            # Scan EVERY transcript this agent owns, not just the one in
+            # this session dir: a spawn that happened before a main-loop
+            # clear/restart is recorded in the PRE-clear file, so reading
+            # only the post-clear continuation would lose the edge (and with
+            # it the nesting) for every agent that outlived a clear.
+            paths = _agent_transcripts(parent_id) or [entry]
+            for path in paths:
+                for child_id in _launched_children(path):
+                    if child_id == parent_id:
+                        continue  # never self-parent
+                    out.setdefault(child_id, parent_id)
     return out
 
 
@@ -2371,13 +3695,19 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for sid, (mtime, path) in best.items():
         age_seconds = max(0.0, now - mtime)
-        first_user = _first_user_text(path)
+        # Resolve the spawn prompt ACROSS the agent's transcripts, not just
+        # the one in this session dir: after a main-loop clear/restart a
+        # still-running agent continues into a NEW session file that starts
+        # mid-stream (no user message, no marker), and its attribution lives
+        # in the pre-clear file. See ``_agent_first_user_text``.
+        first_user = _agent_first_user_text(sid, path)
         label = first_user or sid
         # Attribute the subagent to its owning queue item by parsing the
         # ``Queue item: q-XXXX`` marker the main loop seeds into every
         # spawn prompt (the same first-user text used for the label).
-        # Empty string when the transcript predates / omits the marker;
-        # ``_shape`` only filters when at least one sibling carries one.
+        # Empty string when the transcript predates / omits the marker, in
+        # which case ``_build_subagent_tree`` renders NO node for it rather
+        # than guessing (an unattributed agent is not evidence of kinship).
         m = _QUEUE_MARKER_RE.search(first_user)
         out.append(
             {
@@ -2474,10 +3804,13 @@ def _build_subagent_tree(
         the recursive template has a uniform shape to walk. Peers are flat
         (always ``[]``); only genuine spawn-children nest.
 
-    Fail-soft fallback: when NO subagent has either a binding or a parsed
-    marker (pre-arm-hook transcripts), keep the prior unfiltered behaviour
-    rather than render a silently-empty tree — but STILL drop the owner so
-    the self-nesting bug can't resurface even in fallback mode.
+    NO-ATTRIBUTION CASE: when neither bindings nor transcript markers
+    resolve for any sibling, the result is the owner's spawn descendants
+    only — and an EMPTY list when there are none. We do NOT fall back to
+    "every sibling in the session": those siblings are simply the other
+    agents of the same main-loop session, and rendering them as this item's
+    children invents a relationship the data never recorded (see the inline
+    note at the top of the body for the incident this replaced).
     """
     pmap = parent_map or {}
 
@@ -2488,24 +3821,20 @@ def _build_subagent_tree(
             return b
         return sa.get("queue_id", "") or ""
 
-    # Did ANY sibling carry an attributable owning-item signal?
-    have_attribution = any(_auth_qid(sa) for sa in session_subagents)
-
-    if not have_attribution:
-        # Pre-arm-hook fallback: no bindings + no markers anywhere. Keep the
-        # session list but still drop the owner (it's the item, not a child)
-        # so we never re-introduce the self-nest. Annotate children=[] for
-        # the recursive renderer.
-        nodes: list[dict[str, Any]] = []
-        for sa in session_subagents:
-            if sa.get("subagent_id") == owner_agent_id:
-                continue
-            node = dict(sa)
-            node.setdefault("queue_id", "")
-            node["kind"] = node.get("kind", "child")
-            node["children"] = []
-            nodes.append(node)
-        return nodes
+    # NOTE: there is deliberately NO "no attribution anywhere" fallback. The
+    # code here used to fall back to "every sibling in the session, minus the
+    # owner" when neither bindings nor markers resolved, on the theory that a
+    # rough tree beat an empty one. It does not: a session's subagents/ dir
+    # holds EVERY agent of that main-loop session, so the fallback rendered
+    # unrelated items' agents as this item's children. Three concurrently
+    # running items each showed "Subagents (2)" listing the OTHER two items'
+    # owner agents (2026-08-22) after the bindings file turned out to be
+    # absent on that host AND a mid-flight session clear left every
+    # transcript starting mid-stream with no spawn marker. The paths below
+    # degrade honestly instead: with no attribution the peer filter matches
+    # nothing, and only REAL spawn edges (``parent_map``, which is evidence,
+    # not inference) still nest. An empty tree is the correct rendering of
+    # "we cannot tell".
 
     # Authoritative path. The subagent tree is the REAL spawn graph rooted at
     # the owner agent, walked to ARBITRARY DEPTH. ``parent_map`` (pmap) is the
@@ -4100,7 +5429,7 @@ def api_queue_archive(qid: str) -> Any:
 #
 #   1. queue.json — authoritative for queue-state fields (status, scope,
 #      depends_on, timestamps, summary, description, abandon_reason,
-#      group_id, priority, created_by).
+#      block_reason, group_id, priority, created_by).
 #
 #   2. Parent-session JSONL (the harness writes a `queue-operation`
 #      record of type `enqueue` with a `<task-notification>` XML
@@ -4146,6 +5475,130 @@ def _extract_agent_anchor_from_archive(archive_path: Path) -> tuple[str, str] | 
     if not (isinstance(session_id, str) and isinstance(agent_id, str)):
         return None
     return session_id, agent_id
+
+
+# Which MODEL actually ran a queue item's work.
+#
+# The model is not carried in queue.json, nor in claude-watch's
+# active-agents state — but every Claude Code transcript records it on
+# each assistant record as `message.model` (e.g. "claude-opus-5"). That
+# is the only source that reflects what REALLY served the tokens, as
+# opposed to what a spawn was asked for, so it is the one we read.
+#
+# The scan is cheap: assistant records start within the first handful of
+# lines (the transcript opens with the system/user prompt), we stop at
+# the first hit, and a hard line cap bounds the worst case on a
+# transcript that never produced an assistant turn.
+_MODEL_SCAN_MAX_LINES = 400
+
+# Claude Code stamps `"model": "<synthetic>"` on assistant records it
+# fabricated itself (an interrupt notice, an API-error stub) rather than
+# received from a model. Those are not a model that ran anything, and
+# one can sort ahead of the real first response — skip them and keep
+# scanning, so a transcript whose only synthetic record precedes 59 real
+# ones still reports the model that did the work.
+_SYNTHETIC_MODEL = "<synthetic>"
+
+# Model-family shorthand. The raw id is always kept and surfaced as the
+# hover title; this is only the compact label shown in the metadata row.
+# Ordered longest-distinguishing-first is unnecessary here since the
+# families are disjoint substrings of the id.
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+
+
+def _model_family(model_id: str | None) -> str | None:
+    """Return the short family label ("opus"/"sonnet"/...) for a model id.
+
+    None for an unrecognised id — the caller then shows the raw id
+    verbatim rather than inventing a label for it. We never guess: an
+    unknown model is displayed as whatever string the transcript held.
+    """
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    lowered = model_id.lower()
+    for fam in _MODEL_FAMILIES:
+        if fam in lowered:
+            return fam
+    return None
+
+
+def _extract_transcript_model(path: Path) -> str | None:
+    """Return the model id recorded on the first assistant record of a JSONL.
+
+    Reads `message.model` — present on every assistant record Claude Code
+    writes. Stops at the first hit, and gives up after
+    ``_MODEL_SCAN_MAX_LINES`` lines so a long transcript with no assistant
+    turn (an agent that died before its first response) can't turn a
+    metadata fetch into a full-file scan.
+
+    Returns None on any failure — missing file, unreadable, malformed
+    JSON, or no model recorded. The caller omits the row in that case;
+    it never substitutes a default.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for lineno, raw in enumerate(f):
+                if lineno >= _MODEL_SCAN_MAX_LINES:
+                    return None
+                # Cheap pre-filter — most lines are tool results with no
+                # model key, and the per-line JSON parse is the slow part.
+                if '"model"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                model = msg.get("model")
+                if isinstance(model, str) and model and model != _SYNTHETIC_MODEL:
+                    return model
+    except OSError:
+        return None
+    return None
+
+
+def _resolve_item_model(
+    item: dict[str, Any],
+    shaped: dict[str, Any],
+    archive_path: Path | None,
+) -> str | None:
+    """Resolve which model ran this queue item, or None when unknowable.
+
+    Three sources, in order of authority:
+
+      1. A ``model`` string stamped on the queue record itself. Nothing
+         writes this today; honouring it means tooling can record the
+         model explicitly (for an item whose transcript has since been
+         rotated away) without another change here.
+      2. The archived transcript, for done / abandoned items.
+      3. The owning agent's LIVE transcript, for running items — resolved
+         from the owner's agent id the same way the log stream does.
+
+    Returns None when none of the three yields anything: workload and
+    hostjob items ran no model at all, and an agent item whose transcript
+    is gone has no truthful answer. Callers must render that as absent,
+    never as a default.
+    """
+    stamped = item.get("model")
+    if isinstance(stamped, str) and stamped.strip():
+        return stamped.strip()
+
+    if archive_path is not None:
+        model = _extract_transcript_model(archive_path)
+        if model:
+            return model
+
+    owner = shaped.get("owner") or {}
+    owner_agent_id = owner.get("agent_id") if isinstance(owner, dict) else None
+    if isinstance(owner_agent_id, str) and owner_agent_id:
+        live_path = _find_agent_jsonl(owner_agent_id)
+        if live_path is not None:
+            return _extract_transcript_model(live_path)
+    return None
 
 
 def _fetch_agent_completion(
@@ -4329,6 +5782,7 @@ def api_queue_meta(qid: str) -> Any:
     # transcript content, and the return text doesn't exist until the
     # agent terminates.
     agent_info: dict[str, Any] | None = None
+    archive_path: Path | None = None
     raw_archive = item.get("log_archive_path")
     if (
         isinstance(raw_archive, str)
@@ -4336,8 +5790,9 @@ def api_queue_meta(qid: str) -> Any:
         and "/" not in raw_archive
         and ".." not in raw_archive
     ):
-        archive_path = Path(QUEUE_LOG_ARCHIVE_DIR) / raw_archive
-        if archive_path.is_file():
+        candidate = Path(QUEUE_LOG_ARCHIVE_DIR) / raw_archive
+        if candidate.is_file():
+            archive_path = candidate
             anchor = _extract_agent_anchor_from_archive(archive_path)
             if anchor is not None:
                 session_id, agent_id = anchor
@@ -4348,6 +5803,13 @@ def api_queue_meta(qid: str) -> Any:
                 }
                 if completion is not None:
                     agent_info.update(completion)
+
+    # Which model actually ran this item — read from the transcript
+    # (archived for finished items, live for running ones), so it
+    # reports what served the work rather than what was requested.
+    # None for workload / hostjob items (no model ran) and for agent
+    # items whose transcript is gone; the front-end omits the row.
+    model = _resolve_item_model(item, shaped, archive_path)
 
     # Captured script content for workload-bound items, when the
     # workload command parsed as `<interpreter> <path>` and the
@@ -4379,10 +5841,19 @@ def api_queue_meta(qid: str) -> Any:
         "priority": shaped["priority"],
         "created_by": shaped["created_by"],
         "abandon_reason": shaped["abandon_reason"],
+        # Operator-set free text from `session-task queue block <id>
+        # --reason ...`. Surfaced here so the detail modal can show WHY a
+        # blocked item is parked: the card paragraph that used to be its
+        # only home is elided wholesale by compact density, which made the
+        # reason invisible to anyone running compact (botchat #2413).
+        # Empty string for every non-blocked item -> the front-end hides
+        # the section.
+        "block_reason": shaped["block_reason"],
         "created_at": shaped["created_at_iso"],
         "started_at": shaped["started_at_iso"],
         "completed_at": shaped["completed_at_iso"],
         "abandoned_at": shaped["abandoned_at_iso"],
+        "blocked_at": shaped["blocked_at_iso"],
         "group_id": shaped["group_id"],
         "group_head": shaped["group_head"],
         "ready_now": shaped["ready_now"],
@@ -4398,6 +5869,11 @@ def api_queue_meta(qid: str) -> Any:
         "age": shaped["age"],
         "age_label": shaped["age_label"],
         "runtime_seconds": runtime_seconds,
+        # Raw model id as recorded in the transcript (e.g. "claude-opus-5"),
+        # plus its family shorthand for the compact metadata row. Both null
+        # when no model is attributable — never defaulted or guessed.
+        "model": model,
+        "model_label": _model_family(model),
         "agent": agent_info,
         "script_capture": script_capture,
     }

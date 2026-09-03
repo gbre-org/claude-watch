@@ -326,7 +326,7 @@ def _devbar_env(spool_dir: str) -> dict:
     return {
         "HOME": "/home/hndrewaall",
         "CLAUDE_DEVBAR_ANALYTICS_SPOOL_DIR": spool_dir,
-        "CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos",
+        "CLAUDE_HOST_PROJECT_DIR": "/Users/operator/repos",
         "CLAUDE_HOST_HOOK_BRIDGE": "0",
     }
 
@@ -353,7 +353,7 @@ def test_devbar_analytics_spooled() -> None:
                f"devbar-spool: expected 1 spool file, got {len(files)}; stderr:\n{r.stderr}")
         if files:
             obj = json.loads(files[0].read_text())
-            expect(obj["transcript_path"] == "/Users/hallandrew/.claude/projects/x/s.jsonl",
+            expect(obj["transcript_path"] == "/Users/operator/.claude/projects/x/s.jsonl",
                    f"devbar-spool: transcript_path not rewritten: {obj['transcript_path']}")
 
 

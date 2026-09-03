@@ -235,12 +235,24 @@ class ForceStartEndpointTest(unittest.TestCase):
             )
             with open(ob_path) as f:
                 ob_data = json.load(f)
+            # session-task registers the leaf WRAPPED as
+            # `all_of [is_main_loop, force_started_unspawned]` so the gate
+            # is inert for subagents; accept the wrapped or a bare row.
+            def _leaf(ob):
+                pred = ob.get("predicate", {}) or {}
+                if pred.get("kind") == "force_started_unspawned":
+                    return pred
+                if pred.get("kind") == "all_of":
+                    for child in (pred.get("params", {}) or {}).get(
+                            "predicates", []):
+                        if child.get("kind") == "force_started_unspawned":
+                            return child
+                return {}
+
             matching = [
                 ob for ob in ob_data.get("obligations", [])
-                if (ob.get("predicate", {}).get("kind")
-                    == "force_started_unspawned")
-                and ob.get("predicate", {}).get("params", {}).get("queue_id")
-                    == self.blocked_id
+                if _leaf(ob).get("params", {}).get("queue_id")
+                == self.blocked_id
             ]
             self.assertTrue(
                 matching,
@@ -254,6 +266,142 @@ class ForceStartEndpointTest(unittest.TestCase):
         finally:
             if prior is not None:
                 os.environ["OBLIGATIONS_FORCE_START"] = prior
+
+    # -------------------------------------------------------------- 6
+    def test_stale_session_task_bin_returns_clear_error(self):
+        """When SESSION_TASK_BIN is not OPENABLE, force-start must return an
+        ACTIONABLE 500 rather than the opaque "session-task force-start
+        failed" the raw rc=2 subprocess would produce.
+
+        This is the exact production failure mode Andrew hit (#4386): the
+        container bind-mounted session-task as a SINGLE FILE, so when the
+        host script was replaced via atomic rename the mount went stale
+        (pointed at the now-unlinked inode) and ``python3 /app/session-task
+        ...`` died with ENOENT. The preflight turns that into a diagnostic
+        naming the stale mount; the durable fix is the directory bind mount
+        in docker-compose.yml.
+        """
+        missing = str(Path(self.tmp) / "gone" / "session-task")
+        orig = self.appmod.SESSION_TASK_BIN
+        self.appmod.SESSION_TASK_BIN = missing
+        try:
+            r = self.client.post(
+                f"/api/queue/{self.blocked_id}/force-start",
+                json={"reason": "operator-decided"},
+            )
+            self.assertEqual(r.status_code, 500, r.get_data(as_text=True))
+            body = r.get_json()
+            self.assertFalse(body.get("ok"))
+            err = body.get("error", "")
+            self.assertIn("not readable", err)
+            self.assertIn("stale", err.lower())
+            self.assertEqual(body.get("session_task_bin"), missing)
+
+            # No half-promotion: the item stays pending, untouched.
+            with open(self.queue_actual) as f:
+                data = json.load(f)
+            item = next(
+                it for it in data["items"] if it["id"] == self.blocked_id
+            )
+            self.assertEqual(item["status"], "pending")
+        finally:
+            self.appmod.SESSION_TASK_BIN = orig
+
+
+    # -------------------------------------------------------------- 7
+    def test_co_run_leaves_overlapping_peer_running(self):
+        """`co_run: true` force-starts ALONGSIDE the same-scope running peer
+        WITHOUT autostopping it (Andrew #4529). The endpoint appends
+        --no-interrupt to the session-task force-start argv; default
+        (no co_run) still autostops the peer.
+        """
+        r = self.client.post(
+            f"/api/queue/{self.blocked_id}/force-start",
+            json={"reason": "scopes-safe", "co_run": True},
+        )
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        body = r.get_json()
+        self.assertTrue(body.get("ok"), body)
+        self.assertTrue(body.get("co_run"), body)
+
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        items = {it["id"]: it for it in data["items"]}
+        # Target promoted + marked co-run.
+        self.assertEqual(items[self.blocked_id]["status"], "running")
+        self.assertTrue(items[self.blocked_id].get("force_started_co_run"))
+        # The overlapping peer is STILL running (not autostopped).
+        self.assertEqual(items[self.running_id]["status"], "running")
+        self.assertNotIn(
+            "autostopped_by_force_start", items[self.running_id]
+        )
+
+    # -------------------------------------------------------------- 8
+    def test_default_force_start_autostops_overlapping_peer(self):
+        """Regression: with no co_run flag, force-start still autostops the
+        overlapping same-scope running peer (unchanged default behavior).
+        """
+        r = self.client.post(
+            f"/api/queue/{self.blocked_id}/force-start",
+            json={"reason": "interrupt-default"},
+        )
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertFalse(r.get_json().get("co_run"), r.get_json())
+
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        items = {it["id"]: it for it in data["items"]}
+        self.assertEqual(items[self.blocked_id]["status"], "running")
+        self.assertEqual(items[self.running_id]["status"], "abandoned")
+
+    # -------------------------------------------------------------- 9
+    def test_new_scope_true_re_scopes_and_leaves_peer_running(self):
+        """`new_scope: true` (modal checkbox) appends --new-scope to the
+        session-task argv: the item is re-scoped to a fresh distinct scope so
+        it no longer overlaps the running peer -- both keep running, the peer
+        is NOT autostopped (Andrew #4713). Re-scope implies co-run.
+        """
+        r = self.client.post(
+            f"/api/queue/{self.blocked_id}/force-start",
+            json={"reason": "run-in-parallel", "new_scope": True},
+        )
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        body = r.get_json()
+        self.assertTrue(body.get("ok"), body)
+        self.assertTrue(body.get("rescope"), body)
+
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        items = {it["id"]: it for it in data["items"]}
+        promoted = items[self.blocked_id]
+        self.assertEqual(promoted["status"], "running")
+        self.assertTrue(promoted.get("force_started_rescoped"))
+        self.assertTrue(promoted.get("force_started_co_run"))
+        # The item got a distinct scope; the peer keeps its original one.
+        self.assertNotEqual(promoted.get("scope"), ["repo:web"])
+        self.assertNotIn("repo:web", promoted.get("scope", []))
+        self.assertEqual(items[self.running_id]["status"], "running")
+        self.assertNotIn(
+            "autostopped_by_force_start", items[self.running_id]
+        )
+
+    # -------------------------------------------------------------- 10
+    def test_new_scope_string_sets_scope_verbatim(self):
+        """A non-empty ``new_scope`` STRING is passed verbatim as the item's
+        new scope (the operator-typed-scope alternative).
+        """
+        r = self.client.post(
+            f"/api/queue/{self.blocked_id}/force-start",
+            json={"reason": "typed-scope", "new_scope": "repo:api"},
+        )
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertTrue(r.get_json().get("rescope"), r.get_json())
+
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        items = {it["id"]: it for it in data["items"]}
+        self.assertEqual(items[self.blocked_id].get("scope"), ["repo:api"])
+        self.assertEqual(items[self.running_id]["status"], "running")
 
 
 if __name__ == "__main__":

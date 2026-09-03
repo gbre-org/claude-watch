@@ -1,0 +1,343 @@
+# claude-watch.rules.yml -- Prometheus recording + alert rules for the
+# claude-watch work-queue / owner-liveness stack.
+#
+# ##########################################################################
+# #4039: THESE RULES ARE VERSION-CONTROLLED IN THE claude-watch REPO.
+# ##########################################################################
+# The local Grafana/Prometheus COMPOSE stack lives out-of-tree (in an
+# external monitoring stack), but the alert/recording RULES that encode
+# claude-watch's own semantics belong HERE, next to the two Python exporters
+# that emit the metrics (exporters/work-queue-exporter/,
+# exporters/claude-events-exporter/). This is the single source of truth:
+# any deployment (the local stack, an external host, a future hosted Prometheus)
+# should symlink or copy THIS file rather than fork its own drifting copy.
+#
+# Load it into Prometheus via `rule_files:` in prometheus.yml, e.g.:
+#     rule_files:
+#       - /etc/prometheus/rules/claude-watch.rules.yml
+# then mount this path (or a CW_REPO_DIR-relative bind) into the container.
+# Validate with `promtool check rules monitoring/prometheus/claude-watch.rules.yml`.
+#
+# ## Two-stage orphan escalation ladder (Andrew, #4038/#4039)
+#
+# A `running` queue item that loses its owner is surfaced in TWO stages,
+# fast-then-slow, so the main loop gets an actionable nudge long before the
+# heavier external alert fires:
+#
+#   STAGE 1 -- claude-event (in-tree, FAST, ~2.5 min).
+#     `claude-watch queue-check` (cron, every 5 min) emits a `queue-orphaned`
+#     claude-event once a running item has had NO agent binding for
+#     `[queue_check] no_binding_grace_secs` (default 150s). The event routes
+#     to the ACTIONABLE tier -- the main loop is expected to re-register,
+#     re-spawn, or abandon the item. This is the FIRST and PRIMARY signal;
+#     it needs no Prometheus at all.
+#
+#   STAGE 2 -- Prometheus WorkQueueOrphaned (external, SLOW, ~15 min).
+#     If the item is STILL unowned much later, the work-queue-exporter emits
+#     has_live_owner=0 (once `last_heartbeat_at` is stale past
+#     ORPHAN_HEARTBEAT_STALE_SECONDS, default 600s) and the alert below adds
+#     `for: 5m` on top -- so it fires ~15 min after register, an order of
+#     magnitude past the Stage-1 event grace. That ordering is DELIBERATE:
+#     Prometheus is the escalation/paging backstop for an orphan the main
+#     loop failed to clear after the actionable event, NOT the first-line
+#     notifier. Keep `for` + the exporter stale window comfortably longer
+#     than `no_binding_grace_secs` so the event always leads.
+#
+# Owner attribution note: the exporter + queue-minisite resolve a running
+# item's owner through the SAME three-step ladder -- (1) an active-agents
+# record keyed on this queue id, (2) the item's register-time `agent_id`
+# stamp from `session-task queue register`, (3) the arm-hook
+# agent-queue-bindings.json binding (queue_id -> agent_id, written
+# synchronously at spawn). Steps 2 and 3 name an owner that was definitively
+# spawned, so such an item is treated as OWNED even during active-agents poll
+# lag, and has_live_owner=0 fires only for GENUINELY owner-less items -- the
+# never-spawned / died-after-spawn cases WorkQueueOrphaned is meant to catch.
+# Liveness is ALWAYS active-agents' `alive` flag, never a pid: subagents share
+# the parent Claude Code PID and container-spawned agents have no resolvable
+# pid at all.
+#
+# ## Owner-UNKNOWN is not owner-ORPHANED
+#
+# The ladder above is about an owner that WENT AWAY. A separate failure is an
+# item that never had an attributable owner in the first place: no
+# active-agents record on the qid, no register-time `agent_id` stamp, no
+# arm-hook binding. That is a queue entry meant for an agent that was never
+# assigned one -- or an agent RESUMED onto a rotated queue id, whose stamp was
+# never retrofitted. `worktask_queue_item_owner_unknown_age_seconds` /
+# WorkQueueOwnerUnknown cover that case, and they carry NO heartbeat-staleness
+# precondition on purpose: the never-spawned branch of has_live_owner requires
+# a STALE heartbeat, so an item heartbeating happily while belonging to nobody
+# is invisible to it. Remedy is `session-task queue assign <id> --agent <id>`
+# (owner retrofit), spawning the missing agent, or abandoning the item.
+#
+# When the exporter cannot READ its owner inputs (a container missing a bind
+# mount) every running item looks ownerless. Rather than page the whole queue,
+# the exporter goes SILENT on has_live_owner and publishes
+# worktask_queue_owner_input_available=0 -- which WorkQueueOwnerInputMissing
+# below is the alert for. Do not read the orphan metric's silence as health.
+#
+# Metric provenance:
+#   worktask_queue_*  -> exporters/work-queue-exporter/work_queue_exporter.py
+#   claude_events_*   -> exporters/claude-events-exporter/claude_events_exporter.py
+#   claude_watch_* / claude_code_* -> `claude-watch metrics` textfile (src/metrics.rs)
+
+groups:
+  # ----------------------------------------------------------------------
+  # Recording rules -- pre-aggregated series for dashboards + for external
+  # consumers to reuse without re-deriving the joins. Cheap, evaluated every interval.
+  # ----------------------------------------------------------------------
+  - name: claude-watch-work-queue.recording
+    rules:
+      # Count of running queue items currently flagged orphaned (no live
+      # owner). Drives the "orphaned running items" stat tile and lets external
+      # consumers alert on a COUNT rather than per-series. agent_id="" ones are
+      # never-spawned; agent_id!="" ones died after spawn -- summed here.
+      - record: worktask:queue_items_orphaned:count
+        expr: count(worktask_queue_item_has_live_owner{status="running"} == 0) or vector(0)
+
+      # Count of running items with a healthy live owner. Useful as the
+      # denominator for an "owned vs orphaned" ratio panel.
+      - record: worktask:queue_items_owned:count
+        expr: count(worktask_queue_item_has_live_owner{status="running"} == 1) or vector(0)
+
+      # Never-spawned subset (owner-less AND no agent_id) -- the main-loop
+      # "registered but never spawned an Agent" failure mode specifically.
+      - record: worktask:queue_items_orphaned_never_spawned:count
+        expr: count(worktask_queue_item_has_live_owner{status="running", agent_id=""} == 0) or vector(0)
+
+  # ----------------------------------------------------------------------
+  # Alert rules.
+  # ----------------------------------------------------------------------
+  - name: claude-watch-work-queue
+    rules:
+      # WorkQueueOrphaned -- STAGE 2 of the escalation ladder (see header).
+      # A RUNNING queue item whose owning agent is no longer alive. The
+      # exporter emits has_live_owner for both running and blocked items;
+      # we filter to {status="running"} so blocked items (no live agent BY
+      # DESIGN) never fire. Items with an alive owner (has_live_owner=1) or
+      # no signal at all are excluded, so `== 0` matches only genuine
+      # orphans: never-spawned (agent_id empty) or died-after-spawn
+      # (agent_id set). `for: 5m` on top of the exporter's 600s stale window
+      # keeps this ~15 min behind register -- well past the Stage-1
+      # queue-orphaned claude-event (~2.5 min), so this is the escalation
+      # backstop, not the first notifier.
+      - alert: WorkQueueOrphaned
+        expr: worktask_queue_item_has_live_owner{status="running"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          stage: escalation
+        annotations:
+          summary: "Work-queue item {{ $labels.id }} is running but orphaned"
+          description: >-
+            Running queue item {{ $labels.id }} ({{ $labels.summary }}) has no
+            live agent owner (agent "{{ $labels.agent_id }}"; empty =
+            never-spawned, set = died-after-spawn) and remained so long after
+            the Stage-1 queue-orphaned claude-event should have prompted the
+            main loop. Re-register + re-spawn the work, or abandon the item.
+
+      # WorkQueueOwnerUnknown -- a RUNNING item that NOBODY can be
+      # attributed to. Distinct from WorkQueueOrphaned above, and the two
+      # are deliberately not merged: orphaned means a KNOWN owner is gone
+      # (has_live_owner=0 on a named or once-named agent); owner-unknown
+      # means the item is not attributable to anyone at all -- no
+      # active-agents record on the qid, no register-time agent_id stamp,
+      # no arm-hook binding. That is what a queue entry meant for an agent
+      # that never got one assigned looks like, and what an agent RESUMED
+      # onto a rotated queue id looks like until its owner stamp is
+      # retrofitted.
+      #
+      # The exporter emits this gauge with NO heartbeat-staleness
+      # precondition, unlike the never-spawned branch of has_live_owner.
+      # That staleness gate is exactly why a live-but-ownerless item is
+      # invisible: an item heartbeating happily while belonging to nobody
+      # never trips it. `workload:`/`hostjob:` scoped items and items with
+      # an explicit `pid` are exempt at the exporter (system jobs owned by
+      # a process, not an agent), and the gauge is suppressed entirely when
+      # no owner-attribution input is readable -- WorkQueueOwnerInputMissing
+      # carries that case.
+      #
+      # 10m expr + 10m `for` = ~20 min after registration, well past any
+      # spawn-time attribution lag.
+      - alert: WorkQueueOwnerUnknown
+        expr: worktask_queue_item_owner_unknown_age_seconds > 600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Work-queue item {{ $labels.id }} has no assigned agent"
+          description: >-
+            Running queue item {{ $labels.id }} ({{ $labels.summary }}) has
+            been running for {{ $value | humanizeDuration }} with NO
+            attributable owner -- no active-agents record, no register-time
+            agent_id stamp, no arm-hook binding. This is "owner unknown", not
+            "orphaned": nobody can be named for the work, rather than a known
+            owner having died. Either an agent was never spawned for it, or an
+            agent resumed onto this (rotated) id and its owner stamp was never
+            retrofitted. Remedy: stamp the real owner with
+            `session-task queue assign {{ $labels.id }} --agent <agent_id>`,
+            spawn the missing agent, or abandon the item.
+
+      # WorkQueueStuckSoft -- a running item with long runtime AND stale (or
+      # absent) progress. The base series is running_elapsed; each `unless
+      # on(id)` clause subtracts a class of item that is demonstrably still
+      # progressing:
+      #
+      #   1. progress_age < 900 -- a workload/hostjob still touching its
+      #      heartbeat file (the sidecar only re-touches it when the wrapped
+      #      command's output grows, so a fresh mtime is REAL progress).
+      #   2. agent_jsonl_age < 900 -- an AGENT still writing its transcript.
+      #      Without this, every agent-owned item alerted purely for running
+      #      >30m (15m expr + 15m `for`), because agents have no heartbeat
+      #      file and so never matched clause 1. Transcript freshness is the
+      #      agent-side equivalent of the workload heartbeat, and the 900s
+      #      threshold matches DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS in
+      #      src/active_agents.rs -- an agent parked in one long tool call
+      #      is covered by the same window on both sides.
+      #
+      # 15m mirrors config.toml [queue_check] stale_heartbeat_min = 15.
+      - alert: WorkQueueStuckSoft
+        expr: >-
+          (worktask_queue_items_running_elapsed_seconds > 900)
+          unless on(id) (worktask_queue_item_progress_age_seconds < 900)
+          unless on(id) (worktask_queue_item_agent_jsonl_age_seconds < 900)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Work-queue item {{ $labels.id }} appears stuck"
+          description: >-
+            Running queue item {{ $labels.id }} ({{ $labels.summary }}) has
+            been running >15m with no fresh progress signal. Healthy
+            long-running workloads (fresh progress heartbeat) and healthy
+            long-running agents (fresh JSONL transcript) are excluded via
+            the `unless on(id)` joins.
+
+      # WorkQueueReadyStuck -- a ready-to-spawn pending item unclaimed too
+      # long. The exporter only emits ready_age for pending group-heads that
+      # are NOT scope-locked and have empty dep_blockers, so this gauge is
+      # already the "genuinely waiting" set.
+      - alert: WorkQueueReadyStuck
+        expr: worktask_queue_item_ready_age_seconds > 1800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ready work-queue item {{ $labels.id }} is unclaimed"
+          description: >-
+            Pending, ready (group-head, unlocked, no dep blockers) queue item
+            {{ $labels.id }} ({{ $labels.summary }}) has waited >30m for the
+            main loop to spawn it.
+
+      # AgentStateFileMissing -- the exporter sets agent_state_last_modified
+      # to 0 when claude-watch's active-agents.json is missing; a sustained 0
+      # means claude-watch stopped publishing the file, which also BLINDS
+      # WorkQueueOrphaned (Stage 2 goes dark). Alert so the blindness itself
+      # is visible.
+      - alert: AgentStateFileMissing
+        expr: worktask_queue_agent_state_last_modified == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "claude-watch active-agents state file missing"
+          description: >-
+            worktask_queue_agent_state_last_modified has been 0 for >10m --
+            claude-watch is not publishing active-agents.json, so owner
+            liveness (WorkQueueOrphaned) is blind. Check the active-agents
+            cron / daemon.
+
+      # WorkQueueOwnerInputMissing -- the exporter cannot READ one of the two
+      # files it attributes owners from (active-agents.json, or the arm-hook
+      # agent-queue-bindings.json). In a container that is almost always a
+      # missing bind mount. This is the alert that has to carry the alarm,
+      # because when BOTH inputs are unreadable the exporter deliberately goes
+      # SILENT on worktask_queue_item_has_live_owner: an unmounted path makes
+      # every running item look ownerless, and paging the whole queue as
+      # orphaned would be a deployment fault wearing an incident's clothes.
+      # `for: 10m` rides out a state-file rewrite / a restart.
+      - alert: WorkQueueOwnerInputMissing
+        expr: worktask_queue_owner_input_available == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "work-queue-exporter cannot read owner input {{ $labels.input }}"
+          description: >-
+            worktask_queue_owner_input_available{input="{{ $labels.input }}"}
+            has been 0 for >10m -- the work-queue-exporter cannot read that
+            owner-attribution file (missing, unreadable, or malformed). Owner
+            attribution is degraded; if BOTH inputs read 0 the exporter
+            suppresses has_live_owner entirely and WorkQueueOrphaned is blind.
+            Check the exporter's bind mounts / AGENT_STATE_JSON /
+            AGENT_QUEUE_BINDINGS_JSON, and its log for the path it named.
+
+  - name: claude-watch-events
+    rules:
+      # ClaudeEventsBacklogStale -- the oldest unconsumed event has aged out,
+      # the signal of a wedged main loop / dead claude-event-watch watcher.
+      - alert: ClaudeEventsBacklogStale
+        expr: claude_events_age_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "claude-events backlog is going stale"
+          description: >-
+            Oldest unconsumed claude-event is >10m old. Suggests a wedged
+            main loop or a dead claude-event-watch watcher.
+
+  - name: claude-watch-daemon
+    rules:
+      # ClaudeWatchDown -- the daemon writes claude_watch_up 0 when its state
+      # file is unreadable, or the target is absent.
+      - alert: ClaudeWatchDown
+        expr: claude_watch_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "claude-watch daemon is down or state file unreadable"
+          description: >-
+            claude_watch_up == 0 -- claude-watch's state.json is unreadable or
+            the daemon is not running.
+
+      # ClaudeWatchersMissing -- enabled watchers that have gone missing.
+      #
+      # Source note: this reads the daemon's PERSISTED per-watcher health map
+      # (miss streaks, grace windows), NOT the live config probe behind
+      # claude_code_live_watchers / claude_code_enabled_watchers. The two can
+      # legitimately differ for a cycle or two; a LASTING disagreement (this
+      # alert firing while the live pair reports every watcher healthy) means
+      # the persisted map has drifted from the watcher config, not that a
+      # watcher is down.
+      - alert: ClaudeWatchersMissing
+        expr: claude_watchers_missing > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} claude-watch watcher(s) missing"
+          description: >-
+            claude_watchers_missing > 0 -- one or more enabled watchers have
+            gone missing. The daemon's watcher_down interrupt handles this
+            in-tree; this is the external mirror.
+
+      # ClaudeMainLoopAckStale -- the main loop has not acked ANY claude-event
+      # in >15m, the canonical wedge signal. The loop runs `event-ack
+      # ack-batch` after every batch it handles, and the daemon emits a
+      # `keepalive` event whenever nothing has been acked for the quiet window,
+      # so even a fully idle loop has something to ack well inside 15m. Only
+      # emitted once the loop has acked at least once, so absent != firing.
+      # (Replaced ClaudeMainLoopHeartbeatStale 2026-08-22, when the host
+      # heartbeat file and its `touch` ritual were retired.)
+      - alert: ClaudeMainLoopAckStale
+        expr: time() - claude_mainloop_last_ack_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "claude main loop has not acked an event in >15m"
+          description: >-
+            No claude-event has been acked in >15m, through at least two
+            keepalive windows. The main loop is likely wedged.

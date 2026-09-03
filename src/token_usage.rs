@@ -39,6 +39,41 @@
 //!     per-file dedup is sufficient and per-file results are independent —
 //!     which is what makes the incremental cache below correct.
 //!
+//! ## The counter must survive transcript RETENTION (the 65M-tokens/min bug)
+//!
+//! `claude_code_tokens_total` is scraped as a Prometheus COUNTER, and every
+//! dashboard reads it through `rate()` / `increase()`. Those functions treat
+//! **any decrease as a counter reset** and attribute the whole post-reset
+//! value to the window — so a single downward blip turns a ~340 tokens/min
+//! panel into a ~65,000,000 tokens/min panel, with no matching spend.
+//!
+//! The naive "sum over every transcript currently on disk" is NOT monotonic:
+//!
+//!  * Claude Code prunes transcripts older than `cleanupPeriodDays` (30 by
+//!    default). Measured on a live host: seven drops in seven days, each
+//!    ≈3–6M tokens out of a ~300M total, each producing a 62–68M tokens/min
+//!    reading against a 341 tokens/min median.
+//!  * A transient failure (projects dir briefly unreadable, one file that
+//!    can't be read this pass) used to fold that file's history to zero.
+//!
+//! So the cache is not merely an optimisation — it is the ACCRUAL LEDGER that
+//! makes the counter monotonic:
+//!
+//!  * A transcript that vanishes keeps contributing its last-known per-day
+//!    sums (`missing_since` records when it went away).
+//!  * After `RETIRE_AFTER_SECS` of continuous absence its buckets are folded
+//!    into the cache-wide `retired` day map and the per-file entry is dropped,
+//!    so the ledger stays bounded (day-keyed, not file-keyed) while the totals
+//!    are preserved exactly.
+//!  * A scan that sees ZERO transcripts while the ledger is non-empty is
+//!    treated as a broken scan: nothing is retired, nothing is forgotten.
+//!  * A file whose read fails keeps its previously cached buckets AND its old
+//!    `(size, mtime)` signature, so the next pass re-parses it.
+//!
+//! Net effect: the exported series only ever goes up, and the only thing a
+//! lost cache file costs is the history of already-pruned transcripts (the
+//! counter simply continues from the current value — no downward step).
+//!
 //! ## Incremental cache
 //!
 //! Re-parsing every transcript on each emission (the collector runs ~1×/min
@@ -91,12 +126,30 @@ struct CacheEntry {
     /// platform sub-second mtime-resolution flakiness.
     mtime: i64,
     days: HashMap<String, TokenCounts>,
+    /// Epoch seconds of the first scan that did NOT see this transcript, or
+    /// `None` while the file is present. A missing file keeps contributing its
+    /// cached buckets until it is retired — see the module docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    missing_since: Option<i64>,
 }
 
-/// On-disk cache shape: a map of absolute transcript path → entry.
+/// How long a transcript must stay missing before its buckets are folded into
+/// the cache-wide `retired` day map and its per-file entry dropped. Long
+/// enough that a transient scan failure never retires anything; short enough
+/// that the per-file map stays small. A Claude Code session path is a unique
+/// UUID that is never reused, so a file gone this long will not come back.
+const RETIRE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// On-disk cache shape: a map of absolute transcript path → entry, plus the
+/// accrued day buckets of transcripts that are gone for good.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Cache {
     files: HashMap<String, CacheEntry>,
+    /// Day-keyed token sums inherited from retired (long-deleted) transcripts.
+    /// Keeps the counter monotonic across Claude Code's transcript retention
+    /// sweep without growing per-file forever.
+    #[serde(default)]
+    retired: HashMap<String, TokenCounts>,
 }
 
 fn home_dir() -> PathBuf {
@@ -248,22 +301,31 @@ fn merge_days(dst: &mut HashMap<String, TokenCounts>, src: &HashMap<String, Toke
 }
 
 /// Production entry point: scan all Claude Code transcripts (using the
-/// incremental cache) and return cumulative + month-to-date token usage.
+/// incremental accrual ledger) and return cumulative + month-to-date usage.
 ///
-/// Fail-open: a missing projects dir / unreadable cache degrades to zeros
-/// rather than failing the whole metrics emission (the textfile collector
-/// runs every minute; one bad scan shouldn't blank every other series).
+/// Fail-open: a missing projects dir / unreadable cache never fails the whole
+/// metrics emission (the textfile collector runs every minute; one bad scan
+/// shouldn't blank every other series). Fail-open here means "hold the last
+/// known totals", never "emit zeros" — a zero reads as a counter reset and
+/// blows the tokens/min panels up by five orders of magnitude.
 pub fn collect_token_usage() -> TokenUsage {
+    let now = Local::now();
     collect_token_usage_at(
         &default_projects_dir(),
         &default_cache_path(),
-        &Local::now().format("%Y-%m").to_string(),
+        &now.format("%Y-%m").to_string(),
+        now.timestamp(),
     )
 }
 
-/// Same as `collect_token_usage` but with injected paths + month prefix, so
-/// tests can point at a tempdir and pin "now".
-pub fn collect_token_usage_at(projects_dir: &Path, cache_path: &Path, month_prefix: &str) -> TokenUsage {
+/// Same as `collect_token_usage` but with injected paths, month prefix and
+/// wall clock, so tests can point at a tempdir and pin "now".
+pub fn collect_token_usage_at(
+    projects_dir: &Path,
+    cache_path: &Path,
+    month_prefix: &str,
+    now_secs: i64,
+) -> TokenUsage {
     let mut files = Vec::new();
     collect_transcript_files(projects_dir, &mut files);
 
@@ -273,9 +335,18 @@ pub fn collect_token_usage_at(projects_dir: &Path, cache_path: &Path, month_pref
 
     for path in &files {
         let key = path.to_string_lossy().to_string();
+        let prev = cache.files.remove(&key);
+
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
-            Err(_) => continue,
+            // Stat failed: treat the file as "not seen this pass" rather than
+            // dropping it, so a transient error can't lower the counter.
+            Err(_) => {
+                if let Some(e) = prev {
+                    cache.files.insert(key, e);
+                }
+                continue;
+            }
         };
         let size = meta.len();
         let mtime = meta
@@ -286,27 +357,177 @@ pub fn collect_token_usage_at(projects_dir: &Path, cache_path: &Path, month_pref
             .unwrap_or(0);
 
         // Reuse the cached parse if the file is byte-for-byte unchanged.
-        let entry = match cache.files.remove(&key) {
-            Some(e) if e.size == size && e.mtime == mtime => e,
-            _ => {
-                let content = std::fs::read_to_string(path).unwrap_or_default();
-                CacheEntry {
+        let entry = match prev {
+            Some(e) if e.size == size && e.mtime == mtime => CacheEntry {
+                missing_since: None,
+                ..e
+            },
+            prev => match std::fs::read_to_string(path) {
+                Ok(content) => CacheEntry {
                     size,
                     mtime,
                     days: parse_transcript_days(&content),
-                }
-            }
+                    missing_since: None,
+                },
+                // Unreadable right now: keep the old buckets AND the old
+                // (size, mtime) signature so the next pass re-parses it. A
+                // brand-new unreadable file simply contributes nothing yet.
+                Err(_) => match prev {
+                    Some(e) => e,
+                    None => continue,
+                },
+            },
         };
         merge_days(&mut all_days, &entry.days);
         next.insert(key, entry);
     }
 
-    // Entries left in `cache.files` correspond to transcripts that no longer
-    // exist; dropping them keeps the cache from growing without bound.
-    let new_cache = Cache { files: next };
+    // A scan that found NO transcripts while the ledger holds some is a broken
+    // scan (projects dir unreadable / not yet mounted), not a mass deletion:
+    // hold every entry as-is and retire nothing.
+    let broken_scan = files.is_empty() && !cache.files.is_empty();
+
+    // Whatever is left in `cache.files` was not observed this pass. Such an
+    // entry keeps contributing its last-known buckets — Claude Code prunes
+    // transcripts older than `cleanupPeriodDays`, and forgetting them here is
+    // exactly the downward step `rate()` reads as a counter reset. Once a file
+    // has been gone for RETIRE_AFTER_SECS its buckets are folded into the
+    // day-keyed `retired` map so the per-file map stays bounded.
+    let mut retired = std::mem::take(&mut cache.retired);
+    for (key, mut entry) in cache.files.drain() {
+        let since = *entry.missing_since.get_or_insert(now_secs);
+        if !broken_scan && now_secs.saturating_sub(since) >= RETIRE_AFTER_SECS {
+            // Counted below via `retired` — merging here too would double it.
+            merge_days(&mut retired, &entry.days);
+        } else {
+            merge_days(&mut all_days, &entry.days);
+            next.insert(key, entry);
+        }
+    }
+    merge_days(&mut all_days, &retired);
+
+    let new_cache = Cache {
+        files: next,
+        retired,
+    };
     save_cache(cache_path, &new_cache);
 
     summarize(&all_days, month_prefix)
+}
+
+/// Tail-read window for locating the CURRENT context-window size of the
+/// active main session — distinct from `collect_token_usage`'s full-history
+/// cumulative scan above. Matches `MAIN_TAIL_BYTES` in
+/// `tools/cw-agent-stats/agentstats.py` (`find_main_transcript` /
+/// `parse_main_tail`), which this is a direct Rust port of.
+const MAIN_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Newest top-level `<slug>/<session-uuid>.jsonl` transcript = the active
+/// main loop (one active main session per `~/.claude/projects` tree, matching
+/// cw's topology). Only descends one level (slug dirs, then their direct
+/// `*.jsonl` children) — a subagent transcript lives one level deeper, under
+/// `<slug>/<session-uuid>/subagents/agent-*.jsonl`, so it is never a
+/// candidate here even though `collect_transcript_files` above recurses into
+/// it for the cumulative counters.
+fn find_main_transcript(projects_dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    let slugs = std::fs::read_dir(projects_dir).ok()?;
+    for slug in slugs.flatten() {
+        let Ok(file_type) = slug.file_type() else { continue };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(slug.path()) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(mtime) = meta.modified() else { continue };
+            let is_newer = best.as_ref().is_none_or(|(_, best_mtime)| mtime > *best_mtime);
+            if is_newer {
+                best = Some((path, mtime));
+            }
+        }
+    }
+    best.map(|(path, _)| path)
+}
+
+/// Read the last `tail_bytes` of `path` as a (lossily-decoded) string,
+/// dropping the partial first line when we seeked mid-file. `None` on any
+/// I/O error (missing file, permission denied, etc.).
+fn read_tail(path: &Path, tail_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let size = std::fs::metadata(path).ok()?.len();
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    if size > tail_bytes {
+        file.seek(SeekFrom::Start(size - tail_bytes)).ok()?;
+        file.read_to_end(&mut buf).ok()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            buf.drain(..=pos);
+        }
+    } else {
+        file.read_to_end(&mut buf).ok()?;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Latest `message.usage` context size (`input_tokens +
+/// cache_creation_input_tokens + cache_read_input_tokens`) found in `tail`.
+/// Pure: no I/O. Walks in file order and keeps the LAST usage-bearing
+/// assistant line whose sum is non-zero, matching `parse_main_tail`'s
+/// `ctx = val` overwrite semantics (later turns are always more current).
+fn latest_context_tokens(tail: &str) -> Option<u64> {
+    let mut ctx = None;
+    for line in tail.lines() {
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        let obj: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let usage = match obj.get("message").and_then(|m| m.get("usage")) {
+            Some(u) => u,
+            None => continue,
+        };
+        let val = usage_field(usage, "input_tokens")
+            + usage_field(usage, "cache_creation_input_tokens")
+            + usage_field(usage, "cache_read_input_tokens");
+        if val > 0 {
+            ctx = Some(val);
+        }
+    }
+    ctx
+}
+
+/// Current context-window size of the active main session, read directly
+/// from its JSONL transcript tail — the robust replacement for scraping the
+/// tmux status bar (which freezes when an auto-update banner or other
+/// overlay clobbers the status line; see `status::get_claude_status`).
+///
+/// `None` means "couldn't determine it" (no projects dir, no transcript, or
+/// no usage-bearing line in the tail yet) — callers should fall back to
+/// their existing reading (e.g. the tmux-scraped value) rather than treat
+/// `None`/0 as "context is empty".
+pub fn current_context_tokens() -> Option<u64> {
+    current_context_tokens_at(&default_projects_dir())
+}
+
+/// Same as `current_context_tokens` but with an injected projects dir, so
+/// tests can point at a tempdir.
+pub fn current_context_tokens_at(projects_dir: &Path) -> Option<u64> {
+    let path = find_main_transcript(projects_dir)?;
+    let tail = read_tail(&path, MAIN_TAIL_BYTES)?;
+    latest_context_tokens(&tail)
 }
 
 /// Render the token-usage Prometheus textfile lines. Pure + tested; appended
@@ -315,14 +536,14 @@ pub fn token_metric_lines(usage: &TokenUsage) -> Vec<String> {
     let c = &usage.cumulative;
     let m = &usage.month_to_date;
     vec![
-        "# HELP claude_code_tokens_total Cumulative Claude Code token usage by type across all retained transcripts".to_string(),
+        "# HELP claude_code_tokens_total Monotonic cumulative Claude Code token usage by type; survives transcript retention pruning so rate()/increase() never see a false counter reset. type=cache_read is billed at ~0.1x input and type=cache_creation at 1.25x-2x, so a plain sum over types is NOT proportional to spend".to_string(),
         "# TYPE claude_code_tokens_total counter".to_string(),
         format!("claude_code_tokens_total{{type=\"input\"}} {}", c.input),
         format!("claude_code_tokens_total{{type=\"output\"}} {}", c.output),
         format!("claude_code_tokens_total{{type=\"cache_creation\"}} {}", c.cache_creation),
         format!("claude_code_tokens_total{{type=\"cache_read\"}} {}", c.cache_read),
         "".to_string(),
-        "# HELP claude_code_tokens_month_to_date Claude Code token usage for the current calendar month (resets on the 1st), by type".to_string(),
+        "# HELP claude_code_tokens_month_to_date Claude Code token usage for the current calendar month (resets on the 1st), by type; unaffected by transcript retention pruning".to_string(),
         "# TYPE claude_code_tokens_month_to_date gauge".to_string(),
         format!("claude_code_tokens_month_to_date{{type=\"input\"}} {}", m.input),
         format!("claude_code_tokens_month_to_date{{type=\"output\"}} {}", m.output),
@@ -334,6 +555,9 @@ pub fn token_metric_lines(usage: &TokenUsage) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pinned wall clock for the collector tests (2026-06-27T00:00:00Z).
+    const NOW: i64 = 1_782_518_400;
 
     fn line(ts: &str, id: &str, inp: u64, out: u64, cc: u64, cr: u64) -> String {
         format!(
@@ -460,43 +684,255 @@ mod tests {
         .unwrap();
 
         let cache = tmp.path().join("cache.json");
-        let u1 = collect_token_usage_at(&projects, &cache, "2026-06");
+        let u1 = collect_token_usage_at(&projects, &cache, "2026-06", NOW);
         assert_eq!(u1.cumulative.input, 150);
         assert_eq!(u1.month_to_date.input, 150);
         assert!(cache.exists(), "cache file should be written");
 
         // Second run with the cache present yields the same numbers (cache hit
         // path is exercised; files are unchanged).
-        let u2 = collect_token_usage_at(&projects, &cache, "2026-06");
+        let u2 = collect_token_usage_at(&projects, &cache, "2026-06", NOW);
         assert_eq!(u1, u2);
     }
 
     #[test]
-    fn collect_missing_projects_dir_is_zero() {
+    fn collect_missing_projects_dir_with_no_history_is_zero() {
         let tmp = tempfile::tempdir().unwrap();
         let u = collect_token_usage_at(
             &tmp.path().join("does-not-exist"),
             &tmp.path().join("cache.json"),
             "2026-06",
+            NOW,
         );
         assert_eq!(u, TokenUsage::default());
     }
 
+    /// THE BUG (measured on a live host: seven ~3-6M drops in seven days, each
+    /// rendering as ~65,000,000 tokens/min against a 341 tokens/min median).
+    /// Claude Code prunes transcripts older than `cleanupPeriodDays`; if the
+    /// pruned file's tokens leave the total, `rate()` reads the decrease as a
+    /// counter reset and attributes the ENTIRE cumulative value to one window.
     #[test]
-    fn collect_drops_stale_cache_entries() {
+    fn pruned_transcript_never_lowers_the_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let old = projects.join("old.jsonl");
+        let live = projects.join("live.jsonl");
+        std::fs::write(&old, format!("{}\n", line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0))).unwrap();
+        std::fs::write(&live, format!("{}\n", line("2026-06-11T05:00:00.000Z", "m2", 40, 4, 0, 0))).unwrap();
+
+        let cache = tmp.path().join("cache.json");
+        let before = collect_token_usage_at(&projects, &cache, "2026-06", NOW);
+        assert_eq!(before.cumulative.input, 140);
+
+        // Retention sweep deletes the aged transcript.
+        std::fs::remove_file(&old).unwrap();
+        let after = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 60);
+        assert_eq!(
+            after.cumulative, before.cumulative,
+            "counter went DOWN after retention pruning — rate() will read a reset"
+        );
+        assert_eq!(after.month_to_date, before.month_to_date);
+    }
+
+    #[test]
+    fn long_missing_transcript_is_retired_without_losing_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let old = projects.join("old.jsonl");
+        let live = projects.join("live.jsonl");
+        std::fs::write(&old, format!("{}\n", line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0))).unwrap();
+        // A surviving transcript, so the post-deletion scans are non-empty and
+        // therefore not treated as broken.
+        std::fs::write(&live, format!("{}\n", line("2026-06-11T05:00:00.000Z", "m2", 40, 4, 0, 0))).unwrap();
+        let cache = tmp.path().join("cache.json");
+        let before = collect_token_usage_at(&projects, &cache, "2026-06", NOW);
+        assert_eq!(before.cumulative.input, 140);
+        std::fs::remove_file(&old).unwrap();
+
+        // First pass after the deletion stamps missing_since; still per-file.
+        let mid = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 60);
+        assert_eq!(mid.cumulative, before.cumulative);
+        assert!(std::fs::read_to_string(&cache).unwrap().contains("old.jsonl"));
+
+        // Past the horizon: the per-file entry is dropped, the tokens are not.
+        let after = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 60 + RETIRE_AFTER_SECS);
+        assert_eq!(
+            after.cumulative, before.cumulative,
+            "retiring an entry must preserve its tokens"
+        );
+        assert_eq!(after.month_to_date, before.month_to_date);
+        let raw = std::fs::read_to_string(&cache).unwrap();
+        assert!(!raw.contains("old.jsonl"), "retired entry not pruned: {raw}");
+        assert!(raw.contains("retired"), "retired buckets not persisted: {raw}");
+
+        // And it stays put on later passes rather than accruing twice.
+        let later = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 2 * RETIRE_AFTER_SECS);
+        assert_eq!(later.cumulative, before.cumulative);
+    }
+
+    #[test]
+    fn unreadable_projects_dir_holds_the_last_known_total() {
         let tmp = tempfile::tempdir().unwrap();
         let projects = tmp.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
         let f = projects.join("s.jsonl");
         std::fs::write(&f, format!("{}\n", line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0))).unwrap();
         let cache = tmp.path().join("cache.json");
-        let _ = collect_token_usage_at(&projects, &cache, "2026-06");
+        let before = collect_token_usage_at(&projects, &cache, "2026-06", NOW);
 
-        // Remove the transcript; the cache entry must be pruned and totals zero.
-        std::fs::remove_file(&f).unwrap();
-        let u = collect_token_usage_at(&projects, &cache, "2026-06");
-        assert_eq!(u, TokenUsage::default());
-        let raw = std::fs::read_to_string(&cache).unwrap();
-        assert!(!raw.contains("s.jsonl"), "stale entry not pruned: {raw}");
+        // Whole projects dir vanishes (unmounted / renamed). Emitting zeros
+        // here is what produces the false reset; the ledger must hold — and
+        // must NOT mass-retire on the strength of one empty scan, even weeks
+        // later.
+        std::fs::remove_dir_all(&projects).unwrap();
+        let after = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 4 * RETIRE_AFTER_SECS);
+        assert_eq!(after.cumulative, before.cumulative);
+        assert!(
+            std::fs::read_to_string(&cache).unwrap().contains("s.jsonl"),
+            "an empty scan must not retire the whole ledger"
+        );
+    }
+
+    /// The panels read `claude_code_tokens_total{type!="cache_read"}`, so a
+    /// cache read — billed at ~0.1x the input rate, and re-counting the whole
+    /// cached prefix on EVERY request — must never move that sum.
+    #[test]
+    fn cache_reads_never_enter_the_excl_cache_read_series() {
+        let base = parse_transcript_days(&line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 20, 0));
+        let huge = parse_transcript_days(&line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 20, 900_000_000));
+
+        let excl = |days: &HashMap<String, TokenCounts>| -> u64 {
+            let u = summarize(days, "2026-06");
+            u.cumulative.input + u.cumulative.output + u.cumulative.cache_creation
+        };
+        assert_eq!(excl(&base), 130);
+        assert_eq!(
+            excl(&huge),
+            excl(&base),
+            "cache_read leaked into the excl-cache-read total"
+        );
+
+        // …and it lands on its own labelled series rather than nowhere.
+        let usage = summarize(&huge, "2026-06");
+        assert_eq!(usage.cumulative.cache_read, 900_000_000);
+        let rendered = token_metric_lines(&usage).join("\n");
+        assert!(rendered.contains("claude_code_tokens_total{type=\"cache_read\"} 900000000"));
+        assert!(rendered.contains("claude_code_tokens_total{type=\"input\"} 100"));
+        assert!(rendered.contains("claude_code_tokens_total{type=\"cache_creation\"} 20"));
+    }
+
+    // --- current_context_tokens (JSONL-transcript context-size reader) ---
+
+    #[test]
+    fn latest_context_tokens_takes_the_last_nonzero_usage() {
+        // input=100, cache_creation=20, cache_read=30 -> sum 150; then a
+        // later, smaller turn -> sum 60. The LATER turn wins (current
+        // context size, not a max/total).
+        let a = line("2026-06-27T05:00:00.000Z", "msg_a", 100, 5, 20, 30);
+        let b = line("2026-06-27T05:05:00.000Z", "msg_b", 40, 5, 10, 10);
+        let ctx = latest_context_tokens(&format!("{a}\n{b}\n"));
+        assert_eq!(ctx, Some(60));
+    }
+
+    #[test]
+    fn latest_context_tokens_ignores_non_assistant_and_zero_usage() {
+        let user = r#"{"type":"user","message":{"content":"hi"}}"#;
+        let zero = r#"{"type":"assistant","message":{"id":"z","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+        let real = line("2026-06-27T05:00:00.000Z", "msg_real", 42, 1, 0, 0);
+        // The zero-usage line must NOT overwrite a real reading that follows
+        // it in iteration order being absent here — but it must also not be
+        // mistaken for a valid (zero) context size on its own.
+        let ctx = latest_context_tokens(&format!("{user}\n{zero}\n{real}\n"));
+        assert_eq!(ctx, Some(42));
+    }
+
+    #[test]
+    fn latest_context_tokens_none_when_no_usage_present() {
+        let user = r#"{"type":"user","message":{"content":"hi, no usage here"}}"#;
+        assert_eq!(latest_context_tokens(user), None);
+    }
+
+    #[test]
+    fn find_main_transcript_picks_newest_top_level_file_across_slugs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let slug_a = projects.join("-home-a");
+        let slug_b = projects.join("-home-b");
+        std::fs::create_dir_all(&slug_a).unwrap();
+        std::fs::create_dir_all(&slug_b).unwrap();
+
+        let older = slug_a.join("older-session.jsonl");
+        let newer = slug_b.join("newer-session.jsonl");
+        std::fs::write(&older, "{}\n").unwrap();
+        // Ensure a distinct, later mtime than `older` regardless of
+        // filesystem mtime-resolution granularity.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&newer, "{}\n").unwrap();
+
+        let found = find_main_transcript(&projects).expect("a transcript should be found");
+        assert_eq!(found, newer, "expected the newer top-level transcript across slugs");
+    }
+
+    #[test]
+    fn find_main_transcript_ignores_nested_subagent_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let slug = projects.join("-home-x");
+        let subagents = slug.join("uuid-1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+
+        let main_transcript = slug.join("uuid-1.jsonl");
+        std::fs::write(&main_transcript, "{}\n").unwrap();
+        // Subagent file written LATER (newer mtime) must still be ignored —
+        // only top-level <slug>/<session>.jsonl files are candidates.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(subagents.join("agent-a.jsonl"), "{}\n").unwrap();
+
+        let found = find_main_transcript(&projects).expect("main transcript should be found");
+        assert_eq!(found, main_transcript);
+    }
+
+    #[test]
+    fn current_context_tokens_at_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let slug = projects.join("-home-x");
+        std::fs::create_dir_all(&slug).unwrap();
+        let a = line("2026-06-27T05:00:00.000Z", "msg_a", 100, 5, 20, 30); // sum 150
+        let b = line("2026-06-27T05:05:00.000Z", "msg_b", 40, 5, 10, 10); // sum 60
+        std::fs::write(slug.join("uuid-1.jsonl"), format!("{a}\n{b}\n")).unwrap();
+
+        assert_eq!(current_context_tokens_at(&projects), Some(60));
+    }
+
+    #[test]
+    fn current_context_tokens_at_missing_projects_dir_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(current_context_tokens_at(&tmp.path().join("does-not-exist")), None);
+    }
+
+    #[test]
+    fn read_tail_truncates_large_files_and_drops_partial_first_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.jsonl");
+        // Pad the file past the tail window with filler lines, then a real
+        // usage line near the end, so only the tail read can see it.
+        let filler = "x".repeat(1024);
+        let mut content = String::new();
+        for _ in 0..300 {
+            content.push_str(&filler);
+            content.push('\n');
+        }
+        content.push_str(&line("2026-06-27T05:00:00.000Z", "msg_tail", 77, 1, 0, 0));
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+        assert!(content.len() as u64 > MAIN_TAIL_BYTES, "test file must exceed the tail window");
+
+        let tail = read_tail(&path, MAIN_TAIL_BYTES).expect("tail read should succeed");
+        assert!(tail.contains("msg_tail"), "the real usage line must survive truncation");
+        assert_eq!(latest_context_tokens(&tail), Some(77));
     }
 }

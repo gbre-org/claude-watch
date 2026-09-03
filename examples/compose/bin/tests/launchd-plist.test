@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist
+"""Tests for examples/compose/launchd/org.claude-watch.mcp-host-bash.plist
 — the macOS LaunchAgent template for persistent auto-start of
-mcp-host-bash on operator-login.
+mcp-host-bash-server on operator-login.
 
 Coverage:
   - File-level structural validation only (no `launchctl` invocation).
@@ -12,15 +12,15 @@ Coverage:
     silently accept.
   - `Label` matches the filename convention launchd enforces
     (basename minus `.plist`).
-  - `ProgramArguments[0]` looks like an absolute path (the launcher
-    binary launchd will exec).
+  - `ProgramArguments[0]` looks like an absolute path (the binary
+    launchd will exec).
   - `KeepAlive` and `RunAtLoad` are present and truthy (the whole
     point of the LaunchAgent — auto-restart + start-at-login).
   - `EnvironmentVariables`, `WorkingDirectory`, `StandardOutPath`,
     `StandardErrorPath` are present (the README walkthrough relies
     on each one).
-  - The launcher path inside `ProgramArguments[0]` ends in
-    `bin/mcp-host-bash` so a typo / refactor doesn't silently point
+  - The binary path inside `ProgramArguments[0]` ends in
+    `mcp-host-bash-server` so a typo / refactor doesn't silently point
     launchd at a stale binary.
 
 Run:  ./launchd-plist.test
@@ -28,7 +28,6 @@ Run:  ./launchd-plist.test
 
 from __future__ import annotations
 
-import os
 import plistlib
 import shutil
 import subprocess
@@ -39,7 +38,7 @@ HERE = Path(__file__).resolve().parent
 PLIST = (
     HERE.parent.parent
     / "launchd"
-    / "org.gbre.claude-watch.mcp-host-bash.plist"
+    / "org.claude-watch.mcp-host-bash.plist"
 )
 LAUNCHD_README = HERE.parent.parent / "launchd" / "README.md"
 
@@ -109,7 +108,7 @@ def test_label_matches_filename() -> None:
     minus `.plist`. The plist's `Label` MUST match or the operator's
     workflow (copy file in, then `bootstrap gui/$(id -u)/<label>`)
     breaks at the bootstrap step."""
-    expected_label = PLIST.stem  # "org.gbre.claude-watch.mcp-host-bash"
+    expected_label = PLIST.stem  # "org.claude-watch.mcp-host-bash"
     actual = PARSED.get("Label")
     expect(
         actual == expected_label,
@@ -187,24 +186,17 @@ def test_program_arguments_first_is_absolute() -> None:
 
 
 def test_program_arguments_first_points_at_launcher() -> None:
-    """ProgramArguments[0] must end in either the launcher binary
-    (`bin/mcp-host-bash`) OR the Keychain wrapper
-    (`bin/load-bearer-from-keychain`) — both are valid bootstrap
-    targets. Guards against a refactor renaming the launcher without
-    updating the template (or a typo in the template itself).
-
-    The Keychain wrapper exec's mcp-host-bash after fetching the
-    bearer from the macOS login Keychain; the bare-launcher form is
-    the opt-out for operators who prefer plist plaintext."""
+    """ProgramArguments[0] must end in the mcp-host-bash-server binary
+    (installed to ~/bin by `make install-mcp-host-bash-server`). Guards
+    against a refactor renaming the binary without updating the template
+    (or a typo in the template itself)."""
     pa = PARSED.get("ProgramArguments")
     if not (isinstance(pa, list) and pa):
         return
     first = pa[0]
     accepted_suffixes = (
-        "/bin/mcp-host-bash",
-        "/mcp-host-bash",
-        "/bin/load-bearer-from-keychain",
-        "/load-bearer-from-keychain",
+        "/bin/mcp-host-bash-server",
+        "/mcp-host-bash-server",
     )
     expect(
         any(first.endswith(s) for s in accepted_suffixes),
@@ -225,11 +217,10 @@ def test_environment_variables_dict() -> None:
 
 
 def test_environment_variables_has_path() -> None:
-    """The launcher needs `mcp-proxy` and `cli-mcp-server` on PATH.
+    """The server's run_command invocations resolve host CLIs off PATH.
     launchd's default PATH is `/usr/bin:/bin:/usr/sbin:/sbin` —
     Homebrew + ~/.local/bin are absent. The template MUST declare a
-    PATH entry that adds at least ${HOME}/.local/bin (where
-    install-host-deps drops the static binaries)."""
+    PATH entry that adds at least ${HOME}/.local/bin."""
     ev = PARSED.get("EnvironmentVariables") or {}
     path = ev.get("PATH")
     expect(
@@ -245,7 +236,7 @@ def test_environment_variables_has_path() -> None:
         expect(
             ".local/bin" in path,
             f"EnvironmentVariables.PATH should include `.local/bin` so "
-            f"the install-host-deps shims resolve; got {path!r}",
+            f"host CLIs the server invokes resolve; got {path!r}",
         )
 
 
@@ -348,8 +339,8 @@ def test_readme_documents_required_steps() -> None:
     body = LAUNCHD_README.read_text()
     for needle in (
         "~/Library/LaunchAgents",  # step 1: copy target
-        "/PATH/TO/REPO",  # step 2: search/replace placeholder (repo)
         "/PATH/TO/HOME",  # step 2: search/replace placeholder (home)
+        "make install-mcp-host-bash-server",  # step 0: build + install
         "launchctl bootstrap",  # step 3: bootstrap verb
         "launchctl print",  # step 4: verify
         "lsof",  # step 4: port-ownership check
@@ -360,49 +351,6 @@ def test_readme_documents_required_steps() -> None:
             needle in body,
             f"launchd/README.md must mention {needle!r} (operator "
             f"walkthrough relies on it)",
-        )
-
-
-def test_readme_documents_keychain_bootstrap() -> None:
-    """The Step 0 Keychain bootstrap section must call out the
-    `security add-generic-password` one-liner with the standard
-    service-name convention. Operators copy/paste this verbatim, so
-    drift breaks the on-ramp."""
-    if not LAUNCHD_README.exists():
-        return
-    body = LAUNCHD_README.read_text()
-    for needle in (
-        "security add-generic-password",  # bootstrap one-liner
-        "claude-watch.mcp-host-bash",  # canonical service name
-        "load-bearer-from-keychain",  # the wrapper script
-        "Keychain",  # section header
-    ):
-        expect(
-            needle in body,
-            f"launchd/README.md must mention {needle!r} (Step 0 "
-            f"Keychain bootstrap walkthrough)",
-        )
-
-
-def test_keychain_wrapper_script_exists_and_executable() -> None:
-    """The Keychain wrapper script must exist alongside the launcher
-    and be executable. launchd won't / can't `chmod +x` ProgramArguments
-    targets at bootstrap time; the bit has to be set in the
-    checked-in repo."""
-    wrapper = (
-        HERE.parent.parent
-        / "bin"
-        / "load-bearer-from-keychain"
-    )
-    expect(
-        wrapper.exists(),
-        f"load-bearer-from-keychain wrapper must exist; looked at {wrapper}",
-    )
-    if wrapper.exists():
-        expect(
-            os.access(str(wrapper), os.X_OK),
-            f"load-bearer-from-keychain must be executable (chmod +x); "
-            f"got mode {oct(wrapper.stat().st_mode)}",
         )
 
 
@@ -423,7 +371,7 @@ def test_compose_readme_links_to_launchd() -> None:
         return
     body = compose_readme.read_text()
     expect(
-        "launchd/README.md" in body or "launchd/org.gbre" in body,
+        "launchd/README.md" in body or "launchd/org.claude-watch" in body,
         "examples/compose/README.md should link to the launchd "
         "subdirectory so operators find the persistent-launch path",
     )
@@ -452,8 +400,6 @@ tests = [
     test_readme_exists,
     test_readme_references_label,
     test_readme_documents_required_steps,
-    test_readme_documents_keychain_bootstrap,
-    test_keychain_wrapper_script_exists_and_executable,
     test_compose_readme_links_to_launchd,
 ]
 

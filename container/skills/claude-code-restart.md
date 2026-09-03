@@ -6,7 +6,7 @@ Restart the in-container Claude Code process to pick up a new binary version. Th
 
 **This rolls the Claude Code binary only — NOT the container.** It does NOT re-run `entrypoint.sh`, does NOT re-seed obligations, does NOT pick up new bind-mounts / changed entrypoint-time env vars / freshly-baked skills. For an actual CONTAINER restart (re-run entrypoint, re-seed obligations, pick up a rebuilt image), use the sibling `/claude-container:restart-container` skill instead.
 
-This is the container equivalent of the host's `/restart` skill. The host invokes `claude-watch update --force` against the systemd-managed daemon; the container invokes [`cwsr`](https://github.com/hndrewaall/claude-watch/blob/main/container/bin/cwsr), the in-container self-restart helper, which `npm install -g`s the new claude version and uses `tmux respawn-pane -k` to roll the inner process. (The backing tool is still named `cwsr` — only this skill's label changed from `/claude-container:restart` to `/claude-container:claude-code-restart`, to make clear it rolls Claude Code, not the container.)
+This is the container equivalent of the host's `/restart` skill. The host invokes `claude-watch update --force` against the systemd-managed daemon; the container invokes [`cwsr`](https://github.com/gbre-org/claude-watch/blob/main/container/bin/cwsr), the in-container self-restart helper, which `npm install -g`s the new claude version and uses `tmux respawn-pane -k` to roll the inner process. (The backing tool is still named `cwsr` — only this skill's label changed from `/claude-container:restart` to `/claude-container:claude-code-restart`, to make clear it rolls Claude Code, not the container.)
 
 ## Steps
 
@@ -31,6 +31,6 @@ This is the container equivalent of the host's `/restart` skill. The host invoke
 
 ## Important
 
-- `cwsr` is baked at `/usr/local/bin/cwsr`. Source: [container/bin/cwsr](https://github.com/hndrewaall/claude-watch/blob/main/container/bin/cwsr).
+- `cwsr` is baked at `/usr/local/bin/cwsr`. Source: [container/bin/cwsr](https://github.com/gbre-org/claude-watch/blob/main/container/bin/cwsr).
 - The npm package name (`@anthropic-ai/claude-code`) and install command (`npm install -g`) are cross-platform — the same shape works whether the host is Linux, macOS, or Windows. Inside the container, npm runs as uid 1000 against a writable global path, so no `sudo` is needed.
 - After the respawn, the new claude process loads the same managed-policy CLAUDE.md (`/etc/claude-code/CLAUDE.md`), the same bind-mounted `~/.claude/CLAUDE.md`, and the same project-tier CLAUDE.md, so the session-start checklist runs again.

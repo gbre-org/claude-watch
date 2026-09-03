@@ -51,7 +51,7 @@ In `~/.claude/settings.json` (after `make install` puts the binaries in
 | Script | Hook event | Matcher | Purpose |
 |--------|------------|---------|---------|
 | `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses `Agent` spawns missing a `Queue item: q-XXXX` marker, or whose marker isn't `running` in the queue. |
-| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces built-in architectural gates: (a) bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`); (b) `Monitor` tool denied inside subagent context; (c) narrow ALLOW for the heartbeat-liveness `touch` (see "Hardcoded gates" below). |
+| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces built-in architectural gates: (a) bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`); (b) `Monitor` tool denied inside subagent context; (c) narrow ALLOW for the liveness ack `event-ack ack-batch` (see "Hardcoded gates" below). |
 | `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories) and manages a sidecar registry for `no_pending_watcher_outputs`. |
 | `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks external-messaging attachments as read via a host-specific `*-mark-read` shim when Claude opens a file under a configured attachment dir. Host-specific integration; safe no-op when neither the shim nor the dir is present. |
 
@@ -64,7 +64,7 @@ the loop.
 script-local code, BEFORE the obligations CLI dispatch. These run even
 with an empty obligations store -- they encode invariants that must hold
 regardless of stored-state health. Two are DENY gates (`watcher-ctl run`,
-`Monitor`); one is a narrow ALLOW (the heartbeat-liveness `touch`).
+`Monitor`); one is a narrow ALLOW (the liveness ack).
 
 ### Bare `watcher-ctl run`
 
@@ -94,45 +94,70 @@ Main-loop Monitor calls (watcher captured-output, external-messaging
 threads, etc.) are unaffected -- detection uses the same `agent_id`
 signal as the obligations CLI's `is_main_loop` predicate.
 
-Recovery path (use this instead of `Monitor` to wait for CI):
+Recovery path (use this instead of `Monitor`):
 
-```bash
-for i in $(seq 1 60); do
-    rollup=$(gh pr view <PR#> --json statusCheckRollup \
-        --jq '.statusCheckRollup')
-    # break on all-green, exit 1 on any FAILURE conclusion
-    sleep 30
-done
-gh pr merge <PR#> --squash --delete-branch
-```
+**Do not arm a background task and return.** A subagent that starts a
+`run_in_background: true` Bash task and then ends its turn is NOT woken
+when the task completes -- the turn end *is* the agent's completion, and
+the work sits idle until a human or the operator loop resumes it. (Three
+agents were orphaned this way on 2026-08-21.)
 
-Run that loop with `run_in_background: true` so the agent blocks in a
-normal tool-call wait state (not a Monitor-event-driven async state).
-The harness's "agent is done" semantics correctly distinguish the two.
+- **CI-wait:** open the PR, run `pr-watch add <PR-URL>`, and exit. The
+  operator loop receives the `pr-status-change` event and queues the
+  follow-up (merge on green, re-spawn to fix red). Do not wait for CI
+  inside the agent.
+- **Any other wait:** block *in the foreground* with one long Bash call
+  -- the Bash tool's `timeout` parameter goes up to 600000 ms; the
+  15-second cap is an operator-loop convention, not a subagent rule.
+  Poll an **artifact** (a marker file, an output file, a state command),
+  never a process name: `pgrep -f <name>` matches the polling shell
+  itself (use `pgrep -f "[n]ame"` or `pgrep -x` if you must).
 
-### Heartbeat-liveness `touch` (narrow ALLOW)
+When the operator loop merges, it should use `pr-branches merge` rather
+than `gh pr merge --squash --delete-branch` directly. `gh` performs the
+remote-branch deletion and the local branch cleanup in one step, and the
+local half fails when the branch is still checked out in a worktree --
+aborting *before* the remote ref is deleted, so the branch survives while
+the non-zero exit reads like a cosmetic local-cleanup nit. `pr-branches
+merge` re-reads the PR afterwards and deletes the ref explicitly if that
+happened. See `tools/pr-branches/README.md`.
 
-When claude-watch detects a stale heartbeat it injects an instruction to
-run `touch /var/run/claude/heartbeat` as a single Bash tool call to
-restore liveness. But a stale heartbeat frequently coincides with a
-watcher being momentarily down -- so the `watchers_healthy` (and often
-`no_pending_watcher_outputs`) predicate would DENY that very touch. That
-is a catch-22: the liveness-recovery touch the daemon is begging for
+### Liveness ack (narrow ALLOW)
+
+When claude-watch detects that nothing has been acked for `[ack]
+stale_minutes` it injects an instruction to run `event-ack ack-batch
+--override-reason "<why>"` (the reason is mandatory and audited) as a
+single Bash tool call to restore liveness. But a stale ack frequently
+coincides with a watcher being momentarily down -- so the `watchers_healthy`
+(and often `no_pending_watcher_outputs`) predicate would DENY that very ack.
+That is a catch-22: the liveness-recovery command the daemon is begging for
 can't run until watchers are restarted first.
 
-The fix is a narrow ALLOW evaluated BEFORE the obligations CLI dispatch:
-a Bash command whose SOLE effective action is `touch
-/var/run/claude/heartbeat` passes the gate regardless of obligation
-state. It is tightly scoped via the AST matcher -- the command must be a
-single top-level segment (no `&&` / `||` / `;` / `|` / `&` / newline),
-its effective head (after stripping env-assignments / `sudo` / wrappers)
-must be `touch`, and its only non-flag operand must be exactly
-`/var/run/claude/heartbeat`. A bundled command (`touch
-/var/run/claude/heartbeat && rm -rf x`), a different path, a second
-operand, or a value-taking flag (`-r`/`-t`/`-d`) all fall through to the
-normal gate. The liveness touch is a pure state-restore with no
-destructive side effect, so allowing it is safe. Parse failure fails
-CLOSED (the command is treated as non-exempt).
+The fix is a narrow ALLOW evaluated BEFORE the obligations CLI dispatch: a
+Bash command whose SOLE effective action is `event-ack ack-batch` passes the
+gate regardless of obligation state. It is tightly scoped via the AST matcher
+-- the command must be a single top-level segment (no `&&` / `||` / `;` / `|`
+/ `&` / newline), its effective head (after stripping env-assignments /
+`sudo` / wrappers) must be `event-ack` (bare or an absolute path), and its
+only non-flag operand must be exactly `ack-batch`. Value-taking flags
+(`--state-dir`, `--action`, and the now-mandatory `--override-reason`) have
+their VALUES skipped so they are not misread as a second operand — the
+exemption survives `event-ack ack-batch --override-reason "<why>"`. A bundled command
+(`event-ack ack-batch && rm -rf x`), a different subcommand, a second
+operand, or `ack-batch` appearing as a flag VALUE (`event-ack clear --action
+ack-batch`) all fall through to the normal gate. Parse failure fails CLOSED
+(the command is treated as non-exempt).
+
+`event-ack` is separately exempt from the dedicated `event_must_act`
+evaluator; this ALLOW is broader on purpose (it bypasses EVERY gate) for the
+pathological case where a down watcher blocks `event-ack` itself too.
+
+Until 2026-08-22 this ALLOW covered `touch /var/run/claude/heartbeat`
+instead. That file WAS the liveness signal; it is retired, and the recovery
+action is now the same ack the loop performs after every event batch. Worth
+noting what the old shape permitted: a loop could satisfy the daemon by
+touching a file while never reading a single event. Acking cannot be faked
+that way.
 
 ### Bypass
 
@@ -160,10 +185,11 @@ surface).
 | `marker_file_present {path, negate?}` | alias of `file_exists` |
 | `env_present {var, value?}` | env var set (and optionally equals value) |
 | `queue_status {id, status}` | queue item in expected state |
-| `no_pipe_pattern {regex}` | BAN regex against Bash command |
+| `no_pipe_pattern {regex}` | BAN regex against Bash command (matched against a structure-only rendering, so quoted/heredoc data can't trip it). Prefer `no_output_consumed` for "don't filter this tool's output" rules. |
+| `no_output_consumed {commands, redirect_mode?, include_substitution?}` | BAN, fully AST-based — deny when a command whose HEAD matches `commands` (literal names or globs like `botchat-*`) has its stdout piped, redirected (`redirect_mode`: `devnull` default / `any` / `none`), or captured by `$(...)`. A mention as an argument or inside a string never matches. Unparseable command → DENY (fail-closed). |
 | `process_alive {pid_file}` | PID in file is alive |
 | `process_in_pgrep {pattern}` | pattern matches via `pgrep -f` |
-| `watchers_healthy {}` | `watcher-status --unhealthy-only` is empty |
+| `watchers_healthy {}` | `watcher-status --unhealthy-only` is empty (a monitor-mode watcher in its `ARMING` window — fresh `<name>.monitor-intent` from `watcher-ctl run`, Monitor not live yet — is healthy-pending, not unhealthy). The Monitor call that ARMS a configured monitor-mode watcher passes this gate via the `MonitorArm` universal exempt (see the obligations README) |
 | `is_main_loop {negate?}` | main-loop call vs subagent (scope guard) |
 | `agent_inbox_empty {path}` | `agent-msg` inbox has no unread messages |
 | `stale_ready_queue_present {threshold_secs?, queue_path?}` | BAN — true iff NO ready-now queue item has been waiting `>= threshold_secs` (default 300s). Failure carries the offending ids in `why`. |
@@ -291,7 +317,10 @@ env-var pollution.
 If the `obligations` CLI is missing, JSON parse fails, or any internal
 error happens, the hook logs to `~/.config/claude/obligations-hook-errors.log`
 and allows the call. Same semantics for `watchers_healthy` if
-`watcher-status` is missing or hangs.
+`watcher-status` is missing or hangs. The one deliberate exception is the
+`MonitorArm` exempt, which is fail-CLOSED: if `watcher-ctl list --json`
+is missing or unparseable the arm is simply not exempt (the gate stands,
+`obligations override` remains) — an exemption must never widen on error.
 
 ## Tests
 

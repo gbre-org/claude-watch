@@ -53,8 +53,10 @@ dispatch, so stored-state bugs can't disable them):
   which conflicts with subagent process semantics -- subagents using
   Monitor to wait on long jobs (CI, etc.) reliably return mid-wait
   with thin partial reports. Main-loop Monitor usage is unaffected.
-  Recovery: poll ``gh pr view <PR#> --json statusCheckRollup`` in a
-  Bash loop with ``run_in_background: true``.
+  Recovery: do NOT arm a background Bash task and return (a subagent is
+  not woken when it completes). CI-wait: open the PR, ``pr-watch add
+  <PR-URL>``, exit. Other waits: block in the foreground with one long
+  Bash call (``timeout`` up to 600000 ms), polling an artifact.
 """
 
 from __future__ import annotations
@@ -407,46 +409,59 @@ MONITOR_TOOL_NAME = "Monitor"
 
 
 # ---------------------------------------------------------------------------
-# Hardcoded ALLOW: the heartbeat-liveness `touch` must never be blocked.
+# Hardcoded ALLOW: the liveness ack must never be blocked.
 #
-# When claude-watch detects a stale heartbeat it injects an instruction to run
-# `touch /var/run/claude/heartbeat` as a single Bash tool call to restore
-# liveness. But a stale heartbeat very often coincides with a watcher being
-# momentarily down -- which means the obligations CLI's `watchers_healthy`
-# (and frequently `no_pending_watcher_outputs`) predicates would DENY that
-# very touch. That is a catch-22: the liveness-recovery touch the daemon is
-# begging for can't execute until watchers are restarted first, defeating the
-# whole fallback.
+# When claude-watch detects that nothing has been acked for `[ack]
+# stale_minutes` it injects an instruction to run `event-ack ack-batch` as a
+# single Bash tool call to restore liveness. But a stale ack very often
+# coincides with a watcher being momentarily down -- which means the
+# obligations CLI's `watchers_healthy` (and frequently
+# `no_pending_watcher_outputs`) predicates would DENY that very ack. That is a
+# catch-22: the liveness-recovery command the daemon is begging for can't
+# execute until watchers are restarted first, defeating the whole fallback.
 #
 # The fix is a narrow ALLOW, evaluated BEFORE the obligations CLI dispatch:
-# a Bash command whose SOLE effective action is `touch /var/run/claude/
-# heartbeat` passes the gate regardless of obligation state. We scope it
-# tightly via the AST matcher:
+# a Bash command whose SOLE effective action is `event-ack ack-batch` passes
+# the gate regardless of obligation state. We scope it tightly via the AST
+# matcher:
 #   - exactly ONE top-level segment (no `&&`, `||`, `;`, `|`, `&`, newline) --
-#     so `touch /var/run/claude/heartbeat && rm -rf x` is NOT exempt;
+#     so `event-ack ack-batch && rm -rf x` is NOT exempt;
 #   - effective head (after stripping env-assignments / sudo / wrappers) is
-#     `touch`;
-#   - the only non-flag operand is exactly `/var/run/claude/heartbeat`.
-# Anything else (a different path, a second path, a glob, a subshell in the
-# operand) falls through to the normal gate. The liveness touch is a pure
-# state-restore with no destructive side effect, so allowing it is safe.
+#     `event-ack` (or an absolute path ending in `/event-ack`);
+#   - the first non-flag operand is exactly `ack-batch`, and no OTHER
+#     subcommand-shaped operand follows.
+# Anything else -- a different subcommand, a second command, the path quoted
+# inside an `echo` -- falls through to the normal gate. `ack-batch` only
+# rewrites event-must-act's own state files, so allowing it is safe.
+#
+# (Until 2026-08-22 this ALLOW covered `touch /var/run/claude/heartbeat`
+# instead. That file WAS the liveness signal; it is retired, and the recovery
+# action is now the same ack the loop performs after every event batch. Note
+# what the old shape allowed: a loop could satisfy the daemon by touching a
+# file while never reading a single event. Acking cannot be faked that way.)
 #
 # Like the watcher-ctl / Monitor gates, this lives in the hook itself (NOT a
 # stored obligation) so it holds even with corrupt obligation state. On parse
 # failure we FAIL CLOSED (return False -> normal gate applies); a real
-# liveness touch is a trivially-parseable bare command, so a parse failure
-# means the command is something else and should NOT be auto-allowed.
+# liveness ack is a trivially-parseable bare command, so a parse failure means
+# the command is something else and should NOT be auto-allowed.
 # ---------------------------------------------------------------------------
 
-HEARTBEAT_PATH = "/var/run/claude/heartbeat"
+ACK_CLI = "event-ack"
+ACK_BATCH_SUBCOMMAND = "ack-batch"
+
+# Flags `event-ack` accepts that CONSUME the next token. Listed explicitly so a
+# value that happens to look like a subcommand (`--action ack`) is not mistaken
+# for one.
+_ACK_VALUE_FLAGS = {"--state-dir", "--action", "--override-reason"}
 
 
-def _is_heartbeat_liveness_touch(cmd: str) -> bool:
-    """True iff `cmd`'s sole effective action is `touch /var/run/claude/heartbeat`.
+def _is_liveness_ack(cmd: str) -> bool:
+    """True iff `cmd`'s sole effective action is `event-ack ack-batch`.
 
     AST-aware and tightly scoped (see the block comment above). Returns False
     on parse failure or whenever the structural helper is unavailable -- the
-    exemption fails CLOSED so only an unambiguous bare liveness touch is
+    exemption fails CLOSED so only an unambiguous bare liveness ack is
     auto-allowed.
     """
     if not isinstance(cmd, str) or not cmd.strip():
@@ -469,25 +484,38 @@ def _is_heartbeat_liveness_touch(cmd: str) -> bool:
 
     seg = word_segs[0]
     words = _shell_ast._strip_command_prefix(seg.words)
-    if not words or words[0] != "touch":
+    if not words:
+        return False
+    head = words[0]
+    # Accept an absolute/relative path to the CLI, not just the bare name: the
+    # daemon's prompt says `event-ack ack-batch`, but an operator recovering by
+    # hand may well type the installed path.
+    if head != ACK_CLI and not head.endswith("/" + ACK_CLI):
         return False
 
-    # Collect operands after the `touch` head. ANY operand other than the
-    # exact heartbeat path disqualifies the exemption. We treat a leading-dash
-    # token as a flag and everything else as an operand. Value-taking flags
-    # (-r/-t/-d) could smuggle another path/operand in, so they disqualify.
+    # Walk the operands, honouring value-taking flags so their VALUES are not
+    # read as operands.
     operands = []
+    skip_next = False
     for w in words[1:]:
+        if skip_next:
+            skip_next = False
+            continue
         if w == "--":
             continue
         if w.startswith("-"):
-            flag = w.lstrip("-")
-            if any(c in flag for c in ("r", "t", "d")):
+            if w in _ACK_VALUE_FLAGS:
+                skip_next = True
+            elif "=" in w:
+                pass  # --state-dir=/x carries its own value
+            elif w not in ("-h", "--help"):
+                # An unrecognised flag might take a value we would then
+                # misread; refuse rather than guess.
                 return False
             continue
         operands.append(w)
 
-    return operands == [HEARTBEAT_PATH]
+    return operands == [ACK_BATCH_SUBCOMMAND]
 
 
 def _monitor_subagent_deny() -> dict:
@@ -501,24 +529,21 @@ def _monitor_subagent_deny() -> dict:
         "!! is still in flight -- whoever spawned the agent then has to",
         "!! clean up.",
         "!!",
-        "!! Use this pattern instead for CI-wait:",
+        "!! Do NOT arm a background task and return. A subagent that starts a",
+        "!! `run_in_background: true` Bash and then ends its turn is NOT woken",
+        "!! when the task completes -- the turn end IS the agent's completion,",
+        "!! and the work sits idle until a human or the operator loop resumes it.",
         "!!",
-        "!!     for i in $(seq 1 60); do",
-        "!!         rollup=$(gh pr view <PR#> --json statusCheckRollup \\",
-        "!!             --jq '.statusCheckRollup')",
-        "!!         # break on all-green, exit 1 on any FAILURE",
-        "!!         sleep 30",
-        "!!     done",
-        "!!     gh pr merge <PR#> --squash --delete-branch",
+        "!! CI-wait: open the PR, `pr-watch add <PR-URL>`, and EXIT. The",
+        "!! operator loop receives the status-change event and queues the",
+        "!! follow-up (merge on green / fix on red). Do not wait for CI.",
         "!!",
-        "!! Run that loop with `run_in_background: true` so the agent blocks",
-        "!! in a normal tool-call wait state (NOT a Monitor-event-driven",
-        "!! async state). The harness's \"agent is done\" semantics correctly",
-        "!! distinguish the two.",
-        "!!",
-        "!! For non-CI waits (long-running computation), prefer a workload",
-        "!! runner that survives /clear and lets the spawner pick up the",
-        "!! completion notification.",
+        "!! Any other wait: block IN THE FOREGROUND with ONE long Bash call",
+        "!! (its `timeout` parameter goes up to 600000 ms; the 15-second cap is",
+        "!! an operator-loop convention, not a subagent rule). Poll an ARTIFACT",
+        "!! -- a marker file, an output file, a state command -- never a process",
+        "!! name: `pgrep -f <name>` matches the polling shell itself (use",
+        "!! `pgrep -f \"[n]ame\"` or `pgrep -x` if you must).",
         "!!",
         "!! Main-loop callers: this gate does NOT apply to you -- Monitor",
         "!! is allowed from the main loop (watcher captured-output,",
@@ -532,10 +557,13 @@ def _monitor_subagent_deny() -> dict:
         "Monitor tool is disabled for subagents. The harness treats every "
         "Monitor event as a task-completion signal, so subagents that use "
         "Monitor to wait for CI/long jobs reliably return mid-wait with "
-        "thin partial reports. For CI-wait, poll `gh pr view <PR#> --json "
-        "statusCheckRollup` in a Bash loop with `run_in_background: true` "
-        "and `sleep 30-60` between iterations -- that pattern blocks the "
-        "agent in a normal tool-call wait state."
+        "thin partial reports. Do NOT arm a background task and return "
+        "either -- a subagent is not woken when a background Bash task "
+        "completes. For CI-wait: open the PR, `pr-watch add <PR-URL>`, and "
+        "exit; the operator loop gets the status-change event. For any "
+        "other wait: block in the foreground with one long Bash call "
+        "(timeout up to 600000 ms), polling an artifact (marker/output "
+        "file/state command), never a process name."
     )
     return _deny(banner, reason)
 
@@ -814,16 +842,20 @@ def main() -> int:
             return 0
 
     # ---------------------------------------------------------------------
-    # Hardcoded ALLOW: the heartbeat-liveness touch. See
-    # `_is_heartbeat_liveness_touch` above. claude-watch's stale-heartbeat
-    # fallback injects exactly `touch /var/run/claude/heartbeat`; that touch
-    # must execute even when `watchers_healthy` / `no_pending_watcher_outputs`
-    # would otherwise DENY (a stale heartbeat frequently coincides with a
-    # momentarily-down watcher). Tightly scoped via the AST so a bundled
-    # command (`touch ... && rm -rf x`) or a different path is NOT exempt.
-    # Runs BEFORE the obligations CLI dispatch so no predicate can block it.
+    # Hardcoded ALLOW: the liveness ack. See `_is_liveness_ack` above.
+    # claude-watch's ack-stale recovery prompt injects exactly `event-ack
+    # ack-batch`; that command must execute even when `watchers_healthy` /
+    # `no_pending_watcher_outputs` would otherwise DENY (a stale ack
+    # frequently coincides with a momentarily-down watcher). Tightly scoped
+    # via the AST so a bundled command (`event-ack ack-batch && rm -rf x`) or
+    # a different subcommand is NOT exempt. Runs BEFORE the obligations CLI
+    # dispatch so no predicate can block it.
+    #
+    # `event-ack` is separately exempted from the `event_must_act` evaluator;
+    # this ALLOW is broader on purpose (it bypasses EVERY gate) for the
+    # pathological case where a down watcher is blocking `event-ack` itself.
     # ---------------------------------------------------------------------
-    if tool_name == "Bash" and _is_heartbeat_liveness_touch(cmd_str):
+    if tool_name == "Bash" and _is_liveness_ack(cmd_str):
         print(json.dumps(_allow()))
         return 0
 

@@ -22,12 +22,15 @@
 mod active_agents;
 mod agent;
 mod alert;
+mod bypass_consent;
 mod cadence;
 mod cmd;
 mod config;
+mod credentials;
 mod event_bus;
 mod hook_fire;
 mod inject_dispatch;
+mod inject_lock;
 mod inject_probe;
 mod logging;
 mod metrics;
@@ -252,16 +255,31 @@ enum Commands {
     /// MUST shell out to this subcommand instead of hand-rolling
     /// `tmux send-keys` sequences — drifted copies of that logic (one of
     /// which injected alert text WITHOUT submitting it) are the bug this
-    /// subcommand exists to retire. The keystroke sequence is the proven
-    /// `src/tmux.rs` path: Escape→NORMAL coercion, dd line-clear, `i`
-    /// INSERT verify-and-retry, literal type, then Tab→Escape→Enter to
-    /// submit (or a bare Enter for `--slash-command`).
+    /// subcommand exists to retire.
     ///
-    /// Verification: a landed submit CLEARS the payload from the prompt
-    /// line. If the payload is still on the input line after the verify
-    /// window, the submit did NOT land and the command exits non-zero
-    /// (exit 3) so callers can detect a stuck inject. `--no-submit` types
-    /// without submitting and always exits 0.
+    /// DEFAULT (no `--escape`): NON-CANCELLING. Enter INSERT with an
+    /// idempotent `i`, type, submit with a bare Enter from INSERT. No
+    /// Escape is ever sent, so an in-flight turn is not interrupted and a
+    /// modal on the pane is not cancelled. There is no `dd` line-clear on
+    /// this path (it would need the turn-cancelling Escape), so BEFORE
+    /// pressing Enter the prompt line is checked to hold our payload and
+    /// nothing else. If it holds anything more, the typed payload is
+    /// retracted with backspaces and the inject is REFUSED (exit 4) rather
+    /// than submitting a splice of two payloads.
+    ///
+    /// With `--escape`: the historical CANCELLING choreography —
+    /// Escape→NORMAL coercion, dd line-clear, `i` INSERT verify-and-retry,
+    /// literal type, then Tab→Escape→Enter to submit (or a bare Enter for
+    /// `--slash-command`). The `dd` clears the line, so the exclusivity
+    /// check does not apply there.
+    ///
+    /// Exit codes:
+    ///   0  typed (`--no-submit`), or the submission was verified.
+    ///   3  submit keystrokes were sent but the payload was still on the
+    ///      input line after the verify window — the submit did not land.
+    ///   4  REFUSED: after typing, the prompt line held more than our
+    ///      payload. The payload was retracted and nothing was submitted.
+    ///      Retry when the line is clear.
     Inject {
         /// Text to type (and, unless --no-submit, submit).
         #[arg(long, value_name = "TEXT")]
@@ -284,6 +302,87 @@ enum Commands {
         /// submit via Escape→NORMAL→Enter (documented self-clear `/clear` bug).
         #[arg(long)]
         slash_command: bool,
+
+        /// CANCELLING inject: lead with the Escape→NORMAL blast and `dd`
+        /// line-clear before typing. OFF BY DEFAULT (Andrew, 2026-08-18) —
+        /// that Escape is what CANCELS an in-flight turn, and it also cancels
+        /// any modal standing on the pane (which is why the login flow could
+        /// not use this subcommand at all). Opt in only when the caller
+        /// genuinely needs the turn seized AND the prompt line wiped before
+        /// typing: self-clear's `/clear`, mcp-reconnect's `/mcp`.
+        #[arg(long, visible_alias = "cancel")]
+        escape: bool,
+
+        /// DEPRECATED no-op, kept so older callers keep parsing. Not
+        /// cancelling the turn is the DEFAULT now; pass `--escape` for the
+        /// opposite. Accepted because container scripts and the host binary
+        /// deploy independently, so a rollout can briefly run an updated
+        /// binary against a script that still passes this flag.
+        #[arg(long)]
+        no_cancel: bool,
+
+        /// Emit machine-readable JSON outcome on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scrape the Claude Code OAuth login URL out of the tmux pane.
+    ///
+    /// Companion to `inject`: `inject --slash-command /login` puts the login
+    /// dialog on screen, `login-url` reads the resulting
+    /// `https://claude.ai/oauth/authorize?...` link back OUT of it. The URL is
+    /// reassembled across tmux's hard line wraps by the same
+    /// `tmux::extract_login_url` the daemon's reactive reauth path uses, so
+    /// there is exactly ONE copy of that parser.
+    ///
+    /// Exit codes: 0 = URL printed on stdout. 4 = no URL found (already logged
+    /// in, dialog not rendered yet, or the pane is wedged). A missing URL is
+    /// ALWAYS an error — callers must never treat it as success.
+    LoginUrl {
+        /// Target tmux pane. Same resolution order as `inject`.
+        #[arg(long, value_name = "PANE")]
+        pane: Option<String>,
+
+        /// Poll for up to N seconds for the URL to appear. The dialog is not
+        /// rendered the instant `/login` is submitted, so a single-shot read
+        /// races it. 0 = single shot (default).
+        #[arg(long, default_value_t = 0, value_name = "SECS")]
+        wait: u64,
+
+        /// Reject this URL if it is the one found (it is a STALE URL left on
+        /// screen by an earlier login). Repeatable. Lets a caller snapshot the
+        /// pane before injecting `/login` and refuse to report the old link as
+        /// if it were the new one.
+        #[arg(long, value_name = "URL")]
+        not: Vec<String>,
+
+        /// Emit machine-readable JSON outcome on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report whether the Claude Code login is about to expire — read only.
+    ///
+    /// Shows both halves of the signal the daemon's proactive re-login path
+    /// acts on: Claude Code's on-screen "Your login expires in N days"
+    /// warning, and the OAuth credential store it is corroborated against.
+    /// Neither is sufficient alone — the on-screen text is also just a
+    /// sentence that can appear in conversation, and the store closes the gap
+    /// left by the warning's transient form, which is on screen for about
+    /// fifteen seconds at a time.
+    ///
+    /// This command NEVER injects, types, or opens a dialog. It is the safe
+    /// way to see what the daemon is seeing.
+    ///
+    /// Exit codes: 0 = nothing expiring. 3 = expiring inside the warning
+    /// window. 4 = already expired (the REACTIVE reauth path's territory).
+    LoginExpiry {
+        /// Target tmux pane. Same resolution order as `inject`.
+        #[arg(long, value_name = "PANE")]
+        pane: Option<String>,
+
+        /// Override the credential store path (default:
+        /// `$HOME/.claude/.credentials.json`).
+        #[arg(long, value_name = "PATH")]
+        credentials_file: Option<String>,
 
         /// Emit machine-readable JSON outcome on stdout.
         #[arg(long)]
@@ -393,10 +492,20 @@ enum WorkloadAction {
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
     },
-    /// Kill a running workload
+    /// Kill a running workload AND everything it spawned
+    ///
+    /// Not just the tmux pane: the pane's wrapper, the workload's
+    /// `setsid` process group, and every descendant of both get
+    /// SIGTERM, then SIGKILL after the grace period. Survivors are
+    /// verified afterwards and reported; exit 3 means something
+    /// outlived SIGKILL.
     Kill {
         /// Workload label
         label: String,
+        /// Seconds to wait between SIGTERM and SIGKILL (default 5;
+        /// env: WORKLOAD_KILL_GRACE_SECS)
+        #[arg(long, value_name = "SECS")]
+        grace: Option<f64>,
     },
     /// Internal: emit a workload-done claude-event. Called by the
     /// wrapper script after the workload exits. Hidden from `--help`.
@@ -478,6 +587,12 @@ enum TaskAction {
         /// Allow --recreate even with running workloads
         #[arg(long)]
         force: bool,
+        /// SIGTERM -> SIGKILL grace, in seconds, for the workload
+        /// teardown `--recreate --force` runs before destroying the
+        /// session. Same budget (and same env override,
+        /// WORKLOAD_KILL_GRACE_SECS) as `workload kill --grace`.
+        #[arg(long)]
+        grace: Option<f64>,
     },
     /// List tracked tasks
     #[command(alias = "ls")]
@@ -570,12 +685,18 @@ enum AgentAction {
 
 #[derive(Subcommand)]
 enum WatcherAction {
-    /// Run a watcher by name (exec start_cmd, wait for exit)
+    /// Run a watcher by name (exec start_cmd, wait for exit).
+    ///
+    /// For a `mode=monitor` watcher this does NOT exec anything: it prints
+    /// the exact Monitor-tool invocation the main loop must arm (command,
+    /// `persistent: true`) and records the intent, then exits 0.
     Run {
         /// Watcher name
         name: String,
     },
-    /// List configured watchers
+    /// List configured watchers (effective values after the user-dir
+    /// override layer is applied; the SOURCE column + `layers:` footer say
+    /// which file set what)
     #[command(alias = "ls")]
     List {
         /// Output as JSON
@@ -653,11 +774,15 @@ struct StatusReport {
     active_agents: usize,
     /// Currently-running workload labels (tmux pane alive in `tasks` session).
     running_workloads: usize,
-    /// Number of enabled watchers that are healthy (`status == "ok"`).
+    /// Number of enabled watchers that are live (`WatcherStatus::is_live`:
+    /// UP in either delivery mode, or monitor-mode ARMING).
     healthy_watchers: u32,
     /// Number of enabled watchers (`status != "off"`). Equal to total minus
     /// disabled rows.
     enabled_watchers: u32,
+    /// Number of monitor-mode watchers whose Monitor task is live
+    /// (`WatcherStatus::is_monitor_live`: live pid, ARMING excluded).
+    live_monitors: u32,
     /// claude-watch's own crate version (compile-time CARGO_PKG_VERSION).
     claude_watch_version: &'static str,
     /// `Some(true)` if `claude-watch.service` reports `active`, `Some(false)`
@@ -678,6 +803,7 @@ struct StatusReport {
 ///   Active agents:  1
 ///   Running tasks:  0
 ///   Live watchers:  4/4
+///   Live monitors:  4
 ///   Open bashes:    2
 ///
 /// claude-watch:
@@ -718,6 +844,7 @@ fn format_status_human(r: &StatusReport) -> String {
         "  Live watchers:  {}/{}\n",
         r.healthy_watchers, r.enabled_watchers
     ));
+    out.push_str(&format!("  Live monitors:  {}\n", r.live_monitors));
     out.push_str(&format!("  Open bashes:    {}\n", r.bashes));
 
     out.push_str("\nclaude-watch:\n");
@@ -759,6 +886,7 @@ fn format_status_human(r: &StatusReport) -> String {
 ///   * `active_agents` — count of live subagent PIDs
 ///   * `running_workloads` — count of running workload labels
 ///   * `live_watchers`, `enabled_watchers` — healthy / total counts
+///   * `live_monitors` — monitor-mode watchers with a live Monitor task
 ///
 /// A consumer that grepped for the old keys keeps working.
 fn status_json_value(r: &StatusReport) -> serde_json::Value {
@@ -819,6 +947,10 @@ fn status_json_value(r: &StatusReport) -> serde_json::Value {
         "enabled_watchers".to_string(),
         serde_json::Value::Number(r.enabled_watchers.into()),
     );
+    map.insert(
+        "live_monitors".to_string(),
+        serde_json::Value::Number(r.live_monitors.into()),
+    );
     serde_json::Value::Object(map)
 }
 
@@ -867,6 +999,7 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
                 pane: String::new(),
                 tokens: 0,
                 bashes: 0,
+                active_ui: false,
                 compact_remaining: None,
                 version: version_info.running,
                 latest: version_info.installed,
@@ -909,8 +1042,11 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
         agents: Vec::new(),
     });
 
-    let healthy_watchers = watchers.iter().filter(|w| w.status == "ok").count() as u32;
-    let enabled_watchers = watchers.iter().filter(|w| w.enabled).count() as u32;
+    // Same reduction the `claude_code_live_watchers` gauge uses
+    // (`collect_live_counts` in metrics.rs) — monitor-aware, one predicate.
+    let (healthy_watchers, enabled_watchers) = watcher::count_live_and_enabled(&watchers);
+    // Same reduction as the `claude_code_live_monitors` gauge.
+    let live_monitors = watcher::count_live_monitors(&watchers);
 
     let report = StatusReport {
         pane: cs.pane.clone(),
@@ -924,6 +1060,7 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
         running_workloads: agents.workloads.len(),
         healthy_watchers,
         enabled_watchers,
+        live_monitors,
         claude_watch_version: env!("CARGO_PKG_VERSION"),
         daemon_active,
     };
@@ -985,6 +1122,38 @@ async fn run_daemon() {
 
     let config = load_config();
     let mut state = load_state(&config.general.state_file);
+    // Reconcile the persisted per-watcher health map against the CURRENT
+    // watcher config before anything reads it. `watcher_health` is only ever
+    // grown by the monitor loop (which skips absent/disabled watchers), so a
+    // retired or switched-off watcher would otherwise keep an `enabled: true`
+    // entry with an ever-climbing `consecutive_missing` forever — permanently
+    // inflating `claude_watchers_missing` and the watcher hang signal. Done
+    // here (not only in the monitor) so the map is honest even when the watcher
+    // monitor is disabled; the monitor repeats the pass each cycle so a config
+    // edit is picked up without a restart.
+    {
+        let mut entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
+        if let Some(ref extra) = config.watcher_monitor.watchers_config_extra {
+            entries.extend(status::parse_watchers_config(extra));
+        }
+        let outcome = state::reconcile_watcher_health(&mut state, &entries);
+        if outcome.changed() {
+            info!(
+                removed = ?outcome.removed,
+                disabled = ?outcome.disabled,
+                re_enabled = ?outcome.re_enabled,
+                "reconciled watcher_health against watcher config on load"
+            );
+        }
+    }
+    // Anchor for the "time since last clear" metric fallback: record when THIS
+    // daemon process started, so the (separate, short-lived) `claude-watch
+    // metrics` scraper can render a real duration even before any /clear is
+    // observed (e.g. right after a deploy/recreate). Overwritten each start.
+    state.daemon_start_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs_f64());
 
     // Wire the post-escape settle delay into the tmux module's process-global
     // atomic. Default is 0 (no extra wait — fast path); see TmuxConfig for
@@ -1083,22 +1252,41 @@ async fn run_daemon() {
     );
     let mut last_full_check = std::time::Instant::now() - general_interval; // run immediately
 
-    // Cadence emitter: the daemon sources the `heartbeat-tick` (5min) and
-    // `memory-reminder` (15min) cadence signals, replacing the out-of-tree
-    // self-rescheduling reminder background task. heartbeat-tick is delivered
-    // via the event queue (reminds the main loop to touch the heartbeat file);
-    // memory-reminder is tmux-injected. NOTE: the daemon deliberately does NOT
-    // touch the host heartbeat file itself — that remains the main loop's job
-    // so a wedged loop still goes stale and trips wedge detection. See
+    // Cadence emitter: the daemon sources the `keepalive` and
+    // `memory-reminder` cadence signals, replacing the out-of-tree
+    // self-rescheduling reminder background task. Both ride the event queue.
+    // NOTE: the daemon deliberately does NOT stamp the liveness timestamp
+    // itself — that remains the main loop's job (via `event-ack ack-batch`) so
+    // a wedged loop still goes stale and trips wedge detection. See
     // `crate::cadence`.
     let mut cadence_tracker = cadence::CadenceTracker::with_intervals(
-        Duration::from_secs(current_config.cadence.heartbeat_tick_interval_secs),
+        Duration::from_secs(current_config.cadence.keepalive_interval_secs),
         Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
     );
+
+    // Auto-reload on config-file edits — no SIGHUP required. Sample the newest
+    // mtime across all config layers (baked base + bind-mounted runtime
+    // override) each loop pass; when it advances, an operator edited a config
+    // file on the host, so trip the SAME reload flag SIGHUP uses. This is what
+    // makes cadence (and any other) tunables editable LIVE: change the
+    // bind-mounted ~/.config/claude-container/claude-watch.override.toml on the
+    // host and the daemon picks it up within one loop interval, no image
+    // rebuild. Seeded to the current newest mtime so startup does not reload.
+    let mut last_config_mtime = config::config_layers_mtime();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Auto-reload when an operator edits a config file (no SIGHUP needed).
+        // Reuses the SIGHUP reload path below; a strictly-newer mtime (or a
+        // newly-created runtime-override file) trips it exactly once per edit.
+        let current_config_mtime = config::config_layers_mtime();
+        if current_config_mtime > last_config_mtime {
+            last_config_mtime = current_config_mtime;
+            info!("config file change detected on disk, will reload config");
+            reload.store(true, Ordering::Relaxed);
         }
 
         // Reload config if SIGHUP received
@@ -1113,10 +1301,18 @@ async fn run_daemon() {
             // tuned them via config.toml + SIGHUP (e.g. after confirming the
             // correct key against a live FleetView).
             tmux::set_focus_main_keys(current_config.tmux.focus_main_keys.clone());
-            // Re-arm the cadence tracker in case the operator tuned the
-            // intervals via config.toml + SIGHUP.
-            cadence_tracker = cadence::CadenceTracker::with_intervals(
-                Duration::from_secs(current_config.cadence.heartbeat_tick_interval_secs),
+            // Adopt any retuned cadence intervals WITHOUT resetting the
+            // timers. This MUST NOT rebuild the tracker: a fresh tracker has
+            // no last-fired instants, and a never-fired timer is armed to
+            // fire on the next loop pass, so every config save would emit a
+            // full set of cadence events. That is what produced seven
+            // `memory-reminder` events in 52 seconds on 2026-08-22 (an agent
+            // saved the config file ~7 times) against a 30-minute interval.
+            // Preserving last-fired also makes a SHORTENED interval take
+            // effect against the real last emission rather than against the
+            // reload. Only a genuine process start fires on construction.
+            cadence_tracker.apply_intervals(
+                Duration::from_secs(current_config.cadence.keepalive_interval_secs),
                 Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
             );
             write_jsonl_log(
@@ -1128,55 +1324,78 @@ async fn run_daemon() {
 
         let now = std::time::Instant::now();
 
-        // Cadence signals (heartbeat-tick / memory-reminder).
+        // Cadence signals (keepalive / memory-reminder).
         //
-        // heartbeat-tick: writes a single low-priority claude-event into the
-        // event queue every 5 min. This is the reminder that prompts the main
-        // loop to touch the host heartbeat file (its wedge-detector). Without a
-        // delivered event the main loop has nothing to react to while idle, the
-        // heartbeat goes stale at the 10-min threshold, and the daemon fires a
-        // spurious "heartbeat stale" alert. A lone 5-min single-event cadence is
-        // an acceptable cost: the watcher-restart treadmill is driven by event
-        // *bursts* during active threads, not by one steady periodic event.
-        // The daemon still does NOT touch the host heartbeat file itself — that
-        // remains the main loop's job so a wedged loop is detectable.
+        // keepalive: a POKE FOR QUIET PERIODS, not a schedule. The tracker
+        // ticks every `[cadence] keepalive_interval_secs`, but the event is
+        // emitted ONLY when the last ack is at least that old. ANY ack (the
+        // main loop runs `event-ack ack-batch` on every event batch it
+        // handles) proves the loop is alive, so a loop that is busy handling
+        // real events never sees a keepalive at all — which is the entire
+        // point of the 2026-08-22 redesign: ONE liveness signal, poked only
+        // when it has gone quiet. The daemon still never stamps the ack
+        // timestamp itself; that would defeat wedge detection.
         //
-        // memory-reminder: tmux-inject the checklist directly into the pane so
-        // the main loop sees it as a user-typed prompt. This is the same delivery
-        // mechanism used by other daemon interventions (nudge, resume, etc.) and
-        // intentionally bypasses the event queue.
+        // memory-reminder: non-urgent context hygiene, delivered as an AMBIENT
+        // claude-event (surfaced on the next UserPromptSubmit).
         if current_config.cadence.enabled {
             let due = cadence_tracker.due(now);
             if !due.is_empty() {
                 tracing::debug!(
-                    heartbeat_tick = due.heartbeat_tick,
+                    keepalive = due.keepalive,
                     memory_reminder = due.memory_reminder,
                     "cadence signal(s) due"
                 );
             }
-            if due.heartbeat_tick {
-                // Body carries the configured host heartbeat-file path so the
-                // main loop knows WHICH file to touch. It is the canonical
-                // `[claude].heartbeat_file` path — the same one the daemon
-                // monitors for staleness — so the reminder and the detector
-                // stay pinned to one user-configurable path.
-                event_bus::emit_cadence(&event_bus::CadenceEvent {
-                    tag: cadence::HEARTBEAT_TICK_TAG,
-                    source: cadence::CADENCE_SOURCE,
-                    message: "heartbeat tick",
-                    priority: "low",
-                    data: event_bus::heartbeat_tick_data(
-                        &current_config.claude.heartbeat_file,
-                        current_config.cadence.heartbeat_tick_interval_secs,
-                    ),
-                });
+            if due.keepalive {
+                let quiet_secs = current_config.cadence.keepalive_interval_secs;
+                let last_ack_age =
+                    policy::last_ack_timestamp_age(&current_config.ack.resolve_state_dir());
+
+                // Emit only when the bus has been quiet for the whole window.
+                // `None` (no ack state at all: fresh boot, or a deployment
+                // without event-must-act) emits — that host has no other way
+                // to establish liveness, and the first ack starts the clock.
+                let should_emit = match last_ack_age {
+                    Some(age) if age >= quiet_secs => {
+                        tracing::debug!(
+                            last_ack_age_secs = age,
+                            quiet_secs,
+                            "acks quiet: emitting keepalive"
+                        );
+                        true
+                    }
+                    Some(age) => {
+                        tracing::debug!(
+                            last_ack_age_secs = age,
+                            quiet_secs,
+                            "acks flowing: suppressing keepalive"
+                        );
+                        false
+                    }
+                    None => {
+                        tracing::debug!("no last-ack stamp yet: emitting keepalive");
+                        true
+                    }
+                };
+
+                if should_emit {
+                    event_bus::emit_cadence(&event_bus::CadenceEvent {
+                        tag: cadence::KEEPALIVE_TAG,
+                        source: cadence::CADENCE_SOURCE,
+                        message: "keepalive: no event acked recently — \
+                                  run `event-ack ack-batch --override-reason \"<why>\"` to prove liveness",
+                        priority: "low",
+                        data: event_bus::keepalive_data(quiet_secs, last_ack_age),
+                    });
+                }
             }
             if due.memory_reminder {
                 // Memory-reminder is non-urgent context hygiene, so it is
                 // delivered as an AMBIENT claude-event on the queue (surfaced
                 // on the next UserPromptSubmit) rather than as a
                 // mid-generation tmux-inject interruption. Mirrors the
-                // heartbeat-tick delivery path above; the checklist body
+                // keepalive delivery path above; the checklist body
                 // rides in the event `message`, and event-classify routes
                 // claude-watch/memory-reminder to the ambient tier.
                 event_bus::emit_cadence(&event_bus::CadenceEvent {
@@ -1318,10 +1537,8 @@ async fn run_task(action: TaskAction) -> i32 {
             detach,
             recreate,
             force,
-        } => {
-            task_watch::cmd_task_init(session, all, detach, recreate, force).await;
-            0
-        }
+            grace,
+        } => task_watch::cmd_task_init(session, all, detach, recreate, force, grace).await,
         TaskAction::List { json } => {
             task_watch::cmd_task_list(session, json).await;
             0
@@ -1369,8 +1586,10 @@ async fn run_watcher(action: WatcherAction) {
             watcher::cmd_status(&cfg, extra_ref, json, unhealthy_only, all).await;
             0
         }
-        WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, &name, true).await,
-        WatcherAction::Disable { name } => watcher::cmd_toggle(&cfg, &name, false).await,
+        WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, extra_ref, &name, true).await,
+        WatcherAction::Disable { name } => {
+            watcher::cmd_toggle(&cfg, extra_ref, &name, false).await
+        }
         WatcherAction::Restart => {
             watcher::cmd_restart(&cfg, extra_ref).await;
             0
@@ -1413,7 +1632,7 @@ fn run_workload(action: WorkloadAction) -> i32 {
             follow,
             lines,
         } => workload::cmd_log(&label, lines, follow),
-        WorkloadAction::Kill { label } => workload::cmd_kill(&label),
+        WorkloadAction::Kill { label, grace } => workload::cmd_kill(&label, grace),
         WorkloadAction::EmitDone {
             label,
             exit_code,
@@ -1568,11 +1787,14 @@ async fn resolve_inject_pane(flag: Option<&str>) -> String {
 ///   0 = typed (no-submit) OR submission verified
 ///   3 = submit keystrokes sent but the payload was still on the prompt line
 ///       after the verify window (submission likely did NOT land)
+///   4 = REFUSED because the prompt line held more than our payload after
+///       typing. The payload was retracted; nothing was submitted.
 async fn run_inject(
     text: &str,
     pane_flag: Option<&str>,
     no_submit: bool,
     slash_command: bool,
+    escape: bool,
     json: bool,
 ) -> i32 {
     // Wire the FleetView focus-to-main key sequence into the tmux module's
@@ -1588,24 +1810,58 @@ async fn run_inject(
     }
     let pane = resolve_inject_pane(pane_flag).await;
     let submit = !no_submit;
-    let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command).await;
+
+    // SERIALIZE against every other injector — the daemon's own in-process
+    // alerts and any other `claude-watch inject` process. Without this, two
+    // injectors type into the SAME prompt line concurrently and, because the
+    // default non-cancelling choreography has no `dd` line-clear, their
+    // payloads INTERLEAVE: on 2026-08-19 a `/config theme=light` landed
+    // spliced into the middle of the word "6min" in a WATCHER DOWN banner, and
+    // both injects still reported success. Held across type+submit+verify, and
+    // released when the guard drops. See `inject_lock` for the full autopsy.
+    let _inject_guard = inject_lock::InjectLock::acquire("cli").await;
+
+    let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command, escape).await;
 
     let (code, status) = match outcome {
         tmux::InjectOutcome::Typed => (0, "typed"),
         tmux::InjectOutcome::Submitted => (0, "submitted"),
         tmux::InjectOutcome::SubmitUnverified => (3, "submit_unverified"),
+        tmux::InjectOutcome::PromptDirty => (4, "prompt_dirty"),
     };
+
+    // `submitted` reports what ACTUALLY happened, not what was asked for. It
+    // used to echo the `--no-submit` request flag, so a REFUSED inject
+    // advertised `"submitted":true` next to `"status":"prompt_dirty"` — which
+    // reads as "it submitted anyway", i.e. exactly the bug this change exists
+    // to fix, wearing a nicer name. (A reviewer did read it that way.) Values
+    // for the three pre-existing statuses are unchanged — `typed` => false,
+    // `submitted` and `submit_unverified` => true, since both did press Enter
+    // — so only the new refusal, where Enter is never sent, flips to false.
+    // `status` remains the authoritative field.
+    let submitted = matches!(
+        outcome,
+        tmux::InjectOutcome::Submitted | tmux::InjectOutcome::SubmitUnverified
+    );
 
     if json {
         println!(
-            "{{\"pane\":{},\"status\":\"{}\",\"submitted\":{},\"slash_command\":{}}}",
+            "{{\"pane\":{},\"status\":\"{}\",\"submitted\":{},\"slash_command\":{},\"escape\":{}}}",
             serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
             status,
-            submit,
-            slash_command
+            submitted,
+            slash_command,
+            escape
         );
     } else if code == 0 {
         eprintln!("[claude-watch inject] {} on pane {}", status, pane);
+    } else if code == 4 {
+        eprintln!(
+            "[claude-watch inject] REFUSED on pane {}: after typing, the prompt line held more \
+             than our payload (residue from a half-typed line, or a peer injector). The payload \
+             was RETRACTED and NOTHING was submitted — retry once the line is clear.",
+            pane
+        );
     } else {
         eprintln!(
             "[claude-watch inject] WARNING: submit may not have landed (payload still on prompt line) on pane {}",
@@ -1613,6 +1869,151 @@ async fn run_inject(
         );
     }
 
+    code
+}
+
+/// Handler for `claude-watch login-url`. Returns a process exit code:
+///   0 = a fresh OAuth URL was found and printed
+///   4 = no URL found within the wait window (or only a rejected/stale one)
+///
+/// Deliberately LOUD on failure: "no URL" can mean the session is already
+/// authenticated, the dialog never rendered, or the pane is wedged, and every
+/// one of those is something the caller must surface rather than swallow.
+async fn run_login_url(
+    pane_flag: Option<&str>,
+    wait: u64,
+    not: &[String],
+    json: bool,
+) -> i32 {
+    let pane = resolve_inject_pane(pane_flag).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    let mut saw_stale = false;
+
+    loop {
+        // Visible pane only, never scrollback: an OAuth URL that has scrolled
+        // out of view is by definition not the dialog we just opened, and
+        // treating a scrolled-back link as current is how a stale URL gets
+        // reported as a fresh one.
+        if let Some(out) = tmux::capture_pane(&pane).await {
+            if let Some(url) = tmux::extract_login_url(&out) {
+                if not.iter().any(|n| n == &url) {
+                    saw_stale = true;
+                } else {
+                    if json {
+                        println!(
+                            "{{\"pane\":{},\"url\":{},\"found\":true}}",
+                            serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
+                            serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string()),
+                        );
+                    } else {
+                        println!("{}", url);
+                    }
+                    return 0;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(1000)).await;
+    }
+
+    let reason = if saw_stale {
+        "only a rejected (stale) login URL was on screen"
+    } else {
+        "no claude.ai/oauth/authorize URL on the pane"
+    };
+    if json {
+        println!(
+            "{{\"pane\":{},\"url\":null,\"found\":false,\"reason\":{}}}",
+            serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
+            serde_json::to_string(reason).unwrap_or_else(|_| "\"\"".to_string()),
+        );
+    } else {
+        eprintln!("[claude-watch login-url] {} (pane {})", reason, pane);
+    }
+    4
+}
+
+/// Read-only report on how much login is left. Injects nothing.
+async fn run_login_expiry(
+    pane_flag: Option<&str>,
+    credentials_file: Option<&str>,
+    json: bool,
+) -> i32 {
+    use credentials::CredentialExpiry;
+
+    let pane = resolve_inject_pane(pane_flag).await;
+    let pane_days = tmux::login_expiry_warning(&pane).await;
+
+    let path = match credentials_file {
+        Some(p) => std::path::PathBuf::from(p),
+        None => credentials::default_path(),
+    };
+    let creds = credentials::read(&path);
+    // The OTHER half of the store: the short-lived access token, which is
+    // what the reactive 401 banner is corroborated against. Reported
+    // alongside so "why did / didn't the banner path fire" is answerable
+    // from this one command.
+    let access = credentials::read_access_token(&path);
+
+    let (state_str, days, code) = match creds {
+        CredentialExpiry::Expiring { days_left } => ("expiring", Some(days_left), 3),
+        CredentialExpiry::Expired => ("expired", None, 4),
+        CredentialExpiry::Healthy => ("healthy", None, 0),
+        // An unreadable store is UNKNOWN, never "fine". If the pane is
+        // warning, that warning stands on its own and this still reports it.
+        CredentialExpiry::Unknown if pane_days.is_some() => ("unknown", pane_days, 3),
+        CredentialExpiry::Unknown => ("unknown", None, 0),
+    };
+
+    if json {
+        println!(
+            "{{\"pane\":{},\"pane_warning_days\":{},\"credentials\":{},\"credentials_file\":{},\"days_left\":{},\"access_token\":{}}}",
+            serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
+            pane_days
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            serde_json::to_string(state_str).unwrap_or_else(|_| "\"\"".to_string()),
+            serde_json::to_string(&path.display().to_string())
+                .unwrap_or_else(|_| "\"\"".to_string()),
+            days.map(|d| d.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            serde_json::to_string(access.as_str()).unwrap_or_else(|_| "\"\"".to_string()),
+        );
+        return code;
+    }
+
+    println!("pane:            {pane}");
+    match pane_days {
+        Some(d) => println!("on-screen:       \"Your login expires in {d} day(s)\""),
+        None => println!("on-screen:       no expiry warning on the pane"),
+    }
+    println!("credentials:     {state_str} ({})", path.display());
+    println!(
+        "access token:    {} (the reactive 401 banner fires only on expired/missing)",
+        access.as_str()
+    );
+    match (state_str, days) {
+        ("expiring", Some(d)) if pane_days.is_none() => {
+            println!("=> the credential store says {d} day(s), with no warning on the pane.");
+            println!("   The store only VETOES by default, it does not trigger: a short-lived");
+            println!("   rolling refresh token reads as \"1 day\" for its whole healthy life.");
+            println!("   Compare refreshTokenExpiresAt across a few minutes before setting");
+            println!("   expiry_from_credentials = true.");
+        }
+        ("expiring", Some(d)) => println!("=> login expires in {d} day(s)"),
+        ("expired", _) => println!("=> login has ALREADY expired (reactive reauth territory)"),
+        ("unknown", Some(d)) => println!(
+            "=> the pane says {d} day(s), and the credential store could not be read \
+             to confirm it"
+        ),
+        ("unknown", None) => println!(
+            "=> UNKNOWN: the credential store could not be read, and there is no \
+             warning on the pane. This is not the same as \"fine\"."
+        ),
+        _ => println!("=> login is not expiring"),
+    }
     code
 }
 
@@ -1740,14 +2141,41 @@ async fn main() {
                 std::process::exit(code);
             }
         }
+        Some(Commands::LoginUrl {
+            pane,
+            wait,
+            not,
+            json,
+        }) => {
+            let code = run_login_url(pane.as_deref(), wait, &not, json).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::LoginExpiry {
+            pane,
+            credentials_file,
+            json,
+        }) => {
+            let code =
+                run_login_expiry(pane.as_deref(), credentials_file.as_deref(), json).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Some(Commands::Inject {
             submit,
             pane,
             no_submit,
             slash_command,
+            escape,
+            // Deprecated no-op: non-cancelling is the default now. Bound and
+            // dropped on purpose so an older caller still passing it parses.
+            no_cancel: _,
             json,
         }) => {
-            let code = run_inject(&submit, pane.as_deref(), no_submit, slash_command, json).await;
+            let code =
+                run_inject(&submit, pane.as_deref(), no_submit, slash_command, escape, json).await;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -1775,9 +2203,58 @@ mod tests {
             running_workloads: 0,
             healthy_watchers: 4,
             enabled_watchers: 4,
+            live_monitors: 4,
             claude_watch_version: "0.1.0",
             daemon_active: Some(true),
         }
+    }
+
+    /// Pull the `Inject` variant's flags out of a parsed argv, or panic.
+    fn parse_inject(args: &[&str]) -> (bool, bool, bool) {
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Inject {
+                escape,
+                no_cancel,
+                slash_command,
+                ..
+            }) => (escape, no_cancel, slash_command),
+            other => panic!("expected Inject, got {:?}", other.is_some()),
+        }
+    }
+
+    /// THE contract of the 2026-08-18 flip: a bare `claude-watch inject`
+    /// sends NO Escape. The Escape blast cancels an in-flight turn and
+    /// cancels any modal on the pane, so it must never be what a caller
+    /// gets by forgetting a flag.
+    #[test]
+    fn inject_does_not_escape_by_default() {
+        let (escape, _, _) = parse_inject(&["claude-watch", "inject", "--submit", "hello"]);
+        assert!(
+            !escape,
+            "`claude-watch inject` must NOT lead with an Escape unless --escape is passed"
+        );
+    }
+
+    #[test]
+    fn inject_escape_is_opt_in_under_both_names() {
+        let (escape, _, _) =
+            parse_inject(&["claude-watch", "inject", "--submit", "hello", "--escape"]);
+        assert!(escape, "--escape must select the cancelling choreography");
+        let (aliased, _, _) =
+            parse_inject(&["claude-watch", "inject", "--submit", "hello", "--cancel"]);
+        assert!(aliased, "--cancel must remain a visible alias for --escape");
+    }
+
+    /// `--no-cancel` is now the default, but older container scripts still
+    /// pass it and the binary deploys independently of them. It must PARSE
+    /// (not error) and must not turn the Escape blast back on.
+    #[test]
+    fn inject_accepts_deprecated_no_cancel_as_a_noop() {
+        let (escape, no_cancel, _) =
+            parse_inject(&["claude-watch", "inject", "--submit", "hi", "--no-cancel"]);
+        assert!(no_cancel, "--no-cancel must still parse");
+        assert!(!escape, "--no-cancel must not imply --escape");
     }
 
     #[test]
@@ -1799,6 +2276,7 @@ mod tests {
         assert!(out.contains("Active agents:  1"), "out:\n{}", out);
         assert!(out.contains("Running tasks:  0"), "out:\n{}", out);
         assert!(out.contains("Live watchers:  4/4"), "out:\n{}", out);
+        assert!(out.contains("Live monitors:  4"), "out:\n{}", out);
         assert!(out.contains("Open bashes:    2"), "out:\n{}", out);
     }
 
@@ -1905,6 +2383,7 @@ mod tests {
         assert_eq!(v["running_workloads"], serde_json::json!(0));
         assert_eq!(v["live_watchers"], serde_json::json!(4));
         assert_eq!(v["enabled_watchers"], serde_json::json!(4));
+        assert_eq!(v["live_monitors"], serde_json::json!(4));
     }
 
     #[test]
