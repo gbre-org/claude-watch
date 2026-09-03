@@ -416,8 +416,36 @@ pub struct State {
     /// Cumulative count of cycles where claude-watch suppressed an interrupt
     /// fire because api_retry was active. Persisted across daemon restarts
     /// so Prometheus metrics can graph the suppression rate.
+    ///
+    /// NOT a proxy for "the API is overloaded right now": it counts
+    /// SUPPRESSIONS, so it stops advancing the moment
+    /// `evaluate_api_retry_state` gives up suppressing (past
+    /// `api_retry.max_stuck_secs`) even though the retry banner is still on
+    /// screen — i.e. it goes flat exactly when a storm is at its worst. Use
+    /// `api_retry_last_seen` for the "is it happening now" question.
     #[serde(default)]
     pub api_retry_suppressions_total: u64,
+    /// Timestamp of the most recent check cycle where the pane showed an
+    /// upstream-API retry banner. Stamped on EVERY detection, independent of
+    /// whether suppression is active — that is the whole point: it keeps
+    /// advancing past `api_retry.max_stuck_secs`, when suppression
+    /// deliberately stops but the storm has not. Cleared as soon as a cycle
+    /// observes no banner, so a resolved storm reads resolved on the next
+    /// cycle rather than decaying.
+    ///
+    /// The metrics emitter turns this into `claude_watch_api_retry_active` by
+    /// checking the stamp's freshness, which also covers the cases where the
+    /// daemon simply STOPS observing (guard disabled, pane gone) and would
+    /// otherwise leave a stale episode pinned open forever.
+    /// Transient — reset on daemon load.
+    #[serde(default)]
+    pub api_retry_last_seen: Option<String>,
+    /// Cumulative count of distinct upstream-API retry episodes entered —
+    /// incremented on the 0 -> 1 edge of `api_retry_consecutive`, so one
+    /// multi-minute storm counts once. Persisted across daemon restarts so
+    /// Prometheus can graph storm FREQUENCY independently of storm duration.
+    #[serde(default)]
+    pub api_retry_episodes_total: u64,
 
     // --- Auto-respawn-on-hang -------------------------------------------
     /// Sliding-window observation history of "Claude Code is hung" signals.
@@ -732,10 +760,16 @@ pub fn load_state_with_now(path: &str, startup_now: &str) -> State {
     state.first_suppression_at = None;
     // api_retry tracking is transient — daemon downtime makes the
     // "current episode" timestamp meaningless and the consecutive count
-    // unreliable. Reset on load. (api_retry_suppressions_total persists
-    // for metrics.)
+    // unreliable. Reset on load. (api_retry_suppressions_total and
+    // api_retry_episodes_total persist for metrics.)
     state.api_retry_consecutive = 0;
     state.api_retry_first_seen = None;
+    // Same reason for the liveness stamp: a stamp from before the daemon
+    // went down must not read as a live storm. Clearing it makes
+    // `claude_watch_api_retry_active` fall to 0 across a restart, and the
+    // first post-restart cycle that still sees a banner re-stamps it (and
+    // counts a fresh episode, since api_retry_consecutive reset to 0 too).
+    state.api_retry_last_seen = None;
     // AskUserQuestion stale-monitor timer is transient — daemon downtime
     // makes the elapsed measurement unreliable. Reset on load so tracking
     // starts fresh (mirrors thinking_start).
@@ -1080,6 +1114,40 @@ mod tests {
         assert!(loaded.api_retry_first_seen.is_none());
         // Cumulative preserved
         assert_eq!(loaded.api_retry_suppressions_total, 42);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_api_retry_observability_state_transient_vs_cumulative() {
+        // `api_retry_last_seen` drives the `claude_watch_api_retry_active`
+        // gauge, so a stamp from before a daemon restart must NOT survive
+        // load -- otherwise the gauge would report a live retry storm that
+        // ended while the daemon was down. `api_retry_episodes_total` is a
+        // Prometheus counter and must survive.
+        let path = "/tmp/claude-watch-test-api-retry-observability.json";
+        let mut state = State::default();
+        state.api_retry_last_seen = Some("2026-09-03T09:28:00-04:00".to_string());
+        state.api_retry_episodes_total = 7;
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert!(
+            loaded.api_retry_last_seen.is_none(),
+            "the liveness stamp must not survive a daemon restart"
+        );
+        assert_eq!(loaded.api_retry_episodes_total, 7);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_api_retry_observability_fields_default_on_legacy_state() {
+        // A state file written before these fields existed must deserialize
+        // cleanly to "no storm ever observed".
+        let path = "/tmp/claude-watch-test-api-retry-observability-legacy.json";
+        std::fs::write(path, "{}").unwrap();
+        let loaded = load_state(path);
+        assert!(loaded.api_retry_last_seen.is_none());
+        assert_eq!(loaded.api_retry_episodes_total, 0);
         let _ = std::fs::remove_file(path);
     }
 

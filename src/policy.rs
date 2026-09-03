@@ -1486,6 +1486,38 @@ pub(crate) fn evaluate_api_retry_state(
     (new_consecutive, new_first_seen, true)
 }
 
+/// Pure decision: given the current observation and the PREVIOUS episode's
+/// consecutive count, return the `(new_last_seen, episodes_delta)` pair for
+/// the retry-storm OBSERVABILITY state (`api_retry_last_seen`,
+/// `api_retry_episodes_total`).
+///
+/// Deliberately independent of `evaluate_api_retry_state`'s suppression
+/// decision. Suppression is a policy choice that switches OFF mid-storm once
+/// `max_stuck_secs` elapses, and it never runs at all when the guard is
+/// configured off — so a metric derived from suppression under-reports the
+/// exact incident it exists to describe (a 17-minute 529 storm on
+/// 2026-09-03 was invisible on the stall panels for precisely this reason).
+/// What we want exported is the raw observation: the pane showed a retry
+/// banner on this cycle, yes or no.
+///
+/// Semantics:
+///   - `is_retrying=false` clears the stamp (a resolved storm reads resolved
+///     on the very next cycle) and counts no episode.
+///   - `is_retrying=true` stamps `now`. It counts a NEW episode only on the
+///     0 -> 1 edge of the consecutive counter, so one long storm increments
+///     `api_retry_episodes_total` exactly once.
+pub(crate) fn evaluate_api_retry_observation(
+    is_retrying: bool,
+    prev_consecutive: u32,
+    now: &str,
+) -> (Option<String>, u64) {
+    if !is_retrying {
+        return (None, 0);
+    }
+    let episodes_delta = u64::from(prev_consecutive == 0);
+    (Some(now.to_string()), episodes_delta)
+}
+
 /// Detect whether the pane is currently in an upstream-API retry-backoff and
 /// update the daemon's tracking state accordingly. Returns true when the
 /// caller should SUPPRESS interrupt fires for this cycle.
@@ -1503,6 +1535,21 @@ async fn update_api_retry_state(config: &Config, state: &mut State, pane: &str) 
 
     let is_retrying = tmux::detect_api_retry(pane).await;
     let was_suppressing = is_api_retry_suppressing(config, state);
+
+    // Observability first, and from the RAW detection — see
+    // `evaluate_api_retry_observation` for why this must not be derived from
+    // the suppression decision below. Read `api_retry_consecutive` before
+    // `evaluate_api_retry_state` overwrites it so the 0 -> 1 episode edge is
+    // still visible.
+    let (new_last_seen, episodes_delta) = evaluate_api_retry_observation(
+        is_retrying,
+        state.api_retry_consecutive,
+        &Local::now().to_rfc3339(),
+    );
+    state.api_retry_last_seen = new_last_seen;
+    state.api_retry_episodes_total = state
+        .api_retry_episodes_total
+        .saturating_add(episodes_delta);
 
     let (new_consec, new_first, suppress) = evaluate_api_retry_state(
         is_retrying,
@@ -11771,6 +11818,71 @@ cooldown = 300
             evaluate_api_retry_state(true, u32::MAX, Some(&now), 1, 1800);
         assert_eq!(consec, u32::MAX); // saturated
         assert!(suppress);
+    }
+
+    // --- evaluate_api_retry_observation tests (metrics-facing state) ---
+
+    #[test]
+    fn test_api_retry_observation_stamps_on_detection() {
+        let now = "2026-09-03T09:28:00-04:00";
+        let (last_seen, episodes) = evaluate_api_retry_observation(true, 0, now);
+        assert_eq!(last_seen.as_deref(), Some(now));
+        // 0 -> 1 edge: a new episode.
+        assert_eq!(episodes, 1);
+    }
+
+    #[test]
+    fn test_api_retry_observation_counts_one_episode_per_storm() {
+        // A multi-minute storm must increment the episode counter ONCE, not
+        // once per 10s cycle -- otherwise "episodes" would just be a slower
+        // spelling of "cycles" and storm frequency would be unreadable.
+        let now = "2026-09-03T09:30:00-04:00";
+        for prev in [1u32, 2, 50, 102] {
+            let (last_seen, episodes) = evaluate_api_retry_observation(true, prev, now);
+            assert_eq!(last_seen.as_deref(), Some(now));
+            assert_eq!(episodes, 0, "prev_consecutive={prev} must not re-count");
+        }
+    }
+
+    #[test]
+    fn test_api_retry_observation_clears_stamp_when_resolved() {
+        // The daemon itself reports resolution on the next cycle; the
+        // metrics-side freshness window is only a backstop for "stopped
+        // observing".
+        let (last_seen, episodes) =
+            evaluate_api_retry_observation(false, 102, "2026-09-03T09:45:00-04:00");
+        assert!(last_seen.is_none());
+        assert_eq!(episodes, 0);
+    }
+
+    #[test]
+    fn test_api_retry_observation_recounts_after_resolution() {
+        // Storm 1 ends (consecutive back to 0), storm 2 starts -> a second
+        // episode.
+        let now = "2026-09-03T10:00:00-04:00";
+        let (_, first) = evaluate_api_retry_observation(true, 0, now);
+        let (_, mid) = evaluate_api_retry_observation(true, 1, now);
+        let (_, resolved) = evaluate_api_retry_observation(false, 2, now);
+        let (_, second) = evaluate_api_retry_observation(true, 0, now);
+        assert_eq!((first, mid, resolved, second), (1, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_api_retry_observation_is_independent_of_suppression() {
+        // The whole point: past max_stuck_secs `evaluate_api_retry_state`
+        // stops suppressing, but the observation must keep being recorded --
+        // that is the window in which the old suppressions counter went flat
+        // while the storm raged on.
+        let started = (Utc::now() - chrono::Duration::seconds(2400)).to_rfc3339();
+        let (_, _, suppress) = evaluate_api_retry_state(true, 240, Some(&started), 1, 1800);
+        assert!(!suppress, "suppression should have been lifted by the cap");
+        let now = Utc::now().to_rfc3339();
+        let (last_seen, _) = evaluate_api_retry_observation(true, 240, &now);
+        assert_eq!(
+            last_seen.as_deref(),
+            Some(now.as_str()),
+            "observation must be stamped even with suppression lifted"
+        );
     }
 
     // --- is_api_retry_suppressing tests (read-only state derivation) ---

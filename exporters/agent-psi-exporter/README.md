@@ -62,6 +62,49 @@ that is pure API stall used to read as a healthy in-flight turn — and, past th
 Both stop at `AGENT_PSI_API_STALL_MAX_SECONDS` (default 900, the live window),
 past which a silent transcript reads as dormant/killed rather than stalled.
 
+### A long overload storm is NOT fully visible here — read the daemon gauge
+
+Those two rules cover a stall of up to `AGENT_PSI_API_STALL_MAX_SECONDS`. A
+**longer** overload storm falls off this exporter entirely, and it does so
+silently, in two compounding steps:
+
+1. past `AGENT_PSI_API_STALL_MAX_SECONDS` the stall attribution stops, so the
+   silence reverts to reading as dormant rather than stalled;
+2. past `AGENT_PSI_LIVE_WINDOW_SECONDS` (also 900 by default) the transcript's
+   mtime leaves the live window, so the session is dropped from the fleet
+   before it is aggregated at all — pressure over zero agents is not "high",
+   it is absent.
+
+So a main loop parked in `529 Overloaded · Retrying in 12s · attempt 7/10` for
+17 minutes ends up indistinguishable from an idle one on these panels — the
+failure mode observed 2026-09-03. That is not a tuning bug to widen the
+windows out of: the cause is structural. **A client in retry back-off writes
+nothing to its transcript**, so the only evidence of the storm is the retry
+banner the client paints on its terminal, and a transcript reader cannot see
+that by construction. Raising the windows just trades a false negative for a
+long-silence-reads-as-stall false positive on genuinely dead sessions.
+
+The daemon reads the terminal pane, so it CAN see the banner, and exports the
+state directly (`src/metrics.rs`, via the `claude-watch metrics` textfile):
+
+| metric | meaning |
+|---|---|
+| `claude_watch_api_retry_active` | 1 while a 529/overloaded/5xx retry banner was seen within `claude_watch_api_retry_stale_after_secs`. **The alertable state** |
+| `claude_watch_api_retry_episode_seconds` | how long the current episode has run — the severity axis, since a 12s blip and a 17-minute storm are both `active=1` |
+| `claude_watch_api_retry_consecutive_cycles` | detection cycles in the current episode |
+| `claude_watch_api_retry_last_seen_timestamp_seconds` | epoch of the most recent detection, for age-based queries |
+| `claude_watch_api_retry_episodes_total` | storm COUNT (one per episode, not per cycle) — frequency, independent of duration |
+| `claude_watch_api_retry_stale_after_secs` | the freshness window itself; read it rather than hardcoding a `for:` duration |
+
+Treat these as the authority on "is the API overloaded right now" and this
+exporter's `agent_psi_inference_stalled_*` as the authority on "how much of
+the fleet's active time is going to waiting" — they answer different
+questions and neither substitutes for the other. Note in particular that
+`claude_watch_api_retry_suppressions_total` (which predates the gauges above)
+answers NEITHER: it counts cycles where the daemon suppressed an interrupt,
+so it stops advancing once suppression gives up mid-storm at
+`[api_retry] max_stuck_secs`.
+
 ## What it emits (`/metrics`, default port 9104)
 
 Headline — fleet & per-session-subtree pressure over 10s / 60s / 300s sliding
