@@ -134,6 +134,52 @@ Both rules stop at ``API_STALL_MAX_SECONDS``: past that, a silent transcript is
 better explained by a dormant / resumed / killed session than by an API wait,
 and the old dormancy cap applies. It matches the exporter's live window, past
 which the transcript drops out of the fleet anyway.
+
+FLEET COMPOSITION: WHY ``full`` IS NOT "HOW BUSY IS THE FLEET"
+--------------------------------------------------------------
+``some``/``full`` answer latency and throughput-loss questions, and both are
+normalized over the ACTIVE agents only. That makes ``full`` a UNANIMITY signal,
+not an occupancy one, and it behaves badly as a fleet-composition series in the
+two regimes that matter most:
+
+* ONE active worker, tool-bound -> ``tool_full`` = 1.0. Arithmetically right
+  ("every active agent is in a tool"), but it renders as a saturated fleet when
+  the honest statement is "one agent, in a tool".
+* FOUR active workers doing DIFFERENT things -> every ``*_full`` collapses
+  toward 0 even though the fleet is 100% busy, because no category holds all of
+  them at once. A stack of ``*_full`` series is therefore anti-correlated with
+  fleet busyness exactly when concurrency is high.
+
+``compute_mean_agents`` is the occupancy counterpart: for each state, the MEAN
+NUMBER OF AGENTS in that state over the window (agent-seconds / window). It is
+denominator-free — nothing is divided by an agent count — so one busy agent
+reads as 1.0 and four busy agents read as 4.0, and the states stack to the mean
+number of LIVE agents in the scope rather than to a fraction of a shifting
+denominator. ``idle`` and ``waiting_human`` are first-class states there, which
+is what stops a quiet fleet (or the idle-by-design dispatcher) from rendering
+as saturation.
+
+OBSERVED vs UNOBSERVABLE (the third state)
+------------------------------------------
+Every state above is inferred from transcript writes, so a host that GOES AWAY
+mid-run — a laptop lid closing on a workbot, a suspended VM, a killed client —
+freezes the transcript with the last observed state still "busy". Read
+literally, an in-flight tool tail is then counted as tool time forever (until
+the file-mtime live window drops the agent entirely, at which point it silently
+vanishes). Neither "perpetually busy" nor "quietly idle" is true; the truth is
+that we stopped being able to observe it.
+
+So a trailing active interval is SPLIT at ``STALE_AFTER_SECONDS`` of silence:
+the first part keeps its category and ``observed=True``, and the remainder
+carries the same category with ``observed=False``. Splitting rather than
+re-categorizing is deliberate — every category-based metric
+(``duty_seconds``, ``compute_pressure``, the stalled-inference pressure) sees
+byte-identical coverage, so nothing about the existing some/full series moves —
+while ``compute_mean_agents`` reports the unobserved remainder under its own
+``unobservable`` state. Note what the flag does and does not claim: a genuinely
+long blocking tool and a frozen host are INDISTINGUISHABLE from the transcript,
+and ``unobservable`` is exactly that admission, not an assertion that the agent
+is gone.
 """
 
 from __future__ import annotations
@@ -150,6 +196,20 @@ WAITING_HUMAN = "waiting_human"
 OVERHEAD = "overhead"
 
 CATEGORIES = (INFERENCE, TOOL, IDLE, WAITING_HUMAN, OVERHEAD)
+# Occupancy states for ``compute_mean_agents``. NOT categories: they are how a
+# category+flag pair is rendered for the fleet-composition panel. ``inference``
+# there means PRODUCTIVE inference (the stalled slice is its own state, so the
+# bands stack without a subtraction), and ``unobservable`` overrides whatever
+# the frozen transcript last said (see the module docstring).
+INFERENCE_STALLED = "inference_stalled"
+UNOBSERVABLE = "unobservable"
+AGENT_STATES = (
+    INFERENCE, INFERENCE_STALLED, TOOL, OVERHEAD, IDLE, WAITING_HUMAN,
+    UNOBSERVABLE,
+)
+# The subset of AGENT_STATES that is an agent doing work. ``unobservable`` is
+# deliberately NOT busy and NOT idle — it is the admission that we cannot say.
+BUSY_STATES = (INFERENCE, INFERENCE_STALLED, TOOL, OVERHEAD)
 # Categories that count as an agent "wanting to run" (the PSI denominator and
 # the set that can make a full-pressure slice). idle / waiting_human are the
 # time nobody wanted to run and are excluded.
@@ -202,17 +262,31 @@ DEFAULT_API_STALL_TAIL_SECONDS = 120.0
 # Tunable via AGENT_PSI_API_STALL_MAX_SECONDS.
 DEFAULT_API_STALL_MAX_SECONDS = 900.0
 
+# Silence, on a trailing ACTIVE interval, past which we stop asserting the
+# state and call the remainder ``unobservable``: a host that went away mid-run
+# (laptop lid, suspended VM, killed client) is indistinguishable from a long
+# blocking tool, and claiming either would be a guess. Matches the dormancy cap
+# so the two "we have lost the thread" thresholds agree.
+# Tunable via AGENT_PSI_STALE_AFTER_SECONDS.
+DEFAULT_STALE_AFTER_SECONDS = 300.0
+
 # Decaying-window sizes (seconds) the exporter emits pressure for. Phase 1
 # uses fixed sliding windows ending at ``now``; a true exponential decay is a
 # phase-2 refinement.
 DEFAULT_WINDOWS = (10, 60, 300)
 
-Interval = namedtuple("Interval", ("start", "end", "category", "stalled"))
+Interval = namedtuple(
+    "Interval", ("start", "end", "category", "stalled", "observed")
+)
 # ``stalled`` is meaningful only on an ``inference`` interval: True when the
 # gap's effective throughput fell below the stall floor. Defaults False so every
 # existing 3-arg Interval(...) construction (and the tests') stays valid and
 # reads as productive/not-applicable.
-Interval.__new__.__defaults__ = (False,)
+# ``observed`` is False on the remainder of a trailing ACTIVE interval past
+# ``STALE_AFTER_SECONDS`` of transcript silence — the category is kept (so every
+# category-based metric is unchanged) but the fleet-composition view renders it
+# as ``unobservable`` instead of asserting the frozen state.
+Interval.__new__.__defaults__ = (False, True)
 # A transcript's parsed intervals plus identity/liveness metadata. ``model`` is
 # the short model family the agent ran on (opus / sonnet / haiku / fable /
 # ...), fixed for the agent's lifetime, so per-model pressure = the same
@@ -221,12 +295,15 @@ Interval.__new__.__defaults__ = (False,)
 # (see ``is_running_transcript``) — the accurate "still executing right now"
 # signal, so a finished sub-agent drops from the live count immediately instead
 # of lingering for the whole file-mtime live window.
+# ``api_errors`` is the list of (timestamp, kind) pairs for every API-error
+# entry in the transcript (see ``classify_api_error``) — the per-model
+# upstream-capacity evidence, since the agent's model is fixed for its lifetime.
 Transcript = namedtuple(
     "Transcript",
     ("agent_id", "session_id", "is_main_loop", "model", "mtime", "intervals",
-     "running"),
+     "running", "api_errors"),
 )
-Transcript.__new__.__defaults__ = (True,)
+Transcript.__new__.__defaults__ = (True, ())
 
 # Known short model families, matched as substrings of the raw transcript model
 # string (``claude-opus-5`` / ``claude-sonnet-5`` / bare ``opus`` all fold to a
@@ -237,6 +314,116 @@ MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 # never a real model, so it must not count toward an agent's model.
 _SYNTHETIC_MODEL = "<synthetic>"
 UNKNOWN_MODEL = "unknown"
+
+# --- API-error classes ---------------------------------------------------
+# Claude Code writes a synthetic assistant line with ``isApiErrorMessage: true``
+# whenever a request finally fails, and the text says WHY. One "api errors"
+# number would be useless for the question these metrics exist to answer — how
+# much a given MODEL is costing us upstream — because the causes map to
+# completely different knobs:
+#
+#   capacity          provider is out of headroom (529 / 5xx / overloaded)
+#                     -> knob: which model / when to run, retry budget
+#   rate_limit        we are over our own quota (429 / rate limit)
+#                     -> knob: concurrency, fleet size
+#   network           transport failed before a verdict (timeout / connection)
+#                     -> knob: ours to chase, not the provider's
+#   context_overflow  the request itself was too big (prompt is too long)
+#                     -> knob: context management; the retry cost is self-
+#                        inflicted, so it must never read as provider trouble
+#   refusal           safeguards / content filtering blocked it
+#                     -> not a performance signal at all
+#   auth              401 / login expired -> our credentials
+#   other             recognised as an API error, cause unmatched -- a VISIBLE
+#                     catch-all, never a silent fold into capacity
+#
+# The class set is deliberately provider-agnostic: the same (model x class)
+# schema applies to a Bedrock / gateway-fronted fleet whose failure mix is
+# different, so panels built on it transfer without a schema change.
+API_ERR_CAPACITY = "capacity"
+API_ERR_RATE_LIMIT = "rate_limit"
+API_ERR_NETWORK = "network"
+API_ERR_CONTEXT_OVERFLOW = "context_overflow"
+API_ERR_REFUSAL = "refusal"
+API_ERR_AUTH = "auth"
+API_ERR_OTHER = "other"
+API_ERROR_KINDS = (
+    API_ERR_CAPACITY, API_ERR_RATE_LIMIT, API_ERR_NETWORK,
+    API_ERR_CONTEXT_OVERFLOW, API_ERR_REFUSAL, API_ERR_AUTH, API_ERR_OTHER,
+)
+
+# Substring probes, tried IN ORDER, matched case-insensitively. Sourced from the
+# messages actually present in this fleet's transcripts ("API Error: 529
+# Overloaded. This is a server-side issue...", "Prompt is too long", "Login
+# expired · Please run /login", "Please run /login · API Error: 401 OAuth access
+# token has expired", "...safeguards flagged this message", "Output blocked by
+# content filtering policy", "API Error: Server error mid-response").
+_API_ERROR_PROBES = (
+    # Auth / input / refusal first: their messages can carry an incidental
+    # status code ("Please run /login · API Error: 401 ...") and must not
+    # inflate the capacity series the per-model upstream panels read.
+    (API_ERR_AUTH, ("login expired", "oauth", "re-authenticate", "401")),
+    (API_ERR_CONTEXT_OVERFLOW, ("prompt is too long", "too many tokens",
+                                "context length", "context window")),
+    (API_ERR_REFUSAL, ("safeguards", "content filtering", "aup")),
+    (API_ERR_RATE_LIMIT, ("rate limit", "rate_limit", "429", "quota")),
+    (API_ERR_NETWORK, ("connection error", "connection reset", "timeout",
+                       "timed out", "econnreset", "network")),
+    (API_ERR_CAPACITY, ("overloaded", "529", "503", "502", "500",
+                        "server error", "internal server", "capacity")),
+)
+
+
+def classify_api_error(text):
+    """Classify one API-error entry's text into an ``API_ERROR_KINDS`` bucket.
+
+    See ``_API_ERROR_PROBES`` for the ordering rationale: the causes that are
+    OURS (auth, oversized context, a refusal) are matched before the ones that
+    are the provider's, so a message mentioning both is attributed to the cause
+    that actually needs acting on.
+    """
+    s = (text or "").lower()
+    for kind, needles in _API_ERROR_PROBES:
+        if any(n in s for n in needles):
+            return kind
+    return API_ERR_OTHER
+
+
+def _api_error_text(entry):
+    """Human-readable text of an API-error entry ('' when absent)."""
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and isinstance(b.get("text"), str)
+        ]
+        return " ".join(parts)
+    return ""
+
+
+def extract_api_errors(entries):
+    """[(timestamp, kind), ...] for every API-error entry, sorted by time.
+
+    An entry with no parseable timestamp is skipped — it cannot be placed in a
+    window, and a windowed count is the only thing this feeds.
+    """
+    out = []
+    for e in entries:
+        if e.get("isApiErrorMessage") is not True:
+            continue
+        ts = parse_ts(e.get("timestamp"))
+        if ts is None:
+            continue
+        out.append((ts, classify_api_error(_api_error_text(e))))
+    out.sort(key=lambda p: p[0])
+    return tuple(out)
+
 
 # Internal moment: one timestamped point on the transcript timeline.
 # ``output_tokens`` is the assistant turn's usage.output_tokens (thinking
@@ -426,10 +613,29 @@ def _is_stalled_inference(duration, output_tokens, stalled_tps, min_gap,
     return (output_tokens / duration) < stalled_tps
 
 
+def _split_stale(interval, stale_after):
+    """[interval] or [observed_part, unobservable_part] for an ACTIVE tail.
+
+    An idle / waiting_human tail is never split: absence of writes is exactly
+    what idle looks like, so silence CONFIRMS it rather than undermining it.
+    Only an active tail makes a claim that silence stops supporting.
+    """
+    if interval.category not in ACTIVE_CATEGORIES:
+        return [interval]
+    cut = interval.start + stale_after
+    if cut >= interval.end:
+        return [interval]
+    return [
+        interval._replace(end=cut),
+        interval._replace(start=cut, observed=False),
+    ]
+
+
 def _tail_interval(last, now, pending_tools, max_gap,
                    api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
-                   api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
-    """Open interval from the last moment to ``now`` = the agent's current
+                   api_stall_max=DEFAULT_API_STALL_MAX_SECONDS,
+                   stale_after=DEFAULT_STALE_AFTER_SECONDS):
+    """Open interval(s) from the last moment to ``now`` = the agent's current
     state, or None if ``now`` precedes the last moment.
 
     The current state is decided FIRST, from what the loop last did, and only
@@ -457,6 +663,14 @@ def _tail_interval(last, now, pending_tools, max_gap,
     return-of-control is far more likely a dormant / resumed / killed session
     than a genuine model stall, and must not read as sustained inference
     pressure.
+
+    Returns a LIST of 0-2 intervals. An ACTIVE tail longer than ``stale_after``
+    is split there: the first part keeps ``observed=True``, the remainder keeps
+    the SAME category with ``observed=False``. Same category on both halves is
+    the point — every category-based metric sees identical coverage, and only
+    the fleet-composition view distinguishes "in a tool" from "was in a tool
+    when we last heard from it" (a lid-closed host, an unbounded blocking
+    command — indistinguishable from here, and labelled as such).
     """
     if now is None or now <= last.ts:
         return None
@@ -475,23 +689,27 @@ def _tail_interval(last, now, pending_tools, max_gap,
         category = OVERHEAD
     if category in (IDLE, TOOL):
         # Parked-idle and in-flight tool are true wall-clock, never capped.
-        return Interval(last.ts, now, category)
+        return _split_stale(Interval(last.ts, now, category), stale_after)
     d = now - last.ts
+
     if category == INFERENCE and api_stall_tail <= d <= api_stall_max:
         # In-flight turn with nothing produced for this long: an API stall
         # (retry back-off / network / queueing), counted at true length.
-        return Interval(last.ts, now, INFERENCE, True)
+        return _split_stale(
+            Interval(last.ts, now, INFERENCE, True), stale_after
+        )
     if d > max_gap:
         # Dormant / resumed-session gap; not a multi-minute model stall.
-        return Interval(last.ts, min(now, last.ts + max_gap), IDLE)
-    return Interval(last.ts, now, category)
+        return [Interval(last.ts, min(now, last.ts + max_gap), IDLE)]
+    return _split_stale(Interval(last.ts, now, category), stale_after)
 
 
 def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
                     stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
                     min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
                     api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
-                    api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
+                    api_stall_max=DEFAULT_API_STALL_MAX_SECONDS,
+                    stale_after=DEFAULT_STALE_AFTER_SECONDS):
     """Ordered JSONL entries (dicts) -> list[Interval].
 
     ``entries`` need not be sorted; moments are sorted by timestamp. When
@@ -503,6 +721,10 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
     ``_is_stalled_inference``), from the gap having ended in an API error, or
     — for the trailing open interval — from the in-flight turn having produced
     nothing for ``api_stall_tail`` seconds (API retry back-off).
+
+    An ACTIVE trailing interval past ``stale_after`` seconds of silence is
+    split, the remainder carrying ``observed=False`` (same category) — see
+    ``_split_stale``.
     """
     moments = [m for m in (_entry_to_moment(e) for e in entries) if m is not None]
     moments.sort(key=lambda m: m.ts)
@@ -524,10 +746,11 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
     last = moments[-1]
     pending = [i for i in last.tool_use_ids if i not in result_ids]
     tail = _tail_interval(
-        last, now, pending, max_gap, api_stall_tail, api_stall_max
+        last, now, pending, max_gap, api_stall_tail, api_stall_max, stale_after
     )
-    if tail is not None and tail.end > tail.start:
-        intervals.append(tail)
+    for iv in tail or ():
+        if iv.end > iv.start:
+            intervals.append(iv)
     return intervals
 
 
@@ -715,6 +938,83 @@ def compute_stalled_inference_pressure(agent_intervals, window_start, window_end
     return {k: v / W for k, v in acc.items()}
 
 
+# --- fleet composition (occupancy, not pressure) -------------------------
+def interval_state(iv):
+    """The ``AGENT_STATES`` label for one interval.
+
+    ``observed=False`` wins over everything: once the transcript went silent we
+    are reporting our own blindness, not the state we last saw. Otherwise a
+    stalled inference interval reports ``inference_stalled`` and a productive
+    one ``inference``, so the two never double-count in a stack.
+    """
+    if not iv.observed:
+        return UNOBSERVABLE
+    if iv.category == INFERENCE:
+        return INFERENCE_STALLED if iv.stalled else INFERENCE
+    return iv.category
+
+
+def compute_mean_agents(agent_intervals, window_start, window_end):
+    """Mean number of agents per state over [window_start, window_end].
+
+    Returns a dict keyed by every ``AGENT_STATES`` label -> agent-seconds in
+    that state / window length. The unit is AGENTS: 1.0 means "one agent, the
+    whole window"; 4.0 means four. Summing the returned values gives the mean
+    number of agents present in the scope at all.
+
+    This is the honest fleet-composition series, and the reason it exists is
+    that ``compute_pressure``'s ``full`` cannot be one. ``full`` normalizes over
+    the ACTIVE agents, so a lone tool-bound worker reads 1.0 ("100% of the
+    fleet") while four workers doing four different things read ~0.0 in every
+    category at once. Nothing here is divided by an agent count, so neither
+    distortion is possible, and ``idle`` / ``waiting_human`` / ``unobservable``
+    are first-class: a quiet fleet reads as quiet instead of vanishing into a
+    shrinking denominator.
+    """
+    W = window_end - window_start
+    acc = {s: 0.0 for s in AGENT_STATES}
+    if W <= 0:
+        return acc
+    for ivs in agent_intervals.values():
+        for iv in ivs:
+            lo = max(iv.start, window_start)
+            hi = min(iv.end, window_end)
+            if hi <= lo:
+                continue
+            state = interval_state(iv)
+            if state in acc:
+                acc[state] += hi - lo
+    return {s: v / W for s, v in acc.items()}
+
+
+def is_unobservable_now(intervals):
+    """True when the agent's CURRENT (latest) interval is unobserved.
+
+    "We have not heard from this agent in ``stale_after`` seconds and the last
+    thing it was doing was work" — the suspended-host / runaway-command state,
+    which is neither busy nor idle.
+    """
+    if not intervals:
+        return False
+    latest = max(intervals, key=lambda iv: iv.end)
+    return not latest.observed
+
+
+def count_api_errors(transcripts, window_start, window_end):
+    """{kind: count} of API-error entries in [window_start, window_end).
+
+    ``transcripts`` is an iterable of ``Transcript``. Every kind in
+    ``API_ERROR_KINDS`` is present (0 when unseen) so a series does not blink
+    out of existence between storms.
+    """
+    acc = {k: 0 for k in API_ERROR_KINDS}
+    for t in transcripts:
+        for ts, kind in t.api_errors or ():
+            if window_start <= ts < window_end:
+                acc[kind] = acc.get(kind, 0) + 1
+    return acc
+
+
 # --- transcript discovery + reading -------------------------------------
 def _agent_id_from_path(path):
     base = os.path.basename(path)
@@ -728,7 +1028,8 @@ def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
                     stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
                     min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
                     api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
-                    api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
+                    api_stall_max=DEFAULT_API_STALL_MAX_SECONDS,
+                    stale_after=DEFAULT_STALE_AFTER_SECONDS):
     """Read one transcript file -> Transcript, tolerant of malformed lines.
 
     Returns None if the file can't be read at all. Individual bad JSONL lines
@@ -757,11 +1058,13 @@ def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
         entries, now=now, max_gap=max_gap,
         stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
         api_stall_tail=api_stall_tail, api_stall_max=api_stall_max,
+        stale_after=stale_after,
     )
     model = extract_model(entries)
     running = is_running_transcript(entries)
     return Transcript(
-        agent_id, session_id, is_main_loop, model, mtime, intervals, running
+        agent_id, session_id, is_main_loop, model, mtime, intervals, running,
+        extract_api_errors(entries),
     )
 
 
@@ -809,7 +1112,8 @@ def collect_live_transcripts(projects_dir, now, max_gap=DEFAULT_MAX_GAP_SECONDS,
                              stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
                              min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
                              api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
-                             api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
+                             api_stall_max=DEFAULT_API_STALL_MAX_SECONDS,
+                             stale_after=DEFAULT_STALE_AFTER_SECONDS):
     """Read every transcript whose file was modified within ``live_window`` of
     ``now``. Returns list[Transcript]."""
     live = []
@@ -825,6 +1129,7 @@ def collect_live_transcripts(projects_dir, now, max_gap=DEFAULT_MAX_GAP_SECONDS,
             is_main_loop=is_main, session_id=session_id,
             stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
             api_stall_tail=api_stall_tail, api_stall_max=api_stall_max,
+            stale_after=stale_after,
         )
         if t is not None:
             live.append(t)

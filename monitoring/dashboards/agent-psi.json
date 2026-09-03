@@ -369,7 +369,7 @@
     },
     {
       "id": 4,
-      "title": "tool full (60s)",
+      "title": "tool — every active agent (60s)",
       "type": "stat",
       "gridPos": {
         "h": 5,
@@ -439,11 +439,11 @@
         "justifyMode": "auto",
         "textMode": "value_and_name"
       },
-      "description": "Fraction of the last 60s blocked on a tool. Main = the MAIN LOOP. Fleet = every active sub-agent blocked on a tool at once (main loop excluded)."
+      "description": "agent_psi_tool_full: the fraction of the trailing 60s in which EVERY ACTIVE agent in the scope was inside a tool call. This is PSI `full` — a unanimity signal, normalized over the active agents only — so with a single active worker it saturates at 100% by construction, and it collapses toward 0 when several workers are in different states. It answers 'is tool time blocking the whole scope at once', NOT 'how busy is the fleet'. For occupancy read the mean-concurrent-agents panels below."
     },
     {
       "id": 5,
-      "title": "tool full (300s)",
+      "title": "tool — every active agent (300s)",
       "type": "stat",
       "gridPos": {
         "h": 5,
@@ -513,7 +513,7 @@
         "justifyMode": "auto",
         "textMode": "value_and_name"
       },
-      "description": "Sustained (5-min) tool pressure. Main = main-loop tool pressure. Fleet = every active sub-agent blocked on a tool at once over the trailing 300s (main loop excluded)."
+      "description": "agent_psi_tool_full: the fraction of the trailing 300s in which EVERY ACTIVE agent in the scope was inside a tool call. This is PSI `full` — a unanimity signal, normalized over the active agents only — so with a single active worker it saturates at 100% by construction, and it collapses toward 0 when several workers are in different states. It answers 'is tool time blocking the whole scope at once', NOT 'how busy is the fleet'. For occupancy read the mean-concurrent-agents panels below."
     },
     {
       "id": 6,
@@ -662,67 +662,11 @@
         "justifyMode": "auto",
         "textMode": "value_and_name"
       },
-      "description": "Per-model fleet inference pressure (60s), split PRODUCTIVE vs STALLED over just the fleet workers on that model. A single model whose STALLED share is pinned high is that model rate-limiting the fleet (429 / network / TTFT), while the others still generate — so the split isolates which model is the bottleneck. productive = full − stalled, clamped at 0. Main loop excluded."
-    },
-    {
-      "id": 11,
-      "title": "Main vs fleet — busy full (60s)",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 23
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "clamp_max(agent_psi_inference_full{scope=\"main\",window=\"60\",model=\"all\"} + agent_psi_tool_full{scope=\"main\",window=\"60\",model=\"all\"} + agent_psi_overhead_full{scope=\"main\",window=\"60\",model=\"all\"}, 1)",
-          "legendFormat": "main",
-          "refId": "A"
-        },
-        {
-          "expr": "clamp_max(agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"} + agent_psi_tool_full{scope=\"fleet\",window=\"60\",model=\"all\"} + agent_psi_overhead_full{scope=\"fleet\",window=\"60\",model=\"all\"}, 1)",
-          "legendFormat": "fleet",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "description": "Main loop vs sub-agent fleet busy-full over time (60s window), so the dispatcher idle-heavy profile stays visibly separate from the workers. Busy = inference + tool + overhead; mutually exclusive states, clamped to 100% for measurement-edge noise."
+      "description": "Per-model inference pressure (fleet, 60s), as PSI some/full fractions — note these ARE normalized over each model's active agents, so read them as 'of the opus workers that were active, what share of the window were they all stalled', never as a fleet-wide occupancy. The tiles hardcode opus and sonnet; the by-model time series below plots every family that shows up, including the main loop's."
     },
     {
       "id": 12,
-      "title": "Fleet busy — inference / tool / overhead / stalled (60s, stacked)",
+      "title": "Fleet composition — mean concurrent agents by state (60s, stacked)",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -736,24 +680,39 @@
       },
       "targets": [
         {
-          "expr": "clamp_min(agent_psi_inference_full{scope=\"fleet\",window=\"60\",model=\"all\"} - agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}, 0)",
           "refId": "A",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"inference\"}",
           "legendFormat": "inference (productive)"
         },
         {
-          "expr": "agent_psi_tool_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
+          "refId": "B",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"inference_stalled\"}",
+          "legendFormat": "stalled (capacity / rate-limit / network)"
+        },
+        {
           "refId": "C",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"tool\"}",
           "legendFormat": "tool use"
         },
         {
-          "expr": "agent_psi_overhead_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
           "refId": "D",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"overhead\"}",
           "legendFormat": "overhead (bookkeeping)"
         },
         {
-          "expr": "agent_psi_inference_stalled_full{scope=\"fleet\",window=\"60\",model=\"all\"}",
-          "refId": "B",
-          "legendFormat": "stalled (rate-limit / network)"
+          "refId": "E",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"unobservable\"}",
+          "legendFormat": "unobservable (host silent)"
+        },
+        {
+          "refId": "F",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"idle\"}",
+          "legendFormat": "idle (parked)"
+        },
+        {
+          "refId": "G",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"waiting_human\"}",
+          "legendFormat": "waiting on a human"
         }
       ],
       "fieldConfig": {
@@ -770,11 +729,12 @@
             "spanNulls": false,
             "stacking": {
               "mode": "normal"
-            }
+            },
+            "axisLabel": "agents"
           },
-          "unit": "percentunit",
+          "unit": "none",
           "min": 0,
-          "max": 1
+          "decimals": 2
         },
         "overrides": [
           {
@@ -796,7 +756,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "stalled (rate-limit / network)"
+              "options": "stalled (capacity / rate-limit / network)"
             },
             "properties": [
               {
@@ -840,6 +800,54 @@
                 "value": "#b58900"
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unobservable (host silent)"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#d33682"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "idle (parked)"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#586e75"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "waiting on a human"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#2aa198"
+              }
+            ]
           }
         ]
       },
@@ -852,7 +860,180 @@
           "mode": "multi"
         }
       },
-      "description": "THE headline view: fleet busy time (60s window) split into four stacked bands. The stack HEIGHT is total busy-full (fraction of the window every active worker was doing something at once); the COLOR split shows what that time went to. INFERENCE (green) is productive generation, compute-bound. TOOL USE (blue) is time inside tool calls. OVERHEAD (yellow) is bookkeeping between the two. STALLED (red) is blocked-but-not-generating: 429 back-off / network / TTFT / queueing, i.e. rate-limit bound. When the red band dominates a tall stack, more parallelism buys nothing. The four categories are mutually exclusive by construction, so the stack is an honest total; inference = inference-full minus stalled, clamped at 0. Main loop excluded."
+      "description": "THE headline view: what the sub-agent fleet's time is actually going to, as a stack of MEAN CONCURRENT AGENTS per state over a 60s window. The stack HEIGHT is the mean number of agents present (busy + idle), so the y-axis is agents, not a percentage: one busy worker reads 1.0, four read 4.0. That is the whole point of the unit. This panel used to stack agent_psi_*_full, which CANNOT express fleet composition: `full` is a PSI unanimity signal normalized over the ACTIVE agents, so a single tool-bound worker rendered as a 100%-tool fleet, and — the converse, measured on this fleet — four workers in four different states collapsed every band toward zero at peak concurrency. Bands: INFERENCE (green) productive generation. STALLED (red) blocked but generating nothing — 529 / 429 back-off, network, TTFT, queueing; pair it with the per-model API-error panel below to see WHICH model and WHY. TOOL (blue) inside a tool call. OVERHEAD (yellow) between-turn bookkeeping. UNOBSERVABLE (magenta) no transcript write for AGENT_PSI_STALE_AFTER_SECONDS while last seen working: a suspended host and a runaway blocking command are indistinguishable from a transcript, and this band is that admission, not a claim the agent is gone. IDLE (grey) parked between turns; WAITING (cyan) blocked on a human. Main loop excluded — it has its own panel."
+    },
+    {
+      "id": 11,
+      "title": "Main vs fleet — busy / idle / unobservable agents (60s)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum without (state) (agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=~\"inference|inference_stalled|tool|overhead\"})",
+          "legendFormat": "fleet busy"
+        },
+        {
+          "refId": "B",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"idle\"}",
+          "legendFormat": "fleet idle"
+        },
+        {
+          "refId": "C",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model=\"all\",state=\"unobservable\"}",
+          "legendFormat": "fleet unobservable"
+        },
+        {
+          "refId": "D",
+          "expr": "sum without (state) (agent_psi_mean_agents{scope=\"main\",window=\"60\",model=\"all\",state=~\"inference|inference_stalled|tool|overhead\"})",
+          "legendFormat": "main busy"
+        },
+        {
+          "refId": "E",
+          "expr": "agent_psi_mean_agents{scope=\"main\",window=\"60\",model=\"all\",state=\"idle\"}",
+          "legendFormat": "main idle"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisLabel": "agents"
+          },
+          "unit": "none",
+          "min": 0,
+          "decimals": 2
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fleet busy"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#859900"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fleet idle"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#586e75"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fleet unobservable"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#d33682"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "main busy"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#268bd2"
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "main idle"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#2aa198"
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "description": "Dispatcher vs workers, in MEAN CONCURRENT AGENTS (60s window) — not a percentage, so the two are directly comparable even though the main scope holds exactly one agent (its lines are therefore bounded by 1.0 and read as 'fraction of the window busy'), while the fleet's are unbounded and read as 'how many workers were busy at once'. IDLE is plotted explicitly because the main loop is idle BY DESIGN: it parks on event holds between dispatches, and a busy-only view of a mostly-parked dispatcher has no honest denominator. Unobservable is broken out for the same reason it is on the composition panel: a silent host must not read as either busy or quiet. Busy = inference + stalled + tool + overhead."
     },
     {
       "id": 13,
@@ -907,6 +1088,193 @@
         }
       },
       "description": "Per-agent duty cycle: share of ACTIVE time (total − idle − waiting_human) spent on inference / tool / overhead. agent_id is a sub-agent id or main_loop:<session>. Stacked per agent — for a serial agent this equals its some==full pressure."
+    },
+    {
+      "id": 14,
+      "title": "Upstream API errors by model and cause (fleet + main, 5m)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model, kind) (agent_psi_api_errors{window=\"300\",model!=\"all\",kind!=\"refusal\",kind!=\"auth\"})",
+          "legendFormat": "{{model}} · {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal"
+            },
+            "axisLabel": "errors in window"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Observed API-error entries per MODEL and CAUSE over a trailing 5m window — the per-model upstream-impact signal, and the input to model-routing policy. Model families are provisioned and rate-limited independently, so the actionable statement is 'opus took N capacity errors in this window while fable took none', which a model=all aggregate cannot make. CAUSES are separated because they are different knobs: capacity (529 / 5xx / overloaded — the provider is out of headroom; knob = which model, when, retry budget), rate_limit (429 / quota — knob = our concurrency and fleet size), network (transport failed before a verdict — ours to chase), context_overflow (prompt too long — self-inflicted, and the direct outcome of an opus-vs-sonnet routing choice, so it must never read as provider trouble), other (recognised but unmatched — visible on purpose). Refusals and auth failures are filtered out here: neither is a performance signal. These are counts of OBSERVED events only — the task-level cost of a retry (an agent dying and being respawned) needs cross-agent semantics this layer does not have, and is not modelled here. Both fleet and main scopes are summed, so the dispatcher's own errors are included."
+    },
+    {
+      "id": 15,
+      "title": "Stalled agents by model (fleet, 60s, stacked)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_psi_mean_agents{scope=\"fleet\",window=\"60\",model!=\"all\",state=\"inference_stalled\"}",
+          "legendFormat": "{{model}} stalled"
+        },
+        {
+          "refId": "B",
+          "expr": "agent_psi_mean_agents{scope=\"main\",window=\"60\",model!=\"all\",state=\"inference_stalled\"}",
+          "legendFormat": "main ({{model}}) stalled"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 35,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal"
+            },
+            "axisLabel": "agents"
+          },
+          "unit": "none",
+          "decimals": 2,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "How many agents of each MODEL were stalled at once (mean concurrent agents, 60s window) — the time-in-state companion to the error-count panel above, and the series that answers 'how much did that capacity episode actually cost us, per model'. Legends come from the metric's own model label ({{model}}), so a new family appears without a dashboard edit, and the main loop's model is plotted alongside the workers instead of being aggregated away. Stacked, in agents: unlike agent_psi_inference_stalled_full this is not divided by an active-agent count, so a lone stalled worker reads 1.0 rather than 'the whole fleet is rate-limited', and a fleet split across models still sums honestly."
+    },
+    {
+      "id": 16,
+      "title": "Agents we have lost sight of (unobservable)",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_psi_stale_agents{scope=\"fleet\",model=\"all\"}",
+          "legendFormat": "fleet"
+        },
+        {
+          "refId": "B",
+          "expr": "agent_psi_stale_agents{scope=\"main\",model=\"all\"}",
+          "legendFormat": "main"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#cb4b16",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "description": "Agents whose CURRENT state is unobservable: no transcript write for AGENT_PSI_STALE_AFTER_SECONDS while the last thing we saw them do was work. Nonzero means a host went away mid-run (a closed laptop lid, a suspended VM, a killed client) OR a tool has been blocking for longer than the threshold — indistinguishable from a transcript, which is why this is its own number rather than being counted as busy or idle. Note the horizon: past AGENT_PSI_LIVE_WINDOW_SECONDS the transcript leaves the live set entirely and stops being counted anywhere, so a long suspension shows here first and then simply drops out."
     }
   ]
 }
