@@ -43,6 +43,20 @@ Scenarios covered:
       and blocked status all exempt it; suppressed with no readable
       owner input; the count series is always emitted and resets
       between scrapes.
+  (28) agent runs lost to upstream API errors, read from the per-item
+      transcript archives: a three-death archive reads 3 with
+      model="unknown" (the run never produced a real assistant turn, so
+      the model is genuinely unrecoverable and is NOT guessed); a
+      one-death archive whose run did produce turns has its model
+      recovered, in either file order; a clean archive is absent
+      entirely; transient (529 / mid-response server error) and
+      non-transient (over-long prompt) deaths land in separate counter
+      series; re-scraping does not double-count and a GROWN archive adds
+      only its new death; the scan window excludes old archives and a
+      wider window brings them back; an unreadable archive dir reads
+      input_available=0 with archives_scanned=0 and NO per-item series
+      rather than a confident zero; quarantined items get an age gauge
+      that clears when they leave quarantine.
   (26) build identity: worktask_exporter_build_info carries the
       env-provided commit/version/source, falls back to
       commit="unknown"/version="0.0.0"/source="host" when nothing
@@ -87,6 +101,8 @@ def load_exporter(env):
         "QUEUE_JSON",
         "AGENT_STATE_JSON",
         "AGENT_QUEUE_BINDINGS_JSON",
+        "QUEUE_LOG_ARCHIVE_DIR",
+        "API_DEATH_WINDOW_DAYS",
     ) + BUILD_ENV_KEYS:
         saved[k] = os.environ.get(k)
     for k in BUILD_ENV_KEYS:
@@ -143,6 +159,71 @@ def write_bindings(path, qid_to_aid):
         json.dump({"bindings": bindings}, f)
 
 
+def api_error_line(status, *, error="server_error", ts="2026-09-03T14:09:01.710Z"):
+    """One archived transcript line for a run killed by an upstream API error.
+
+    Mirrors the real shape: the message is composed CLIENT-side when the API
+    call fails, so its `model` reads `<synthetic>` and carries no information
+    about which model the dead run was using. Tests that assert model
+    attribution depend on that being true here.
+    """
+    rec = {
+        "type": "assistant",
+        "isSidechain": True,
+        "timestamp": ts,
+        "isApiErrorMessage": True,
+        "error": error,
+        "message": {
+            "role": "assistant",
+            "model": "<synthetic>",
+            "content": [{"type": "text", "text": f"API Error: {status}"}],
+        },
+    }
+    if status is not None:
+        rec["apiErrorStatus"] = status
+    return rec
+
+
+def assistant_line(model, ts="2026-09-03T14:08:00.000Z"):
+    """An ordinary assistant turn — the ONLY place a real model name appears."""
+    return {
+        "type": "assistant",
+        "isSidechain": True,
+        "timestamp": ts,
+        "message": {
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": "working"}],
+        },
+    }
+
+
+def user_line(text="continue", ts="2026-09-03T14:08:30.000Z"):
+    return {
+        "type": "user",
+        "isSidechain": True,
+        "timestamp": ts,
+        "message": {"role": "user", "content": text},
+    }
+
+
+def write_archive(archive_dir, qid, records, *, age_days=0):
+    """Write `<archive_dir>/<qid>.jsonl` from a list of record dicts.
+
+    `age_days` backdates the file mtime, which is what the exporter's scan
+    window filters on.
+    """
+    os.makedirs(archive_dir, exist_ok=True)
+    path = os.path.join(archive_dir, f"{qid}.jsonl")
+    with open(path, "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    if age_days:
+        old = time.time() - age_days * 86400
+        os.utime(path, (old, old))
+    return path
+
+
 def find_sample(mod, metric_name, label_filters):
     for fam in mod.REG.collect():
         if fam.name != metric_name:
@@ -156,6 +237,26 @@ def find_sample(mod, metric_name, label_filters):
                     ok = False
                     break
             if ok:
+                return sample.value
+    return None
+
+
+def find_counter(mod, family_name, label_filters):
+    """Return a Counter's `_total` sample value, else None.
+
+    `find_sample` cannot do this: prometheus_client names a counter FAMILY
+    without the suffix (`worktask_queue_agent_api_deaths`) while the sample
+    it exposes carries it (`..._total`), so the family==sample equality
+    that helper relies on never holds for a counter.
+    """
+    want = family_name + "_total"
+    for fam in mod.REG.collect():
+        if fam.name != family_name:
+            continue
+        for sample in fam.samples:
+            if sample.name != want:
+                continue
+            if all(sample.labels.get(k) == v for k, v in label_filters.items()):
                 return sample.value
     return None
 
@@ -232,9 +333,18 @@ def run_scenarios():
     qjson = os.path.join(tmpdir, "queue.json")
     astate = os.path.join(tmpdir, "active-agents.json")
 
+    # Every scenario gets an EMPTY archive dir by default. Left unset, the
+    # exporter would derive it from QUEUE_JSON's directory, find nothing, and
+    # log the unreadable-input warning through scenarios that are about
+    # something else entirely — so point it at a real, empty directory and let
+    # scenario 28 populate its own.
+    archives = os.path.join(tmpdir, "queue-logs")
+    os.makedirs(archives, exist_ok=True)
+
     env = {
         "QUEUE_JSON": qjson,
         "AGENT_STATE_JSON": astate,
+        "QUEUE_LOG_ARCHIVE_DIR": archives,
         "PORT": "9099",
     }
 
@@ -1495,6 +1605,235 @@ def run_scenarios():
           "expected None, got " + repr(age))
     n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
     check("S27h owner_unknown_items back to 0", n == 0.0, "got " + repr(n))
+
+    # ---- Scenario 28: agent runs lost to upstream API errors.
+    #
+    # Grounded in a real incident. One queue item was spawned, killed by
+    # `529 Overloaded`, respawned with continuation context, killed again,
+    # respawned, killed a third time, and then quarantined and abandoned —
+    # three agent runs bought nothing. A second, unrelated item lost exactly
+    # one run to the same storm and then completed. The retry of the first
+    # item succeeded on its first try. Nothing in the queue's own fields
+    # records any of that: the free-text abandon reason mentions it, and
+    # nothing else does. The archived transcripts DO, machine-readably, and
+    # 28a/28b/28c reproduce those three items in that order.
+    print("\nScenario 28: agent runs lost to upstream API errors")
+    api_dir = os.path.join(tmpdir, "api-archives")
+    os.makedirs(api_dir, exist_ok=True)
+    api_env = dict(env)
+    api_env["QUEUE_LOG_ARCHIVE_DIR"] = api_dir
+
+    # 28a: three deaths in one archive, and NOT ONE real assistant turn --
+    # every reply the run ever got was an error. This is the worst case for
+    # model attribution and the one that matters most: the model must read
+    # `unknown` rather than be inferred from anything else.
+    write_archive(api_dir, "q-s28a", [
+        user_line("Queue item: q-s28a"),
+        api_error_line(529, ts="2026-09-03T14:09:01.710Z"),
+        user_line("continue", ts="2026-09-03T14:09:13.822Z"),
+        api_error_line(529, ts="2026-09-03T14:12:54.209Z"),
+        user_line("continue", ts="2026-09-03T14:28:15.717Z"),
+        api_error_line(529, ts="2026-09-03T14:31:39.652Z"),
+    ])
+    # 28b: one death, but the run had produced real assistant turns first,
+    # so its model IS recoverable.
+    write_archive(api_dir, "q-s28b", [
+        user_line("Queue item: q-s28b"),
+        assistant_line("claude-opus-5"),
+        api_error_line(529, ts="2026-09-03T15:45:04.853Z"),
+    ])
+    # 28c: a clean run. Must not appear in the per-item gauge at all.
+    write_archive(api_dir, "q-s28c", [
+        user_line("Queue item: q-s28c"),
+        assistant_line("claude-opus-5"),
+    ])
+    items = [
+        {**make_running_item("q-s28a", "burned three runs"), "status": "abandoned"},
+        {**make_running_item("q-s28b", "burned one run"), "status": "done"},
+        {**make_running_item("q-s28c", "succeeded first try"), "status": "done"},
+    ]
+    write_queue(qjson, items)
+    write_agent_state(astate, [])
+    mod = load_exporter(api_env)
+    mod.collect()
+
+    v = find_any_sample(mod, "worktask_queue_item_api_deaths", "q-s28a")
+    check("S28a item that burned three runs reads 3", v == 3.0, f"got {v!r}")
+    v = find_sample(mod, "worktask_queue_item_api_deaths",
+                    {"id": "q-s28a", "model": "unknown"})
+    check(
+        "S28a model is `unknown`, not guessed, when no real turn ever ran",
+        v == 3.0, f"got {v!r}",
+    )
+    v = find_sample(mod, "worktask_queue_item_api_deaths",
+                    {"id": "q-s28b", "model": "claude-opus-5"})
+    check("S28b model recovered from a real assistant turn", v == 1.0,
+          f"got {v!r}")
+    v = find_any_sample(mod, "worktask_queue_item_api_deaths", "q-s28c")
+    check("S28c clean item absent from the per-item gauge", v is None,
+          f"got {v!r}")
+    n = find_sample(mod, "worktask_queue_items_with_api_deaths", {})
+    check("S28 items_with_api_deaths counts only the two offenders",
+          n == 2.0, f"got {n!r}")
+    n = find_sample(mod, "worktask_queue_api_death_archives_scanned", {})
+    check("S28 archives_scanned counts every archive, not just the bad ones",
+          n == 3.0, f"got {n!r}")
+    n = find_sample(mod, "worktask_queue_api_death_input_available", {})
+    check("S28 input_available == 1 with a readable archive dir", n == 1.0,
+          f"got {n!r}")
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "529", "error_class": "transient",
+                     "model": "unknown"})
+    check("S28 counter: 3 transient 529 deaths at model=unknown", n == 3.0,
+          f"got {n!r}")
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "529", "error_class": "transient",
+                     "model": "claude-opus-5"})
+    check("S28 counter: 1 transient 529 death at model=claude-opus-5",
+          n == 1.0, f"got {n!r}")
+
+    # 28d: the transient/non-transient split. A run lost to 529 is a capacity
+    # cost; a run lost to an over-long prompt is a briefing bug that would
+    # fail identically on respawn. Counting them under one label would answer
+    # neither question, so they must land in different series.
+    write_archive(api_dir, "q-s28d", [
+        user_line("Queue item: q-s28d"),
+        assistant_line("claude-sonnet-5"),
+        api_error_line(None, error="invalid_request",
+                       ts="2026-06-18T07:45:32.351Z"),
+    ])
+    write_archive(api_dir, "q-s28d2", [
+        user_line("Queue item: q-s28d2"),
+        assistant_line("claude-sonnet-5"),
+        api_error_line(None, error="server_error",
+                       ts="2026-08-21T00:31:41.477Z"),
+    ])
+    mod = load_exporter(api_env)
+    mod.collect()
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "none", "error_class": "non_transient",
+                     "model": "claude-sonnet-5"})
+    check("S28d over-long prompt (no status) classed non_transient",
+          n == 1.0, f"got {n!r}")
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "none", "error_class": "transient",
+                     "model": "claude-sonnet-5"})
+    check("S28d mid-response server error (no status) classed transient",
+          n == 1.0, f"got {n!r}")
+
+    # 28e: an archive GROWS while its item keeps churning -- each respawn
+    # appends another error line. The counter must pick up only the NEW
+    # death, and repeated scrapes of an unchanged archive must add nothing.
+    mod.collect()
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "529", "error_class": "transient",
+                     "model": "unknown"})
+    check("S28e re-scraping an unchanged archive does not double-count",
+          n == 3.0, f"got {n!r}")
+    write_archive(api_dir, "q-s28a", [
+        user_line("Queue item: q-s28a"),
+        api_error_line(529, ts="2026-09-03T14:09:01.710Z"),
+        user_line("continue", ts="2026-09-03T14:09:13.822Z"),
+        api_error_line(529, ts="2026-09-03T14:12:54.209Z"),
+        user_line("continue", ts="2026-09-03T14:28:15.717Z"),
+        api_error_line(529, ts="2026-09-03T14:31:39.652Z"),
+        user_line("continue", ts="2026-09-03T14:35:00.000Z"),
+        api_error_line(529, ts="2026-09-03T14:38:12.000Z"),
+    ])
+    mod.collect()
+    n = find_counter(mod, "worktask_queue_agent_api_deaths",
+                    {"status_code": "529", "error_class": "transient",
+                     "model": "unknown"})
+    check("S28e a grown archive adds exactly its new death", n == 4.0,
+          f"got {n!r}")
+    v = find_any_sample(mod, "worktask_queue_item_api_deaths", "q-s28a")
+    check("S28e per-item gauge tracks the grown total", v == 4.0, f"got {v!r}")
+
+    # 28f: archives older than the window are not scanned. The window bounds
+    # the work AND defines what the counters describe.
+    write_archive(api_dir, "q-s28f", [
+        user_line("Queue item: q-s28f"),
+        assistant_line("claude-opus-4-8"),
+        api_error_line(529, ts="2026-01-01T00:00:00.000Z"),
+    ], age_days=90)
+    mod = load_exporter(api_env)
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_api_deaths", "q-s28f")
+    check("S28f archive outside the window is not counted", v is None,
+          f"got {v!r}")
+    # ...and widening the window brings it back, proving the omission was the
+    # window rather than a parse failure.
+    wide_env = dict(api_env)
+    wide_env["API_DEATH_WINDOW_DAYS"] = "365"
+    mod = load_exporter(wide_env)
+    mod.collect()
+    v = find_sample(mod, "worktask_queue_item_api_deaths",
+                    {"id": "q-s28f", "model": "claude-opus-4-8"})
+    check("S28f a wider window does count it", v == 1.0, f"got {v!r}")
+
+    # 28g: an unreadable archive dir is a DEPLOYMENT fault, and must not be
+    # published as a confident "no task ever lost a run". The per-item series
+    # go absent and archives_scanned reads 0 so the zero is explicable.
+    missing_env = dict(env)
+    missing_env["QUEUE_LOG_ARCHIVE_DIR"] = os.path.join(tmpdir, "not-mounted")
+    mod = load_exporter(missing_env)
+    mod.collect()
+    n = find_sample(mod, "worktask_queue_api_death_input_available", {})
+    check("S28g input_available == 0 on an unreadable archive dir", n == 0.0,
+          f"got {n!r}")
+    n = find_sample(mod, "worktask_queue_api_death_archives_scanned", {})
+    check("S28g archives_scanned == 0 explains the zero death count",
+          n == 0.0, f"got {n!r}")
+    got = [
+        s for fam in mod.REG.collect() if fam.name == "worktask_queue_item_api_deaths"
+        for s in fam.samples
+    ]
+    check("S28g per-item death series absent, not zeroed", got == [],
+          f"got {got!r}")
+
+    # 28h: quarantine — where an item lands when its runs kept dying and the
+    # main loop stopped respawning. Not terminal, and it still holds its
+    # scope lock, so the age is what makes a forgotten one alertable.
+    q_item = make_running_item("q-s28h", "quarantined after a retry storm")
+    q_item["status"] = "quarantined"
+    q_item["quarantined_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=900)
+    ).isoformat()
+    write_queue(qjson, [q_item])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_any_sample(
+        mod, "worktask_queue_item_quarantined_age_seconds", "q-s28h",
+    )
+    check("S28h quarantined_age emitted for a quarantined item",
+          v is not None and 890 <= v <= 960, f"got {v!r}")
+    n = find_sample(mod, "worktask_queue_items_total", {"status": "quarantined"})
+    check("S28h status count still reports the quarantined item", n == 1.0,
+          f"got {n!r}")
+    q_item["status"] = "running"
+    write_queue(qjson, [q_item])
+    mod.collect()
+    v = find_any_sample(
+        mod, "worktask_queue_item_quarantined_age_seconds", "q-s28h",
+    )
+    check("S28h series cleared once the item leaves quarantine", v is None,
+          f"got {v!r}")
+
+    # 28i: a run whose only real assistant turn came AFTER the death line
+    # (the death was a retried early call). One archive holds one agent run,
+    # so that turn still identifies the model — attribution must not depend
+    # on file order.
+    write_archive(api_dir, "q-s28i", [
+        user_line("Queue item: q-s28i"),
+        api_error_line(500, ts="2026-05-16T18:13:58.448Z"),
+        assistant_line("claude-opus-4-7", ts="2026-05-16T18:15:00.000Z"),
+    ])
+    mod = load_exporter(api_env)
+    mod.collect()
+    v = find_sample(mod, "worktask_queue_item_api_deaths",
+                    {"id": "q-s28i", "model": "claude-opus-4-7"})
+    check("S28i model recovered from a turn AFTER the death", v == 1.0,
+          f"got {v!r}")
 
     print()
     if failures:

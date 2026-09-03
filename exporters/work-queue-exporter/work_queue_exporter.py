@@ -101,6 +101,67 @@ Progress-vs-runtime (rev 2026-05-16 — workload heartbeat):
   WITH stale progress (workloads). Either-or, never both timers AND'd
   against an absent metric.
 
+Upstream-API death cost (rev 2026-09-03 — task-level retry cost):
+
+  A queue item can burn several agent runs before it produces anything:
+  the agent is spawned, the upstream API returns a capacity error
+  (529 Overloaded, 500, 503, a mid-response server error), the run dies,
+  the main loop respawns it with continuation context, and the cycle can
+  repeat up to the respawn cap before the item is quarantined and finally
+  abandoned. The wall-clock and agent-run cost of that is real and it is
+  invisible in every existing series here: the item just reads `running`
+  for a while and then flips to `abandoned`, indistinguishable from an
+  item abandoned for any other reason.
+
+  Process-level pressure sampling cannot supply this number either. It
+  can see that a process is retrying, but "how many AGENT RUNS did this
+  QUEUE ITEM lose" is inter-agent semantics — it lives in the work-queue
+  layer, which is the only place that knows an agent run belonged to a
+  task and that a later run continued the same task.
+
+  The durable evidence is the per-item transcript archive: `session-task`
+  copies the owning agent's JSONL to
+  `<QUEUE_LOG_ARCHIVE_DIR>/<queue-id>.jsonl` when an item is finalized
+  (done / abandoned), and stamps `log_archive_path` on the item. A run
+  killed by an upstream API error leaves a machine-readable terminal
+  record in that transcript: an assistant line with
+  `isApiErrorMessage: true`, an `apiErrorStatus` (the HTTP status, when
+  the client captured one) and an `error` class. Counting those lines per
+  archive IS the per-item count of agent runs lost to the API.
+
+  Three properties of this source are load-bearing and are NOT papered
+  over anywhere below:
+
+    1. It is POST-HOC, not live. An archive appears when the item is
+       finalized, so a task currently burning runs is not yet visible
+       here. This is a cost/accounting series, not an incident alert —
+       alert on the retry-storm and stall series instead, and read these
+       to answer "what did that storm cost us".
+    2. MODEL ATTRIBUTION IS BEST-EFFORT. The error line's own `model`
+       field reads `<synthetic>` — the message is composed client-side,
+       not by a model — so the model must be recovered from a real
+       assistant turn elsewhere in the same archive. One archive holds
+       exactly one agent run, so any real model in it identifies the run.
+       But a run that died on its FIRST turn never produced a real
+       assistant message, and for that run the model is genuinely
+       unrecoverable: it is labelled `model="unknown"` rather than
+       guessed. That is the worst case for the question being asked (the
+       hardest-hit runs are the least attributable), and pretending
+       otherwise would be worse than saying so.
+    3. RESPAWN CHAINS ARE NOT RECONSTRUCTABLE. When a quarantined item
+       is released and re-queued under a NEW id, nothing structured links
+       the two — the relationship survives only in free-text reasons. The
+       queue's `resurrected_from` / `resurrected_as` fields are a
+       different mechanism (recovering orphans after a restart) and are
+       deliberately not reported as API respawns. The honest per-task
+       cost number available here is deaths-per-item, and that is what is
+       exported; no cross-item respawn chain is synthesised.
+
+  The scan is bounded to archives modified within API_DEATH_WINDOW_DAYS
+  and memoised on (mtime, size), so a scrape re-reads only archives that
+  changed. Archives without the error marker are rejected on a substring
+  test without being parsed.
+
 Metrics:
   - worktask_queue_items_total{status}       gauge  (pending/running/done/abandoned)
   - worktask_queue_duration_seconds{phase}   histogram (wait/run/total)
@@ -165,6 +226,39 @@ Metrics:
         — is readable and well-formed, 0 otherwise. Both 0 means the
         exporter has no owner signal at all and is deliberately silent on
         has_live_owner.)
+  - worktask_queue_agent_api_deaths_total{status_code,error_class,model}
+        counter (agent runs lost to an upstream API error, discovered in
+        the per-item transcript archives. `status_code` is the HTTP status
+        the client recorded, or `none` when it recorded none — a stream
+        idle timeout and an over-long prompt both land there. `error_class`
+        is `transient` for the capacity/availability statuses worth
+        respawning into (408/429/500/502/503/504/529 and unclassified
+        server errors) and `non_transient` otherwise. `model` is the model
+        the dead run was using, or `unknown` when it died before emitting
+        a real assistant turn.)
+  - worktask_queue_item_api_deaths{id,summary,model} gauge (count of agent
+        runs THIS item lost to API errors, within the scan window. The
+        per-task cost number: an item that burned three runs reads 3.
+        Emitted only for items with at least one death.)
+  - worktask_queue_items_with_api_deaths     gauge (how many items in the
+        window lost at least one run. Unlabelled, so it is always one
+        series and cannot go absent — a 0 here is only evidence of a clean
+        window when archives_scanned > 0 and input_available = 1.)
+  - worktask_queue_api_death_archives_scanned gauge (archives considered
+        in the window. This is the disambiguator: a wrong or unmounted
+        QUEUE_LOG_ARCHIVE_DIR reads 0 here, while items_with_api_deaths
+        reads an identical-looking 0 either way.)
+  - worktask_queue_api_death_input_available gauge (1 when
+        QUEUE_LOG_ARCHIVE_DIR is readable, 0 otherwise, with a loud log
+        line on each transition. The per-ITEM death series go ABSENT while
+        this reads 0; the two unlabelled scalars above cannot, so alert on
+        this gauge rather than trusting their zeros.)
+  - worktask_queue_item_quarantined_age_seconds{id,summary} gauge (seconds
+        since `quarantined_at` for items currently quarantined — the
+        containment state an item lands in when its agent runs kept dying.
+        Not terminal: a quarantined item still holds its scope lock, so a
+        long-lived one is worth alerting on. The count is already available
+        as worktask_queue_items_total{status="quarantined"}.)
   - worktask_queue_scrape_errors_total       counter (reads that failed)
   - worktask_exporter_build_info{commit,version,source} gauge, always 1.
         Build identity of the exporter ITSELF, so "is the deployed
@@ -257,6 +351,70 @@ AGENT_QUEUE_BINDINGS_PATH = os.environ.get(
     "AGENT_QUEUE_BINDINGS_JSON",
     "/queue-home/.config/claude/agent-queue-bindings.json",
 )
+# Directory of per-item agent transcript archives. `session-task` copies the
+# owning agent's JSONL to `<dir>/<queue-id>.jsonl` when an item is finalized
+# and stamps `log_archive_path` on the item; `session-task queue rotate`
+# prunes the directory by age and count, so the corpus is already bounded.
+#
+# The default is derived from QUEUE_JSON's own directory rather than
+# hard-coded, because the archive dir is that file's SIBLING on the host
+# (`~/.config/session/queue.json` next to `~/.config/session/queue-logs/`).
+# Deriving it means any deployment that already bind-mounts the session dir
+# to reach queue.json gets the archives for free, under whatever mount point
+# it chose. Override explicitly when the two are mounted separately; the env
+# var name matches the one queue-minisite already uses for the same dir.
+QUEUE_LOG_ARCHIVE_DIR = os.environ.get("QUEUE_LOG_ARCHIVE_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(QUEUE_PATH)), "queue-logs"
+)
+# How far back to scan archives for API deaths. Bounds the work AND defines
+# the window the counters describe. 30d comfortably exceeds any dashboard
+# range that would ask this question while keeping a warm scrape's scan to a
+# substring test over files that have not changed since the last one.
+API_DEATH_WINDOW_DAYS = int(os.environ.get("API_DEATH_WINDOW_DAYS", "30"))
+
+# --- upstream-API error classification -----------------------------------
+#
+# Restated here rather than imported: the exporter is a standalone container
+# that vendors only its own sources, and the same split is applied by the
+# queue-side monitor that decides whether to respawn. Keeping the two in
+# agreement matters more than sharing the literal, so the reasoning is
+# written out instead of referenced.
+#
+# `transient` means "the upstream was busy or briefly broken, a respawn of
+# the same work is reasonable". Those are the capacity and availability
+# statuses. Anything else — a malformed request, an over-long prompt, an
+# auth failure — would fail identically on respawn, so it is classed
+# non-transient and counted separately: a task that lost runs to 529s is a
+# capacity cost, while one that lost runs to an over-long prompt is a bug in
+# how it was briefed, and averaging those together would hide both.
+TRANSIENT_API_STATUS_CODES = frozenset(
+    {"408", "429", "500", "502", "503", "504", "529"}
+)
+NON_TRANSIENT_API_STATUS_CODES = frozenset(
+    {"400", "401", "403", "404", "413", "422"}
+)
+# When no status code was captured, fall back to the client's own error
+# class. `server_error` (a mid-response stream failure, an idle timeout) is
+# the same kind of upstream flakiness as a 5xx and respawns fine; an
+# `invalid_request` (canonically "Prompt is too long") does not.
+TRANSIENT_API_ERROR_CLASSES = frozenset({"server_error", "overloaded_error"})
+# Substring that must appear in a raw archive for it to be worth parsing.
+# Cheap reject for the overwhelming majority of archives, which record no
+# API error at all.
+#
+# Deliberately the KEY only, not `"isApiErrorMessage":true`. JSON separator
+# spacing is a writer's choice — the transcripts on disk are compact, but a
+# tool that re-serialised one with `json.dump` defaults would emit
+# `"isApiErrorMessage": true` and a value-inclusive marker would silently
+# skip the file, reporting zero deaths for an archive full of them. The
+# truthiness is re-checked per record after parsing, so the loose marker
+# costs at most a few needless parses and cannot produce a false death.
+API_ERROR_MARKER = b'"isApiErrorMessage"'
+# The model field on an API-error line. The message is composed client-side
+# rather than by a model, so this value identifies nothing and must never be
+# reported as the dead run's model.
+SYNTHETIC_MODEL = "<synthetic>"
+MODEL_UNKNOWN = "unknown"
 
 # --- build identity ------------------------------------------------------
 #
@@ -434,6 +592,91 @@ g_owner_unknown_count = Gauge(
         "emitted, so its ABSENCE means an exporter predating this metric "
         "rather than a healthy queue."
     ),
+    registry=REG,
+)
+g_item_api_deaths = Gauge(
+    "worktask_queue_item_api_deaths",
+    (
+        "Agent runs THIS queue item lost to an upstream API error, counted "
+        "from its archived transcript within the scan window. The per-task "
+        "cost number: an item whose agent was killed by 529 Overloaded "
+        "three times before it was quarantined reads 3. Emitted only for "
+        "items with at least one death, so the series set is small. "
+        "`model` is the model the dead runs were using, or \"unknown\" when "
+        "the run died before emitting a real assistant turn and the model "
+        "is genuinely unrecoverable -- see the module docstring; it is "
+        "never guessed. POST-HOC: an archive is written when the item is "
+        "finalized, so an item currently burning runs is not here yet."
+    ),
+    ["id", "summary", "model"],
+    registry=REG,
+)
+g_items_with_api_deaths = Gauge(
+    "worktask_queue_items_with_api_deaths",
+    (
+        "How many queue items in the scan window lost at least one agent "
+        "run to an upstream API error. Unlabelled, so this is always "
+        "exactly one series and can never go absent -- which means a 0 is "
+        "evidence of a clean window ONLY alongside "
+        "worktask_queue_api_death_archives_scanned > 0 and "
+        "worktask_queue_api_death_input_available == 1. Read on its own it "
+        "cannot distinguish a quiet month from an unmounted directory."
+    ),
+    registry=REG,
+)
+g_api_death_archives_scanned = Gauge(
+    "worktask_queue_api_death_archives_scanned",
+    (
+        "Number of per-item transcript archives considered in the current "
+        "window. Exists so a zero death count can be told apart from a scan "
+        "that saw no files at all -- a wrong QUEUE_LOG_ARCHIVE_DIR reads 0 "
+        "here while every death series reads a plausible zero."
+    ),
+    registry=REG,
+)
+g_api_death_input_available = Gauge(
+    "worktask_queue_api_death_input_available",
+    (
+        "1 when QUEUE_LOG_ARCHIVE_DIR is readable, 0 when it is missing or "
+        "unreadable, with a loud log line naming the path on each "
+        "transition. Same posture as worktask_queue_owner_input_available: "
+        "a container that never got the bind mount would otherwise publish "
+        "a confident, permanent \"nothing was ever lost\". The per-item "
+        "death series go absent while this reads 0; the unlabelled scalars "
+        "cannot, so ALERT ON THIS GAUGE rather than trusting their zeros."
+    ),
+    registry=REG,
+)
+g_quarantined_age = Gauge(
+    "worktask_queue_item_quarantined_age_seconds",
+    (
+        "Seconds since `quarantined_at` for items currently in the "
+        "`quarantined` state -- where an item lands when its agent runs "
+        "kept dying and the main loop stopped respawning. Quarantine is "
+        "NOT terminal and the item still holds its scope lock, so a "
+        "long-lived one blocks its whole scope and is worth alerting on. "
+        "The count is already available as "
+        "worktask_queue_items_total{status=\"quarantined\"}; this adds the "
+        "age and the identity."
+    ),
+    ["id", "summary"],
+    registry=REG,
+)
+c_api_deaths = Counter(
+    "worktask_queue_agent_api_deaths",
+    (
+        "Agent runs lost to an upstream API error, discovered in the "
+        "per-item transcript archives. `status_code` is the HTTP status the "
+        "client recorded, or \"none\" when it recorded none (a stream idle "
+        "timeout, an over-long prompt). `error_class` is `transient` for "
+        "the capacity/availability failures a respawn can reasonably "
+        "retry, `non_transient` for the ones that would fail identically. "
+        "`model` is the dead run's model, or \"unknown\" when unrecoverable. "
+        "Counter semantics: the process counts each (item, timestamp) death "
+        "once, and a restart re-counts the window from scratch -- normal "
+        "counter-reset behaviour that rate()/increase() already handle."
+    ),
+    ["status_code", "error_class", "model"],
     registry=REG,
 )
 g_file_mtime = Gauge(
@@ -737,6 +980,243 @@ def _resolve_owner(iid, item, agent_by_qid, agent_by_aid, owner_bindings):
     return None
 
 
+# --- upstream-API death accounting ---------------------------------------
+#
+# Memo of parsed archives, keyed by path -> (mtime, size, deaths). An archive
+# is immutable once its item is finalized, but it can be REWRITTEN while the
+# item is still churning (the 529 case appends another error line each time a
+# run dies), so the memo is invalidated on either mtime or size changing
+# rather than on existence alone.
+_archive_cache = {}
+# (queue_id, death timestamp) pairs already counted into c_api_deaths, so a
+# re-parse of a grown archive re-counts only its NEW deaths. Same
+# once-per-fact discipline as _seen_done_ids_by_creator above.
+_seen_api_deaths = set()
+# Last-reported readability of the archive dir, so the warning below is loud
+# once per transition rather than once per scrape.
+_api_death_input_last_status = [None]
+
+
+def _classify_api_error(status_code, error_class):
+    """Return `transient` / `non_transient` for one API error record.
+
+    `transient` means the failure was upstream capacity or availability and
+    respawning the same work is reasonable; `non_transient` means a respawn
+    would fail the same way. The split is what makes the counter useful:
+    runs lost to 529 Overloaded are a capacity cost worth pricing, runs lost
+    to an over-long prompt are a briefing bug, and one number covering both
+    would answer neither question.
+
+    Status code decides when there is one. With no status code we fall back
+    to the client's error class, and an UNRECOGNISED value is classed
+    non_transient -- the conservative direction, since over-reporting
+    capacity loss is the failure mode that would mislead the decision this
+    metric exists to inform.
+    """
+    if status_code in TRANSIENT_API_STATUS_CODES:
+        return "transient"
+    if status_code in NON_TRANSIENT_API_STATUS_CODES:
+        return "non_transient"
+    if status_code == "none" and error_class in TRANSIENT_API_ERROR_CLASSES:
+        return "transient"
+    return "non_transient"
+
+
+def _parse_archive_deaths(path):
+    """Parse one transcript archive; return a list of death records.
+
+    Each record is {timestamp, status_code, error_class, model}.
+
+    Model attribution, which is the delicate part: the API-error line's own
+    `model` reads `<synthetic>` because the message is composed client-side,
+    so the real model has to come from an ordinary assistant turn in the
+    same file. One archive holds exactly one agent run, so ANY real model in
+    it identifies the run -- we prefer the nearest turn BEFORE the death and
+    fall back to any real model in the file. When the run died before ever
+    completing an assistant turn there is no such line and the model is
+    genuinely unrecoverable; those deaths are labelled `unknown` rather than
+    inferred from anything else, because every remaining signal (the item's
+    text, the fleet's usual model) would be a guess dressed as a fact.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return []
+    # Cheap reject: the overwhelming majority of archives record no API
+    # error, and this avoids JSON-parsing megabytes of ordinary transcript.
+    if API_ERROR_MARKER not in raw:
+        return []
+
+    deaths = []
+    preceding_model = None
+    any_model = None
+    for line in raw.splitlines():
+        if b'"model"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+        model = msg.get("model")
+        is_real_model = isinstance(model, str) and model and model != SYNTHETIC_MODEL
+        if not rec.get("isApiErrorMessage"):
+            if is_real_model:
+                preceding_model = model
+                if any_model is None:
+                    any_model = model
+            continue
+        status = rec.get("apiErrorStatus")
+        deaths.append({
+            "timestamp": rec.get("timestamp") or "",
+            "status_code": str(status) if status is not None else "none",
+            "error_class": str(rec.get("error") or "unknown"),
+            # Resolved after the pass so a death that precedes the only real
+            # assistant turn still gets attributed to it.
+            "model": preceding_model,
+        })
+        if is_real_model:
+            preceding_model = model
+            if any_model is None:
+                any_model = model
+
+    for d in deaths:
+        d["model"] = d["model"] or any_model or MODEL_UNKNOWN
+    return deaths
+
+
+def _report_api_death_input(status):
+    """Publish + log the readability of the archive directory.
+
+    Returns True when the directory is readable. While it is NOT, every
+    api-death series is suppressed by the caller: a container that never got
+    the bind mount would otherwise publish a confident and permanent "no
+    task has ever lost a run", which is exactly the false-healthy this
+    exporter refuses to emit for owner attribution either.
+    """
+    g_api_death_input_available.set(1 if status else 0)
+    if _api_death_input_last_status[0] == status:
+        return status
+    previous = _api_death_input_last_status[0]
+    _api_death_input_last_status[0] = status
+    if status:
+        if previous is not None:
+            log.info(
+                "api-death input recovered (%s)", QUEUE_LOG_ARCHIVE_DIR,
+            )
+    else:
+        log.warning(
+            "API-DEATH INPUT UNREADABLE at %s (set QUEUE_LOG_ARCHIVE_DIR to "
+            "fix). Agent runs lost to upstream API errors CANNOT be counted; "
+            "the worktask_queue_*api_death* series are suppressed rather "
+            "than reported as zero. Container deployments must bind-mount "
+            "the session-task queue-logs directory.",
+            QUEUE_LOG_ARCHIVE_DIR,
+        )
+    return status
+
+
+def _scan_api_deaths(now_ts):
+    """Scan the archive dir; return (deaths_by_qid, available, scanned).
+
+    `deaths_by_qid` maps queue id -> list of death records. Bounded to
+    archives modified within API_DEATH_WINDOW_DAYS and memoised on
+    (mtime, size), so a warm scrape re-reads only archives that changed
+    since the last one.
+    """
+    try:
+        entries = list(os.scandir(QUEUE_LOG_ARCHIVE_DIR))
+    except OSError:
+        _report_api_death_input(False)
+        return {}, False, 0
+    _report_api_death_input(True)
+
+    cutoff = now_ts - API_DEATH_WINDOW_DAYS * 86400
+    deaths_by_qid = {}
+    scanned = 0
+    live_paths = set()
+    for entry in entries:
+        name = entry.name
+        if not name.endswith(".jsonl"):
+            continue
+        try:
+            st = entry.stat()
+        except OSError:
+            continue
+        if st.st_mtime < cutoff:
+            continue
+        scanned += 1
+        path = entry.path
+        live_paths.add(path)
+        key = (st.st_mtime, st.st_size)
+        cached = _archive_cache.get(path)
+        if cached is not None and cached[0] == key:
+            deaths = cached[1]
+        else:
+            deaths = _parse_archive_deaths(path)
+            _archive_cache[path] = (key, deaths)
+        if deaths:
+            deaths_by_qid[name[: -len(".jsonl")]] = deaths
+
+    # Drop memo entries for archives that rotated out of the window, so the
+    # cache tracks the corpus instead of growing for the process's lifetime.
+    for stale in set(_archive_cache) - live_paths:
+        del _archive_cache[stale]
+
+    return deaths_by_qid, True, scanned
+
+
+def _publish_api_deaths(summaries, now_ts):
+    """Refresh every api-death series from a fresh archive scan."""
+    deaths_by_qid, available, scanned = _scan_api_deaths(now_ts)
+
+    # The per-ITEM gauge is the one that can genuinely go absent, and it
+    # does: with no readable archive dir there is no item to name, so the
+    # series set is empty rather than a set of confident zeros.
+    g_item_api_deaths.clear()
+    # The two scalars are unlabelled, so they cannot be withdrawn from the
+    # registry the way a labelled family can -- an unlabelled Gauge is one
+    # permanent series by construction. Rather than reach into
+    # prometheus_client internals to fake an absence, they read 0 and
+    # `worktask_queue_api_death_archives_scanned` carries the disambiguation
+    # in the open: 0 archives scanned is the visible difference between "a
+    # clean window" and "the exporter cannot see the archives at all", and
+    # `worktask_queue_api_death_input_available` says which.
+    g_api_death_archives_scanned.set(scanned)
+    g_items_with_api_deaths.set(len(deaths_by_qid))
+    if not available:
+        return
+
+    for qid, deaths in deaths_by_qid.items():
+        # One model per archive by construction (one archive = one agent
+        # run), but attribute defensively: if a file somehow carries deaths
+        # under more than one model, the item gauge reports the one the most
+        # deaths landed under rather than silently dropping a series.
+        model_counts = {}
+        for d in deaths:
+            model_counts[d["model"]] = model_counts.get(d["model"], 0) + 1
+            fact = (qid, d["timestamp"], d["status_code"])
+            if fact in _seen_api_deaths:
+                continue
+            _seen_api_deaths.add(fact)
+            c_api_deaths.labels(
+                status_code=d["status_code"],
+                error_class=_classify_api_error(
+                    d["status_code"], d["error_class"]
+                ),
+                model=d["model"],
+            ).inc()
+        item_model = max(model_counts.items(), key=lambda kv: kv[1])[0]
+        g_item_api_deaths.labels(
+            id=qid,
+            summary=summaries.get(qid, "(no summary)"),
+            model=item_model,
+        ).set(len(deaths))
+
+
 def collect():
     """Re-read queue.json + agent state and refresh all metrics."""
     try:
@@ -782,6 +1262,7 @@ def collect():
     g_locked_age.clear()
     g_progress_age.clear()
     g_owner_unknown_age.clear()
+    g_quarantined_age.clear()
     g_owner_unknown_count.set(0)
 
     # Seeded so every known status reports a 0 series rather than
@@ -800,9 +1281,18 @@ def collect():
     # per-series aggregation.
     owner_unknown_count = 0
     now = datetime.now(timezone.utc)
+    # queue_id -> summary, so the api-death gauges below can name an item
+    # without a second pass over `items`. Built for every status: an item
+    # that burned agent runs is typically abandoned by the time its archive
+    # exists, so restricting this to live items would leave exactly the
+    # interesting rows unnamed.
+    summaries = {}
 
     for it in items:
         status = it.get("status", "unknown")
+        iid_any = it.get("id")
+        if iid_any:
+            summaries[iid_any] = (it.get("summary") or "")[:80] or "(no summary)"
         status_counts[status] = status_counts.get(status, 0) + 1
 
         gid = it.get("group_id") or "none"
@@ -988,6 +1478,20 @@ def collect():
                             status="running",
                         ).set(0)
 
+        # Quarantine age. `quarantined` is where an item lands when its
+        # agent runs kept dying and the main loop stopped respawning --
+        # the containment state at the end of the retry-cost story the
+        # api-death series price. It is NOT terminal and the item still
+        # holds its scope lock, so a forgotten one silently parks every
+        # other task in that scope; the age is what makes that alertable.
+        if status == "quarantined":
+            q_ts = _parse_ts(it.get("quarantined_at"))
+            if q_ts:
+                g_quarantined_age.labels(
+                    id=it.get("id", ""),
+                    summary=(it.get("summary") or "")[:80] or "(no summary)",
+                ).set(max(0.0, (now - q_ts).total_seconds()))
+
         # Ready-stuck / locked-age gauges.
         # A pending group-head may be intentionally held by a scope lock
         # OR waiting on an upstream depends_on task (dep_blockers non-empty).
@@ -1052,6 +1556,13 @@ def collect():
 
     g_owner_unknown_count.set(owner_unknown_count)
 
+    # Agent runs lost to upstream API errors, read from the per-item
+    # transcript archives. Deliberately last: it is the only input outside
+    # queue.json + agent state, and an unreadable archive dir must degrade
+    # exactly one family of series rather than cost the scrape its
+    # queue-shaped ones.
+    _publish_api_deaths(summaries, time.time())
+
     for s, n in status_counts.items():
         g_items_total.labels(status=s).set(n)
     for p, n in priority_counts.items():
@@ -1083,6 +1594,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
 def main():
     log.info("Starting work-queue exporter on :%d (queue=%s, agent_state=%s)",
              PORT, QUEUE_PATH, AGENT_STATE_PATH)
+    log.info("API-death scan: archives=%s window=%dd",
+             QUEUE_LOG_ARCHIVE_DIR, API_DEATH_WINDOW_DAYS)
     log.info("Build: commit=%s version=%s source=%s",
              EXPORTER_COMMIT, EXPORTER_VERSION, EXPORTER_SOURCE)
     collect()
