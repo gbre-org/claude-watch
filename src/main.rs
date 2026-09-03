@@ -1384,7 +1384,7 @@ async fn run_daemon() {
                         tag: cadence::KEEPALIVE_TAG,
                         source: cadence::CADENCE_SOURCE,
                         message: "keepalive: no event acked recently — \
-                                  run `event-ack ack-batch` to prove liveness",
+                                  run `event-ack ack-batch --override-reason \"<why>\"` to prove liveness",
                         priority: "low",
                         data: event_bus::keepalive_data(quiet_secs, last_ack_age),
                     });

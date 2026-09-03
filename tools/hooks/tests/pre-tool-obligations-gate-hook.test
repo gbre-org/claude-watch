@@ -3090,6 +3090,24 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
 
+            # 74hb3d: the now-mandatory --override-reason (a value-taking
+            # flag, same shape as --action) does not disqualify the exemption:
+            # its VALUE must not be misread as a second operand. Regression
+            # guard for the ack-batch mandatory-reason change.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "event-ack ack-batch --override-reason 'reviewed, nothing actionable'",
+                 }},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb3d. liveness ack with --override-reason -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
             # 74hb4: bundled `event-ack ack-batch && rm -rf x` -> NOT exempt
             # -> DENY. The exemption must never let a second action ride along.
             _write_hb_sidecar()
