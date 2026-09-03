@@ -989,6 +989,128 @@ fn operator_present_block() -> Vec<String> {
     operator_present_lines(presence_carrier_mtime(), now, presence_max_age())
 }
 
+/// How long an `api_retry_last_seen` stamp keeps reading as "a retry storm is
+/// happening RIGHT NOW".
+///
+/// The daemon re-stamps on every check cycle (`general.check_interval`,
+/// shipped at 10s) and clears the stamp on the first cycle that sees no
+/// banner, so a storm that RESOLVES is reported resolved by the daemon itself
+/// — this window is not the resolution path. What it covers is the daemon
+/// silently ceasing to OBSERVE: the guard turned off, the pane gone, the
+/// daemon down between two metrics runs. Without it those cases would pin
+/// `claude_watch_api_retry_active` at 1 indefinitely.
+///
+/// 120s is therefore deliberately loose relative to the 10s cycle: the
+/// metrics emitter runs from cron once a minute, so anything tighter would
+/// let ordinary cron/cycle skew blank an active storm — a false NEGATIVE on
+/// the exact signal this metric exists to provide.
+const API_RETRY_STALE_AFTER_SECS: f64 = 120.0;
+
+/// Pure: render the upstream-API retry-storm gauges from already-parsed state.
+///
+/// This is the answer to "a Claude Code main loop parked in `529 Overloaded ·
+/// Retrying in 12s · attempt 7/10` looks identical to an idle one". The
+/// transcript-driven pressure exporter cannot see that state by construction —
+/// a client in retry back-off writes NOTHING to its transcript, and once the
+/// silence outlasts that exporter's live window the session drops out of the
+/// fleet entirely. The daemon, which reads the terminal pane, is the only
+/// component that observes the banner directly, so the state is exported here.
+///
+/// Emitted:
+///   - `claude_watch_api_retry_active` (0/1) — the alertable state. 1 while a
+///     retry banner was seen within `stale_after`.
+///   - `claude_watch_api_retry_episode_seconds` — how long the CURRENT
+///     episode has been running; 0 when inactive. This is the severity axis:
+///     a 12s blip and a 17-minute storm are both `active=1`.
+///   - `claude_watch_api_retry_consecutive_cycles` — detection cycles in the
+///     current episode; 0 when inactive.
+///   - `claude_watch_api_retry_last_seen_timestamp_seconds` — epoch of the
+///     most recent detection (0 when never seen), for age-based queries.
+///   - `claude_watch_api_retry_episodes_total` — storm COUNT (one per
+///     episode, not per cycle), for frequency independent of duration.
+///
+/// Every epoch input is filtered to `> 0.0` before being used in a
+/// `now - t` subtraction: an absent/unparseable timestamp parses to 0.0, and
+/// treating that as a real epoch would render a ~56-year episode.
+fn api_retry_lines(
+    last_seen: f64,
+    first_seen: f64,
+    consecutive: u64,
+    episodes_total: u64,
+    now: f64,
+    stale_after: f64,
+) -> Vec<String> {
+    let active = last_seen > 0.0 && now - last_seen <= stale_after;
+    let episode_secs = if active && first_seen > 0.0 {
+        (now - first_seen).max(0.0)
+    } else {
+        0.0
+    };
+    let consecutive = if active { consecutive } else { 0 };
+    vec![
+        "# HELP claude_watch_api_retry_active Whether Claude Code is currently parked in upstream-API retry backoff (529/overloaded/5xx banner seen within the freshness window); 1=retry storm in progress 0=not".to_string(),
+        "# TYPE claude_watch_api_retry_active gauge".to_string(),
+        format!("claude_watch_api_retry_active {}", u8::from(active)),
+        "".to_string(),
+        "# HELP claude_watch_api_retry_episode_seconds Seconds the current upstream-API retry-backoff episode has been running; 0 when no episode is in progress".to_string(),
+        "# TYPE claude_watch_api_retry_episode_seconds gauge".to_string(),
+        format!(
+            "claude_watch_api_retry_episode_seconds {:.3}",
+            episode_secs
+        ),
+        "".to_string(),
+        "# HELP claude_watch_api_retry_consecutive_cycles Consecutive claude-watch check cycles that observed an upstream-API retry banner; 0 when no episode is in progress".to_string(),
+        "# TYPE claude_watch_api_retry_consecutive_cycles gauge".to_string(),
+        format!(
+            "claude_watch_api_retry_consecutive_cycles {}",
+            consecutive
+        ),
+        "".to_string(),
+        "# HELP claude_watch_api_retry_last_seen_timestamp_seconds Epoch of the most recent cycle that observed an upstream-API retry banner; 0 when never observed".to_string(),
+        "# TYPE claude_watch_api_retry_last_seen_timestamp_seconds gauge".to_string(),
+        format!(
+            "claude_watch_api_retry_last_seen_timestamp_seconds {:.3}",
+            last_seen.max(0.0)
+        ),
+        "".to_string(),
+        "# HELP claude_watch_api_retry_episodes_total Distinct upstream-API retry-backoff episodes entered (one per episode, not per cycle)".to_string(),
+        "# TYPE claude_watch_api_retry_episodes_total counter".to_string(),
+        format!(
+            "claude_watch_api_retry_episodes_total {}",
+            episodes_total
+        ),
+        "".to_string(),
+        "# HELP claude_watch_api_retry_stale_after_secs Freshness window in seconds after which an api_retry observation stops counting as current -- SINGLE SOURCE OF TRUTH for consumers writing `for:` durations against claude_watch_api_retry_active".to_string(),
+        "# TYPE claude_watch_api_retry_stale_after_secs gauge".to_string(),
+        format!(
+            "claude_watch_api_retry_stale_after_secs {:.0}",
+            stale_after
+        ),
+    ]
+}
+
+/// Collect the upstream-API retry-storm gauges from the daemon state file.
+/// Kept as an appended block (rather than folded into `build_metrics`) for the
+/// same reason as the presence / container-start blocks: it needs a clock
+/// read, and `build_metrics` stays a pure function of state.
+fn api_retry_block(state: &Value) -> Vec<String> {
+    let ts = |key: &str| {
+        state
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(parse_iso_timestamp)
+            .unwrap_or(0.0)
+    };
+    api_retry_lines(
+        ts("api_retry_last_seen"),
+        ts("api_retry_first_seen"),
+        num(state, "api_retry_consecutive"),
+        num(state, "api_retry_episodes_total"),
+        now_epoch(),
+        API_RETRY_STALE_AFTER_SECS,
+    )
+}
+
 /// Persisted streak state (sidecar JSON). Load is tolerant of missing fields.
 #[derive(Debug, Clone, Default)]
 struct StreakState {
@@ -1539,6 +1661,16 @@ pub async fn cmd_metrics() -> i32 {
         .unwrap_or_default();
     lines.push(String::new());
     lines.extend(crate::token_usage::token_metric_lines(&token_usage));
+
+    // Upstream-API retry-storm gauges. THE signal that distinguishes a main
+    // loop wedged in `529 Overloaded · Retrying in Ns · attempt N/M` from an
+    // idle one: the daemon reads the retry banner off the pane, so this is
+    // the only place that state is observable at all (a client in retry
+    // back-off writes nothing to its transcript, so the transcript-driven
+    // pressure exporter cannot see it). Appended as a separate block so
+    // `build_metrics`'s signature + tests stay untouched.
+    lines.push(String::new());
+    lines.extend(api_retry_block(&state));
 
     // Operator-presence gauges (present flag + carrier mtime). Reads the SAME
     // carrier mtime + freshness window as the desk-streak block below, so the
@@ -2463,6 +2595,208 @@ mod tests {
         assert_eq!(
             oldest_start_epoch(&stats, "btime 1000\n", 100),
             Some(1002.0)
+        );
+    }
+
+    /// Pull one sample value out of an `api_retry_lines` rendering.
+    fn api_retry_sample(lines: &[String], metric: &str) -> f64 {
+        let prefix = format!("{metric} ");
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("{metric} not emitted"))
+            .parse()
+            .expect("sample is numeric")
+    }
+
+    #[test]
+    fn api_retry_lines_report_a_live_storm_as_active() {
+        // The headline case: the pane showed `529 Overloaded · Retrying in
+        // 12s · attempt 7/10` one cycle ago and the episode started 17 min
+        // back. active=1 with the real duration, so an alert can distinguish
+        // this from a 12s blip.
+        let now = 1_757_000_000.0;
+        let lines = api_retry_lines(now - 10.0, now - 1020.0, 102, 7, now, 120.0);
+        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 1.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_episode_seconds"),
+            1020.0
+        );
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_consecutive_cycles"),
+            102.0
+        );
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_episodes_total"),
+            7.0
+        );
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_last_seen_timestamp_seconds"),
+            now - 10.0
+        );
+    }
+
+    #[test]
+    fn api_retry_lines_stay_active_past_the_suppression_cap() {
+        // The bug this metric exists to fix. `api_retry_suppressions_total`
+        // stops advancing once the episode outlasts `max_stuck_secs` (shipped
+        // at 1800s) because suppression deliberately gives up — so the old
+        // counter went FLAT exactly when the storm was worst. `active` is
+        // driven by the raw observation stamp instead, so a 40-minute storm
+        // still reads 1.
+        let now = 1_757_000_000.0;
+        let lines = api_retry_lines(now - 5.0, now - 2400.0, 240, 1, now, 120.0);
+        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 1.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_episode_seconds"),
+            2400.0
+        );
+    }
+
+    #[test]
+    fn api_retry_lines_go_inactive_when_the_stamp_goes_stale() {
+        // The daemon stopped observing (guard disabled, pane gone, daemon
+        // down) without ever clearing the episode. A stale stamp must NOT
+        // pin the gauge at 1 forever.
+        let now = 1_757_000_000.0;
+        let lines = api_retry_lines(now - 600.0, now - 900.0, 90, 3, now, 120.0);
+        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 0.0);
+        // Episode duration and cycle count are episode-scoped: zeroed when
+        // inactive so a graph can't read a stale duration as a live one.
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_episode_seconds"),
+            0.0
+        );
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_consecutive_cycles"),
+            0.0
+        );
+        // The cumulative episode counter is NOT zeroed -- it is a counter.
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_episodes_total"),
+            3.0
+        );
+    }
+
+    #[test]
+    fn api_retry_lines_never_render_an_epoch_zero_duration() {
+        // A missing/unparseable timestamp parses to 0.0. Treating that as a
+        // real epoch renders a ~56-year episode (the classic epoch-zero bug
+        // this file guards against elsewhere).
+        let now = 1_757_000_000.0;
+        // Never observed at all.
+        let never = api_retry_lines(0.0, 0.0, 0, 0, now, 120.0);
+        assert_eq!(api_retry_sample(&never, "claude_watch_api_retry_active"), 0.0);
+        assert_eq!(
+            api_retry_sample(&never, "claude_watch_api_retry_episode_seconds"),
+            0.0
+        );
+        assert_eq!(
+            api_retry_sample(&never, "claude_watch_api_retry_last_seen_timestamp_seconds"),
+            0.0
+        );
+        // Active, but first_seen failed to parse: report the state without
+        // inventing a duration.
+        let no_start = api_retry_lines(now - 5.0, 0.0, 1, 1, now, 120.0);
+        assert_eq!(
+            api_retry_sample(&no_start, "claude_watch_api_retry_active"),
+            1.0
+        );
+        assert_eq!(
+            api_retry_sample(&no_start, "claude_watch_api_retry_episode_seconds"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn api_retry_lines_publish_their_own_freshness_window() {
+        // Consumers writing `for:` durations against the active gauge should
+        // read the window rather than hardcode it.
+        let now = 1_757_000_000.0;
+        let lines = api_retry_lines(now, now, 1, 1, now, API_RETRY_STALE_AFTER_SECS);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_stale_after_secs"),
+            API_RETRY_STALE_AFTER_SECS
+        );
+    }
+
+    #[test]
+    fn api_retry_lines_are_well_formed_prometheus() {
+        let now = 1_757_000_000.0;
+        let lines = api_retry_lines(now - 1.0, now - 30.0, 3, 2, now, 120.0);
+        for metric in [
+            "claude_watch_api_retry_active",
+            "claude_watch_api_retry_episode_seconds",
+            "claude_watch_api_retry_consecutive_cycles",
+            "claude_watch_api_retry_last_seen_timestamp_seconds",
+            "claude_watch_api_retry_episodes_total",
+            "claude_watch_api_retry_stale_after_secs",
+        ] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("# HELP {metric} "))),
+                "{metric} missing HELP"
+            );
+            assert!(
+                lines.iter().any(|l| l.starts_with(&format!("# TYPE {metric} "))),
+                "{metric} missing TYPE"
+            );
+            assert!(
+                lines.iter().any(|l| l.starts_with(&format!("{metric} "))),
+                "{metric} missing sample"
+            );
+        }
+        // Only the two cumulative series are counters; the rest are gauges.
+        assert!(lines
+            .iter()
+            .any(|l| l == "# TYPE claude_watch_api_retry_episodes_total counter"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "# TYPE claude_watch_api_retry_active gauge"));
+    }
+
+    #[test]
+    fn api_retry_block_reads_the_state_keys_it_documents() {
+        // Guards the state-key spelling: a typo here would emit a
+        // permanently-zero gauge, which is exactly the silent-false-negative
+        // failure this whole change is about.
+        let state = serde_json::json!({
+            "api_retry_last_seen": Local::now().to_rfc3339(),
+            "api_retry_first_seen": (Local::now() - chrono::Duration::seconds(300)).to_rfc3339(),
+            "api_retry_consecutive": 30,
+            "api_retry_episodes_total": 4,
+        });
+        let lines = api_retry_block(&state);
+        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 1.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_consecutive_cycles"),
+            30.0
+        );
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_episodes_total"),
+            4.0
+        );
+        let episode = api_retry_sample(&lines, "claude_watch_api_retry_episode_seconds");
+        assert!(
+            (episode - 300.0).abs() < 5.0,
+            "episode seconds should track first_seen, got {episode}"
+        );
+    }
+
+    #[test]
+    fn api_retry_block_is_inactive_on_an_empty_state() {
+        // A state file written before these fields existed must read as
+        // "no storm", not as a storm that started at the epoch.
+        let lines = api_retry_block(&serde_json::json!({}));
+        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 0.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_episode_seconds"),
+            0.0
+        );
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_episodes_total"),
+            0.0
         );
     }
 
