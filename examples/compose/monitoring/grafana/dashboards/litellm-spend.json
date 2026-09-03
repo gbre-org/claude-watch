@@ -131,10 +131,11 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "One tile per team, labeled by team_alias. If a team is renamed upstream, its old alias tile disappears on the exporter's next poll instead of leaving a frozen duplicate.",
       "targets": [
         {
           "expr": "litellm_team_spend_dollars",
-          "legendFormat": "",
+          "legendFormat": "{{team}}",
           "refId": "A"
         }
       ],
@@ -232,7 +233,7 @@
       "targets": [
         {
           "expr": "litellm_team_members",
-          "legendFormat": "",
+          "legendFormat": "{{team}}",
           "refId": "A"
         }
       ],
@@ -281,7 +282,7 @@
       "targets": [
         {
           "expr": "100 * litellm_team_spend_dollars / litellm_team_max_budget_dollars",
-          "legendFormat": "",
+          "legendFormat": "{{team}}",
           "refId": "A"
         }
       ],

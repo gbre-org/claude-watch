@@ -30,9 +30,12 @@ Config via env:
   LITELLM_BASE_URL      gateway base URL (required),
                         e.g. https://eng-ai-model-gateway.sfproxy...aws.sfdc.cl
   LITELLM_API_KEY       gateway sk-... key. If unset, tried in order:
+  LITELLM_API_KEY_FILE  path to a file containing the key (preferred over
+                        the cmd: a dropped team key at this path can read
+                        /user/info + /team/info, so the file wins when present)
   LITELLM_API_KEY_CMD   shell command whose stdout is the key
-                        (e.g. "devbar auth claude")
-  LITELLM_API_KEY_FILE  path to a file containing the key
+                        (e.g. "devbar auth claude"; fallback — yields the
+                        personal key_spend only)
   LITELLM_USER_ID       user email to query (default: taken from /key/info)
   LITELLM_TEAM_IDS      comma-separated team ids (default: auto-discovered
                         from /user/info user_info.teams)
@@ -129,6 +132,31 @@ g_last_scrape = Gauge(
     "Unix timestamp of the last upstream poll.",
     registry=REG,
 )
+# Upstream-freshness signal, independent of whether OUR poll succeeded.
+# The gateway's /key/info and /user/info responses carry their own
+# `updated_at`, i.e. when the GATEWAY last wrote a new spend value for this
+# key/user. A poll can succeed (litellm_spend_scrape_success=1, fresh
+# litellm_spend_last_scrape_timestamp_seconds) while the *reported number*
+# is frozen because the gateway's own cost-tracking/billing backend has
+# stalled upstream of us -- request routing and token accounting keep
+# working, but spend stops incrementing. Surfacing the raw `updated_at` here
+# lets a dashboard compute `time() - this` as a staleness panel/alert, so
+# "our pipeline died" and "the gateway's spend backend is stuck" are
+# visually distinguishable instead of both just looking like a flat $0/hr
+# line (see 2026-08-31 incident: ~40min gateway spend freeze, tokens/min
+# unaffected).
+g_user_spend_updated = Gauge(
+    "litellm_user_spend_updated_at_timestamp_seconds",
+    "Unix timestamp the GATEWAY last updated user_info.spend (from "
+    "/user/info updated_at) -- distinct from when WE last polled it.",
+    ["user"], registry=REG,
+)
+g_key_spend_updated = Gauge(
+    "litellm_key_spend_updated_at_timestamp_seconds",
+    "Unix timestamp the GATEWAY last updated key info.spend (from "
+    "/key/info updated_at) -- distinct from when WE last polled it.",
+    ["key_name", "key_hash"], registry=REG,
+)
 
 _lock = threading.Lock()
 _last_poll = 0.0
@@ -136,11 +164,21 @@ _api_key = None
 
 
 def resolve_api_key():
-    """Resolve the gateway key from env / cmd / file (once, memoized)."""
+    """Resolve the gateway key from env / file / cmd (once, memoized)."""
     global _api_key
     if _api_key:
         return _api_key
     key = os.environ.get("LITELLM_API_KEY", "").strip()
+    # Prefer the FILE over the CMD: a team key dropped at LITELLM_API_KEY_FILE
+    # can read /user/info + /team/info (populating the user/team panels),
+    # whereas the devbar cmd yields the personal key that reads key_spend only.
+    # If we tried the cmd first it would always win once devbar resolves,
+    # silently ignoring a dropped team key.
+    if not key:
+        path = os.environ.get("LITELLM_API_KEY_FILE", "").strip()
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                key = fh.read().strip()
     if not key:
         cmd = os.environ.get("LITELLM_API_KEY_CMD", "").strip()
         if cmd:
@@ -150,11 +188,6 @@ def resolve_api_key():
                 ).strip()
             except Exception as e:  # noqa: BLE001
                 log.error("LITELLM_API_KEY_CMD failed: %s", e)
-    if not key:
-        path = os.environ.get("LITELLM_API_KEY_FILE", "").strip()
-        if path and os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                key = fh.read().strip()
     _api_key = key
     return key
 
@@ -181,6 +214,27 @@ def _iso_to_epoch(s):
         return None
 
 
+_TEAM_GAUGES = (g_team_spend, g_team_budget, g_team_reset, g_team_members)
+
+# team_id -> last-published team_alias. Lets poll() detect a rename (same
+# team_id, new team_alias -- e.g. 2026-08-31:
+# sf-restricted-opus-5-aman-naimat -> sf-restricted-opus-5-anaimat-team) and
+# surgically drop the OLD alias's label-set from every team gauge, instead
+# of leaking it forever (prometheus_client never expires an unused label
+# combo on its own -- that's exactly how "Team Spend (MTD)" ended up
+# rendering 3 bars for 2 real teams).
+#
+# This is deliberately NOT a blanket `.clear()` of all labeled gauges at
+# the top of every poll: the gateway is observably flaky (frequent
+# /team/info, /user/info, /key/info timeouts -- see the log), so a
+# blanket clear would blank every team/user/key panel on any single
+# failed upstream call until the next successful poll. Only removing the
+# specific old label-set on a *confirmed* rename means a transient
+# timeout leaves the last-known-good value in place (stale but visible)
+# rather than flapping the dashboard to "No data".
+_last_team_alias = {}
+
+
 def poll():
     """Poll the gateway and update the gauges. Returns True if fully ok."""
     ok = True
@@ -192,10 +246,16 @@ def poll():
         ki = kresp.get("info", {}) or {}
         # The key hash is the top-level "key" field; "info" carries key_name,
         # spend, user_id (no raw token). Expose a truncated hash only.
-        g_key_spend.labels(
-            key_name=str(ki.get("key_name", "")),
-            key_hash=str(kresp.get("key", ""))[:12],
-        ).set(float(ki.get("spend") or 0.0))
+        key_name = str(ki.get("key_name", ""))
+        key_hash = str(kresp.get("key", ""))[:12]
+        g_key_spend.labels(key_name=key_name, key_hash=key_hash).set(
+            float(ki.get("spend") or 0.0)
+        )
+        key_updated = _iso_to_epoch(ki.get("updated_at"))
+        if key_updated:
+            g_key_spend_updated.labels(key_name=key_name, key_hash=key_hash).set(
+                key_updated
+            )
         if not user_id:
             user_id = ki.get("user_id") or ""
     except Exception as e:  # noqa: BLE001
@@ -213,6 +273,9 @@ def poll():
             reset = _iso_to_epoch(ui.get("budget_reset_at"))
             if reset:
                 g_user_reset.labels(user=user_id).set(reset)
+            user_updated = _iso_to_epoch(ui.get("updated_at"))
+            if user_updated:
+                g_user_spend_updated.labels(user=user_id).set(user_updated)
             discovered_teams = list(ui.get("teams") or [])
         except Exception as e:  # noqa: BLE001
             log.error("/user/info failed for %s: %s", user_id, e)
@@ -230,6 +293,19 @@ def poll():
         try:
             ti = _get("/team/info", {"team_id": tid}).get("team_info", {}) or {}
             alias = ti.get("team_alias") or tid
+            old_alias = _last_team_alias.get(tid)
+            if old_alias and old_alias != alias:
+                # Confirmed rename: drop the OLD alias's label-set from
+                # every team gauge so it doesn't sit frozen as a ghost
+                # duplicate. remove() is missing-label-safe -- KeyError is
+                # never raised for an already-absent combo -- but guard
+                # anyway since this runs on a long-lived process.
+                for g in _TEAM_GAUGES:
+                    try:
+                        g.remove(old_alias, tid)
+                    except KeyError:
+                        pass
+            _last_team_alias[tid] = alias
             g_team_spend.labels(team=alias, team_id=tid).set(
                 float(ti.get("spend") or 0.0)
             )
