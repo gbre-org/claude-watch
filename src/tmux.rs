@@ -1062,16 +1062,26 @@ pub(crate) fn handoff_is_recent(marker_mtime: Option<f64>, now: f64, grace_secs:
 /// Distinct from `self_clear_in_progress` (lock HELD during the handoff): that
 /// covers only the in-flight window; this covers the post-release bootstrap
 /// window. Fail-open (returns false) so a probe glitch never wedges recovery.
+/// Filesystem mtime (epoch float secs) of the `self-clear` handoff marker, or
+/// `None` when the marker is absent. The `self-clear` tool touches
+/// `self_clear_handoff_path()` the instant it finishes delivering its resume
+/// prompt, so this mtime is the completion time of the most recent self-clear.
+/// Exposed so the daemon can stamp `last_context_clear` from it when the
+/// token-drop detector missed a poll-gap self-clear (see
+/// `policy::maybe_stamp_self_clear_handoff`).
+pub(crate) fn self_clear_handoff_mtime() -> Option<f64> {
+    std::fs::metadata(self_clear_handoff_path())
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+}
+
 pub(crate) fn self_clear_handoff_recent(grace_secs: u64) -> bool {
     if grace_secs == 0 {
         return false;
     }
-    let path = self_clear_handoff_path();
-    let mtime = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64());
+    let mtime = self_clear_handoff_mtime();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())

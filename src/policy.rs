@@ -2846,6 +2846,87 @@ pub(crate) fn maybe_reset_context_clear(
     }
 }
 
+/// Stamp `last_context_clear` from a `self-clear` handoff marker when the
+/// token-drop detector (`maybe_reset_context_clear` / `context_reset_signal`)
+/// missed the clear.
+///
+/// `context_reset_signal` can only recognise a clear it SEES as a token drop
+/// between two consecutive polls. A `self-clear` (`/clear` + an
+/// immediately-injected resume prompt) re-inflates the context within seconds,
+/// so the brief low-token window can fall ENTIRELY between two polls -- no drop
+/// sample is ever taken and `last_context_clear` is never stamped, leaving the
+/// dashboard's "Since Clear" tile counting from the PREVIOUS clear. This is the
+/// self-clear analogue of the 2026-08-22 poll-gap incident; PR #732 fixed the
+/// continue/recreate boundary, not the self-clear `/clear` path.
+///
+/// The `self-clear` tool touches `tmux::self_clear_handoff_path()` the moment
+/// it finishes delivering the resume prompt (the same marker the post-clear
+/// resume gate consults via `tmux::self_clear_handoff_recent`). That marker is
+/// an out-of-band signal, immune to the poll gap, that a clear DID happen, so
+/// we stamp `last_context_clear` from it whenever the drop path missed it.
+///
+/// Idempotent: `state.self_clear_handoff_stamped_mtime` records the marker
+/// mtime already accounted for, so the stamp fires ONCE per self-clear -- not
+/// on every poll while the marker stays inside its grace window (the mtime is
+/// stable until the next self-clear touches it anew).
+///
+/// STAMP SEMANTICS mirror `maybe_reset_context_clear`: `last_context_clear` is
+/// stamped with `now` (the observation cycle), not the marker mtime; the two
+/// differ by at most `self_clear_handoff_grace_secs`, immaterial to a tile
+/// rendered in minutes/hours/days.
+pub(crate) fn maybe_stamp_self_clear_handoff(
+    config: &Config,
+    state: &mut State,
+    handoff_mtime: Option<f64>,
+    now_epoch: f64,
+    now: &str,
+) {
+    let grace = config.fresh_clear.self_clear_handoff_grace_secs;
+    if grace == 0 {
+        return;
+    }
+    let Some(mtime) = handoff_mtime else {
+        return;
+    };
+    if !tmux::handoff_is_recent(Some(mtime), now_epoch, grace) {
+        return;
+    }
+    // Already stamped for this exact self-clear (marker mtime unchanged) -- do
+    // not re-stamp on every subsequent poll inside the grace window.
+    if state.self_clear_handoff_stamped_mtime == Some(mtime) {
+        return;
+    }
+
+    info!(
+        mtime, now_epoch,
+        "self-clear handoff marker observed — stamping last_context_clear (token-drop path missed it)"
+    );
+    write_jsonl_log(
+        &config.general.log_file,
+        "context_clear_reset",
+        serde_json::json!({
+            "detected_by": "self_clear_handoff",
+            "handoff_mtime": mtime,
+            "external": true,
+        }),
+    );
+    record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
+
+    state.self_clear_handoff_stamped_mtime = Some(mtime);
+    state.last_context_clear = Some(now.to_string());
+    // The self-clear delivered its OWN resume prompt, so latch the post-clear
+    // resume gate closed for this clear (mirror Path 1 of
+    // `maybe_reset_context_clear`).
+    state.post_clear_resume_injected_for = Some(now.to_string());
+    // The context-low condition has been resolved by the clear: reset the
+    // in-flight trigger + episode/obligation bookkeeping so the next crossing
+    // can fire, exactly as the token-drop path does.
+    state.context_clear_triggered = false;
+    state.context_clear_child_pid = None;
+    state.context_obligation_armed_at = None;
+    state.context_threshold_first_seen_at = None;
+}
+
 /// Seconds after a detected /clear (or compaction) boundary during which the
 /// malformed-tool-call guardrail is suppressed. The pane-history capture reads
 /// ~60 lines of scrollback, which immediately after a clear STILL includes the
@@ -6583,6 +6664,23 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // a JSONL-derived current sample against a tmux-derived previous
         // sample (or vice versa) would make the drop comparison meaningless.
         state.last_seen_tokens = Some(context_tokens);
+        // Fallback for a self-clear that landed inside a poll gap: /clear +
+        // immediate resume re-inflates the context within one check interval,
+        // so `maybe_reset_context_clear` above never observes the drop. The
+        // self-clear handoff marker is an out-of-band, poll-gap-proof signal
+        // that a clear happened -- stamp `last_context_clear` from it so the
+        // "Since Clear" tile does not keep counting from the previous clear.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        maybe_stamp_self_clear_handoff(
+            config,
+            state,
+            tmux::self_clear_handoff_mtime(),
+            now_epoch,
+            &now,
+        );
     }
     if config.context_monitor.enabled && tokens > 0 {
         if let Some((pct, _by_compact)) = check_context_threshold_with_margin(
@@ -9303,6 +9401,62 @@ cooldown = 300
     // and the dashboard's "Since Clear" tile read 1.07 DAYS (the previous
     // day's clear) 50 minutes after the clear it should have shown. These
     // tests pin drop-based detection, one per path that resets a context.
+
+    #[test]
+    fn test_self_clear_in_poll_gap_stamps_from_handoff() {
+        // A self-clear (/clear + immediate resume) re-inflates the context
+        // within one poll gap, so `maybe_reset_context_clear` never sees a
+        // token drop and never stamps `last_context_clear` -- the same
+        // poll-gap miss as 2026-08-22, on the self-clear path PR #732 did not
+        // cover. The handoff marker must stamp it instead so "Since Clear"
+        // stops counting from the previous clear.
+        let config = config_for_reset_test();
+        let now_epoch = 1_000_000.0_f64;
+        let now = "2026-09-02T12:00:00-07:00";
+
+        // No prior clear; both token samples stay high (the low window fell
+        // entirely between polls), so the drop path is a no-op.
+        let mut state = State::default();
+        state.last_seen_tokens = Some(900_000);
+        maybe_reset_context_clear(&config, &mut state, 850_000, now);
+        assert_eq!(
+            state.last_context_clear, None,
+            "token-drop path must miss the poll-gap self-clear"
+        );
+
+        // A handoff marker touched 5s ago (well within the 120s grace) stamps.
+        let mtime = now_epoch - 5.0;
+        maybe_stamp_self_clear_handoff(&config, &mut state, Some(mtime), now_epoch, now);
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(now),
+            "handoff marker must stamp last_context_clear when the drop path missed it"
+        );
+        assert_eq!(state.self_clear_handoff_stamped_mtime, Some(mtime));
+        // The self-clear delivered its own resume -> post-clear gate latched.
+        assert_eq!(state.post_clear_resume_injected_for.as_deref(), Some(now));
+
+        // Idempotent: a later poll inside the grace window (same marker mtime)
+        // must NOT re-stamp.
+        let later = "2026-09-02T12:00:33-07:00";
+        maybe_stamp_self_clear_handoff(&config, &mut state, Some(mtime), now_epoch + 33.0, later);
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(now),
+            "same handoff marker must not re-stamp on a subsequent poll"
+        );
+
+        // A stale marker (older than grace) does not stamp.
+        let mut fresh = State::default();
+        let stale = now_epoch - (config.fresh_clear.self_clear_handoff_grace_secs as f64) - 10.0;
+        maybe_stamp_self_clear_handoff(&config, &mut fresh, Some(stale), now_epoch, now);
+        assert_eq!(fresh.last_context_clear, None, "a stale handoff marker must not stamp");
+
+        // Absent marker does not stamp.
+        let mut none_state = State::default();
+        maybe_stamp_self_clear_handoff(&config, &mut none_state, None, now_epoch, now);
+        assert_eq!(none_state.last_context_clear, None);
+    }
 
     #[test]
     fn test_context_reset_signal_fresh_sample() {

@@ -116,6 +116,14 @@ pub struct State {
     /// Last observed token count (for detecting external clears)
     #[serde(default)]
     pub last_seen_tokens: Option<u64>,
+    /// Filesystem mtime (epoch float secs) of the `self-clear` handoff marker
+    /// (`tmux::self_clear_handoff_path`) we have ALREADY stamped
+    /// `last_context_clear` from. Dedupes the poll-gap self-clear fallback in
+    /// `policy::maybe_stamp_self_clear_handoff` so it stamps ONCE per
+    /// self-clear rather than on every poll while the marker stays inside its
+    /// grace window. Transient.
+    #[serde(default)]
+    pub self_clear_handoff_stamped_mtime: Option<f64>,
     /// RFC3339 timestamp of the FIRST check cycle on which the context
     /// threshold was seen crossed in the current episode. Anchors the hard
     /// ceiling on hook-deferral (`hybrid.context_fallback_max_secs`): the
