@@ -49,6 +49,26 @@ Scenarios:
       ending at an API-error entry escapes the dormancy cap and is stalled
       while the same gap without the marker does not, and both rules stop at
       the API-stall ceiling.
+  (10) mean_agents, the honest fleet denominator: the reported bug (one
+      tool-bound worker -> tool_full 1.0 "fleet saturated" vs mean_agents 1.0
+      AGENTS) and its converse (four workers in four states -> every *_full
+      collapses to 0 while mean_agents sums to 4), idle / waiting_human as
+      first-class states, productive vs stalled inference as distinct states,
+      window clipping and the zero-length-window guard.
+  (11) The unobservable third state: a host frozen mid-tool splits its tail at
+      the stale threshold, category coverage (and therefore every existing
+      pressure metric) is UNCHANGED, the composition view reports
+      `unobservable` rather than busy or idle, a short tool wait is not stale,
+      and a long parked-idle tail never decays into unobservable.
+  (12) API-error classification by cause (capacity / rate_limit / network /
+      context_overflow / refusal / auth / other), the ordering guard that keeps
+      an auth message carrying "401" out of the capacity series, and windowed
+      per-kind counting.
+  (13) End-to-end for the new gauges: per-model api_errors attribute a 529 and
+      a context overflow to the opus worker (and not to the sonnet one), the
+      main loop gets its own per-model line, a frozen worker reads as
+      mean_agents{state=unobservable} and lifts stale_agents, a parked main
+      loop reads as idle, and fleet mean_agents sums to the live worker count.
 
 Run:  python3 test_agent_psi_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
@@ -625,14 +645,26 @@ def run():
         ivs = agent_psi.parse_intervals(entries, now=now)
         return ivs[-1] if ivs else None
 
+    def tail_ivs(entries, now):
+        """Every trailing interval past the last closed gap. A silent ACTIVE
+        tail is split at the stale threshold (scenario 10), so an API-stall
+        tail longer than that arrives as observed + unobserved halves of the
+        SAME category."""
+        return agent_psi.parse_intervals(entries, now=now)
+
     # The reported case: a turn dispatched, then the client sits in
     # "Waiting for API response - will retry in 1m 14s" writing nothing.
+    # 400s of it: still 400s of STALLED INFERENCE end to end (the category
+    # coverage the stall metrics read is unchanged), reported as an observed
+    # first 300s plus an unobserved remainder.
     stuck = [assistant(0, tool_use_ids=["R"]), tool_result(1, "R")]
-    iv = tail_iv(stuck, now=1 + 400)
-    check("in-flight turn silent 400s -> stalled inference at true length",
-          iv is not None and iv.category == agent_psi.INFERENCE and iv.stalled
-          and approx(iv.end - iv.start, 400.0),
-          f"got {iv}")
+    ivs_stuck = tail_ivs(stuck, now=1 + 400)
+    inf_stuck = [iv for iv in ivs_stuck if iv.category == agent_psi.INFERENCE]
+    secs_stuck = agent_psi.duty_seconds(ivs_stuck)
+    check("in-flight turn silent 400s -> 400s of stalled inference",
+          approx(secs_stuck[agent_psi.INFERENCE], 400.0)
+          and inf_stuck and all(iv.stalled for iv in inf_stuck),
+          f"got {ivs_stuck}")
 
     # ... and it shows up in the stalled pressure the dashboards read.
     p = agent_psi.compute_stalled_inference_pressure(
@@ -697,6 +729,298 @@ def run():
     ivs = agent_psi.parse_intervals(quick_err, now=None)
     check("2s API-error gap -> not stalled (under min gap)",
           not ivs[0].stalled, f"got {ivs}")
+
+    # ---- Scenario 10: mean_agents -- the honest fleet denominator -------
+    print("\nScenario 10: mean_agents fixes what *_full cannot express")
+    # (a) THE REPORTED BUG. One tool-bound worker: tool_full says 1.0, which
+    # renders as "the fleet is 100% on tool use". mean_agents says 1.0 AGENTS,
+    # which is the true statement. Both numbers are computed here so the
+    # distinction is the assertion, not a comment.
+    lone = {"w1": [I(0, 60, agent_psi.TOOL)]}
+    p_lone = agent_psi.compute_pressure(lone, 0, 60)
+    m_lone = agent_psi.compute_mean_agents(lone, 0, 60)
+    check("one tool-bound worker: tool_full = 1.0 (reads as fleet saturation)",
+          approx(p_lone[(agent_psi.TOOL, "full")], 1.0),
+          f"got {p_lone[(agent_psi.TOOL, 'full')]}")
+    check("... while mean_agents.tool = 1.0 AGENTS (the honest reading)",
+          approx(m_lone[agent_psi.TOOL], 1.0), f"got {m_lone}")
+
+    # (b) THE CONVERSE BUG, measured on the live fleet the same day: four
+    # workers, each in a DIFFERENT state, fleet 100% busy -> every *_full
+    # collapses to 0, so a stack of them reads "idle" at peak concurrency.
+    # mean_agents stacks to 4.
+    split = {
+        "w1": [I(0, 60, agent_psi.INFERENCE)],
+        "w2": [I(0, 60, agent_psi.TOOL)],
+        "w3": [I(0, 60, agent_psi.OVERHEAD)],
+        "w4": [I(0, 60, agent_psi.INFERENCE, True)],
+    }
+    p_split = agent_psi.compute_pressure(split, 0, 60)
+    m_split = agent_psi.compute_mean_agents(split, 0, 60)
+    full_stack = sum(
+        p_split[(c, "full")] for c in agent_psi.PRESSURE_CATEGORIES
+    )
+    check("four busy workers in different states: every *_full = 0",
+          approx(full_stack, 0.0), f"got stack {full_stack} from {p_split}")
+    busy = sum(m_split[s] for s in agent_psi.BUSY_STATES)
+    check("... while mean_agents busy states sum to 4.0 agents",
+          approx(busy, 4.0), f"got {busy} from {m_split}")
+
+    # (c) idle and waiting_human are FIRST-CLASS states, so a mostly-parked
+    # scope reads as parked instead of disappearing into a shrinking
+    # denominator. Three agents, one working: busy 1, idle 1, waiting_human 1,
+    # and the states sum to the 3 agents present.
+    quiet = {
+        "w1": [I(0, 60, agent_psi.TOOL)],
+        "w2": [I(0, 60, agent_psi.IDLE)],
+        "w3": [I(0, 60, agent_psi.WAITING_HUMAN)],
+    }
+    m_quiet = agent_psi.compute_mean_agents(quiet, 0, 60)
+    check("idle / waiting_human are first-class mean_agents states",
+          approx(m_quiet[agent_psi.IDLE], 1.0)
+          and approx(m_quiet[agent_psi.WAITING_HUMAN], 1.0)
+          and approx(m_quiet[agent_psi.TOOL], 1.0),
+          f"got {m_quiet}")
+    check("mean_agents sums to the agents present (3.0)",
+          approx(sum(m_quiet.values()), 3.0), f"got {m_quiet}")
+
+    # (d) Productive and stalled inference are SEPARATE states, so the stack
+    # needs no clamp_min subtraction and cannot double-count.
+    mix = {
+        "w1": [I(0, 30, agent_psi.INFERENCE, False),
+               I(30, 60, agent_psi.INFERENCE, True)],
+    }
+    m_mix = agent_psi.compute_mean_agents(mix, 0, 60)
+    check("productive vs stalled inference split into distinct states",
+          approx(m_mix[agent_psi.INFERENCE], 0.5)
+          and approx(m_mix[agent_psi.INFERENCE_STALLED], 0.5),
+          f"got {m_mix}")
+    # Partial-overlap arithmetic: an interval half inside the window counts
+    # half. (Guards against a naive whole-interval sum.)
+    edge = {"w1": [I(-30, 30, agent_psi.TOOL)]}
+    m_edge = agent_psi.compute_mean_agents(edge, 0, 60)
+    check("intervals are clipped to the window, not counted whole",
+          approx(m_edge[agent_psi.TOOL], 0.5), f"got {m_edge}")
+    check("degenerate window returns zeros, not a divide-by-zero",
+          approx(sum(agent_psi.compute_mean_agents(lone, 5, 5).values()), 0.0),
+          "nonzero for a zero-length window")
+
+    # ---- Scenario 11: unobservable -- the suspended-host third state ----
+    print("\nScenario 11: a host that went away is neither busy nor idle")
+    STALE = agent_psi.DEFAULT_STALE_AFTER_SECONDS  # 300
+
+    # A worker mid-tool when its host suspends (laptop lid): the transcript
+    # freezes with a dispatched tool and no result, forever.
+    frozen = [prompt(0), assistant(2, tool_use_ids=["T"])]
+    ivs_frozen = agent_psi.parse_intervals(frozen, now=2 + STALE + 600)
+    tail_parts = [iv for iv in ivs_frozen if iv.category == agent_psi.TOOL]
+    check("frozen mid-tool tail splits at the stale threshold",
+          len(tail_parts) == 2
+          and tail_parts[0].observed is True
+          and approx(tail_parts[0].end - tail_parts[0].start, STALE)
+          and tail_parts[1].observed is False
+          and approx(tail_parts[1].end - tail_parts[1].start, 600.0),
+          f"got {tail_parts}")
+    # The category is DELIBERATELY unchanged, so no existing metric moves:
+    # duty_seconds and tool_full see the same coverage as before the split.
+    secs_frozen = agent_psi.duty_seconds(ivs_frozen)
+    check("category coverage is unchanged by the split (no metric regression)",
+          approx(secs_frozen[agent_psi.TOOL], STALE + 600.0),
+          f"got {secs_frozen}")
+    p_frozen = agent_psi.compute_pressure(
+        {"f": ivs_frozen}, 2 + STALE, 2 + STALE + 600
+    )
+    check("tool_full over the frozen stretch is still 1.0 (unchanged)",
+          approx(p_frozen[(agent_psi.TOOL, "full")], 1.0),
+          f"got {p_frozen[(agent_psi.TOOL, 'full')]}")
+    # ... but the composition view reports our blindness, not a busy agent.
+    m_frozen = agent_psi.compute_mean_agents(
+        {"f": ivs_frozen}, 2 + STALE, 2 + STALE + 600
+    )
+    check("mean_agents reports it as unobservable, not tool, not idle",
+          approx(m_frozen[agent_psi.UNOBSERVABLE], 1.0)
+          and approx(m_frozen[agent_psi.TOOL], 0.0)
+          and approx(m_frozen[agent_psi.IDLE], 0.0),
+          f"got {m_frozen}")
+    check("unobservable counts as neither busy nor idle",
+          agent_psi.UNOBSERVABLE not in agent_psi.BUSY_STATES
+          and agent_psi.UNOBSERVABLE != agent_psi.IDLE,
+          "unobservable leaked into the busy set")
+    check("is_unobservable_now flags the frozen agent",
+          agent_psi.is_unobservable_now(ivs_frozen) is True, "not flagged")
+
+    # A short blocking tool is NOT stale: the threshold must not turn ordinary
+    # foreground waits into "we lost the host".
+    working = agent_psi.parse_intervals(frozen, now=2 + STALE - 60)
+    check("a tool wait under the threshold stays fully observed",
+          all(iv.observed for iv in working)
+          and agent_psi.is_unobservable_now(working) is False,
+          f"got {working}")
+
+    # An IDLE tail is never split, however long: silence is what idle looks
+    # like, so it confirms the state rather than undermining it. A parked
+    # dispatcher must not decay into "unobservable".
+    parked_long = [prompt(0), assistant(2)]  # end_turn -> idle tail
+    ivs_parked = agent_psi.parse_intervals(parked_long, now=2 + STALE + 600)
+    check("a long parked-idle tail stays observed idle (never unobservable)",
+          all(iv.observed for iv in ivs_parked)
+          and approx(
+              agent_psi.duty_seconds(ivs_parked)[agent_psi.IDLE],
+              STALE + 600.0,
+          ),
+          f"got {ivs_parked}")
+
+    # ---- Scenario 12: API-error classes, per model ----------------------
+    print("\nScenario 12: API-error classification by cause")
+    cls = agent_psi.classify_api_error
+    check("529 Overloaded -> capacity",
+          cls("API Error: 529 Overloaded. This is a server-side issue, "
+              "usually temporary") == agent_psi.API_ERR_CAPACITY,
+          f"got {cls('API Error: 529 Overloaded.')}")
+    check("Server error mid-response -> capacity",
+          cls("API Error: Server error mid-response. The response above may "
+              "be incomplete.") == agent_psi.API_ERR_CAPACITY, "misclassified")
+    check("429 / rate limit -> rate_limit (its own knob, not capacity)",
+          cls("API Error: 429 rate limit exceeded")
+          == agent_psi.API_ERR_RATE_LIMIT, f"got {cls('API Error: 429')}")
+    check("Prompt is too long -> context_overflow",
+          cls("Prompt is too long") == agent_psi.API_ERR_CONTEXT_OVERFLOW,
+          f"got {cls('Prompt is too long')}")
+    check("safeguards / content filtering -> refusal, never capacity",
+          cls("API Error: Fable 5's safeguards flagged this message")
+          == agent_psi.API_ERR_REFUSAL
+          and cls("API Error: Output blocked by content filtering policy")
+          == agent_psi.API_ERR_REFUSAL, "misclassified as a perf signal")
+    check("Login expired -> auth",
+          cls("Login expired · Please run /login") == agent_psi.API_ERR_AUTH,
+          "misclassified")
+    # The ordering guard: an auth message carrying a status code must not land
+    # in capacity and inflate the upstream-impact series.
+    check("'/login · API Error: 401 OAuth ... expired' -> auth, not capacity",
+          cls("Please run /login · API Error: 401 OAuth access token has "
+              "expired. Re-authenticate to continue.")
+          == agent_psi.API_ERR_AUTH, "leaked into capacity")
+    check("connection error -> network, not capacity",
+          cls("API Error: Connection error") == agent_psi.API_ERR_NETWORK,
+          "misclassified")
+    check("unrecognised text -> other (visible, not folded into capacity)",
+          cls("API Error: something entirely new")
+          == agent_psi.API_ERR_OTHER, "silently bucketed")
+    check("empty / None text -> other",
+          cls("") == agent_psi.API_ERR_OTHER
+          and cls(None) == agent_psi.API_ERR_OTHER, "crashed or misbucketed")
+
+    # extract_api_errors pulls (ts, kind) pairs and ignores ordinary turns.
+    err_entries = [
+        assistant(0, model="claude-opus-5", output_tokens=100),
+        api_error(10),                                   # 529 -> capacity
+        api_error(20, text="Prompt is too long"),        # context_overflow
+        tool_result(30, "X"),
+    ]
+    errs = agent_psi.extract_api_errors(err_entries)
+    check("extract_api_errors returns (ts, kind) for error entries only",
+          errs == ((10.0, agent_psi.API_ERR_CAPACITY),
+                   (20.0, agent_psi.API_ERR_CONTEXT_OVERFLOW)),
+          f"got {errs}")
+    # Windowed counting is half-open and every kind is always present, so a
+    # series does not blink out of existence between storms.
+    T = agent_psi.Transcript
+    t_err = T("a1", "s", False, "opus", 0, [], True, errs)
+    counts = agent_psi.count_api_errors([t_err], 0, 15)
+    check("count_api_errors windows the events",
+          counts[agent_psi.API_ERR_CAPACITY] == 1
+          and counts[agent_psi.API_ERR_CONTEXT_OVERFLOW] == 0,
+          f"got {counts}")
+    check("every kind is present even at zero",
+          set(counts) == set(agent_psi.API_ERROR_KINDS), f"got {set(counts)}")
+
+    # ---- Scenario 13: new gauges end-to-end, per model ------------------
+    print("\nScenario 13: mean_agents / api_errors / stale_agents end-to-end")
+    tmp3 = tempfile.mkdtemp(prefix="agent-psi-model-")
+    slug3 = os.path.join(tmp3, "-home-someone")
+    sess3 = "cafe9999-0000-0000-0000-000000000000"
+    subs3 = os.path.join(slug3, sess3, "subagents")
+    os.makedirs(subs3)
+    now3 = time.time()
+    # Main loop on fable: parked idle across the whole 60s window (an uncapped
+    # idle tail), and NO api errors.
+    with open(os.path.join(slug3, f"{sess3}.jsonl"), "w") as fh:
+        for e in [prompt(now3 - 400),
+                  assistant(now3 - 398, model="claude-fable-5")]:
+            fh.write(json.dumps(e) + "\n")
+    # An opus worker that took a 529 and a context overflow, present for the
+    # whole window.
+    with open(os.path.join(subs3, "agent-aaaa.jsonl"), "w") as fh:
+        for e in [prompt(now3 - 400),
+                  assistant(now3 - 398, model="claude-opus-5",
+                            output_tokens=2000),
+                  api_error(now3 - 30),
+                  api_error(now3 - 25, text="Prompt is too long"),
+                  assistant(now3 - 20, tool_use_ids=["Z"],
+                            model="claude-opus-5"),
+                  tool_result(now3 - 2, "Z")]:
+            fh.write(json.dumps(e) + "\n")
+    # A sonnet worker frozen mid-tool well past the stale threshold: file mtime
+    # is fresh (we just wrote it) but the transcript's last write is old, which
+    # is exactly the suspended-host shape.
+    stale_ts = now3 - agent_psi.DEFAULT_STALE_AFTER_SECONDS - 120
+    with open(os.path.join(subs3, "agent-bbbb.jsonl"), "w") as fh:
+        for e in [prompt(stale_ts - 5),
+                  assistant(stale_ts, tool_use_ids=["F"],
+                            model="claude-sonnet-5")]:
+            fh.write(json.dumps(e) + "\n")
+
+    os.environ["CLAUDE_PROJECTS_DIR"] = tmp3
+    mod.PROJECTS_DIR = tmp3
+    mod.collect()
+
+    opus_errs_cap = sample("agent_psi_api_errors", scope="fleet", window="60",
+                           model="opus", kind=agent_psi.API_ERR_CAPACITY)
+    check("per-model capacity error attributed to opus", opus_errs_cap == 1,
+          f"got {opus_errs_cap}")
+    opus_errs_ctx = sample("agent_psi_api_errors", scope="fleet", window="60",
+                           model="opus",
+                           kind=agent_psi.API_ERR_CONTEXT_OVERFLOW)
+    check("per-model context_overflow attributed to opus", opus_errs_ctx == 1,
+          f"got {opus_errs_ctx}")
+    sonnet_errs_cap = sample("agent_psi_api_errors", scope="fleet",
+                             window="60", model="sonnet",
+                             kind=agent_psi.API_ERR_CAPACITY)
+    check("the sonnet worker's capacity count is 0, not opus's",
+          sonnet_errs_cap == 0, f"got {sonnet_errs_cap}")
+    # The main loop gets its OWN model line, so "which models did upstream hit"
+    # is answerable for the dispatcher's model too.
+    main_fable = sample("agent_psi_scope_agents", scope="main", model="fable")
+    check("main scope emits a per-model line for the dispatcher's model",
+          main_fable == 1, f"got {main_fable}")
+    main_fable_err = sample("agent_psi_api_errors", scope="main", window="60",
+                            model="fable", kind=agent_psi.API_ERR_CAPACITY)
+    check("main per-model api_errors emitted (0 for a clean run)",
+          main_fable_err == 0, f"got {main_fable_err}")
+
+    # mean_agents: two workers on the fleet, one of them unobservable.
+    mean_unobs = sample("agent_psi_mean_agents", scope="fleet", window="60",
+                        model="all", state=agent_psi.UNOBSERVABLE)
+    check("frozen worker shows up as mean_agents{state=unobservable}",
+          mean_unobs is not None and mean_unobs > 0.9,
+          f"got {mean_unobs}")
+    stale_fleet = sample("agent_psi_stale_agents", scope="fleet", model="all")
+    check("stale_agents counts exactly the frozen worker", stale_fleet == 1,
+          f"got {stale_fleet}")
+    # The parked main loop reads as IDLE, not as saturation -- the series that
+    # makes an idle-by-design dispatcher legible.
+    main_idle = sample("agent_psi_mean_agents", scope="main", window="60",
+                       model="all", state=agent_psi.IDLE)
+    check("parked main loop reads as mean_agents{state=idle} ~1",
+          main_idle is not None and main_idle > 0.9, f"got {main_idle}")
+    # Sum over states = agents present in the scope (2 workers).
+    fleet_total = sum(
+        sample("agent_psi_mean_agents", scope="fleet", window="60",
+               model="all", state=s) or 0.0
+        for s in agent_psi.AGENT_STATES
+    )
+    check("fleet mean_agents sums to ~the 2 live workers",
+          1.9 <= fleet_total <= 2.05, f"got {fleet_total}")
 
     # ---- summary -------------------------------------------------------
     print()

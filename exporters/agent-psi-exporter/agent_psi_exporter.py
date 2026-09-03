@@ -60,6 +60,33 @@ Metrics
         for the per-model breakdown emitted on the "fleet" scope so a single
         model's rate-limiting isolates as e.g.
         agent_psi_inference_full{scope="fleet",model="opus"}.
+  - agent_psi_mean_agents{scope,window,model,state} gauge [HEADLINE]
+        Mean NUMBER OF AGENTS in `state` over the trailing `window`
+        (agent-seconds / window), for state in {inference, inference_stalled,
+        tool, overhead, idle, waiting_human, unobservable}. This is the fleet
+        COMPOSITION series, and it exists because a stack of *_full ones cannot
+        be: `full` divides by the active-agent count, so a single tool-bound
+        worker reads 1.0 ("the whole fleet, saturated") while four workers in
+        four different states read ~0 in every category at once. mean_agents
+        has no denominator, so it is 1.0 for one busy agent and 4.0 for four,
+        and idle / waiting_human / unobservable are first-class states -- a
+        quiet fleet reads as quiet rather than as saturation.
+  - agent_psi_api_errors{scope,window,model,kind} gauge [HEADLINE]
+        API-error transcript entries in the trailing `window`, by cause:
+        capacity (529 / 5xx / overloaded), rate_limit (429 / quota), network,
+        context_overflow (prompt too long), refusal (safeguards / content
+        filter), auth (401 / login expired), other. Dimensioned by `model`
+        because that is the actionable axis: model families are provisioned and
+        rate-limited independently, so "opus took 28 capacity errors while
+        fable took none" is a model-policy input, and context_overflow per
+        model is the outcome of an opus-vs-sonnet routing choice. Counts of
+        OBSERVED events only -- no attempt to model task-level retry cost,
+        which needs cross-agent semantics this layer does not have.
+  - agent_psi_stale_agents{scope,model}      gauge
+        Agents whose CURRENT state is unobservable: silent for
+        AGENT_PSI_STALE_AFTER_SECONDS while last seen working. A suspended host
+        and a runaway blocking command look identical from a transcript, so
+        this is deliberately neither busy nor idle.
   - agent_psi_scope_agents{scope,model}      gauge
         Count of live agents contributing to each (scope, model) pressure line.
   - agent_psi_live_agents                    gauge
@@ -149,6 +176,14 @@ API_STALL_MAX_SECONDS = float(
         str(agent_psi.DEFAULT_API_STALL_MAX_SECONDS),
     )
 )
+# Silence on an ACTIVE trailing interval past which the state is reported as
+# `unobservable` rather than asserted (suspended host / runaway command).
+STALE_AFTER_SECONDS = float(
+    os.environ.get(
+        "AGENT_PSI_STALE_AFTER_SECONDS",
+        str(agent_psi.DEFAULT_STALE_AFTER_SECONDS),
+    )
+)
 
 EXPORTER_COMMIT = os.environ.get("AGENT_PSI_EXPORTER_COMMIT", "").strip() or "unknown"
 EXPORTER_VERSION = os.environ.get("AGENT_PSI_EXPORTER_VERSION", "").strip() or "0.0.0"
@@ -204,6 +239,49 @@ for _kind in ("some", "full"):
         registry=REG,
     )
 
+g_mean_agents = Gauge(
+    "agent_psi_mean_agents",
+    (
+        "Mean NUMBER OF AGENTS in `scope` (restricted to `model`, or "
+        "model=all) in `state` over the trailing `window` seconds "
+        "(agent-seconds / window). Unit is agents: 1 means one agent for the "
+        "whole window, 4 means four. Summing over `state` gives the mean "
+        "agents present. Unlike agent_psi_*_full this has NO agent-count "
+        "denominator, so a lone busy worker reads 1 rather than 100%, and a "
+        "fleet split across states does not collapse to 0. States: "
+        "inference (productive) / inference_stalled / tool / overhead / idle / "
+        "waiting_human / unobservable."
+    ),
+    ["scope", "window", "model", "state"],
+    registry=REG,
+)
+g_api_errors = Gauge(
+    "agent_psi_api_errors",
+    (
+        "Count of API-error transcript entries (isApiErrorMessage) from agents "
+        "in `scope` on `model` in the trailing `window` seconds, by `kind`: "
+        "capacity (529/5xx/overloaded) / rate_limit (429/quota) / network / "
+        "context_overflow (prompt too long) / refusal (safeguards, content "
+        "filter) / auth (401, login expired) / other. The per-model "
+        "upstream-impact and policy-outcome signal: an agent's model is fixed "
+        "for its lifetime, so each failure attributes to the model that hit it."
+    ),
+    ["scope", "window", "model", "kind"],
+    registry=REG,
+)
+g_stale_agents = Gauge(
+    "agent_psi_stale_agents",
+    (
+        "Live agents in `scope` on `model` whose CURRENT state is "
+        "unobservable: no transcript write for AGENT_PSI_STALE_AFTER_SECONDS "
+        "while the last observed state was work. A suspended host (laptop lid, "
+        "paused VM) and an unbounded blocking command are indistinguishable "
+        "from a transcript, so this is neither busy nor idle - it is the count "
+        "of agents we have lost sight of."
+    ),
+    ["scope", "model"],
+    registry=REG,
+)
 g_scope_agents = Gauge(
     "agent_psi_scope_agents",
     "Count of live agents contributing to each (scope, model) pressure line.",
@@ -258,23 +336,52 @@ g_build_info.labels(
 ).set(1)
 
 
-def _emit_pressure(scope, agent_intervals, now, model="all"):
-    """Emit some/full for every pressure category (inference / tool /
-    overhead) and window for one scope+model, plus the stalled-inference
-    some/full subset."""
+def _emit_scope(scope, transcripts, now, model="all"):
+    """Emit every windowed series for one (scope, model) line.
+
+    Three families, from the same transcript set:
+
+    * PRESSURE — some/full per pressure category plus the stalled-inference
+      subset (PSI semantics: normalized over the active agents).
+    * COMPOSITION — agent_psi_mean_agents per state (occupancy, no denominator).
+    * FAILURES — agent_psi_api_errors per kind, the per-model upstream-impact
+      and policy-outcome counts.
+
+    Plus the two instantaneous counts for the line: how many agents it spans
+    and how many of those we have currently lost sight of.
+    """
+    agent_intervals = {t.agent_id: t.intervals for t in transcripts}
     for window in WINDOWS:
-        ratios = agent_psi.compute_pressure(agent_intervals, now - window, now)
+        start = now - window
+        ratios = agent_psi.compute_pressure(agent_intervals, start, now)
         for (cat, kind), value in ratios.items():
             _PRESSURE_GAUGES[(cat, kind)].labels(
                 scope=scope, window=str(window), model=model
             ).set(value)
         stalled = agent_psi.compute_stalled_inference_pressure(
-            agent_intervals, now - window, now
+            agent_intervals, start, now
         )
         for kind, value in stalled.items():
             _STALLED_GAUGES[kind].labels(
                 scope=scope, window=str(window), model=model
             ).set(value)
+        for state, value in agent_psi.compute_mean_agents(
+            agent_intervals, start, now
+        ).items():
+            g_mean_agents.labels(
+                scope=scope, window=str(window), model=model, state=state
+            ).set(value)
+        for kind, count in agent_psi.count_api_errors(
+            transcripts, start, now
+        ).items():
+            g_api_errors.labels(
+                scope=scope, window=str(window), model=model, kind=kind
+            ).set(count)
+
+    g_scope_agents.labels(scope=scope, model=model).set(len(transcripts))
+    g_stale_agents.labels(scope=scope, model=model).set(
+        sum(1 for t in transcripts if agent_psi.is_unobservable_now(t.intervals))
+    )
 
 
 def collect():
@@ -288,6 +395,7 @@ def collect():
             min_stall_gap=MIN_STALL_GAP_SECONDS,
             api_stall_tail=API_STALL_TAIL_SECONDS,
             api_stall_max=API_STALL_MAX_SECONDS,
+            stale_after=STALE_AFTER_SECONDS,
         )
     except Exception as e:  # pragma: no cover - defensive
         log.error("Failed to read %s: %s", PROJECTS_DIR, e)
@@ -298,6 +406,9 @@ def collect():
         gauge.clear()
     for gauge in _STALLED_GAUGES.values():
         gauge.clear()
+    g_mean_agents.clear()
+    g_api_errors.clear()
+    g_stale_agents.clear()
     g_scope_agents.clear()
     g_duty_ratio.clear()
     g_duty_seconds.clear()
@@ -324,35 +435,36 @@ def collect():
         for cat, value in ratios.items():
             g_duty_ratio.labels(agent_id=t.agent_id, category=cat).set(value)
 
-    # Fleet pressure (headline) — SUB-AGENTS ONLY, main loop excluded.
-    fleet = {t.agent_id: t.intervals for t in sub_transcripts}
-    _emit_pressure("fleet", fleet, now, model="all")
-    g_scope_agents.labels(scope="fleet", model="all").set(len(fleet))
+    def by_model(ts):
+        groups = {}
+        for t in ts:
+            groups.setdefault(t.model or agent_psi.UNKNOWN_MODEL, []).append(t)
+        return groups
 
-    # Per-model fleet pressure (headline) — the same some/full math restricted
-    # to the workers on each model family, so per-model rate-limiting isolates.
-    by_model = {}
-    for t in sub_transcripts:
-        by_model.setdefault(t.model or agent_psi.UNKNOWN_MODEL, {})[
-            t.agent_id
-        ] = t.intervals
-    for model, members in by_model.items():
-        _emit_pressure("fleet", members, now, model=model)
-        g_scope_agents.labels(scope="fleet", model=model).set(len(members))
+    # Fleet (headline) — SUB-AGENTS ONLY, main loop excluded.
+    _emit_scope("fleet", sub_transcripts, now, model="all")
 
-    # Main-loop pressure (headline) — the dispatcher on its own scope/line.
-    main = {t.agent_id: t.intervals for t in main_transcripts}
-    _emit_pressure("main", main, now, model="all")
-    g_scope_agents.labels(scope="main", model="all").set(len(main))
+    # Per-model fleet lines — the same math restricted to the workers on each
+    # model family, so one model's rate-limiting / overload isolates.
+    for model, members in by_model(sub_transcripts).items():
+        _emit_scope("fleet", members, now, model=model)
 
-    # Per-session subtree pressure (headline) — main loop + its live workers.
+    # Main-loop (headline) — the dispatcher on its own scope/line, and on its
+    # own model line too: the dispatcher usually runs a DIFFERENT model from the
+    # workers, and "which models did upstream hit" is unanswerable if the main
+    # loop's model is only ever aggregated into model="all".
+    _emit_scope("main", main_transcripts, now, model="all")
+    for model, members in by_model(main_transcripts).items():
+        _emit_scope("main", members, now, model=model)
+
+    # Per-session subtree (headline) — main loop + its live workers.
     by_session = {}
     for t in transcripts:
-        by_session.setdefault(t.session_id or "unknown", {})[t.agent_id] = t.intervals
+        by_session.setdefault(t.session_id or "unknown", []).append(t)
     for session_id, members in by_session.items():
-        scope = "session:" + (session_id or "unknown")[:8]
-        _emit_pressure(scope, members, now, model="all")
-        g_scope_agents.labels(scope=scope, model="all").set(len(members))
+        _emit_scope(
+            "session:" + (session_id or "unknown")[:8], members, now, model="all"
+        )
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
@@ -390,6 +502,10 @@ def main():
     log.info(
         "API stall: in-flight turn silent >=%.0fs => stalled (capped at %.0fs)",
         API_STALL_TAIL_SECONDS, API_STALL_MAX_SECONDS,
+    )
+    log.info(
+        "Observability: active tail silent >=%.0fs => unobservable",
+        STALE_AFTER_SECONDS,
     )
     collect()
     HTTPServer(("0.0.0.0", PORT), MetricsHandler).serve_forever()

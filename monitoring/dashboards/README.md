@@ -22,8 +22,11 @@ drifts.
   items with elapsed time. Needs `exporters/work-queue-exporter/`.
 - **`agent-psi.json`** (uid `agent-psi`) — pressure-stall (PSI) metrics over
   the Claude Code agent fleet: live-agent count, fleet inference/tool
-  pressure at multiple sliding windows, and per-agent duty cycle. Needs
-  `exporters/agent-psi-exporter/`.
+  pressure at multiple sliding windows, per-agent duty cycle, fleet
+  composition as mean concurrent agents per state (the two are NOT
+  interchangeable — `*_full` is a unanimity signal normalized over active
+  agents, `mean_agents` is denominator-free occupancy), and per-model
+  upstream API errors by cause. Needs `exporters/agent-psi-exporter/`.
 
 Validate with `jq empty monitoring/dashboards/*.json`.
 
