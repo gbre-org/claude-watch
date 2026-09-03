@@ -276,7 +276,7 @@ pub fn build_cadence_json(ev: &CadenceEvent<'_>) -> serde_json::Value {
 /// daemon reads, so it is both the gate-clear and the proof-of-life. Kept as
 /// a const because three producers quote it: the keepalive event body, the
 /// ack-stale recovery prompt, and `claude-event-watch`'s per-batch footer.
-pub const ACK_BATCH_COMMAND: &str = "event-ack ack-batch";
+pub const ACK_BATCH_COMMAND: &str = "event-ack ack-batch --override-reason \"<why>\"";
 
 /// Build the `data` body for a `keepalive` cadence event.
 ///
@@ -1062,7 +1062,7 @@ mod tests {
         // The body must TELL the loop the ritual, not assume it remembers.
         // claude-event-watch renders every scalar in `data` on the EVENT line,
         // so this is what makes the instruction visible.
-        assert_eq!(parsed["data"]["ack_command"], "event-ack ack-batch");
+        assert_eq!(parsed["data"]["ack_command"], "event-ack ack-batch --override-reason \"<why>\"");
     }
 
     #[test]

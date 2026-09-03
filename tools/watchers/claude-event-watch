@@ -1223,7 +1223,7 @@ PYEOF
 # The one command the main loop runs after handling a batch. It acks every
 # pending entry AND stamps the liveness timestamp claude-watch's ack-stale
 # detector reads. Overridable for a deployment that wraps it.
-ACK_BATCH_COMMAND="${CLAUDE_EVENT_ACK_COMMAND:-event-ack ack-batch}"
+ACK_BATCH_COMMAND="${CLAUDE_EVENT_ACK_COMMAND:-event-ack ack-batch --override-reason \"<why>\"}"
 
 # Print the per-batch ack instruction (monitor mode only).
 #
@@ -1236,7 +1236,7 @@ ACK_BATCH_COMMAND="${CLAUDE_EVENT_ACK_COMMAND:-event-ack ack-batch}"
 # `ack-batch` clears the whole drain.
 print_ack_footer() {
     [[ "$MODE_RESOLVED" == "monitor" ]] || return 0
-    echo "EVENT-ACK REQUIRED: after handling the batch above, run \`$ACK_BATCH_COMMAND\` (one bare command — acks every pending entry and stamps liveness)"
+    echo "EVENT-ACK REQUIRED: after handling the batch above, run \`$ACK_BATCH_COMMAND\` (--override-reason required, audited — acks every pending entry and stamps liveness)"
 }
 
 # Count the number of pending event files currently in the queue. Used by the

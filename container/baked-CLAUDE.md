@@ -1278,8 +1278,7 @@ PR CI failure / merge conflict, workbot-prompt, queue-stale-ready, slack-unread,
 > your batches you never see one. Clear it like any batch:
 > **`event-ack ack-batch --override-reason "<why>"`**. The stamp must come from YOU, never the daemon:
 > that is the wedge detector. Miss it past `[ack] stale_minutes` (20) and
-> claude-watch nudges + alerts. (Was `heartbeat-tick`; the file it told you
-> to `touch` is gone.)
+> claude-watch nudges + alerts.
 
   - Routed into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt
@@ -1312,12 +1311,11 @@ table → fail-LOUD `actionable`. Inspect: `event-classify --list-rules`.
 3. Ingest is automatic (the watcher does it as it drains).
 4. **Handle the batch**: queue an agent / act directly / dismiss, per event.
 5. **Ack the batch, every batch: `event-ack ack-batch --override-reason
-   "<why>"`.** `--override-reason` is REQUIRED (audited; refused exit 2
-   if blank): clears all pending,
-   resets the N-counter, stamps `last-ack-timestamp` (its age is
-   claude-watch's ONLY liveness signal). Monitor mode prints an `EVENT-ACK
-   REQUIRED:` line per batch as the reminder. Per-key `event-ack ack
-   "<key>"` only to leave part of a batch pending.
+   "<why>"`** (REQUIRED, audited): clears all pending, resets the
+   N-counter, stamps `last-ack-timestamp` (its age is claude-watch's ONLY
+   liveness signal). Monitor mode prints an `EVENT-ACK REQUIRED:` line per
+   batch. Per-key `event-ack ack "<key>"` only to leave part of a batch
+   pending.
 6. **Ambient events** need no action: they surface in the next prompt's
    context via the UserPromptSubmit hook. Ack the batch anyway.
 

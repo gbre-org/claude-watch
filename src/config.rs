@@ -533,7 +533,7 @@ fn default_interrupt_enabled() -> bool {
 /// the loop recognises it as a daemon interrupt, and asks for a watcher
 /// sanity-check so a genuinely-wedged event pipeline still gets surfaced.
 fn default_ack_stale_prompt() -> String {
-    "[CLAUDE-WATCH] No claude-event has been acked for longer than the stale window — from here the loop looks wedged. Run `event-ack ack-batch` NOW (one bare command; it acks every pending entry and stamps the liveness timestamp). Then check why events weren't reaching you (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM the operator with the details.".to_string()
+    "[CLAUDE-WATCH] No claude-event has been acked for longer than the stale window — from here the loop looks wedged. Run `event-ack ack-batch --override-reason \"<why>\"` NOW (--override-reason is required and audited; it acks every pending entry and stamps the liveness timestamp). Then check why events weren't reaching you (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM the operator with the details.".to_string()
 }
 
 /// Default post-clear resume prompt. Single-line (the tmux inject pipeline
