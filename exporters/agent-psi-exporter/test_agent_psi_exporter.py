@@ -69,6 +69,12 @@ Scenarios:
       main loop gets its own per-model line, a frozen worker reads as
       mean_agents{state=unobservable} and lifts stale_agents, a parked main
       loop reads as idle, and fleet mean_agents sums to the live worker count.
+  (14) Terminated workers leave the fleet: `terminated=True` drops the trailing
+      interval (closed intervals byte-identical), the reported regression shape
+      — every worker returned minutes ago — leaves an EMPTY composition stack
+      instead of a flat "idle (parked)" block disagreeing with live_agents=0,
+      a worker that returned inside the window still counts for the part of it
+      it was alive, and the parked main loop keeps its idle tail.
 
 Run:  python3 test_agent_psi_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
@@ -1021,6 +1027,126 @@ def run():
     )
     check("fleet mean_agents sums to ~the 2 live workers",
           1.9 <= fleet_total <= 2.05, f"got {fleet_total}")
+
+    # ---- Scenario 14: terminated workers leave the fleet ----------------
+    print("\nScenario 14: a returned sub-agent stops occupying the fleet")
+    # Pure level: a terminated transcript gets no trailing interval at all, so
+    # its timeline ends at its last write instead of growing an idle phantom.
+    done_entries = [prompt(1000), assistant(1002, tool_use_ids=["T"]),
+                    tool_result(1004, "T"), assistant(1006)]  # end_turn
+    ivs_open = agent_psi.parse_intervals(done_entries, now=1600)
+    ivs_done = agent_psi.parse_intervals(done_entries, now=1600, terminated=True)
+    check("without `terminated` the returned agent grows an idle tail",
+          any(iv.category == agent_psi.IDLE for iv in ivs_open)
+          and max(iv.end for iv in ivs_open) == 1600,
+          f"got {ivs_open[-1] if ivs_open else None}")
+    check("terminated=True ends the timeline at the last write",
+          max(iv.end for iv in ivs_done) == 1006
+          and not any(iv.category == agent_psi.IDLE for iv in ivs_done),
+          f"got {ivs_done[-1] if ivs_done else None}")
+    check("terminated only drops the tail, closed intervals are identical",
+          ivs_done == ivs_open[:len(ivs_done)], "closed intervals differ")
+
+    # read_transcript applies it to SUB-AGENTS only: the main loop's parked
+    # transcript has the identical trailing shape but the dispatcher is still
+    # there, so its (uncapped) idle tail must survive.
+    tmp4 = tempfile.mkdtemp(prefix="agent-psi-term-")
+    slug4 = os.path.join(tmp4, "-home-someone")
+    sess4 = "d00d1234-0000-0000-0000-000000000000"
+    subs4 = os.path.join(slug4, sess4, "subagents")
+    os.makedirs(subs4)
+    now4 = time.time()
+
+    def write(path, entries):
+        with open(path, "w") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+
+    # The reported shape: real work up to T-420 / T-400, then both workers
+    # RETURN and nothing writes again. Before the fix each kept an uncapped
+    # idle tail to `now`, so the composition panel showed a flat 2-agent
+    # "idle (parked)" block for the whole file-mtime live window while
+    # live_agents read 0.
+    write(os.path.join(subs4, "agent-1111.jsonl"), [
+        prompt(now4 - 900),
+        assistant(now4 - 880, tool_use_ids=["P"], model="claude-opus-5"),
+        tool_result(now4 - 500, "P"),
+        assistant(now4 - 420, model="claude-opus-5", output_tokens=4000),
+    ])
+    write(os.path.join(subs4, "agent-2222.jsonl"), [
+        prompt(now4 - 900),
+        assistant(now4 - 870, tool_use_ids=["Q"], model="claude-opus-5"),
+        tool_result(now4 - 480, "Q"),
+        assistant(now4 - 400, model="claude-opus-5", output_tokens=4000),
+    ])
+    # Parked main loop: same trailing end_turn, but it is the dispatcher.
+    write(os.path.join(slug4, f"{sess4}.jsonl"), [
+        prompt(now4 - 900), assistant(now4 - 890, model="claude-fable-5")])
+
+    os.environ["CLAUDE_PROJECTS_DIR"] = tmp4
+    mod.PROJECTS_DIR = tmp4
+    mod.collect()
+
+    live4 = sample("agent_psi_live_agents")
+    check("both workers have returned -> live_agents 0", live4 == 0,
+          f"got {live4}")
+    for state in agent_psi.AGENT_STATES:
+        value = sample("agent_psi_mean_agents", scope="fleet", window="60",
+                       model="all", state=state) or 0.0
+        check(f"terminated workers contribute no fleet {state}",
+              approx(value, 0.0, tol=1e-6), f"got {value}")
+    # ...and they must not have merely SHIFTED into another band: the whole
+    # stack, summed, is empty.
+    fleet_total4 = sum(
+        sample("agent_psi_mean_agents", scope="fleet", window="60",
+               model="all", state=s) or 0.0
+        for s in agent_psi.AGENT_STATES
+    )
+    check("fleet composition stack is empty once every worker returned",
+          approx(fleet_total4, 0.0, tol=1e-6), f"got {fleet_total4}")
+    # The parked main loop is NOT terminated — the dispatcher's idle stays.
+    main_idle4 = sample("agent_psi_mean_agents", scope="main", window="60",
+                        model="all", state=agent_psi.IDLE)
+    check("parked main loop still reads as idle (not treated as terminated)",
+          main_idle4 is not None and main_idle4 > 0.9, f"got {main_idle4}")
+
+    # A worker that returned INSIDE the trailing window still counts for the
+    # part of it that it was alive — the fix truncates the phantom, it does not
+    # erase real occupancy — and one still mid-tool is untouched.
+    tmp5 = tempfile.mkdtemp(prefix="agent-psi-term2-")
+    slug5 = os.path.join(tmp5, "-home-someone")
+    sess5 = "feed5678-0000-0000-0000-000000000000"
+    subs5 = os.path.join(slug5, sess5, "subagents")
+    os.makedirs(subs5)
+    now5 = time.time()
+    # Returned 20s ago after a 40s tool: 20 of the last 60s were real tool time.
+    write(os.path.join(subs5, "agent-3333.jsonl"), [
+        prompt(now5 - 90),
+        assistant(now5 - 80, tool_use_ids=["R"], model="claude-opus-5"),
+        tool_result(now5 - 25, "R"),
+        assistant(now5 - 20, model="claude-opus-5", output_tokens=4000),
+    ])
+    # Still working: tool dispatched 10s ago, no result yet.
+    write(os.path.join(subs5, "agent-4444.jsonl"), [
+        prompt(now5 - 30),
+        assistant(now5 - 10, tool_use_ids=["S"], model="claude-opus-5"),
+    ])
+    os.environ["CLAUDE_PROJECTS_DIR"] = tmp5
+    mod.PROJECTS_DIR = tmp5
+    mod.collect()
+
+    live5 = sample("agent_psi_live_agents")
+    check("only the mid-tool worker is live", live5 == 1, f"got {live5}")
+    tool5 = sample("agent_psi_mean_agents", scope="fleet", window="60",
+                   model="all", state=agent_psi.TOOL)
+    # ~35s of the returned worker's tool time plus ~10s of the live one's, over
+    # a 60s window: comfortably positive, and nowhere near a phantom 1.0-each.
+    check("pre-exit tool time inside the window still counts",
+          tool5 is not None and 0.5 < tool5 < 1.2, f"got {tool5}")
+    idle5 = sample("agent_psi_mean_agents", scope="fleet", window="60",
+                   model="all", state=agent_psi.IDLE) or 0.0
+    check("the returned worker adds no idle after its exit",
+          approx(idle5, 0.0, tol=1e-6), f"got {idle5}")
 
     # ---- summary -------------------------------------------------------
     print()

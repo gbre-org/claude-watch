@@ -70,7 +70,12 @@ Metrics
         four different states read ~0 in every category at once. mean_agents
         has no denominator, so it is 1.0 for one busy agent and 4.0 for four,
         and idle / waiting_human / unobservable are first-class states -- a
-        quiet fleet reads as quiet rather than as saturation.
+        quiet fleet reads as quiet rather than as saturation. A sub-agent that
+        has RETURNED contributes nothing after its last write, so the fleet
+        stack drains within one `window` of the last worker exiting instead of
+        holding a terminated agent in `idle` until the file-mtime live window
+        expires -- it cannot disagree with agent_psi_live_agents about whether
+        the fleet is still busy.
   - agent_psi_api_errors{scope,window,model,kind} gauge [HEADLINE]
         API-error transcript entries in the trailing `window`, by cause:
         capacity (529 / 5xx / overloaded), rate_limit (429 / quota), network,
@@ -424,7 +429,12 @@ def collect():
     # drops immediately instead of lingering for the whole file-mtime live
     # window; a mid-tool-wait agent (open trailing interval) stays counted.
     # Pressure/scope membership still spans every file-recent sub-agent, since
-    # one that finished mid-window legitimately contributed to that window.
+    # one that finished mid-window legitimately contributed to that window --
+    # but only up to its LAST WRITE: a terminated worker gets no trailing
+    # interval (agent_psi.parse_intervals' ``terminated``), so it stops
+    # contributing agent-seconds the moment it returns and ages out of each
+    # window on its own. That is what keeps this count and the composition
+    # series describing the same fleet.
     g_live_agents.set(sum(1 for t in sub_transcripts if t.running))
 
     # Per-agent duty cycle (byproduct) — every live transcript, main + workers.
