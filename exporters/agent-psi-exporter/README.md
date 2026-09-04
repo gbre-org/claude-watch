@@ -190,6 +190,34 @@ entirely and stops being counted anywhere. A long suspension therefore shows up
 as `unobservable` first and then drops out — the same live-window edge that
 makes a long retry storm invisible here (see above).
 
+### A returned sub-agent has no current state
+
+The trailing interval says "this is what the agent is doing *now*", which
+assumes there still is one. A **sub-agent** that ends in a completed final turn
+(assistant `end_turn`, nothing left in flight) has returned its answer and
+exited, so no tail is synthesized for it: its timeline ends at its last write.
+
+Without that rule the returned worker's tail was classified `idle` (a returned
+`end_turn` is also the parked-dispatcher shape) and, because an idle tail is
+never capped, it accrued one agent-second per second until the file-mtime live
+window expired — up to `AGENT_PSI_LIVE_WINDOW_SECONDS` of a **terminated**
+worker sitting in the composition panel's `idle (parked)` band while
+`agent_psi_live_agents`, which already consulted the same "still running?"
+test, read 0. Two panels, one fleet, incompatible stories.
+
+Closed intervals are untouched, so a worker that returned partway through a
+window still contributes the agent-seconds it really occupied (returning 20s
+into the trailing 60s counts for 40s of it), and the stack then drains on its
+own within one `window` instead of lingering.
+
+The **main loop is exempt**: its transcript takes the identical shape whenever
+it is parked between turns, but the dispatcher is still there — that is its
+steady state, and suppressing its idle tail would re-create the main-loop idle
+undercount. Termination is a claim only made about workers, whose return *is*
+an exit. A worker that dies mid-tool or mid-turn writes no `end_turn`, so it is
+not terminal by this rule; it goes `unobservable` at the stale threshold and
+then falls out at the live-window horizon, as before.
+
 ### Per-model upstream impact
 
 `agent_psi_api_errors{scope,window,model,kind}` counts the synthetic

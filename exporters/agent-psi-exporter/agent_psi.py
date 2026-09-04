@@ -180,6 +180,34 @@ while ``compute_mean_agents`` reports the unobserved remainder under its own
 long blocking tool and a frozen host are INDISTINGUISHABLE from the transcript,
 and ``unobservable`` is exactly that admission, not an assertion that the agent
 is gone.
+
+A TERMINATED SUB-AGENT HAS NO CURRENT STATE
+-------------------------------------------
+The trailing open interval above says "this is what the agent is doing right
+now", which presupposes there still IS an agent. For a SUB-AGENT that is not
+true once it returns: a worker whose transcript ends in a completed final turn
+(assistant ``end_turn``, no tool left in flight — ``is_running_transcript``)
+has handed its answer back and is gone. Synthesizing a tail for it read as
+``idle`` (a returned ``end_turn`` is the parked-dispatcher shape) and, because
+an idle tail is deliberately never capped, that phantom accrued one agent-second
+per second until the file-mtime live window finally dropped the file — up to
+``LIVE_WINDOW_SECONDS`` of a terminated worker sitting in
+``compute_mean_agents``' ``idle`` band. The live-agent count already consulted
+``is_running_transcript`` and said 0 while the composition panel showed a flat
+stack: the same fleet, described two incompatible ways.
+
+So a terminated sub-agent's timeline simply ENDS at its last transcript write:
+``parse_intervals(..., terminated=True)`` emits no tail. Its closed intervals
+are untouched, so the work it did before returning still counts for whatever
+part of a trailing window it really occupied (an agent that finished 20s into
+the last 60s contributed 20 agent-seconds, and should), and it then falls out
+of every window on its own within one window length rather than lingering.
+
+The MAIN LOOP is deliberately exempt. Its transcript ends in exactly the same
+completed final turn whenever it is between turns, but the dispatcher is still
+there, parked and waiting — that IS its steady state, and suppressing its idle
+tail would re-create the main-loop idle undercount the uncap fixed. Termination
+is a claim we only make about workers, whose return is an exit.
 """
 
 from __future__ import annotations
@@ -709,12 +737,18 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
                     min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
                     api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
                     api_stall_max=DEFAULT_API_STALL_MAX_SECONDS,
-                    stale_after=DEFAULT_STALE_AFTER_SECONDS):
+                    stale_after=DEFAULT_STALE_AFTER_SECONDS,
+                    terminated=False):
     """Ordered JSONL entries (dicts) -> list[Interval].
 
     ``entries`` need not be sorted; moments are sorted by timestamp. When
     ``now`` is given a trailing open interval is appended for the agent's
-    current state (what makes the live fleet PSI reflect the present).
+    current state (what makes the live fleet PSI reflect the present) —
+    UNLESS ``terminated`` says the agent is gone, in which case the timeline
+    ends at its last write and no current state is invented. Callers set that
+    for a sub-agent whose transcript ended in a completed final turn; see the
+    module docstring's terminated-sub-agent section for why the main loop,
+    whose transcript looks identical while it is merely parked, is exempt.
 
     Each ``inference`` interval also carries a ``stalled`` flag set from the
     ending assistant turn's output-token throughput (see
@@ -741,6 +775,10 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
             api_error=cur.api_error,
         )
         intervals.append(Interval(prev.ts, cur.ts, cat, stalled))
+
+    if terminated:
+        # The agent returned and exited: there is no "right now" to describe.
+        return intervals
 
     result_ids = _all_result_ids(entries)
     last = moments[-1]
@@ -1054,14 +1092,21 @@ def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
         agent_id = "main_loop:" + (session_id or "")[:8]
     else:
         agent_id = _agent_id_from_path(path) or os.path.basename(path)
+    running = is_running_transcript(entries)
+    # A SUB-AGENT that is not running has returned and exited, so it gets no
+    # trailing "current state" interval — otherwise its returned-end_turn tail
+    # reads as (uncapped) idle and the terminated worker keeps occupying the
+    # fleet-composition series until the file-mtime live window expires. The
+    # main loop's transcript has the same shape whenever it is parked between
+    # turns, but the dispatcher is still there, so it keeps its idle tail.
+    terminated = not is_main_loop and not running
     intervals = parse_intervals(
         entries, now=now, max_gap=max_gap,
         stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
         api_stall_tail=api_stall_tail, api_stall_max=api_stall_max,
-        stale_after=stale_after,
+        stale_after=stale_after, terminated=terminated,
     )
     model = extract_model(entries)
-    running = is_running_transcript(entries)
     return Transcript(
         agent_id, session_id, is_main_loop, model, mtime, intervals, running,
         extract_api_errors(entries),
