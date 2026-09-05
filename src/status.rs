@@ -721,7 +721,8 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 fn resolve_running_version(pid: &str) -> Option<String> {
     // Layout 1: versioned /proc/PID/exe target.
     let exe_path = format!("/proc/{pid}/exe");
-    if let Ok(target) = std::fs::read_link(&exe_path) {
+    let exe_link = std::fs::read_link(&exe_path);
+    if let Ok(target) = &exe_link {
         if let Some(ver) = extract_version_from_path(&target.to_string_lossy()) {
             return Some(ver);
         }
@@ -742,6 +743,28 @@ fn resolve_running_version(pid: &str) -> Option<String> {
     // installed value. (The `installed`/`latest` field is sourced separately via
     // find_claude_launcher() + resolve_installed_version(), where the installed
     // binary IS the right answer.)
+    //
+    // PID-REUSE GUARD: before trusting the marker, sanity-check that this PID
+    // still looks like a claude process by inspecting the resolved
+    // `/proc/<pid>/exe` TARGET (what the kernel says the PID is actually
+    // executing) via `is_claude_tui_exe`. This deliberately does NOT re-check
+    // the argv/cmdline for the substring "claude" — that is exactly the check
+    // that let PID reuse fool the caller in the first place (`pgrep -af
+    // claude` matches ANY process whose full command line merely contains
+    // "claude", e.g. the tmux SERVER, whose own spawn argv can include it).
+    // When the kernel recycles a PID that a now-exited claude session once
+    // held, the leftover `~/.claude/sessions/<pid>.json` marker must not be
+    // resurrected for the new, unrelated process that now owns that PID. If
+    // the exe link itself couldn't be read (process gone, permission denied,
+    // /proc unavailable on this platform) there's no signal to sanity-check
+    // against — fall back to the historical behavior of trusting the marker
+    // rather than guessing.
+    if let Ok(target) = &exe_link {
+        if !is_claude_tui_exe(&target.to_string_lossy()) {
+            return None;
+        }
+    }
+
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let session_marker = format!("{home}/.claude/sessions/{pid}.json");
     if let Ok(contents) = std::fs::read_to_string(&session_marker) {
@@ -1209,9 +1232,15 @@ async fn get_claude_status_inner(
                 );
             }
 
-            let version_info = tokio::task::spawn_blocking(get_version_info)
-                .await
-                .unwrap_or_default();
+            // Pane-scoped, matching the auto-update daemon path
+            // (`policy::check_auto_update` / `check_update_trigger`): the pane
+            // is already resolved above (either the configured fixed
+            // main-loop pane or the auto-detect scan), so read the running
+            // version off THAT pane's PID rather than falling back to the
+            // unscoped first-`pgrep -af claude`-match resolver, which PID
+            // reuse can fool (see `resolve_running_version`'s session-marker
+            // hardening below).
+            let version_info = get_version_info_for_pane(&pane).await;
 
             let status = ClaudeStatus {
                 pane,

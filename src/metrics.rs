@@ -705,10 +705,29 @@ fn write_prom(lines: &[String], path: &Path) -> std::io::Result<()> {
 ///
 /// Previous implementation shelled out to `claude-watch status --json`, which
 /// broke when PATH resolved to a stale binary at /usr/local/bin/claude-watch
-/// that couldn't parse the current config. Calling get_version_info() directly
-/// avoids the recursive subprocess and config dependency entirely.
-fn fetch_version_info() -> (String, String) {
-    let info = get_version_info();
+/// that couldn't parse the current config. Calling the version resolver
+/// directly avoids the recursive subprocess and config dependency entirely.
+///
+/// Pane-scoped: resolves the main-loop pane the same way the auto-update
+/// daemon path does (`policy::check_auto_update` / `check_update_trigger`,
+/// via `status::find_claude_pane_with_config`) and reads the running version
+/// off THAT pane's PID, not off the first PID a bare `pgrep -af claude`
+/// happens to match. The unscoped `get_version_info()` took the first match
+/// unconditionally, which PID reuse can fool: once a claude session exits,
+/// its PID can be recycled by an unrelated process (e.g. the tmux server)
+/// whose own argv still contains the substring "claude", and a leftover
+/// `~/.claude/sessions/<pid>.json` marker for that PID then resurrects the
+/// exited session's stale version — the ghost `current` version on the
+/// dashboard panel. Falls back to the unscoped resolver only when no pane
+/// can be resolved at all (fresh install / no tmux running).
+async fn fetch_version_info() -> (String, String) {
+    let tmux_cfg = crate::config::try_load_config()
+        .map(|c| c.tmux)
+        .unwrap_or_default();
+    let info = match crate::status::find_claude_pane_with_config(&tmux_cfg).await {
+        Some(pane) => crate::status::get_version_info_for_pane(&pane).await,
+        None => get_version_info(),
+    };
     // "latest" is the on-disk installed version (the versions-dir active
     // symlink); it resolves independently of any running process.
     let installed = info.installed;
@@ -717,10 +736,10 @@ fn fetch_version_info() -> (String, String) {
     // layout), fall back to the installed version — the versions-dir active
     // symlink is what a freshly-(re)spawned native-install claude runs — rather
     // than emitting the useless `unknown`. NOTE: this fallback lives HERE, at
-    // the metric layer, on purpose: `get_version_info().running` MUST stay a
-    // truthful Option for `hook_fire::handle_version_update`, whose
-    // running != installed check drives the restart nudge. Collapsing them in
-    // get_version_info would silence that nudge.
+    // the metric layer, on purpose: the pane-scoped `running` field MUST stay
+    // a truthful Option for `hook_fire::handle_version_update`, whose
+    // running != installed check drives the restart nudge. Collapsing them
+    // upstream would silence that nudge.
     let current = info
         .running
         .or_else(|| installed.clone())
@@ -1624,7 +1643,7 @@ pub async fn cmd_metrics() -> i32 {
         }
     };
 
-    let (cur, latest) = fetch_version_info();
+    let (cur, latest) = fetch_version_info().await;
     let live = collect_live_counts().await;
 
     // Resolve the ack state dir from config (`[ack] state_dir`, else
