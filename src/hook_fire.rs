@@ -164,9 +164,20 @@ async fn handle_context_high(hook_event: Option<&str>) -> serde_json::Value {
 
 async fn handle_version_update(hook_event: Option<&str>) -> serde_json::Value {
     let event_name = hook_event.unwrap_or("SessionStart");
-    let info = tokio::task::spawn_blocking(status::get_version_info)
-        .await
-        .unwrap_or_default();
+    // Pane-scoped, mirroring the auto-update daemon path
+    // (`policy::check_auto_update` / `check_update_trigger`): resolve the
+    // main-loop pane and read the running version off THAT pane's PID rather
+    // than the first PID an unscoped `pgrep -af claude` happens to match,
+    // which PID reuse can fool (see `status::resolve_running_version`'s
+    // session-marker hardening). Falls back to the unscoped resolver only
+    // when no pane can be found at all (fresh install / no tmux running).
+    let tmux_cfg = try_load_config().map(|c| c.tmux).unwrap_or_default();
+    let info = match status::find_claude_pane_with_config(&tmux_cfg).await {
+        Some(pane) => status::get_version_info_for_pane(&pane).await,
+        None => tokio::task::spawn_blocking(status::get_version_info)
+            .await
+            .unwrap_or_default(),
+    };
 
     let running = match info.running {
         Some(v) => v,
