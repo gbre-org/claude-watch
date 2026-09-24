@@ -863,6 +863,16 @@ fi
 if [ -d /opt/claude-container/plugin/.claude-plugin ]; then
     CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /opt/claude-container/plugin"
 fi
+if [ -d /opt/claude-container/linked-skills/.claude-plugin ]; then
+    # Linked-in skills: a second, bind-mounted plugin dir holding
+    # repo-linked Agent Skills (e.g. eichi-search) COPIED in by
+    # scripts/install-linked-skills.sh. Loaded as a plugin (not via
+    # --add-dir) so it works in EVERY launch mode, including the
+    # OAuth-farm mode that drops the project setting-source --add-dir
+    # depends on. Skills surface as /linked-skills:<name>. Adding a
+    # skill is a runtime op (re-run the installer); no docker rebuild.
+    CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /opt/claude-container/linked-skills"
+fi
 if [ "${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}" = "1" ]; then
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
 fi

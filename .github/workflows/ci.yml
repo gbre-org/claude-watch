@@ -203,6 +203,14 @@ jobs:
       - name: Run host-skills installer tests
         run: make test-install-host-skills
 
+      # Linked-in skills installer: COPY (not symlink — a host /Users/...
+      # symlink target does not resolve in the container namespace) of repo
+      # Agent Skills into the central linked-skills plugin dir, plus
+      # provenance stamping and the --prune / --dry-run / reserved-name
+      # contract. Runs against tmpdirs only.
+      - name: Run linked-skills installer tests
+        run: make test-install-linked-skills
+
       # Host cron fragment + its installer: that cron.d/cw-host is fully
       # parameterized (this repo is public, and a second deployment must be
       # able to consume the same fragment), that rendering resolves every

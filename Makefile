@@ -81,7 +81,7 @@
 .PHONY: test-personal-mcp-install
 # Tests — repo-wide gates + installers
 .PHONY: test-doc-links test-claude-md-size test-install-hooks
-.PHONY: test-install-host-skills test-install-host-cron test-install-links
+.PHONY: test-install-host-skills test-install-linked-skills test-install-host-cron test-install-links
 .PHONY: test-ci-apt-install test-make-help test-prometheus-rules
 # Build + install / deploy — Linux host
 .PHONY: build install install-skills install-cron deploy-systemd deploy
@@ -594,6 +594,13 @@ test-install-hooks: ## Tests for the install-hooks target (core.hooksPath)
 test-install-host-skills: ## Tests for the host-skills installer + its wiring
 	scripts/tests/install-host-skills.test
 
+# Tests for scripts/install-linked-skills.sh: COPY (not symlink) of repo
+# Agent Skills into the central linked-skills plugin dir, provenance
+# stamping, bare-dir vs repo source, idempotency, --dry-run, --prune, the
+# reserved 'synced' skip, and the Makefile wiring.
+test-install-linked-skills: ## Tests for the linked-skills installer + its wiring
+	scripts/tests/install-linked-skills.test
+
 # Tests for cron.d/cw-host + scripts/install-host-cron.sh: that the shipped
 # fragment is fully parameterized (no operator paths in a public repo), that
 # every placeholder it uses is one the installer substitutes, that rendering
@@ -767,6 +774,22 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 # CLAUDE_COMMANDS_DIR (default ~/.claude/commands).
 install-skills: ## Install skills/ as /cw-<name> host slash commands
 	@scripts/install-host-skills.sh
+
+# COPY repo-linked Agent Skills (SKILL.md dirs) into the central linked-skills
+# plugin dir that claude-container bind-mounts, so they load INSIDE the
+# container (as /linked-skills:<name>) without a docker rebuild. Unlike
+# install-skills above (host /cw-<name> slash commands), this targets the
+# CONTAINER: the central dir is bind-mounted at
+# /opt/claude-container/linked-skills and loaded via --plugin-dir by
+# entrypoint.sh. COPY, not symlink — a host symlink's /Users/... target does
+# not resolve in the container namespace (verified). Stamps provenance
+# (source repo + path + commit + timestamp) per skill. Point --src at a repo
+# (its .claude/skills/ is used) or a skills dir; SRC / DEST override the
+# defaults. Re-run any time a source skill changes; `-n` dry run, `--prune`
+# drops installs whose source is gone. FIRST install needs one container
+# recreate to add the bind-mount; after that it's pick-up-on-next-session.
+install-linked-skills: ## COPY repo Agent Skills into the container's linked-skills plugin dir
+	@scripts/install-linked-skills.sh $(if $(SRC),--src $(SRC),) $(if $(DEST),--dest $(DEST),)
 
 # Render + install the HOST cron fragment (cron.d/cw-host) into /etc/cron.d.
 #
