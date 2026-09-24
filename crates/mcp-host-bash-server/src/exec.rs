@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use crate::config::Policy;
+use crate::config::{load_host_exec_env, Policy};
 
 /// Result of a tool invocation, mapped to MCP `{content, isError}` by the caller.
 pub struct ToolOutput {
@@ -93,6 +93,17 @@ fn basename(prog: &str) -> &str {
 }
 
 async fn run_with_timeout(mut cmd: Command, timeout: u64, stdin_data: Option<&str>) -> ToolOutput {
+    // GENERIC operator-configured env injection. Every shell this server spawns
+    // (run_command's two paths + run_script all funnel through here) inherits
+    // whatever KEY=VALUE pairs the operator put in the host-exec-env config
+    // (path via CW_HOST_EXEC_ENV, default ~/.config/claude-container/host-exec-env).
+    // cw defines NO specific keys — this is a pure passthrough, so a shell-
+    // history/telemetry capture becomes operator config with zero cw knowledge
+    // of it. Read at spawn time so config edits take effect with no restart.
+    // Best-effort: an empty/missing config injects nothing and never errors.
+    for (k, v) in load_host_exec_env() {
+        cmd.env(k, v);
+    }
     cmd.stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

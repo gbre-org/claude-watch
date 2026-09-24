@@ -153,6 +153,22 @@ fn state_file() -> PathBuf {
     PathBuf::from(WORKLOAD_DIR).join("state.json")
 }
 
+/// Path to the GENERIC operator-configured host-exec env-injection config,
+/// shared with the host-bash server + hostjob. `CW_HOST_EXEC_ENV` if set and
+/// non-empty, else `~/.config/claude-container/host-exec-env`. May be a single
+/// env-file or a directory of them. The generated workload wrapper sources it
+/// best-effort so the user command inherits the operator's KEY=VALUE pairs; cw
+/// references no specific tool.
+fn host_exec_env_path() -> PathBuf {
+    if let Ok(p) = std::env::var("CW_HOST_EXEC_ENV") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    PathBuf::from(home).join(".config/claude-container/host-exec-env")
+}
+
 fn output_file(label: &str) -> PathBuf {
     PathBuf::from(WORKLOAD_DIR).join(format!("{label}.output"))
 }
@@ -1404,6 +1420,12 @@ fn build_wrapper_script(
     let cmd_q = shell_quote(command);
     let label_q = shell_quote(label);
     let exe_q = shell_quote(exe_path);
+    // GENERIC host-exec env injection path (see host_exec_env_path()). Resolved
+    // here (respecting CW_HOST_EXEC_ENV, else the default under ~/.config) and
+    // baked shell-quoted into the wrapper, which sources it best-effort so the
+    // user command inherits whatever KEY=VALUE the operator configured. cw
+    // references no specific tool.
+    let hee_path_q = shell_quote(&host_exec_env_path().to_string_lossy());
     // Inner command strings passed as a single argument to `script -q
     // -f -c <STR>` (or to `bash -c <STR>` in the no-PTY fallback). The
     // inner string is what the PTY-wrapped shell will parse, so it
@@ -1446,7 +1468,22 @@ fn build_wrapper_script(
          # bring-up — without this, the EXIT-trap kill of the heartbeat\n\
          # sidecar fires but the sidecar lives on with PPID=1.\n\
          trap : INT TERM\n\
-         # Send all wrapper-side output (headers, heartbeat-related noise,\n\
+         # GENERIC host-exec env injection: source the operator-configured\n\
+         # KEY=VALUE env config (a file, or every file in a dir) with set -a\n\
+         # so the exported vars reach the user command below. Best-effort:\n\
+         # missing path is a silent no-op; a source error never aborts the\n\
+         # workload (guarded with || true). cw knows no specific tool -- this\n\
+         # is pure operator config (e.g. a shell-history capture bracket).\n\
+         __hee={hee_path_q}\n\
+         if [ -f \"$__hee\" ]; then\n\
+           set -a; . \"$__hee\" 2>/dev/null || true; set +a\n\
+         elif [ -d \"$__hee\" ]; then\n\
+           for __f in \"$__hee\"/*; do\n\
+             [ -f \"$__f\" ] || continue\n\
+             set -a; . \"$__f\" 2>/dev/null || true; set +a\n\
+           done\n\
+         fi\n\
+                  # Send all wrapper-side output (headers, heartbeat-related noise,\n\
          # footer) straight to {out_q}. NOTE: we deliberately do NOT pipe\n\
          # through `ts | tee` here — `ts` reads line-by-line and would\n\
          # buffer the user command's `\\r`-separated progress frames\n\
@@ -4269,6 +4306,39 @@ mod tests {
         assert!(
             script.contains("exec >> '/tmp/claude-workloads/demo.output' 2>&1"),
             "wrapper must redirect headers/footers straight into the .output path:\n{script}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_sources_host_exec_env_generically() {
+        // The wrapper must best-effort source the operator-configured
+        // host-exec env config so the user command inherits the operator's
+        // KEY=VALUE pairs — and it must reference NO specific tool (generic).
+        let script = build_wrapper_script(
+            "hee",
+            "echo hi",
+            Path::new("/tmp/claude-workloads/hee.output"),
+            Path::new("/tmp/claude-workloads/hee.exit"),
+            Path::new("/tmp/claude-workloads/hee.heartbeat"),
+            Path::new("/tmp/claude-wl-rt/hee.heartbeat"),
+            Path::new("/tmp/claude-workloads/hee.pgid"),
+            "/usr/local/bin/claude-watch",
+            None,
+        );
+        // Sources with `set -a` (export) and swallows errors (`|| true`).
+        assert!(
+            script.contains("set -a; . \"$__hee\"") && script.contains("|| true"),
+            "wrapper must best-effort `set -a; source` the host-exec env:\n{script}"
+        );
+        // Handles both a file and a directory of files.
+        assert!(
+            script.contains("if [ -f \"$__hee\" ]") && script.contains("elif [ -d \"$__hee\" ]"),
+            "wrapper must handle both a file and a dir of env files:\n{script}"
+        );
+        // Generic: the wrapper source references no specific capture tool.
+        assert!(
+            !script.to_lowercase().contains("atuin"),
+            "wrapper must stay tool-agnostic (no atuin/tool specifics):\n{script}"
         );
     }
 

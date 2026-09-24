@@ -68,6 +68,69 @@ STATE_ROOT = os.path.join(os.path.expanduser("~"), ".cache", "hostjob")
 
 
 # --------------------------------------------------------------------------
+# host-exec env injection (GENERIC — cw references no specific tool)
+# --------------------------------------------------------------------------
+# Every hostjob worker inherits whatever KEY=VALUE pairs the operator drops
+# into the host-exec-env config (path via CW_HOST_EXEC_ENV, default
+# ~/.config/claude-container/host-exec-env; a single env-file OR a directory
+# of them, merged in filename order, later wins). This is the SAME mechanism
+# the host-bash MCP server applies, so a shell-history/telemetry capture
+# becomes pure operator config with zero hostjob knowledge of it. A missing
+# path injects nothing and never raises.
+def _host_exec_env_path():
+    p = os.environ.get("CW_HOST_EXEC_ENV")
+    if p:
+        return p
+    return os.path.join(
+        os.path.expanduser("~"), ".config", "claude-container", "host-exec-env"
+    )
+
+
+def _parse_env_file(text):
+    """Parse a flat KEY=VALUE env-file (optional `export `, one layer of
+    surrounding quotes, `#` comments and blanks skipped). No $VAR expansion."""
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if not key or not all(c.isalnum() or c == "_" for c in key):
+            continue
+        val = val.strip()
+        if len(val) >= 2 and (
+            (val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")
+        ):
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def load_host_exec_env():
+    """Return {KEY: VALUE} to inject into hostjob workers. Best-effort/no-raise."""
+    path = _host_exec_env_path()
+    merged = {}
+    try:
+        if os.path.isfile(path):
+            with open(path) as fh:
+                merged.update(_parse_env_file(fh.read()))
+        elif os.path.isdir(path):
+            for name in sorted(os.listdir(path)):
+                fp = os.path.join(path, name)
+                if os.path.isfile(fp):
+                    with open(fp) as fh:
+                        merged.update(_parse_env_file(fh.read()))
+    except Exception:
+        return {}
+    return merged
+
+
+# --------------------------------------------------------------------------
 # state helpers
 # --------------------------------------------------------------------------
 def job_dir(label):
@@ -769,6 +832,12 @@ def cmd_run(args):
     )
 
     env = dict(os.environ)
+    # GENERIC host-exec env injection: merge operator-configured KEY=VALUE
+    # pairs so the detached worker (the reaper's child, which inherits this
+    # env) picks them up. cw references no specific tool — see
+    # load_host_exec_env(). Best-effort; missing config is a no-op.
+    for _k, _v in load_host_exec_env().items():
+        env[_k] = _v
     # Pass everything the reaper needs via argv-free env to keep argv clean.
     env["HOSTJOB_LABEL"] = label
     env["HOSTJOB_STATUS"] = sp

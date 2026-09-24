@@ -117,6 +117,22 @@
         to invoke via run_command. e.g. `telemetry-hook,corp-trace-hook`.
         Layered on top of CW_PROFILE.
 
+      - CW_HOST_EXEC_ENV: path to a GENERIC env-injection config the
+        server merges into EVERY shell it spawns (run_command +
+        run_script). May be a single KEY=VALUE env-file or a directory
+        of them (merged in filename order, later wins). Default
+        ${HOME}/.config/claude-container/host-exec-env. cw references NO
+        specific tool — whatever KEY=VALUE lines you put there are
+        applied verbatim, so adding/changing an injected var is pure
+        local config with no server rebuild (the file is read at spawn
+        time). Best-effort: a missing path injects nothing and never
+        fails/slows a call. Use it e.g. to set ATUIN_SESSION + BASH_ENV
+        so host-bash shells get captured into your shell history — cw
+        knows nothing about atuin, it just applies the vars. The SAME
+        config path is read by `hostjob` (host-side) and, when bind-
+        mounted in, by the in-container `workload` runner. Verify via
+        show_security_rules (it reports the path + loaded key names).
+
       - PATH: launchd starts with a minimal PATH. Declare one that adds
         ${HOME}/.local/bin so any host CLIs the server's run_command
         invocations rely on resolve.

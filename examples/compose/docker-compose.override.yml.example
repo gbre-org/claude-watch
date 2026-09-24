@@ -195,6 +195,43 @@ services:
       # - "${HOME}/.cache/claude-clipboard-bridge:/host-clipboard:ro"
 
       # ----------------------------------------------------------------
+      # host-exec env injection (GENERIC) — make the IN-CONTAINER
+      # `workload` runner inherit operator-configured env vars.
+      #
+      # cw's three host-exec surfaces inject a set of ARBITRARY
+      # operator-configured KEY=VALUE env vars into every shell they
+      # spawn, read from a LOCAL config file/dir (default
+      # ~/.config/claude-container/host-exec-env, overridable via
+      # CW_HOST_EXEC_ENV). cw references NO specific tool — you drop
+      # whatever vars you want into that config and every host-exec
+      # shell picks them up. Adding/changing a var is pure local config
+      # (read at spawn time, no cw rebuild).
+      #
+      #   - host-bash MCP server + hostjob run ON THE HOST and read the
+      #     host path (~/.config/claude-container/host-exec-env)
+      #     NATIVELY — nothing to mount.
+      #   - the `workload` runner runs IN THIS CONTAINER, so it can only
+      #     see the config if you bind-mount it in. Uncomment the mount
+      #     below (host file/dir -> the same in-container path) AND set
+      #     CW_HOST_EXEC_ENV to that path in your deploy.env so the
+      #     workload runner reads the right location.
+      #
+      # As a single-file env-file:
+      # - "${HOME}/.config/claude-container/host-exec-env:/home/hndrewaall/.config/claude-container/host-exec-env:ro"
+      # ...or as a directory of KEY=VALUE files (merged in filename order):
+      # - "${HOME}/.config/claude-container/host-exec-env.d:/home/hndrewaall/.config/claude-container/host-exec-env.d:ro"
+      #   (then set CW_HOST_EXEC_ENV=/home/hndrewaall/.config/claude-container/host-exec-env.d)
+      #
+      # EXAMPLE — capturing host-bash/hostjob/workload shell history with
+      # atuin (this is OPERATOR CONFIG living in the gitignored env file,
+      # NOT in cw): put in ~/.config/claude-container/host-exec-env:
+      #     ATUIN_SESSION=<your-session-id>
+      #     BASH_ENV=/Users/you/.config/claude-container/atuin-bracket.sh
+      # where atuin-bracket.sh sets up the atuin preexec/precmd hooks.
+      # cw knows nothing about atuin — it just applies the two vars.
+      # ----------------------------------------------------------------
+
+      # ----------------------------------------------------------------
       # LEGACY STOPGAP (no longer needed on current images) — shadow a
       # poison project-tier apiKeyHelper.
       #
