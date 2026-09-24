@@ -1160,7 +1160,22 @@ If eichi returns no results or all `[distant]` scores, THEN fall back to grep
 
 ### How to invoke
 
-**From inside the container** (web API — the CLI venv is host-only):
+**Primary — the `eichi` CLI via `host-bash`.** The CLI is the preferred
+interface everywhere. From inside the container, reach it through the
+`host-bash` bridge (the CLI venv lives host-side); on a host shell, run it
+directly. **NEVER bare-curl the HTTP endpoint as your default** — check the
+CLI is reachable (`eichi stats` via host-bash) before assuming it isn't:
+
+```sh
+# host-bash run_command (or directly on the host):
+eichi query "alerting tier design decisions" -k 6   # also: --added-since 7d, --sort added
+eichi stats        # last-indexed timestamp / corpus size
+eichi ls           # what's indexed
+```
+
+**Last resort ONLY — the web API.** If, and only if, the `eichi` CLI is
+genuinely unreachable (confirmed, not assumed) AND the `eichi-search` compose
+container is running, fall back to its HTTP endpoint:
 
 ```sh
 curl -s "http://eichi-search:8000/api/search?q=alerting+tiers&k=5" | jq .
@@ -1171,16 +1186,9 @@ curl -s "http://eichi-search:8000/api/search?q=alerting+tiers&k=5" | jq .
 
 Query params: `q` (required), `k` (top-K, default 20), `source`
 (filter tag), `added_since` (duration: `1d`, `7d`, `30d`), `retrieval`
-(`hybrid`|`vector`|`bm25`).
-
-**From the host** (via `host-bash`, if the CLI venv is bootstrapped):
-
-```sh
-# host-bash run_command:
-eichi query "alerting tier design decisions" -k 5   # also: --added-since 7d, --sort added
-eichi stats        # last-indexed timestamp / corpus size
-eichi ls           # what's indexed
-```
+(`hybrid`|`vector`|`bm25`). Treat this as a documented fallback for an
+environment with no CLI access at all — not a shortcut when the CLI is simply
+inconvenient to invoke.
 
 ### Interpreting results
 
