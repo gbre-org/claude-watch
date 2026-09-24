@@ -848,7 +848,7 @@ version_fallback_secs = 900
 #
 # Two events are emitted on the daemon's monotonic clock:
 #   * keepalive       — a POKE FOR QUIET PERIODS, not a schedule. The daemon
-#                       ticks every keepalive_interval_secs (300s = 5min) but
+#                       ticks every keepalive_interval_secs (210s = 3.5min) but
 #                       EMITS only when nothing has been acked in that whole
 #                       window. A loop busy handling real events never sees
 #                       one; an idle loop gets something to ack before [ack]
@@ -856,9 +856,20 @@ version_fallback_secs = 900
 #                       run (data.ack_command = `event-ack ack-batch`), so the
 #                       loop is told the action rather than having to recall
 #                       it. Renamed from `heartbeat-tick` 2026-08-22.
-#   * memory-reminder — every memory_reminder_interval_secs (1800s = 30min),
-#                       carrying the action checklist (update logs, commit
-#                       + push repos, etc.).
+#                       KEPT SHORT ON PURPOSE (idle-spend): 210s stays under the
+#                       ~5min Anthropic prompt-cache TTL so idle keepalive turns
+#                       hit the WARM cache instead of a full cold rewrite (~12x
+#                       costlier). Do NOT "raise the interval to save money" —
+#                       that regresses cost. See src/cadence.rs / PR #794.
+#   * memory-reminder — every memory_reminder_interval_secs (1800s = 30min)
+#                       while the operator is PRESENT, carrying the action
+#                       checklist (update logs, commit + push repos, etc.).
+#                       When memory_reminder_idle_interval_secs > 0 AND the
+#                       operator is AWAY (presence carrier stale), the daemon
+#                       stretches it to that longer idle interval — cutting the
+#                       overnight reminder-cascade idle spend — and snaps back
+#                       to the base the instant presence returns. keepalive is
+#                       NOT idle-gated (it must stay warm/frequent regardless).
 #
 # IMPORTANT: the daemon emits these EVENTS only — it deliberately does NOT
 # stamp the liveness timestamp itself. That stays the main loop's job so a
@@ -869,8 +880,9 @@ enabled = true
 # defaults (KEEPALIVE_INTERVAL_SECS / MEMORY_REMINDER_INTERVAL_SECS in
 # src/cadence.rs), which is the single source of truth. Uncomment to override
 # on a specific host; otherwise a bump to the const is the only change needed.
-#   keepalive_interval_secs = 300          # default: 5min
-#   memory_reminder_interval_secs = 1800   # default: 30min
+#   keepalive_interval_secs = 210               # default: 3.5min (kept under cache TTL)
+#   memory_reminder_interval_secs = 1800        # default: 30min (operator present)
+#   memory_reminder_idle_interval_secs = 7200   # default: 0 (off); 2h when operator away
 #
 # RUNTIME (live) override without editing this file: the loader also layers, at
 # highest precedence, the file named by $CLAUDE_WATCH_RUNTIME_CONFIG (if set +

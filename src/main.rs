@@ -1429,6 +1429,27 @@ async fn run_daemon() {
         // memory-reminder: non-urgent context hygiene, delivered as an AMBIENT
         // claude-event (surfaced on the next UserPromptSubmit).
         if current_config.cadence.enabled {
+            // Idle backoff for the memory-reminder cadence. keepalive is left
+            // alone (its 210s cadence is tuned to stay warm under the prompt-
+            // cache TTL — see PR #794 / crate::cadence). The memory-reminder,
+            // by contrast, is non-liveness context hygiene whose cost lever is
+            // wake COUNT; when the operator is away we stretch it to the
+            // configured idle interval so overnight-idle reminder cascades
+            // (git status across every repo, log updates) stop firing on a
+            // 30-min beat with nothing changed and nobody waiting. It snaps
+            // back to the base interval the instant presence returns — and
+            // `apply_intervals` preserves the last-fired instant, so switching
+            // regimes never replays a startup burst. A no-op when the idle
+            // interval is 0 (the field default) or the operator is present.
+            let effective_memory_secs = cadence::effective_memory_interval_secs(
+                current_config.cadence.memory_reminder_interval_secs,
+                current_config.cadence.memory_reminder_idle_interval_secs,
+                metrics::operator_is_away(),
+            );
+            cadence_tracker.apply_intervals(
+                Duration::from_secs(current_config.cadence.keepalive_interval_secs),
+                Duration::from_secs(effective_memory_secs),
+            );
             let due = cadence_tracker.due(now);
             if !due.is_empty() {
                 tracing::debug!(

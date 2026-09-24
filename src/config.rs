@@ -1868,6 +1868,17 @@ pub struct CadenceConfig {
     /// of truth for the value).
     #[serde(default = "default_memory_reminder_interval_secs")]
     pub memory_reminder_interval_secs: u64,
+    /// Seconds between `memory-reminder` events while the operator is AWAY
+    /// (idle backoff). `0` (the default) disables the backoff — the base
+    /// [`Self::memory_reminder_interval_secs`] is always used. When set > 0
+    /// AND the operator-presence carrier is stale (operator away), the daemon
+    /// uses the LONGER of this and the base interval, cutting the idle-only
+    /// memory-reminder wake cascade; it snaps back to the base the moment
+    /// presence returns, so active responsiveness is never affected. See
+    /// [`crate::cadence::effective_memory_interval_secs`] and
+    /// [`crate::cadence::MEMORY_REMINDER_IDLE_INTERVAL_SECS`].
+    #[serde(default = "default_memory_reminder_idle_interval_secs")]
+    pub memory_reminder_idle_interval_secs: u64,
 }
 
 impl Default for CadenceConfig {
@@ -1876,6 +1887,7 @@ impl Default for CadenceConfig {
             enabled: default_cadence_enabled(),
             keepalive_interval_secs: default_keepalive_interval_secs(),
             memory_reminder_interval_secs: default_memory_reminder_interval_secs(),
+            memory_reminder_idle_interval_secs: default_memory_reminder_idle_interval_secs(),
         }
     }
 }
@@ -1890,6 +1902,13 @@ fn default_keepalive_interval_secs() -> u64 {
 
 fn default_memory_reminder_interval_secs() -> u64 {
     crate::cadence::MEMORY_REMINDER_INTERVAL_SECS
+}
+
+/// Idle-backoff memory-reminder interval default: `0` = disabled (always use
+/// the base interval). Deployments opt in by setting a value > 0 (the
+/// container config sets [`crate::cadence::MEMORY_REMINDER_IDLE_INTERVAL_SECS`]).
+fn default_memory_reminder_idle_interval_secs() -> u64 {
+    0
 }
 
 /// AFK auto-reject of a stale interactive `AskUserQuestion` prompt.
