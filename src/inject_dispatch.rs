@@ -332,6 +332,11 @@ async fn inject_to_agent_inner(pane: &str, text: &str, cancel_turn: bool) {
         );
         return;
     }
+    // NOTE: the operator-typing guard (is there unsubmitted text already on
+    // the prompt line?) lives INSIDE `tmux::inject_text` / `inject_text_queued`
+    // themselves, not here — see those functions. That way it protects every
+    // caller of the raw primitives, not just the ones routed through this
+    // dispatcher.
     let backends = RealBackends;
     let agent_pid = resolve_agent_pid_for_pane(pane).await;
     let mode = mode_for(agent_pid);

@@ -1702,7 +1702,38 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
 /// isn't matching what the pane actually shows (stale thinking line in
 /// scrollback, custom theme, etc.) and waiting longer doesn't help.
 /// We send anyway.
+/// PRE-check for `inject_text` / `inject_text_queued`: is there unsubmitted
+/// human-typed text on the prompt line right now?
+///
+/// This is the fire-and-forget daemon injectors' guard, distinct from
+/// `inject_and_verify`'s (the `claude-watch inject` CLI path) deliberately
+/// advisory-only `settle_prompt_line`: that path is invoked by an operator or
+/// script that EXPECTS to possibly race a human and already has a
+/// post-type/retract recovery dance for it, so a hard pre-refusal there would
+/// just add a second, redundant failure mode. The daemon's automatic
+/// interruption tier has no such recovery — its choreography (Escape, `dd`
+/// line-clear, literal type) runs BLIND into whatever is on the line, so the
+/// only safe move is to not send it at all. Skipping this cycle costs
+/// nothing; the daemon re-evaluates on the next tick.
+async fn operator_typing_in_progress(pane: &str) -> bool {
+    let prompt = capture_pane(pane).await.and_then(|out| prompt_line_text(&out));
+    if prompt_has_unsubmitted_text(prompt.as_deref()) {
+        info!(
+            pane = %pane,
+            residue = ?prompt,
+            "inject: unsubmitted text already on the prompt line (operator likely \
+             mid-keystroke) -- skipping this inject rather than typing over it"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 pub async fn inject_text(pane: &str, text: &str) {
+    if operator_typing_in_progress(pane).await {
+        return;
+    }
     // Steps 0-4 (settle, Escape→NORMAL coercion, idle-wait, dd line-clear,
     // `i` INSERT verify-and-retry, literal type) are factored into
     // `inject_text_no_submit` so this fire-and-forget path and the verified
@@ -1866,6 +1897,9 @@ async fn ensure_insert_mode(pane: &str) {
 /// that genuinely must seize the turn (context-critical, wedged, auto-update,
 /// prolonged-thinking) keep using `inject_text` + `interrupt_and_wait`.
 pub async fn inject_text_queued(pane: &str, text: &str) {
+    if operator_typing_in_progress(pane).await {
+        return;
+    }
     type_text_non_cancelling(pane, text).await;
 
     // Submit with a bare Enter from INSERT. A message typed-and-Entered while a
@@ -1970,6 +2004,31 @@ const PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// input line, so we cannot assert anything about it.
 pub(crate) fn prompt_line_is_empty(prompt: Option<&str>) -> bool {
     matches!(prompt, Some(p) if p.is_empty())
+}
+
+/// The TUI's own hint text for a never-touched input line, e.g.
+/// `❯ Try "edit <file>"`. See `prompt_line_is_empty`'s doc comment for
+/// the live-pane example this is lifted from.
+const PROMPT_PLACEHOLDER_PREFIX: &str = "Try \"";
+
+/// Pure: does the prompt line hold genuine unsubmitted operator text — as
+/// opposed to being bare, or showing the TUI's own placeholder hint?
+///
+/// This is the inverse question from `prompt_line_is_empty`, asked for a
+/// different purpose: `prompt_line_is_empty` feeds a POST-type submit
+/// check, where treating a placeholder as "not empty" is the conservative
+/// (cheap-to-retry) choice. This helper feeds a PRE-type check that decides
+/// whether to send ANY keystrokes into the pane at all — treating a
+/// placeholder as "occupied" here would mean a daemon-driven inject could
+/// never land on a pane that has simply never been touched, which is
+/// exactly the boot-time deadlock this check exists to avoid. So the
+/// placeholder is excluded; anything else non-empty counts as real,
+/// unsubmitted human input that an inject would collide with.
+pub(crate) fn prompt_has_unsubmitted_text(prompt: Option<&str>) -> bool {
+    match prompt {
+        Some(p) if !p.is_empty() => !p.starts_with(PROMPT_PLACEHOLDER_PREFIX),
+        _ => false,
+    }
 }
 
 /// Pure: after typing `text`, is the prompt line EXACTLY our payload and
@@ -4269,6 +4328,23 @@ mod tests {
         // No `❯` rendered at all: we cannot SEE the input line, so we must not
         // claim anything about it. A missing prompt is UNKNOWN, never empty.
         assert!(!prompt_line_is_empty(None));
+    }
+
+    #[test]
+    fn prompt_has_unsubmitted_text_detects_real_typed_content() {
+        assert!(prompt_has_unsubmitted_text(Some("half-typed operator input")));
+        assert!(prompt_has_unsubmitted_text(Some("/config theme=light")));
+    }
+
+    #[test]
+    fn prompt_has_unsubmitted_text_ignores_bare_and_placeholder_prompts() {
+        // Bare submitted/cleared prompt: nothing to collide with.
+        assert!(!prompt_has_unsubmitted_text(Some("")));
+        // TUI-painted hint on a never-touched pane, not operator input.
+        assert!(!prompt_has_unsubmitted_text(Some("Try \"edit <file>\"")));
+        // No `❯` rendered at all: unknown, not "occupied" -- an inject must
+        // not be blocked forever just because the pane state is unreadable.
+        assert!(!prompt_has_unsubmitted_text(None));
     }
 
     #[test]
