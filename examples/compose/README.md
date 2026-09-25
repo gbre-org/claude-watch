@@ -353,6 +353,23 @@ Security: the server applies an allow-list by default that covers the read-y / o
 
 **Trust profile** (`CW_PROFILE`): set `CW_PROFILE=corp-dev-trusted` in the server's shell env to opt into a wider allow-list that adds host-scheduling tooling — `crontab` (Linux + macOS), `launchctl` (macOS launchd), `systemctl` (Linux systemd user units), `schtasks` / `powershell` / `pwsh` (Windows Task Scheduler), `sw_vers` / `lsb_release` (extra OS detection), file mutation (`tee`, `mkdir`, `chmod`, `cp`, `mv`, `rm`), outbound bytes (`curl`, `wget`, `scp`), key/cert tooling (`openssl`, `ssh-keygen`), container management (`docker`, `docker-compose`), and the detached long-command runner (`hostjob`, see below). Default unset (`corp-dev`) keeps the read-y dev-tooling floor described above. Use the trusted profile when you want the in-container claude to wire periodic claude-event jobs on the host (cron / launchd / systemd timers / Task Scheduler), push artifacts off-host, or recreate the compose stack from inside its own session (`docker compose up -d --force-recreate <svc>`, `docker compose exec <svc> ...`) — see the "Host-side scheduled tasks" section in `container/baked-CLAUDE.md` for the workflow. Note: `docker` / `docker-compose` are trusted-only because the binary covers destructive subcommands (`docker rm`, `docker stop`, `docker kill`) alongside read-y ones (`docker ps`, `docker logs`); the allow-list is per-binary, not per-subcommand. Operator's explicit `ALLOWED_COMMANDS` in `~/.config/claude-container/mcp-host-bash.env` always wins over the profile default.
 
+### Host-exec env injection (`CW_HOST_EXEC_ENV`) — generic, tool-agnostic
+
+All three of cw's host-exec surfaces — the **host-bash MCP server** (`run_command` + `run_script`), **`hostjob`**, and the **`workload`** runner — inject a set of ARBITRARY operator-configured environment variables into every shell they spawn. The vars come from a LOCAL config file (or directory of files) at `CW_HOST_EXEC_ENV` (default `~/.config/claude-container/host-exec-env`), read at spawn time. The file is plain `KEY=VALUE` lines (same lenient parser as `mcp-host-bash.env` — optional `export `, one layer of quotes, `#` comments); a directory is merged in filename order (later files win).
+
+The mechanism is **completely generic — cw references no specific tool.** Whatever `KEY=VALUE` lines you put in the config are applied verbatim. So adding or changing an injected var is **pure local config with no cw code change and no rebuild.** It's best-effort: a missing/unreadable config injects nothing and never fails or slows a call. `show_security_rules` reports the resolved path and the loaded key names (values are never printed — they may be secrets).
+
+This is the same private-config pattern as the docker-compose override: keep the file in your gitignored `~/.config/claude-container/` (out of the public tree). The host-bash server and `hostjob` run on the host and read the host path natively (nothing to mount); the `workload` runner runs in-container, so bind-mount the host file/dir in and point the container's `CW_HOST_EXEC_ENV` at it (see the host-exec-env block in `docker-compose.override.yml.example`).
+
+**Example — capture host-bash / hostjob / workload shell history with atuin** (this is OPERATOR config that lives in the gitignored env file, NOT in cw). Put in `~/.config/claude-container/host-exec-env`:
+
+```
+ATUIN_SESSION=<your-atuin-session-id>
+BASH_ENV=/Users/you/.config/claude-container/atuin-bracket.sh
+```
+
+where `atuin-bracket.sh` wires the atuin preexec/precmd capture hooks. Every host-exec shell then sources it and records into atuin — cw knows nothing about atuin; it just applies the two vars.
+
 ### `hostjob` — run host commands past the 30s host-bash cap
 
 `mcp-host-bash-server` enforces a hard `COMMAND_TIMEOUT` (default **30s**, see the

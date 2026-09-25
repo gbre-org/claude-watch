@@ -18,8 +18,8 @@
 //! [`Policy::max_command_length`] and [`Policy::max_script_length`] for why
 //! they must not be the same cap.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 /// Read-y / observation / standard-dev-tool floor — the conservative default
 /// allow-list, byte-for-byte the launcher's `DEFAULT_ALLOWED_COMMANDS`.
@@ -95,6 +95,67 @@ pub struct ServerConfig {
 fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     PathBuf::from(home).join(".config/claude-container/mcp-host-bash.env")
+}
+
+/// Default path for the operator's GENERIC host-exec env-injection config.
+/// Overridable via the `CW_HOST_EXEC_ENV` env var. May be a single
+/// `KEY=VALUE` env-file OR a directory of such files.
+fn default_host_exec_env_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    PathBuf::from(home).join(".config/claude-container/host-exec-env")
+}
+
+/// Resolve the configured host-exec env path: `CW_HOST_EXEC_ENV` if set and
+/// non-empty, else [`default_host_exec_env_path`].
+pub fn host_exec_env_path() -> PathBuf {
+    match std::env::var("CW_HOST_EXEC_ENV") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => default_host_exec_env_path(),
+    }
+}
+
+/// Load operator-configured environment variables to inject into EVERY shell
+/// this server spawns (`run_command` + `run_script`, both paths).
+///
+/// GENERIC BY DESIGN: cw defines no specific keys — whatever `KEY=VALUE` lines
+/// the operator drops into the configured file/dir are returned verbatim, so
+/// adding or changing an injected var is pure LOCAL CONFIG (no cw code change,
+/// no rebuild — the path is read at spawn time, see [`crate::exec`]).
+///
+/// Best-effort: a missing path, unreadable file, or parse hiccup yields an
+/// empty vec and NEVER errors — env injection must not fail or slow a tool
+/// call. The path (`CW_HOST_EXEC_ENV`, default
+/// `~/.config/claude-container/host-exec-env`) may be a single env-file or a
+/// directory of them, merged in lexical filename order (later files win),
+/// mirroring the `docker-compose.override` private-config pattern.
+pub fn load_host_exec_env() -> Vec<(String, String)> {
+    load_host_exec_env_from(&host_exec_env_path())
+}
+
+fn load_host_exec_env_from(path: &Path) -> Vec<(String, String)> {
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    if meta.is_file() {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            merged.extend(parse_env_file(&text));
+        }
+    } else if meta.is_dir() {
+        let Ok(rd) = std::fs::read_dir(path) else {
+            return Vec::new();
+        };
+        let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        entries.sort();
+        for entry in entries {
+            if entry.is_file() {
+                if let Ok(text) = std::fs::read_to_string(&entry) {
+                    merged.extend(parse_env_file(&text));
+                }
+            }
+        }
+    }
+    merged.into_iter().collect()
 }
 
 /// Parse a bash-`KEY=VALUE` config file leniently. Handles optional `export `,
@@ -252,6 +313,17 @@ impl Policy {
                 self.allowed_flags.iter().cloned().collect::<Vec<_>>().join(", ")
             )
         };
+        // Operator-configured env injection: report the path + how many keys
+        // are currently loaded (read live, so this reflects the config as of
+        // now). Values are NOT printed — they may be secrets.
+        let env_path = host_exec_env_path();
+        let env_keys: Vec<String> =
+            load_host_exec_env().into_iter().map(|(k, _)| k).collect();
+        let host_exec_env = if env_keys.is_empty() {
+            format!("{} (none loaded)", env_path.display())
+        } else {
+            format!("{} ({} keys: {})", env_path.display(), env_keys.len(), env_keys.join(", "))
+        };
         format!(
             "host-bash MCP server — effective security policy\n\
              profile:               {}\n\
@@ -262,6 +334,7 @@ impl Policy {
              max_command_length:    {} (run_command)\n\
              max_script_length:     {} (run_script)\n\
              allow_shell_operators: {}\n\
+             host_exec_env:         {}\n\
              \n\
              run_command runs the string via `bash -c` when allow_shell_operators=true;\n\
              otherwise it rejects shell metacharacters and exec's the whitelisted binary\n\
@@ -280,6 +353,7 @@ impl Policy {
             self.max_command_length,
             self.max_script_length,
             self.allow_shell_operators,
+            host_exec_env,
         )
     }
 
@@ -302,6 +376,35 @@ mod tests {
         assert_eq!(m.get("MCP_HOST_BASH_BEARER").unwrap(), "sekret");
         assert_eq!(m.get("CW_PROFILE").unwrap(), "corp-dev-trusted");
         assert!(!m.contains_key("BAD"));
+    }
+
+    #[test]
+    fn host_exec_env_missing_path_is_empty_noop() {
+        let missing = PathBuf::from("/nonexistent/cw-host-exec-env-xyz");
+        assert!(load_host_exec_env_from(&missing).is_empty());
+    }
+
+    #[test]
+    fn host_exec_env_reads_flat_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("env");
+        std::fs::write(&f, "# a comment\nFOO=bar\nexport BAZ=\"q u x\"\n").unwrap();
+        let got: std::collections::HashMap<_, _> =
+            load_host_exec_env_from(&f).into_iter().collect();
+        assert_eq!(got.get("FOO").unwrap(), "bar");
+        assert_eq!(got.get("BAZ").unwrap(), "q u x");
+    }
+
+    #[test]
+    fn host_exec_env_merges_dir_later_file_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("00-base"), "A=1\nB=2\n").unwrap();
+        std::fs::write(dir.path().join("10-override"), "B=99\nC=3\n").unwrap();
+        let got: std::collections::HashMap<_, _> =
+            load_host_exec_env_from(dir.path()).into_iter().collect();
+        assert_eq!(got.get("A").unwrap(), "1");
+        assert_eq!(got.get("B").unwrap(), "99"); // later file wins
+        assert_eq!(got.get("C").unwrap(), "3");
     }
 
     #[test]

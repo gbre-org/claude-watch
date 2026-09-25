@@ -292,6 +292,21 @@ services:
       # mount that node-exporter mounts read-only, e.g.
       # /home/hndrewaall/repos/.claude-watch-textfile/claude_watch.prom.
       CLAUDE_WATCH_PROM_FILE: ${CLAUDE_WATCH_PROM_FILE:-}
+      # CW_HOST_EXEC_ENV — path (IN-CONTAINER) to the GENERIC host-exec
+      # env-injection config that the `workload` runner sources into every
+      # shell it spawns, so long-running workloads inherit operator-configured
+      # KEY=VALUE pairs (e.g. a shell-history/telemetry capture bracket). cw
+      # references NO specific tool — whatever KEY=VALUE lines you drop in the
+      # file/dir are applied verbatim, so adding/changing them is pure LOCAL
+      # CONFIG (read at spawn time, no cw rebuild). The SAME mechanism is
+      # applied host-side by the host-bash MCP server and by `hostjob` (both
+      # run on the host and read the host path natively — no mount needed).
+      # For the in-container `workload` runner to see the operator's config,
+      # bind-mount the host file/dir to this path (see the host-exec-env block
+      # in docker-compose.override.yml.example) and point this var at it.
+      # Default (unset): ~/.config/claude-container/host-exec-env inside the
+      # container — a no-op unless something is mounted there.
+      CW_HOST_EXEC_ENV: ${CW_HOST_EXEC_ENV:-}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in
