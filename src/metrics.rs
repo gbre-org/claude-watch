@@ -383,6 +383,7 @@ fn build_metrics(
     let context_warning_interrupts = num(state, "context_warning_interrupts_total");
     let watcher_down_interrupts = num(state, "watcher_down_interrupts_total");
     let wedged_clear_interrupts = num(state, "wedged_clear_interrupts_total");
+    let idle_autocompact_interrupts = num(state, "idle_autocompact_count");
     let malformed_tool_call_nudges = num(state, "malformed_tool_call_nudge_count");
     let malformed_tool_call_hard_blocks = num(state, "malformed_tool_call_hard_block_count");
     let auto_update_interrupts = num(state, "auto_update_interrupts_total");
@@ -569,6 +570,15 @@ fn build_metrics(
         format!(
             "claude_interrupts_total{{kind=\"restart_claude\"}} {}",
             restart_claude_interrupts
+        ),
+        // Idle auto-compaction: a self-clear the daemon fired because the
+        // session was GENUINELY IDLE (operator away, queue empty, N idle
+        // keepalives) — an idle-spend optimization, not a recovery. Opt-in
+        // (`[idle_autocompact] enabled`, default false), so this stays 0 on
+        // any host that has not turned the feature on.
+        format!(
+            "claude_interrupts_total{{kind=\"idle_autocompact\"}} {}",
+            idle_autocompact_interrupts
         ),
         "".to_string(),
         "# HELP claude_watch_api_retry_suppressions_total Cycles where claude-watch suppressed an interrupt because Claude Code was in upstream-API retry backoff".to_string(),

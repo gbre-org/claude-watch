@@ -29,6 +29,7 @@ mod config;
 mod credentials;
 mod event_bus;
 mod hook_fire;
+mod idle_autocompact;
 mod inject_dispatch;
 mod inject_lock;
 mod inject_menu;
@@ -1507,6 +1508,70 @@ async fn run_daemon() {
                     // later — which is what doubled the effective cadence and
                     // let idle keepalive turns miss the prompt cache.
                     cadence_tracker.record_keepalive_emitted(now);
+
+                    // Idle auto-compaction (opt-in; `enabled` defaults false).
+                    //
+                    // An EMITTED keepalive already proves the bus has been
+                    // quiet for the whole window (no acks == no real work
+                    // handled). That is one necessary idle signal; the full
+                    // trigger also requires the operator AWAY, the queue
+                    // EMPTY, and N consecutive such idle keepalives. When all
+                    // hold, reset the (large, ever-growing) context so idle
+                    // wakes stop paying cache_read freight. The decision is a
+                    // pure function (`idle_autocompact::decide`); the daemon
+                    // gathers the inputs (presence, queue probe, cooldown)
+                    // here. Cheap when disabled: `decide` short-circuits on
+                    // `enabled=false` BEFORE any queue I/O, so a default
+                    // config does zero extra work.
+                    let ia_cfg = &current_config.idle_autocompact;
+                    if ia_cfg.enabled {
+                        // Queue probe only when the feature is on (avoids the
+                        // session-task shell-out on every idle keepalive for
+                        // the default-disabled majority). `None` (unreadable
+                        // queue) is treated as NOT empty — fail-safe: never
+                        // clear on an unknown queue state.
+                        let queue_empty =
+                            idle_autocompact::queue_is_empty(10).unwrap_or(false);
+                        let in_cooldown = state
+                            .last_idle_autocompact
+                            .as_deref()
+                            .and_then(policy::elapsed_since)
+                            .is_some_and(|e| e < ia_cfg.cooldown_secs as f64);
+                        let decision = idle_autocompact::decide(idle_autocompact::IdleInputs {
+                            enabled: true,
+                            operator_away: metrics::operator_is_away(),
+                            queue_empty,
+                            prior_streak: state.idle_autocompact_streak,
+                            after_keepalives: ia_cfg.after_keepalives,
+                            in_cooldown,
+                        });
+                        match decision {
+                            idle_autocompact::IdleAutocompactDecision::Fire => {
+                                // Save state, then clear. If the save fails the
+                                // helper does NOT clear (a clear wipes anything
+                                // not in the resume prompt). On a successful
+                                // fire, reset the streak so the next clear
+                                // needs a fresh full accumulation (anti-loop),
+                                // and stamp the cooldown anchor.
+                                if policy::fire_idle_autocompact(&current_config, &mut state) {
+                                    state.idle_autocompact_streak = 0;
+                                }
+                            }
+                            idle_autocompact::IdleAutocompactDecision::Accumulate {
+                                new_streak,
+                            } => {
+                                state.idle_autocompact_streak = new_streak;
+                            }
+                            idle_autocompact::IdleAutocompactDecision::NotIdle => {
+                                state.idle_autocompact_streak = 0;
+                            }
+                            idle_autocompact::IdleAutocompactDecision::Disabled => {}
+                        }
+                    } else if state.idle_autocompact_streak != 0 {
+                        // Feature toggled off since the last emit — drop any
+                        // carried streak so a later re-enable starts clean.
+                        state.idle_autocompact_streak = 0;
+                    }
                 }
             }
             if due.memory_reminder {

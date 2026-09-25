@@ -2379,6 +2379,157 @@ pub fn pidfile_watcher_is_down(
     crate::status::pidfile_watcher_is_down(recorded_pid, pid_alive, cmdline_matches)
 }
 
+/// Fire an idle auto-compaction: save a resume pointer, then drive a
+/// `self-clear` with an idle-specific resume prompt. Returns `true` iff the
+/// clear was actually spawned (so the caller resets the idle streak and
+/// stamps the cooldown), `false` if it was skipped — because the state save
+/// failed (a clear wipes anything not carried in the resume prompt, so a
+/// failed save MUST abort the clear), or the spawn itself failed.
+///
+/// State-save-before-clear contract: we run `session-task set "<resume
+/// text>"` first so the next session has a resume pointer even if the
+/// resume-prompt injection is lost. Only on a successful save do we clear.
+/// The operator is away and the queue is empty by the time we get here (the
+/// trigger gate guarantees it), so there is no in-flight repo work to commit
+/// — the resume pointer is the whole of the state that must survive.
+///
+/// The clear is delivered via `self-clear --resume-prompt <text>`, the same
+/// baked tool the wedged-recovery path uses, detached via setsid() so it
+/// survives a daemon restart.
+pub(crate) fn fire_idle_autocompact(config: &Config, state: &mut State) -> bool {
+    let now = Utc::now().to_rfc3339();
+
+    // Guard: never double-drive a clear if one is already in flight.
+    if let Some(pid) = state.context_clear_child_pid {
+        if clear_child_is_running(pid) {
+            debug!(pid, "idle-autocompact: a self-clear child is already running; skipping");
+            return false;
+        }
+        state.context_clear_child_pid = None;
+    }
+
+    let resume_prompt = config.idle_autocompact.resume_prompt.clone();
+
+    // STATE SAVE FIRST. If this fails, do NOT clear.
+    if !save_idle_resume_pointer(&resume_prompt) {
+        tracing::warn!("idle-autocompact: resume-pointer save failed; NOT clearing");
+        write_jsonl_log(
+            &config.general.log_file,
+            "idle_autocompact_aborted",
+            serde_json::json!({ "reason": "resume_pointer_save_failed" }),
+        );
+        return false;
+    }
+
+    // Spawn `self-clear --resume-prompt <text>`, detached.
+    // SAFETY: setsid() is async-signal-safe and called before exec.
+    let spawned = match unsafe {
+        std::process::Command::new("self-clear")
+            .args(["--resume-prompt", &resume_prompt])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .pre_exec(|| {
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            })
+            .spawn()
+    } {
+        Ok(child) => {
+            state.context_clear_child_pid = Some(child.id());
+            info!(pid = child.id(), "idle-autocompact: spawned self-clear (idle recovery)");
+            true
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "idle-autocompact: failed to spawn self-clear");
+            false
+        }
+    };
+
+    if spawned {
+        state.last_idle_autocompact = Some(now.clone());
+        state.idle_autocompact_count = state.idle_autocompact_count.saturating_add(1);
+        write_jsonl_log(
+            &config.general.log_file,
+            "idle_autocompact_fired",
+            serde_json::json!({
+                "at": now,
+                "count": state.idle_autocompact_count,
+                "after_keepalives": config.idle_autocompact.after_keepalives,
+            }),
+        );
+        write_legacy_log(
+            &config.general.legacy_log_file,
+            "idle auto-compaction: session idle (operator away, queue empty) — self-clear fired",
+        );
+    }
+    spawned
+}
+
+/// Store the idle-resume pointer via `session-task set`. Returns `true` on a
+/// clean exit (rc 0), `false` on any failure (CLI missing, exec error,
+/// non-zero exit, timeout). Best-effort with a short timeout so a hung CLI
+/// never wedges the daemon loop.
+fn save_idle_resume_pointer(resume_text: &str) -> bool {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let Some(cli) = find_session_task_cli_for_set() else {
+        tracing::warn!("idle-autocompact: session-task CLI not found; cannot save resume pointer");
+        return false;
+    };
+    let text = resume_text.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new(&cli).args(["set", &text]).output();
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(o)) if o.status.success() => true,
+        Ok(Ok(o)) => {
+            tracing::warn!(rc = ?o.status.code(), "idle-autocompact: session-task set exited non-zero");
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "idle-autocompact: session-task set exec failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("idle-autocompact: session-task set timed out");
+            false
+        }
+    }
+}
+
+/// Locate the `session-task` CLI (PATH, then `~/bin`), honouring the
+/// `SESSION_TASK_CLI` test-injection env var. Mirrors the resolver in
+/// `crate::stale_ready` / `crate::idle_autocompact`.
+fn find_session_task_cli_for_set() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(p) = std::env::var("SESSION_TASK_CLI") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("session-task");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = PathBuf::from(home).join("bin/session-task");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Spawn `self-clear` immediately (no grace period). Used for the
 /// wedged-pane recovery path: when the agent is too stuck to run any tool
 /// call (context limit reached, persistent 429), claude-watch must drive
