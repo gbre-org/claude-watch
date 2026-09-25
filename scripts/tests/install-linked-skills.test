@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Tests for scripts/install-linked-skills.sh and its wiring.
+
+The installer COPIES repo-linked Agent Skills (SKILL.md dirs) into a central
+"linked-skills" plugin dir that claude-container bind-mounts at
+/opt/claude-container/linked-skills and loads via --plugin-dir. Unlike
+install-host-skills.sh (host /cw-<name> slash-command SYMLINKS), this one
+COPIES — a host symlink's /Users/... target does not resolve in the container
+namespace — and stamps provenance so each install is traceable.
+
+Contract pinned here:
+  1. From a repo-shaped source (.claude/skills/<name>/SKILL.md), install copies
+     the payload to <dest>/skills/<name>/SKILL.md and seeds the plugin manifest.
+  2. Provenance (.provenance.json) records source_repo/path/commit/timestamp.
+  3. It COPIES (dest is a regular file, not a symlink).
+  4. --src pointing at a bare skills dir (<name>/SKILL.md children) works.
+  5. Idempotent: second run == same tree, exit 0.
+  6. --dry-run touches nothing.
+  7. --prune removes an install whose source path is gone, and keeps live ones.
+  8. The reserved 'synced' skill name is skipped.
+  9. Makefile: install-linked-skills invokes the script.
+"""
+from __future__ import annotations
+import json, os, subprocess, sys, tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+SCRIPT = REPO / "scripts" / "install-linked-skills.sh"
+failures: list[str] = []
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+def run(*args, cwd=None, env=None):
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    return subprocess.run([str(SCRIPT), *args], cwd=cwd, env=e,
+                          capture_output=True, text=True, timeout=30)
+
+def make_src_repo(root: Path, names) -> None:
+    """A git repo with skills under .claude/skills/."""
+    sk = root / ".claude" / "skills"
+    for n in names:
+        d = sk / n
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {n}\ndescription: test skill {n}\n---\nbody {n}\n")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=root, check=True)
+
+def test_basic_install_and_provenance() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        src = td / "srcrepo"; src.mkdir()
+        make_src_repo(src, ["alpha", "beta"])
+        dest = td / "central"
+        r = run("--src", str(src), "--dest", str(dest))
+        expect(r.returncode == 0, f"install rc={r.returncode}: {r.stderr}")
+        for n in ("alpha", "beta"):
+            sm = dest / "skills" / n / "SKILL.md"
+            expect(sm.is_file(), f"{n}/SKILL.md not copied")
+            expect(f"body {n}" in sm.read_text(), f"{n} body not copied")
+            prov = dest / "skills" / n / ".provenance.json"
+            expect(prov.is_file(), f"{n} provenance missing")
+            if prov.is_file():
+                p = json.loads(prov.read_text())
+                expect(p.get("skill") == n, f"{n} provenance skill wrong")
+                expect(p.get("source_commit") not in (None, "", "unknown"),
+                       f"{n} provenance commit missing")
+                expect("installed_at" in p, f"{n} provenance ts missing")
+        man = dest / ".claude-plugin" / "plugin.json"
+        expect(man.is_file(), "plugin manifest not seeded")
+        if man.is_file():
+            expect(json.loads(man.read_text()).get("name") == "linked-skills",
+                   "manifest name != linked-skills")
+
+def test_copies_not_symlinks() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        src = td / "srcrepo"; src.mkdir()
+        make_src_repo(src, ["alpha"])
+        dest = td / "central"
+        run("--src", str(src), "--dest", str(dest))
+        sm = dest / "skills" / "alpha" / "SKILL.md"
+        expect(sm.is_file() and not sm.is_symlink(),
+               "installed SKILL.md must be a COPY, not a symlink")
+
+def test_bare_skills_dir_source() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        skdir = td / "someskills"
+        (skdir / "gamma").mkdir(parents=True)
+        (skdir / "gamma" / "SKILL.md").write_text(
+            "---\nname: gamma\ndescription: d\n---\nb\n")
+        dest = td / "central"
+        r = run("--src", str(skdir), "--dest", str(dest))
+        expect(r.returncode == 0, f"bare-dir rc={r.returncode}: {r.stderr}")
+        expect((dest / "skills" / "gamma" / "SKILL.md").is_file(),
+               "bare skills-dir source not installed")
+
+def test_idempotent() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        src = td / "srcrepo"; src.mkdir()
+        make_src_repo(src, ["alpha"])
+        dest = td / "central"
+        run("--src", str(src), "--dest", str(dest))
+        r2 = run("--src", str(src), "--dest", str(dest))
+        expect(r2.returncode == 0, f"2nd run rc={r2.returncode}: {r2.stderr}")
+        expect((dest / "skills" / "alpha" / "SKILL.md").is_file(),
+               "alpha gone after 2nd run")
+
+def test_dry_run_touches_nothing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        src = td / "srcrepo"; src.mkdir()
+        make_src_repo(src, ["alpha"])
+        dest = td / "central"
+        r = run("--src", str(src), "--dest", str(dest), "-n")
+        expect(r.returncode == 0, f"dry rc={r.returncode}: {r.stderr}")
+        expect(not dest.exists(), "dry-run created dest")
+
+def test_prune() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        src = td / "srcrepo"; src.mkdir()
+        make_src_repo(src, ["alpha", "beta"])
+        dest = td / "central"
+        run("--src", str(src), "--dest", str(dest))
+        # remove beta from source, then prune
+        import shutil
+        shutil.rmtree(src / ".claude" / "skills" / "beta")
+        r = run("--src", str(src), "--dest", str(dest), "--prune")
+        expect(r.returncode == 0, f"prune rc={r.returncode}: {r.stderr}")
+        expect((dest / "skills" / "alpha").exists(), "prune removed live alpha")
+        expect(not (dest / "skills" / "beta").exists(),
+               "prune did NOT remove dead beta")
+
+def test_synced_reserved_name_skipped() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        skdir = td / "someskills"
+        for n in ("synced", "real"):
+            (skdir / n).mkdir(parents=True)
+            (skdir / n / "SKILL.md").write_text("---\nname: x\ndescription: d\n---\nb\n")
+        dest = td / "central"
+        run("--src", str(skdir), "--dest", str(dest))
+        expect(not (dest / "skills" / "synced").exists(),
+               "reserved 'synced' name should be skipped")
+        expect((dest / "skills" / "real").exists(), "real skill missing")
+
+def test_makefile_wiring() -> None:
+    r = subprocess.run(["make", "-n", "install-linked-skills",
+                        "SRC=/tmp/x", "DEST=/tmp/y"],
+                       cwd=REPO, capture_output=True, text=True, timeout=30)
+    expect(r.returncode == 0, f"make -n rc={r.returncode}: {r.stderr}")
+    expect("install-linked-skills.sh" in r.stdout,
+           f"make target does not invoke installer: {r.stdout!r}")
+
+TESTS = [
+    test_basic_install_and_provenance,
+    test_copies_not_symlinks,
+    test_bare_skills_dir_source,
+    test_idempotent,
+    test_dry_run_touches_nothing,
+    test_prune,
+    test_synced_reserved_name_skipped,
+    test_makefile_wiring,
+]
+
+def main() -> int:
+    if not SCRIPT.exists():
+        print(f"FAIL: installer not found at {SCRIPT}", file=sys.stderr)
+        return 2
+    for t in TESTS:
+        try:
+            t()
+            if not any(f for f in failures if f.startswith(t.__name__)):
+                print(f"PASS  {t.__name__}")
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{t.__name__}: raised {e!r}")
+    if failures:
+        print("\nFAILURES:", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print("\nAll install-linked-skills tests passed.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

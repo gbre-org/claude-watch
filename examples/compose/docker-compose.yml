@@ -426,6 +426,31 @@ services:
       # mount being RW lets the operator add / remove the symlink itself
       # in the same workflow.
       - "${CLAUDE_HOST_BIN_DIR:-${HOME}/bin}:/home/hndrewaall/bin:rw"
+      # Linked-in skills — ro. The central dir holding repo-linked Agent
+      # Skills (e.g. eichi-search) COPIED in by
+      # scripts/install-linked-skills.sh. Bind-mounted over the image-baked
+      # /opt/claude-container/linked-skills so the in-container claude loads
+      # them as the `linked-skills` plugin (/linked-skills:<name>) at session
+      # start, ALONGSIDE the baked /opt/claude-container plugin. This is the
+      # ONE bind-mount that makes host-side skills reach the container; after
+      # it exists, adding a skill is a pure RUNTIME op (re-run the installer
+      # into the central dir) — NO docker rebuild, NO compose change, NO
+      # recreate: the next in-container session start picks it up.
+      #
+      # WHY COPY (installer), not a host symlink: a host ~/.claude/skills
+      # entry is typically a symlink to a HOST-ABSOLUTE path (/Users/...)
+      # that does not exist in the container namespace, so it can't resolve
+      # through the bind-mount (verified). The installer copies the payload
+      # in, so there is no cross-namespace target to resolve.
+      #
+      # ro: skills are read-only content in-container. Default /dev/null =
+      # graceful no-op: docker mounts the null device (a non-directory) at
+      # the path, so entrypoint.sh's `[ -d .../linked-skills/.claude-plugin ]`
+      # test is false and no --plugin-dir is added. Same shape as the
+      # managed-settings /dev/null default above. Set
+      # CLAUDE_HOST_LINKED_SKILLS_DIR=~/.config/claude-container/linked-skills
+      # (created by scripts/install-linked-skills.sh) to opt in.
+      - "${CLAUDE_HOST_LINKED_SKILLS_DIR:-/dev/null}:/opt/claude-container/linked-skills:ro"
       # claude-event spool — rw. Host cron / alertmanager / queue
       # producers write here; the in-container claude-event-watch reads
       # + consumes them. Same-path-on-both-sides mirror so the spool
