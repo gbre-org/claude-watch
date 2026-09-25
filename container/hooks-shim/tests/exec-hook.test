@@ -262,6 +262,9 @@ def test_mach_o_bridge_on_invokes_bridge() -> None:
             tmpdir=td,
             extra_env={
                 "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                # The target basename MUST be allow-listed or exec-hook
+                # refuses to bridge it (q-2026-09-25-f027 env-leak gate).
+                "CLAUDE_HOOK_BRIDGE_BINS": "telemetry-hook",
                 "CLAUDE_HOST_HOOK_BRIDGE_URL": "http://127.0.0.1:1/mcp",
                 "CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT": "2",
             },
@@ -289,6 +292,9 @@ def test_missing_target_bridge_on_invokes_bridge() -> None:
             tmpdir=td,
             extra_env={
                 "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                # Allow-list the (missing) target's basename so the bridge
+                # is attempted (q-2026-09-25-f027 env-leak gate).
+                "CLAUDE_HOOK_BRIDGE_BINS": "exist",
                 "CLAUDE_HOST_HOOK_BRIDGE_URL": "http://127.0.0.1:1/mcp",
                 "CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT": "2",
             },
@@ -300,6 +306,35 @@ def test_missing_target_bridge_on_invokes_bridge() -> None:
         expect(bridge_fired or helper_missing,
                f"bridge-on missing: expected bridge attempt or helper-missing heads-up, "
                f"got stderr:\n{r.stderr}")
+
+
+def test_bridge_on_target_not_allowlisted_noops() -> None:
+    """SECURITY (q-2026-09-25-f027): a bridge-eligible target whose basename
+    is NOT in CLAUDE_HOOK_BRIDGE_BINS must NOT be bridged — it silent-no-ops
+    so no host-env dump lands in the transcript. Canonical case: the
+    container's `atuin hook claude-code` hook (atuin absent in-container).
+    """
+    with tempfile.TemporaryDirectory() as td:
+        r = run_shim(
+            "/this/file/does/not/exist/atuin",
+            "hook", "claude-code",
+            tmpdir=td,
+            extra_env={
+                "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                # atuin is NOT in the allow-list -> must be skipped.
+                "CLAUDE_HOOK_BRIDGE_BINS": "devbar,telemetry-hook",
+                "CLAUDE_HOST_HOOK_BRIDGE_URL": "http://127.0.0.1:1/mcp",
+                "CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT": "2",
+            },
+        )
+        expect(r.returncode == 0,
+               f"not-allowlisted: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        # The bridge helper must NOT have fired (no [hook-bridge] line);
+        # exec-hook records the skip via its one-time [hook-shim] heads-up.
+        expect("[hook-bridge]" not in r.stderr,
+               f"not-allowlisted: bridge should NOT fire, got stderr:\n{r.stderr}")
+        expect("not in CLAUDE_HOOK_BRIDGE_BINS" in r.stderr,
+               f"not-allowlisted: expected skip heads-up, got stderr:\n{r.stderr}")
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +457,7 @@ TESTS = [
     test_mach_o_bridge_off_silent_noop,
     test_mach_o_bridge_on_invokes_bridge,
     test_missing_target_bridge_on_invokes_bridge,
+    test_bridge_on_target_not_allowlisted_noops,
     test_devbar_analytics_spooled,
     test_devbar_wrong_args_not_spooled,
     test_non_devbar_not_spooled,

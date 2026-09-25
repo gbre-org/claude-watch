@@ -547,6 +547,33 @@ def fall_back(reason: str) -> None:
     sys.exit(0)
 
 
+def target_bridge_allowed(target: str) -> bool:
+    """Return True iff `target`'s basename is in CLAUDE_HOOK_BRIDGE_BINS.
+
+    Defense-in-depth for the env-leak fix (q-2026-09-25-f027). exec-hook
+    already gates the bridge on this allow-list, but this helper is a bare
+    entry point too, so we enforce the same rule here.
+
+    WHY: the bridge runs the host binary as `env KEY=VAL ... <target> args`
+    (see call_run_command). The host mcp-host-bash server enforces its own
+    allow-list; when <target> is NOT allow-listed it is dropped from the
+    argv and `env KEY=VAL ...` runs with no command, which PRINTS THE ENTIRE
+    HOST ENVIRONMENT (incl. MCP_HOST_BASH_BEARER, SSH_AUTH_SOCK) to stdout —
+    stdout that Claude Code persists as a transcript hook record. Refusing
+    to bridge an un-allow-listed target stops that leak at the source; the
+    target couldn't have run on the host anyway.
+
+    Empty / unset CLAUDE_HOOK_BRIDGE_BINS => allow nothing (secure default;
+    matches the documented "operator must opt a hook basename in" contract).
+    """
+    base = os.path.basename(target)
+    if not base:
+        return False
+    raw = os.environ.get("CLAUDE_HOOK_BRIDGE_BINS", "")
+    allowed = {b.strip() for b in raw.split(",") if b.strip()}
+    return base in allowed
+
+
 def main(argv: list[str]) -> None:
     target, args = parse_argv(argv)
 
@@ -555,6 +582,17 @@ def main(argv: list[str]) -> None:
         # so this script is safe to install unconditionally — it only
         # wakes up when the operator opts in.
         sys.exit(0)
+
+    if not target_bridge_allowed(target):
+        # Un-allow-listed target: bridging it would degrade to a bare-`env`
+        # host-environment dump (see target_bridge_allowed). No-op instead
+        # so nothing lands in the transcript. Canonical case: `atuin hook
+        # claude-code` (atuin's real capture is a host-side shell hook, not
+        # this bridge). Same silent-no-op contract as any other fall-back.
+        fall_back(
+            f"{os.path.basename(target)!r} not in CLAUDE_HOOK_BRIDGE_BINS; "
+            "bridge skipped to avoid host-env leak"
+        )
 
     url = bridge_url()
     timeout = bridge_timeout()

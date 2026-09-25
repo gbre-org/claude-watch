@@ -225,6 +225,52 @@ maybe_spool_devbar_analytics() {
     exec "$spooler" "$target" "$@"
 }
 
+# SECURITY GATE (q-2026-09-25-f027): decide whether TARGET may be bridged to
+# the host. Only targets whose basename appears in CLAUDE_HOOK_BRIDGE_BINS
+# (comma-separated basenames) are eligible.
+#
+# WHY THIS EXISTS
+#
+# The bridge invokes the host binary via mcp-host-bash's `run_command` as
+# `env KEY=VAL ... <target> <args>` (see exec-hook-bridge). The host
+# mcp-host-bash server enforces its OWN allow-list; a <target> that is NOT
+# allow-listed there is dropped from the argv, leaving `env KEY=VAL ...`
+# with no command to exec. A bare `env` with only NAME=VALUE assignments
+# PRINTS THE ENTIRE PROCESS ENVIRONMENT to stdout and exits 0 — including
+# live secrets (MCP_HOST_BASH_BEARER, SSH_AUTH_SOCK) and the full host PATH.
+# Claude Code persists a hook's stdout as a `hook_success` record in the
+# session transcript, so an un-allow-listed bridged hook leaked the host
+# env into the JSONL on EVERY Bash tool call (twice: Pre + Post).
+#
+# Gating the bridge on the SAME allow-list the host enforces stops the leak
+# at the source: a target that isn't allow-listed can't usefully run on the
+# host anyway, so we no-op it here (stdout discarded, nothing persisted)
+# instead of bridging it into the env-dump. The canonical offender is
+# `atuin hook claude-code` (atuin isn't installed in the container, so
+# exec-hook takes the missing-file -> bridge path) — but atuin's REAL shell
+# history capture happens host-side via the ~/.zshenv shell hook writing
+# straight to atuin's sqlite DB, NOT via this bridge, so no-op'ing the
+# bridged call loses zero history.
+#
+# Empty / unset CLAUDE_HOOK_BRIDGE_BINS => bridge nothing (secure default;
+# matches the documented contract that an operator MUST add a hook basename
+# to CLAUDE_HOOK_BRIDGE_BINS to opt it into bridging).
+target_bridge_allowed() {
+    local target="$1"
+    local base
+    base="$(basename -- "$target" 2>/dev/null)"
+    [ -n "$base" ] || return 1
+    local bins="${CLAUDE_HOOK_BRIDGE_BINS:-}"
+    [ -n "$bins" ] || return 1
+    # Comma-delimited membership test (no subshell / IFS clobber). Handles
+    # a single entry and a comma-separated list; per the documented format
+    # entries are bare basenames with no surrounding whitespace.
+    case ",${bins}," in
+        *",${base},"*) return 0 ;;
+    esac
+    return 1
+}
+
 # Try to bridge the call to the host via host-bash MCP. Only invoked
 # from the Mach-O / unknown-format branch when CLAUDE_HOST_HOOK_BRIDGE=1.
 #
@@ -237,6 +283,14 @@ maybe_bridge_to_host() {
     local target="$1"
     shift
     if [ "${CLAUDE_HOST_HOOK_BRIDGE:-0}" != "1" ]; then
+        return 1
+    fi
+    # SECURITY GATE (q-2026-09-25-f027): refuse to bridge a target that is
+    # not in CLAUDE_HOOK_BRIDGE_BINS. Bridging an un-allow-listed target
+    # leaks the full host environment (incl. MCP_HOST_BASH_BEARER) into the
+    # transcript via a degraded bare-`env` dump (see target_bridge_allowed).
+    if ! target_bridge_allowed "$target"; then
+        emit_skip_warning_once "$target (not in CLAUDE_HOOK_BRIDGE_BINS; bridge skipped)"
         return 1
     fi
     local bridge
