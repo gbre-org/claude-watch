@@ -1102,16 +1102,14 @@ event, is worse). If your team requires telemetry from container sessions:
 1. Ship a Linux-amd64 build of the hook binary and bind-mount it at the same
    path the host config references (coordinate with the hook's owning team).
 2. **Enable the host-bash bridge** (`CLAUDE_HOST_HOOK_BRIDGE=1`): exec-hook
-   hands each **allow-listed** Mach-O / wrong-arch hook off to
-   `exec-hook-bridge`, which marshals the call across the host-bash MCP server
-   (`host.docker.internal:8766/mcp`) so the REAL host binary runs and its exit
-   code propagates back. The hook basename MUST be in
-   `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook` (comma-separated for many): it
-   gates BOTH the container bridge decision AND the host allow-list. A
-   non-listed target is NOT bridged (else it runs as a bare
-   `env KEY=VAL <target>` dumping the host env — incl. `MCP_HOST_BASH_BEARER` —
-   into the transcript). Bridge failures (host-bash unreachable, allow-list
-   reject) fall back to the silent-no-op contract.
+   hands each **allow-listed** Mach-O / wrong-arch hook to `exec-hook-bridge`,
+   which marshals the call over the host-bash MCP server so the real host
+   binary runs and its exit code returns. The basename MUST be in
+   `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook` (comma-separated): it gates the
+   bridge decision AND the host allow-list. An unlisted target is NOT
+   bridged (else it runs as a bare `env KEY=VAL <target>`, dumping the host
+   env — incl. `MCP_HOST_BASH_BEARER` — into the transcript). Bridge
+   failures fall back to silent-no-op.
 3. Accept that in-container sessions aren't telemetered into the host's
    pipeline.
 
