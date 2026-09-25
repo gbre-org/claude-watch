@@ -4,7 +4,7 @@
 
 ## Want to add a skill that lives OUTSIDE this repo? (no image rebuild)
 
-Skills in **this** dir (and the shared [`skills/`](../../skills/) dir) are **baked** into the image — changing them needs a rebuild. If you want to autoload an **out-of-tree Agent Skill** — one that lives in another repo (e.g. `~/repos/claude-config`, `~/repos/eichi`) or any host path — **without** rebuilding the image, use the **linked-skills** mechanism instead:
+Skills in **this** dir (and the shared [`skills/`](../../skills/) dir) are **baked** into the image — changing them needs a rebuild. If you want to autoload an **out-of-tree Agent Skill** — one that lives in another repo (your own scratch notes repo, a personal tools checkout, etc.) or any host path — **without** rebuilding the image, use the **linked-skills** mechanism instead:
 
 ```sh
 # From a repo that ships Agent Skills under .claude/skills/ (or a skills/ dir):

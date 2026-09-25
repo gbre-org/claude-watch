@@ -89,8 +89,8 @@ prefix with `--prefix`.
 The two dirs above (`skills/`, `container/skills/`) are for skills that ship
 **in this repo** — changing them in the container needs an image rebuild. To
 autoload an **Agent Skill that lives in another repo or host path** (e.g.
-`~/repos/claude-config`, `~/repos/eichi`) inside the container **without** a
-rebuild, use the **linked-skills** mechanism:
+your own scratch notes repo, or a personal tools checkout) inside the
+container **without** a rebuild, use the **linked-skills** mechanism:
 
 ```sh
 make install-linked-skills SRC=~/repos/<repo>   # COPY its .claude/skills/ in
