@@ -2,6 +2,21 @@
 
 **CONTAINER-ONLY** slash-command source files baked into the [claude-container](https://github.com/gbre-org/claude-watch/tree/main/container) image. Each file is one skill that the in-container `claude` process can invoke as `/<plugin>:<name>` (the plugin name is `claude-container`, set by `/opt/claude-container/plugin/.claude-plugin/plugin.json`).
 
+## Want to add a skill that lives OUTSIDE this repo? (no image rebuild)
+
+Skills in **this** dir (and the shared [`skills/`](../../skills/) dir) are **baked** into the image — changing them needs a rebuild. If you want to autoload an **out-of-tree Agent Skill** — one that lives in another repo (e.g. `~/repos/claude-config`, `~/repos/eichi`) or any host path — **without** rebuilding the image, use the **linked-skills** mechanism instead:
+
+```sh
+# From a repo that ships Agent Skills under .claude/skills/ (or a skills/ dir):
+make install-linked-skills SRC=~/repos/<repo>
+```
+
+That **COPIES** each `<name>/SKILL.md` into a central host dir (`~/.config/claude-container/linked-skills`) that is bind-mounted read-only over the image path `/opt/claude-container/linked-skills`. `entrypoint.sh` loads it as a **second `--plugin-dir`**, so the skills surface in-container as `/linked-skills:<name>` on the next session start. Adding/updating a skill is then a pure runtime op — re-run the installer, no docker rebuild, no compose edit.
+
+**First-time enable** needs the bind-mount wired once: set `CLAUDE_HOST_LINKED_SKILLS_DIR` (default `/dev/null`, a graceful no-op) to the central dir in your compose override, then one `make deploy-container` (force-recreate) to pick up the mount. After that, `make install-linked-skills` + next session start is all it takes.
+
+Full mechanism, why `--plugin-dir` (not `--add-dir`), the symlink-vs-copy rationale, and the exact "what makes a change go live" table: **[`docs/linked-skills.md`](../../docs/linked-skills.md)**.
+
 ## This dir vs. the shared [`skills/`](../../skills/) dir
 
 The repo has two skill dirs, and picking the wrong one has real consequences:
