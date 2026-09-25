@@ -86,8 +86,66 @@ use std::time::{Duration, Instant};
 /// cache. See analyze-session-spend, 2026-09.)
 pub const KEEPALIVE_INTERVAL_SECS: u64 = 210;
 
-/// Interval between `memory-reminder` events. 30 minutes.
+/// Interval between `memory-reminder` events when the operator is PRESENT.
+/// 30 minutes.
+///
+/// Unlike `keepalive` (whose 210s cadence is tuned to stay under the ~5min
+/// Anthropic prompt-cache TTL so idle wakes hit the WARM cache — see
+/// [`KEEPALIVE_INTERVAL_SECS`] and PR #794), the memory-reminder is a
+/// non-liveness, non-urgent context-hygiene nudge (update logs, commit + push
+/// repos). Its cost lever is therefore turn COUNT, not cache warmth: each
+/// reminder that fires while the operator is away drives a work-cascade
+/// (git status across every repo, log update) that is pure idle spend when
+/// nothing has changed and nobody is waiting on it. The base interval is kept
+/// at 30min so hygiene stays responsive whenever someone is actually at the
+/// desk.
 pub const MEMORY_REMINDER_INTERVAL_SECS: u64 = 1800;
+
+/// Interval between `memory-reminder` events when the operator is AWAY (idle).
+/// 2 hours.
+///
+/// This is the idle-spend lever measured on the 2026-09-23/24 overnight
+/// windows (analyze-session-spend, `#9352`): with keepalive already warm-tuned
+/// by PR #794 (measured 0% cache-miss overnight), the remaining idle cost is
+/// per-turn cache_read FREIGHT × wake frequency. keepalive frequency cannot be
+/// safely cut (stretching it past the ~5min TTL turns every wake COLD at ~12×
+/// the warm price, and past [`crate::config::AckConfig`]'s `stale_minutes`=20
+/// it trips the wedge alarm). The memory-reminder has neither constraint: it is
+/// not a liveness signal, so lengthening it when the operator is away trips no
+/// alarm and loses no responsiveness (it snaps back to
+/// [`MEMORY_REMINDER_INTERVAL_SECS`] the moment presence returns). Stretching
+/// 30min → 2h while away removes ~3 of every 4 overnight reminder wakes and
+/// their downstream commit/log cascades. `0` (the config default for the field
+/// that selects this) means "no idle backoff — always use the base interval".
+///
+/// `#[allow(dead_code)]`: a documentary single-source-of-truth value mirrored
+/// by the container's `[cadence] memory_reminder_idle_interval_secs` (config is
+/// TOML data and cannot reference a Rust const). The field's code default is
+/// `0` (off), so nothing in non-test code reads this const directly.
+#[allow(dead_code)]
+pub const MEMORY_REMINDER_IDLE_INTERVAL_SECS: u64 = 7200;
+
+/// Pick the effective memory-reminder interval for this loop pass.
+///
+/// Pure decision, unit-testable without I/O: the daemon passes the current
+/// operator-presence state and the two configured intervals. When the operator
+/// is AWAY and an idle interval is configured (`idle > 0`), the LONGER of the
+/// two is used (a mis-set `idle < base` can never SHORTEN the base); otherwise
+/// the base interval stands. Applied via
+/// [`CadenceTracker::apply_intervals`], which preserves the last-fired instant,
+/// so switching regimes never replays a startup burst and a shortened interval
+/// (operator returns) takes effect measured from the real last emission.
+pub fn effective_memory_interval_secs(
+    base_secs: u64,
+    idle_secs: u64,
+    operator_away: bool,
+) -> u64 {
+    if operator_away && idle_secs > 0 {
+        base_secs.max(idle_secs)
+    } else {
+        base_secs
+    }
+}
 
 /// claude-event tag for the keepalive probe.
 ///
@@ -269,6 +327,68 @@ impl Default for CadenceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_memory_interval_uses_base_when_present() {
+        // Operator PRESENT => always the base interval, even if an idle
+        // interval is configured. Responsiveness is never harmed by the
+        // backoff while someone is at the desk.
+        assert_eq!(
+            effective_memory_interval_secs(1800, 7200, false),
+            1800
+        );
+    }
+
+    #[test]
+    fn effective_memory_interval_backs_off_when_away() {
+        // Operator AWAY + idle configured => the longer idle interval.
+        assert_eq!(
+            effective_memory_interval_secs(1800, 7200, true),
+            7200
+        );
+    }
+
+    #[test]
+    fn effective_memory_interval_idle_zero_disables_backoff() {
+        // idle == 0 means "no backoff": use the base even when away. This is
+        // the field default, so a deployment that does not opt in behaves
+        // exactly as before this change.
+        assert_eq!(
+            effective_memory_interval_secs(1800, 0, true),
+            1800
+        );
+    }
+
+    #[test]
+    fn effective_memory_interval_uses_the_canonical_idle_const() {
+        // The idle const is the recommended idle interval; the container config
+        // mirrors it as a literal. Assert the helper backs off to exactly it
+        // from the base when the operator is away (this also keeps the const a
+        // live single-source-of-truth value rather than dead code).
+        assert_eq!(
+            effective_memory_interval_secs(
+                MEMORY_REMINDER_INTERVAL_SECS,
+                MEMORY_REMINDER_IDLE_INTERVAL_SECS,
+                true,
+            ),
+            MEMORY_REMINDER_IDLE_INTERVAL_SECS
+        );
+        assert!(
+            MEMORY_REMINDER_IDLE_INTERVAL_SECS > MEMORY_REMINDER_INTERVAL_SECS,
+            "idle backoff must be longer than the base interval"
+        );
+    }
+
+    #[test]
+    fn effective_memory_interval_never_shortens_base() {
+        // A mis-set idle interval SHORTER than the base must never shorten the
+        // base (that would INCREASE idle spend). The max() guards it.
+        assert_eq!(
+            effective_memory_interval_secs(1800, 600, true),
+            1800
+        );
+    }
+
 
     /// Model the daemon's loop pass with keepalive emission UNCONDITIONAL
     /// (as if the ack gate always let it through): call `due` and, when

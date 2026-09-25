@@ -1018,6 +1018,17 @@ fn operator_present_block() -> Vec<String> {
     operator_present_lines(presence_carrier_mtime(), now, presence_max_age())
 }
 
+/// Is the operator currently AWAY (idle), by the SAME presence decision the
+/// `claude_operator_present` gauge and desk-streak use? True iff the presence
+/// carrier is absent or its mtime is older than the gate freshness window.
+///
+/// Reused by the daemon main loop to select the idle-backoff memory-reminder
+/// cadence (see [`crate::cadence::effective_memory_interval_secs`]). Kept here
+/// so the "away" judgement can never drift from the exported presence gauge.
+pub(crate) fn operator_is_away() -> bool {
+    !presence_is_fresh(presence_carrier_mtime(), now_epoch(), presence_max_age())
+}
+
 /// How long an `api_retry_last_seen` stamp keeps reading as "a retry storm is
 /// happening RIGHT NOW".
 ///

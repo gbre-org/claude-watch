@@ -341,10 +341,19 @@ respawn_command = ["cwsr", "--no-upgrade"]
 # stretched from the 30-min code default to 1 hour for this deployment
 # (operator directive, botchat #4712) — the reminder checklist (update logs,
 # commit + push repos) is heavier-touch than a 30-min beat warrants here.
-# keepalive_interval_secs is left unset -> inherits the 300s (5-min) code
-# default. This is a plain daemon config VALUE, not an overlay mount.
+# keepalive_interval_secs is left unset -> inherits the 210s (3.5-min) code
+# default, which PR #794 tuned to stay under the ~5min prompt-cache TTL so idle
+# keepalive wakes stay WARM. Do NOT raise it to "save money" — cold wakes cost
+# ~12x more. This is a plain daemon config VALUE, not an overlay mount.
 #
-# NOTE: this value is the baked DEFAULT — frozen into the image. To retune the
+# memory_reminder_idle_interval_secs stretches the memory-reminder cadence to 2h
+# WHILE THE OPERATOR IS AWAY (present -> stays at the 1h base below). The
+# reminder is non-liveness context hygiene; overnight, firing its commit/push/
+# log-update cascade every hour with nothing changed is pure idle spend. It
+# snaps back to the base the instant presence returns, so responsiveness is
+# untouched. Off (0) by code default; enabled here for this deployment.
+#
+# NOTE: these values are the baked DEFAULT — frozen into the image. To retune the
 # cadence WITHOUT a rebuild + redeploy, edit the operator runtime override at
 # ~/.config/claude-container/claude-watch.override.toml on the host (a separate
 # bind-mounted file, seeded commented on first boot). The daemon layers it on
@@ -352,3 +361,4 @@ respawn_command = ["cwsr", "--no-upgrade"]
 # live. See $CLAUDE_WATCH_RUNTIME_CONFIG in container/entrypoint.sh.
 enabled = true
 memory_reminder_interval_secs = 3600
+memory_reminder_idle_interval_secs = 7200

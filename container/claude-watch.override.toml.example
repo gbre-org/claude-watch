@@ -26,8 +26,9 @@
 # --- Cadence claude-events (keepalive + memory-reminder) -------------------
 # [cadence]
 # enabled = true
-# memory_reminder_interval_secs = 3600   # 1h    (code default 1800 = 30 min)
-# keepalive_interval_secs       = 300    # 5min  (code default 300)
+# memory_reminder_interval_secs = 3600        # 1h    (code default 1800 = 30 min)
+# memory_reminder_idle_interval_secs = 7200   # 2h when operator AWAY (code default 0 = off)
+# keepalive_interval_secs       = 210         # 3.5min (code default 210, kept under cache TTL)
 
 # --- Liveness (ack age) -----------------------------------------------------
 # Minutes without ANY claude-event ack before the daemon calls the loop wedged.
