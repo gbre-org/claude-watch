@@ -386,6 +386,43 @@ if start_watchers.is_file():
         f"no built-in watchers today (don't pretend the dir is populated)",
     )
 
+# 4b. authoring-skills.md present + covers the baked-vs-linked decision
+#     (the meta-skill teaching how to add a new skill to this system,
+#     added alongside the linked-skills mechanism from PR #798).
+authoring_skills = SKILLS_DIR / "authoring-skills.md"
+expect(
+    authoring_skills.is_file(),
+    f"{authoring_skills} missing — the skill-authoring meta-skill teaching "
+    f"baked vs. linked delivery must ship as its own skill",
+)
+if authoring_skills.is_file():
+    text = authoring_skills.read_text(encoding="utf-8")
+    expect(
+        len(text) > 200,
+        f"{authoring_skills} suspiciously short (<200 chars)",
+    )
+    expect(
+        "install-linked-skills.sh" in text,
+        f"{authoring_skills} should reference scripts/install-linked-skills.sh "
+        f"— the installer that ships a linked skill without a rebuild",
+    )
+    expect(
+        "docs/linked-skills.md" in text,
+        f"{authoring_skills} should point to docs/linked-skills.md as the "
+        f"full reference rather than duplicating the mechanism wholesale",
+    )
+    expect(
+        "rebuild" in text.lower() and "recreate" in text.lower(),
+        f"{authoring_skills} should explain that a BAKED skill needs an "
+        f"image rebuild + container recreate to activate, unlike a linked one",
+    )
+    first_line = first_content_line(text).lower()
+    expect(
+        "skill" in first_line,
+        f"{authoring_skills} first line should describe teaching how to add "
+        f"a new skill, got: {first_content_line(text)!r}",
+    )
+
 # 5. agents/ only ships README.md today.
 agent_files = sorted(p.name for p in AGENTS_DIR.iterdir() if p.is_file())
 expect(
