@@ -113,6 +113,22 @@ pub struct State {
     pub daemon_start_epoch: Option<f64>,
     #[serde(default)]
     pub context_clear_child_pid: Option<u32>,
+    /// Consecutive-idle-keepalive streak for the idle auto-compaction feature
+    /// (`crate::idle_autocompact`). Incremented on each emitted keepalive
+    /// while the operator is away AND the queue is empty; reset to 0 whenever
+    /// the operator is present, the queue is non-empty, or an idle clear
+    /// fires. Only meaningful when `[idle_autocompact] enabled = true`;
+    /// otherwise it stays 0 (the feature never runs). Transient.
+    #[serde(default)]
+    pub idle_autocompact_streak: u32,
+    /// RFC3339 timestamp of the last idle auto-compaction clear the daemon
+    /// fired. Anchors the cooldown backstop (`cooldown_secs`) that prevents a
+    /// clear loop. `None` until the first idle clear.
+    #[serde(default)]
+    pub last_idle_autocompact: Option<String>,
+    /// Cumulative count of idle auto-compaction clears (for metrics).
+    #[serde(default)]
+    pub idle_autocompact_count: u64,
     /// Last observed token count (for detecting external clears)
     #[serde(default)]
     pub last_seen_tokens: Option<u64>,

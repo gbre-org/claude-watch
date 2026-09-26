@@ -905,6 +905,49 @@ enabled = true
 # cold-start state and every save emitted a full set of events: seven
 # memory-reminders landed in 52 seconds against a 30-minute interval.
 
+[idle_autocompact]
+# Idle auto-compaction: when the session is GENUINELY IDLE, reset the main
+# loop's context (a self-clear + resume prompt) so idle wakes stop paying
+# cache_read freight on a large, ever-growing context.
+#
+# WHY: claude-watch's own main loop runs on Opus. While the operator is away
+# it still wakes on every keepalive (~210s) and re-reads its whole context
+# from cache. On a long idle stretch that context grows unbounded and the
+# per-wake cache_read of it dominates idle spend. If nothing is in flight,
+# that carried context is pure cost — resetting it drops the freight back to
+# a fresh-boot preamble.
+#
+# OPT-IN — DISABLED BY DEFAULT. `enabled` defaults to false, so a fresh or
+# default config NEVER auto-compacts. Turn it on explicitly to activate.
+enabled = false
+# Consecutive idle keepalives required before a clear fires. An idle
+# keepalive is one emitted while the operator is AWAY and the session-task
+# queue is EMPTY (no running, no ready) — i.e. no real work is happening. At
+# the 210s keepalive cadence, 3 ticks ≈ 10.5 min of sustained idle before the
+# first clear. Default 3.
+after_keepalives = 3
+# Minimum seconds between two idle auto-compactions. A backstop on top of the
+# streak-reset-on-fire anti-loop rule: even if the streak accounting is
+# perturbed, no second clear fires within this window. Default 1800 (30 min).
+cooldown_secs = 1800
+# Resume prompt injected after the /clear lands (self-clear --resume-prompt).
+# Kept generic and low-key: the operator is away and nothing is queued, so it
+# just re-establishes liveness and points at the queue. Omit to inherit the
+# code default (see src/idle_autocompact.rs).
+#   resume_prompt = "..."
+#
+# SAFETY / TRIGGER SUMMARY (all must hold to fire):
+#   * enabled = true (this master gate; default false = fully inert)
+#   * operator AWAY (presence carrier stale) — never mid-conversation
+#   * queue EMPTY (no running AND no ready session-task items) — never while
+#     work is in flight or waiting; an unreadable queue is treated as NOT
+#     empty (fail-safe, never clears on unknown state)
+#   * after_keepalives consecutive idle keepalives accumulated
+# The streak resets to 0 whenever the operator returns, the queue becomes
+# non-empty, or a clear fires (so it never loops — the next clear needs a
+# fresh full accumulation). State is SAVED (session-task set resume pointer)
+# BEFORE the clear; if the save fails, the daemon does NOT clear.
+
 # --- Event-watcher health check (cw-watcher-health-check cron) --------------
 # CONSUMED BY THE cw-watcher-health-check CRON SCRIPT, not the claude-watch
 # daemon (the daemon ignores unknown sections). Sets how many minutes a

@@ -76,6 +76,13 @@ pub struct Config {
     /// never approve one. See `PermissionPromptMonitorConfig`.
     #[serde(default)]
     pub permission_prompt_monitor: PermissionPromptMonitorConfig,
+    /// Idle auto-compaction: reset the main loop's context via `self-clear`
+    /// when the session is genuinely idle (operator away, queue empty, N
+    /// consecutive idle keepalives). OPT-IN — `enabled` defaults FALSE, so a
+    /// fresh/default config never auto-compacts. See
+    /// `crate::idle_autocompact::IdleAutocompactConfig`.
+    #[serde(default)]
+    pub idle_autocompact: crate::idle_autocompact::IdleAutocompactConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
