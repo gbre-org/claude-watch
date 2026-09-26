@@ -84,6 +84,26 @@ prefix with `--prefix`.
    `make install-skills`. Container: needs a rebuild + force-recreate — `cwsr`
    will NOT pick it up.
 
+## Out-of-tree skills — link them in with NO image rebuild
+
+The two dirs above (`skills/`, `container/skills/`) are for skills that ship
+**in this repo** — changing them in the container needs an image rebuild. To
+autoload an **Agent Skill that lives in another repo or host path** (e.g.
+your own scratch notes repo, or a personal tools checkout) inside the
+container **without** a rebuild, use the **linked-skills** mechanism:
+
+```sh
+make install-linked-skills SRC=~/repos/<repo>   # COPY its .claude/skills/ in
+```
+
+It copies each `<name>/SKILL.md` into a central host dir bind-mounted over
+`/opt/claude-container/linked-skills`, which `entrypoint.sh` loads as a second
+`--plugin-dir`; the skills surface in-container as `/linked-skills:<name>` on
+the next session start. First-time enable wires the bind-mount once
+(`CLAUDE_HOST_LINKED_SKILLS_DIR` + one force-recreate); after that, re-running
+the installer + a session start is all it takes — no rebuild, no compose edit.
+Full details: [`docs/linked-skills.md`](../docs/linked-skills.md).
+
 ## Currently shipping
 
 - [`distill.md`](distill.md) — the DISTILLATION METASKILL: take a completed

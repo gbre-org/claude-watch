@@ -109,8 +109,6 @@ machine. The distinction matters for many decisions:
 compaction): run this checklist BEFORE doing anything else.** It surfaces
 what the container exposes — and what it doesn't — so the conversation
 doesn't drift into assumptions about a host-side surface that isn't here.
-The list is intentionally short — the container is a sandbox for code work,
-not the host's full automation stack, so these checks are all that's needed.
 
 1. **Self-id**: run `cat /etc/claude-code/CLAUDE.md | head -3`. Confirm
    you see the "claude-container — runtime environment" header. If you
@@ -141,15 +139,16 @@ not the host's full automation stack, so these checks are all that's needed.
 6. **List baked skills + agents + watchers**: `ls
    /opt/claude-container/skills/ /opt/claude-container/agents/
    /opt/claude-container/watchers/`. Skills land at
-   `/claude-container:<name>` (e.g. `/claude-container:claude-code-restart`,
-   `/claude-container:start-watchers`); agents are spawned with
-   `Agent(subagent_type="claude-container:<name>", ...)`; watchers are
-   shell scripts the agent launches via the `Bash` tool with
-   `run_in_background: true`. The full convention + how-to-add lives in
-   the per-dir READMEs at the repo's
+   `/claude-container:<name>` (e.g. `/claude-container:claude-code-restart`);
+   agents via `Agent(subagent_type="claude-container:<name>")`; watchers are
+   shell scripts launched via `Bash` with `run_in_background: true`. Convention
+   + how-to-add: the per-dir READMEs at
    [`container/skills/`](/opt/claude-container/container/skills),
-   [`container/agents/`](/opt/claude-container/container/agents),
-   [`container/watchers/`](/opt/claude-container/container/watchers).
+   [`agents/`](/opt/claude-container/container/agents),
+   [`watchers/`](/opt/claude-container/container/watchers). **Out-of-tree skills
+   autoload with NO rebuild** — `make install-linked-skills SRC=<repo>` copies
+   them into the bind-mounted `linked-skills` plugin dir as `/linked-skills:<name>`
+   ([`docs/linked-skills.md`](/opt/claude-container/docs/linked-skills.md)).
 7. **Start event watchers via `/claude-container:start-watchers`**.
    A watcher is a **live `run_in_background` Bash shell the main loop
    holds** — NOT a daemon or pidfile process. It is "running" ONLY while
