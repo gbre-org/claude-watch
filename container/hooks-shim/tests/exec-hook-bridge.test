@@ -251,6 +251,11 @@ def run_bridge(
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": os.environ.get("HOME", "/tmp"),
+        # Allow-list the test target's basename by default so the bridge
+        # is permitted to run (q-2026-09-25-f027 env-leak gate refuses to
+        # bridge un-allow-listed targets). Individual tests override this
+        # via bridge_env when they exercise the gate itself.
+        "CLAUDE_HOOK_BRIDGE_BINS": "telemetry-hook",
     }
     if bridge_env:
         env.update(bridge_env)
@@ -697,12 +702,62 @@ def test_bridge_stateless_server_skips_session_header() -> None:
             )
 
 
+def test_bridge_target_not_allowlisted_falls_back() -> None:
+    """SECURITY (q-2026-09-25-f027): a target whose basename is NOT in
+    CLAUDE_HOOK_BRIDGE_BINS must fall back to no-op BEFORE any HTTP call —
+    so an un-allow-listed hook can't be run as `env KEY=VAL <target>` on
+    the host and dump the host environment into the transcript. Canonical
+    case: `atuin` (atuin isn't installed in the container)."""
+    reset_fake()
+    with fake_server() as url:
+        set_tools_call_response(stdout="SHOULD-NOT-RUN", exit_code=0)
+        r = run_bridge(
+            "atuin", "hook", "claude-code",
+            bridge_env={
+                "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                "CLAUDE_HOST_HOOK_BRIDGE_URL": url,
+                # atuin NOT in the list -> gate must refuse.
+                "CLAUDE_HOOK_BRIDGE_BINS": "devbar,telemetry-hook",
+            },
+        )
+        expect(r.returncode == 0,
+               f"not-allowlisted: expected exit 0, got {r.returncode}; stderr: {r.stderr!r}")
+        expect("SHOULD-NOT-RUN" not in r.stdout,
+               f"not-allowlisted: host command must NOT run, got stdout: {r.stdout!r}")
+        expect(FakeMCPHandler.requests == [],
+               f"not-allowlisted: NO HTTP call expected, got {[q['method'] for q in FakeMCPHandler.requests]}")
+        expect("not in CLAUDE_HOOK_BRIDGE_BINS" in r.stderr,
+               f"not-allowlisted: expected skip reason in stderr, got: {r.stderr!r}")
+
+
+def test_bridge_empty_allowlist_falls_back() -> None:
+    """Empty / unset CLAUDE_HOOK_BRIDGE_BINS => bridge nothing (secure
+    default). Even the usual telemetry-hook target is refused."""
+    reset_fake()
+    with fake_server() as url:
+        set_tools_call_response(stdout="SHOULD-NOT-RUN", exit_code=0)
+        r = run_bridge(
+            "/host/path/telemetry-hook",
+            bridge_env={
+                "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                "CLAUDE_HOST_HOOK_BRIDGE_URL": url,
+                "CLAUDE_HOOK_BRIDGE_BINS": "",
+            },
+        )
+        expect(r.returncode == 0,
+               f"empty-allowlist: expected exit 0, got {r.returncode}; stderr: {r.stderr!r}")
+        expect(FakeMCPHandler.requests == [],
+               f"empty-allowlist: NO HTTP call expected, got {[q['method'] for q in FakeMCPHandler.requests]}")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
 TESTS = [
     test_bridge_off_short_circuits,
+    test_bridge_target_not_allowlisted_falls_back,
+    test_bridge_empty_allowlist_falls_back,
     test_bridge_on_runs_full_handshake,
     test_bridge_forwards_env_via_env_prefix,
     test_bridge_on_is_error_falls_back_silently,
