@@ -285,8 +285,14 @@ console.log('refresh.js: buildTopbarMetaDOM renders the agent-bar pill (active /
     const ls = live.querySelector('#count-stack');
     assert('merge onto flat pills: stack present', !!ls);
     assert('merge onto flat pills: stack is first child', live.firstElementChild === ls);
+    // "Flat pill" means a STATUS pill (running / pending / …) stranded outside
+    // the keyed stack. The header's operator CONTROLS also borrow the .count
+    // skin and legitimately live outside it — density and multitail — so they
+    // are excluded by name rather than by the shared class.
     assert('merge onto flat pills: no flat pill left outside the stack',
-      Array.from(live.children).filter((e) => e.classList.contains('count') && !e.classList.contains('density-control')).length === 0,
+      Array.from(live.children).filter((e) => e.classList.contains('count') &&
+        !e.classList.contains('density-control') &&
+        !e.classList.contains('multitail-control')).length === 0,
       Array.from(live.children).map((e) => e.className).join('|'));
     assert('merge onto flat pills: counts updated',
       ls && ls.querySelector('.count-running').textContent === '2 running' && ls.querySelector('.count-pending').textContent === '1 pending');

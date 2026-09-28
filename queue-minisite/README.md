@@ -174,6 +174,78 @@ render as ABSENT — no chip, no "unknown" placeholder. Resolution is
 memoised on each transcript's (mtime, size), so the archived transcripts
 behind the done section are scanned once rather than on every 5s poll.
 
+## Multitail mode (all running tails at once)
+
+A whole-window mode that stacks one live tail per RUNNING item, so one glance
+answers "what is everything doing" instead of opening the single-item log
+modal N times in a row.
+
+* **Toggle**: the `multitail` pill in the header, or the **`m`** key. `m`,
+  `Esc` or the **exit** button leave it. `m` is inert while you are typing in
+  a field and while another dialog (the log modal, the stop/abandon confirm)
+  owns the keyboard.
+* **Dismiss one pane**: the `×` in that pane's header. It does not leave the
+  mode, and the pane does not come back while the mode stays open.
+* Nothing is persisted. A full-window takeover that survived a reload would
+  be a surprise rather than a convenience.
+
+**Which items get a pane — and why some do not.** Exactly the rows the server
+marks with a non-empty `live_log_mode` (`hostjob` / `workload` / `live`),
+surfaced to both renderers as `data-live-log-mode`. That is deliberately
+NARROWER than the `data-log-mode` every running card carries: every running
+card is clickable, because clicking a `starting` item opens the modal in a
+polling state and waits for its agent's first write — but an item with nothing
+to read yet must not get a pane, since an empty pane spends a slice of the
+viewport and one of the browser's scarce connections to say nothing. An item
+that acquires a log joins on the next reconcile pass (2s). Precedence matches
+the stream endpoint's own dispatch (hostjob → workload → agent), so a pane can
+never advertise a tail the server would not serve.
+
+**How many panes stay legible.** Panes flex-share the viewport evenly, but only
+down to `--mt-pane-min` (132px — a header plus roughly ten monospace lines;
+108px under 560px wide). Below that a tail shows a line or two and stops being
+information, so past that point the stack **scrolls** instead of shrinking
+further. On a laptop viewport that is an even split up to about five or six
+tails and a scrolling stack beyond.
+
+**Why only four stream at a time.** Each pane tails via `EventSource`, i.e. a
+long-lived HTTP connection, and a browser allows only about six concurrent
+connections per origin on HTTP/1.1. Six open tails and the site's own 5s
+`/api/queue` poll can no longer get a connection: the page freezes in a way
+that looks exactly like a server fault. So `MAX_LIVE_STREAMS` (4) panes hold a
+connection at a time; the rest are built, visible, and labelled "waiting for a
+stream slot", and are promoted the moment an earlier pane is closed or its job
+ends. Every eligible item still gets a pane — what is rationed is the socket,
+not the row.
+
+**Panes render one line per event**, not the modal's full pretty-printed
+transcript: the modal is where a single item gets read properly, and a rich
+renderer inside a 132px pane shows one tool call. Agent transcript records
+collapse to `▸ Bash <command>` / `← <first line of result>` / `· <text>`;
+plain-text workload and hostjob logs pass through verbatim. Lines are clipped
+rather than wrapped, and each pane retains the last 400.
+
+**A job that finishes while the mode is open keeps its pane.** Removing it
+would delete the output the operator was reading at the exact moment it became
+final. The pane keeps its content, its header flips to `ended` (with the exit
+code when the stream reported one), and its stream slot returns to the pool.
+The same is true for an item that leaves the running section entirely. Closing
+it is the operator's call.
+
+The mode reads eligibility off the rendered rows rather than re-fetching
+`/api/queue`, so it is consistent with what the page is showing by
+construction and adds no second poller — the existing 5s tick is what moves
+the attribute. `data-no-morph` on the overlay keeps that merge away from the
+panes, whose live connections and scroll positions a re-render would destroy.
+
+`test_multitail.py` pins the server-side eligibility rules, the rendered
+attributes, and (by grep, since it is the CI-gating suite) the fact that
+`refresh.js` mirrors both the attribute and the toggle.
+`static/multitail.test.js` drives the module itself under jsdom — pane
+construction, the connection cap and slot promotion, manual close, the
+toggles, the terminal-event handling and the compact formatter — plus the same
+parity checks against the real `refresh.js` builders.
+
 ## Layout
 
 | Path | Purpose |
@@ -181,7 +253,7 @@ behind the done section are scanned once rather than on every 5s poll.
 | `app.py` | Single-file Flask app (read endpoints + Stop/Abandon/Force-start writers + SSE live-log stream). |
 | `claude_agents.py` | Shared helpers for parsing `claude-watch active-agents` JSON state (agent\_id, queue-id join, dedup). |
 | `templates/index.html` | Solarized-themed queue view. |
-| `static/` | JS modules (`refresh.js`, `live-log.js`, `keyboard.js`, etc.), CSS, icons. |
+| `static/` | JS modules (`refresh.js`, `live-log.js`, `multitail.js`, `keyboard.js`, etc.), CSS, icons. |
 | `claude-event` | Vendored event-emitter CLI used by `session-task` lifecycle hooks. |
 | `obligations` | Vendored obligations-gate CLI used by the force-start endpoint. |
 | `Dockerfile` | Build (python:3.12-alpine + gunicorn). |

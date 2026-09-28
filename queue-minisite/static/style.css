@@ -2410,3 +2410,263 @@ html.density-compact .subagent-node {
 html.density-compact .subagent-node .subagent-id,
 html.density-compact .subagent-node .subagent-label,
 html.density-compact .subagent-node .subagent-age { font-size: 0.68rem; }
+
+/* ================= MULTITAIL MODE =================
+ *
+ * A whole-window overlay stacking one live tail per running item that has a
+ * log. static/multitail.js builds every pane; this block is the frame + the
+ * pane skin.
+ *
+ * SIZING IS THE WHOLE DESIGN HERE. Panes flex-share the viewport evenly, but
+ * only down to --mt-pane-min: below a header plus roughly ten monospace lines
+ * a tail shows nothing you can read, so past that point the stack SCROLLS
+ * instead of shrinking further. On a laptop viewport that is an even split up
+ * to about five or six tails and a scrolling stack beyond.
+ */
+
+:root {
+  --mt-pane-min: 132px;
+}
+
+/* Header toggle pill — mirrors the density pill's shape so the two read as one
+   control group. Both renderers emit it (Jinja template + refresh.js). */
+.multitail-control .multitail-btn {
+  padding: 1px 8px;
+  border: 1px solid var(--running);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--running);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.multitail-control .multitail-btn:hover { background: var(--bg-alt); }
+.multitail-control .multitail-btn[aria-pressed="true"] {
+  background: var(--running);
+  color: var(--bg);
+}
+
+/* The overlay itself. `position: fixed; inset: 0` is the "whole window" part —
+   it sits above the sticky topbar and the log modal's own z-index band is
+   higher, so opening a single-item modal from elsewhere still wins. */
+.multitail {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  /* Respect notches / home indicators on phones (the page already opts into
+     viewport-fit=cover). */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+           env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.multitail[hidden] { display: none; }
+
+/* Lock the page behind the overlay so a scroll gesture that misses a pane
+   doesn't drift the queue list underneath. */
+body.multitail-open { overflow: hidden; }
+
+.multitail-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-alt);
+}
+.multitail-title {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--fg-emph);
+  text-transform: lowercase;
+}
+.multitail-count {
+  font-size: 0.72rem;
+  color: var(--fg-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.multitail-hint {
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: var(--fg-mute);
+  white-space: nowrap;
+}
+.multitail-hint kbd {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.68rem;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.multitail-exit {
+  flex: 0 0 auto;
+  padding: 2px 10px;
+  border: 1px solid var(--fg-mute);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.multitail-exit:hover { background: var(--bg-alt); color: var(--fg-emph); }
+
+/* The stack. `min-height: 0` on a flex child is what lets the panes actually
+   shrink inside the column instead of overflowing it. */
+.multitail-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow-y: auto;
+  background: var(--line);
+}
+
+.multitail-empty {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 18px 12px;
+  text-align: center;
+  color: var(--fg-mute);
+  font-size: 0.8rem;
+}
+.multitail-empty[hidden] { display: none; }
+
+/* ONE PANE. flex-basis 0 + grow means equal shares of whatever is left;
+   min-height is the legibility floor that turns "more panes" into "scroll the
+   stack" rather than "thinner useless panes". */
+.mt-pane {
+  flex: 1 1 0;
+  min-height: var(--mt-pane-min);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border-left: 3px solid var(--running);
+}
+.mt-pane.mt-ended { border-left-color: var(--abandoned); }
+
+.mt-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 6px;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--line);
+  font-size: 0.7rem;
+}
+.mt-pane-badge {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 3px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--bg);
+  background: var(--running);
+}
+.mt-badge-workload { background: var(--ready); }
+.mt-badge-hostjob { background: var(--other); }
+.mt-pane-id {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.68rem;
+  color: var(--fg-emph);
+}
+.mt-pane-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fg-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mt-pane-status {
+  flex: 0 0 auto;
+  font-size: 0.64rem;
+  color: var(--fg-mute);
+}
+.mt-pane-status.mt-ok { color: var(--running); }
+.mt-pane-status.mt-idle { color: var(--pending); }
+.mt-pane-status.mt-err { color: var(--critical); }
+.mt-pane-status.mt-done { color: var(--done); }
+.mt-pane-close {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--fg-mute);
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.mt-pane-close:hover {
+  border-color: var(--line);
+  background: var(--bg);
+  color: var(--critical);
+}
+
+.mt-pane-stream {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 3px 6px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.7rem;
+  line-height: 1.35;
+  color: var(--fg);
+}
+.mt-pane-stream:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+
+/* One event = one line, clipped rather than wrapped: a wrapped 400-character
+   tool result would swallow a whole short pane. */
+.mt-line {
+  display: flex;
+  gap: 5px;
+  white-space: pre;
+  overflow: hidden;
+}
+.mt-line .mt-sigil {
+  flex: 0 0 auto;
+  color: var(--fg-mute);
+}
+.mt-line .mt-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mt-line.mt-tool .mt-body { color: var(--link); }
+.mt-line.mt-result .mt-body { color: var(--fg); }
+.mt-line.mt-result.mt-err .mt-body { color: var(--critical); }
+.mt-line.mt-text .mt-body { color: var(--fg-emph); }
+.mt-line.mt-think .mt-body { color: var(--fg-mute); font-style: italic; }
+.mt-line.mt-user .mt-body { color: var(--ready); }
+.mt-line.mt-sys .mt-body { color: var(--fg-mute); }
+.mt-line.mt-note .mt-body { color: var(--pending); }
+.mt-line.mt-plain .mt-body,
+.mt-line.mt-raw .mt-body { color: var(--fg); }
+
+/* Phones: the header hint costs a line it cannot afford, and the floor drops
+   so three tails still fit above the fold. */
+@media (max-width: 560px) {
+  :root { --mt-pane-min: 108px; }
+  .multitail-hint { display: none; }
+  .multitail-exit { margin-left: auto; }
+  .mt-pane-summary { display: none; }
+}

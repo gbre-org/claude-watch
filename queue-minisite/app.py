@@ -2008,6 +2008,37 @@ def _shape(
     # so the front-end / live-log endpoint can dispatch on it, mirroring
     # the workload path above.
     shaped["hostjob_label"] = _extract_hostjob_label(shaped["scope"])
+    # WHETHER THIS ROW HAS A LOG THAT CAN BE TAILED RIGHT NOW, and which
+    # kind. This is deliberately NARROWER than the `data-log-mode` the cards
+    # carry: every running card is clickable (a starting item opens the modal
+    # in a polling state and waits for its agent's first write), but an item
+    # with nothing to read yet must NOT get a multitail pane — an empty pane
+    # is worse than no pane, because it costs a slice of the viewport and one
+    # of the browser's few concurrent connections to say nothing.
+    #
+    #   "hostjob"   tail <HOSTJOB_LOG_DIR>/<label>/log        (plain text)
+    #   "workload"  tail <WORKLOAD_LOG_DIR>/<label>.output    (plain text)
+    #   "live"      tail the owning agent's transcript JSONL
+    #   ""          nothing to tail: a `starting` item whose agent has not
+    #               written yet, an item whose owner we cannot identify, or
+    #               any non-running status.
+    #
+    # Precedence matches `_tail`-dispatch in /api/queue/<qid>/stream
+    # (hostjob before workload before agent) so the flag can never claim a
+    # mode the stream endpoint would not actually serve.
+    live_log_mode = ""
+    if status == "running":
+        if shaped["hostjob_label"]:
+            live_log_mode = "hostjob"
+        elif shaped["workload_label"]:
+            live_log_mode = "workload"
+        elif (shaped.get("owner") or {}).get("agent_id"):
+            # An owner record exists, so a transcript exists — including for
+            # an ORPHANED item (alive == False). The agent is gone but what it
+            # wrote is still the log for this item, and it is usually exactly
+            # what the operator wants to read.
+            live_log_mode = "live"
+    shaped["live_log_mode"] = live_log_mode
     # WHICH MODEL ran this item — resolved from the transcript (archived for
     # finished items, live for running ones) by the same ``_resolve_item_model``
     # the /meta endpoint uses, so the list row and the detail modal can never

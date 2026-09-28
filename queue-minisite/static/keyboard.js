@@ -4,6 +4,11 @@
 // Enter        — open the live-log / archive modal for the selected item
 //                (only fires for items that already have .log-clickable).
 // Esc          — close any open modal; second Esc clears selection.
+// m            — toggle MULTITAIL mode (whole-window stack of live tails for
+//                every running item that has a log). Owned by multitail.js,
+//                listed here so this file stays the map of what the page
+//                binds; while that overlay is up it counts as an open modal
+//                below, so j/k stop moving the row selection behind it.
 // /            — focus a search/filter input if one exists (#search-input).
 //                No-op otherwise — the queue minisite has no search box
 //                today, but we leave the binding in place so adding one

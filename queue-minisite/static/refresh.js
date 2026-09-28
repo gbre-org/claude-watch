@@ -456,6 +456,18 @@
     const logModeAttr = `data-log-mode="${logMode}" tabindex="0" role="button" aria-label="View ${logKindLabel} log for ${attr(it.id)}" title="${attr(titleText)}"`;
     const workloadAttr = isWorkload ? ` data-workload-label="${attr(workloadLabel)}"` : '';
     const hostjobAttr = isHostjob ? ` data-hostjob-label="${attr(hostjobLabel)}"` : '';
+    // MULTITAIL ELIGIBILITY (data-live-log-mode). Emitted ONLY when the server
+    // says this row has a log to tail right now — `live_log_mode` is
+    // "hostjob" / "workload" / "live" / "" and is NARROWER than logMode above:
+    // every running card is clickable, but a `starting` item whose agent has
+    // not written yet has nothing to read, and multitail.js must not spend a
+    // pane (or one of the browser's few concurrent connections) on an empty
+    // stream. MUST mirror templates/index.html — this markup replaces the
+    // server paint on the first tick.
+    const liveLogMode = it.live_log_mode || '';
+    const liveLogAttr = liveLogMode
+      ? ` data-live-log-mode="${attr(liveLogMode)}"`
+      : '';
 
     let head = '';
     if (isStarting && !isWorkload && !isHostjob) {
@@ -551,7 +563,7 @@
     }
 
     return (
-      `<article id="queue-${attr(it.id)}" class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr}${hostjobAttr} ${logModeAttr}>` +
+      `<article id="queue-${attr(it.id)}" class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr}${hostjobAttr}${liveLogAttr} ${logModeAttr}>` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       `<div class="age">${ageBlock}</div>` +
@@ -1246,6 +1258,24 @@
     }
     html += `</div>`; // .count-row-status
     html += `</div>`; // .count-stack
+    // Multitail toggle pill. Flips the whole window into the stacked-tails
+    // mode (one live tail per running item that has a log); keyboard
+    // equivalent is `m`. MUST be rendered here as well as in the Jinja
+    // template for the same reason as the density pill and the source filter:
+    // this subtree is rebuilt every tick, so a control that exists only
+    // server-side is discarded ~5s after load. aria-pressed mirrors the LIVE
+    // overlay state so the merge never flaps the button; the click handler is
+    // delegated in multitail.js, which also re-syncs the button after a merge.
+    {
+      const mtEl = document.getElementById('multitail');
+      const mtOpen = !!(mtEl && !mtEl.hidden);
+      html +=
+        `<span class="count multitail-control" title="Multitail — take over the window with one live tail per running task/workload that has a log. Keyboard: m.">` +
+        `<button type="button" id="multitail-toggle" class="multitail-btn" ` +
+          `aria-pressed="${mtOpen ? 'true' : 'false'}" aria-controls="multitail" ` +
+          `title="Toggle multitail mode (m)">multitail</button>` +
+        `</span>`;
+    }
     // Density toggle pill (botchat #1944). MUST be rendered here too (not just
     // in the Jinja template): mergeTopbarMeta rebuilds #topbar-meta every tick,
     // so omitting it would let morphdom discard the server-rendered control on

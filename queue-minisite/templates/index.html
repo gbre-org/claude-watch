@@ -203,6 +203,19 @@
       {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
       </div>
       </div>
+      {#- MULTITAIL TOGGLE: flips the whole window into the stacked-tails mode
+          (one live tail per running item that has a log). Keyboard equivalent
+          is `m`. Like the density pill this lives inside #topbar-meta, which
+          static/refresh.js buildTopbarMetaDOM() rebuilds every 5s tick, so it
+          MUST also be emitted there or the server-rendered button is discarded
+          on the first tick. The click handler is DELEGATED (multitail.js) for
+          the same reason. aria-pressed reflects whether the mode is open;
+          multitail.js re-syncs it after each merge. -#}
+      <span class="count multitail-control" title="Multitail — take over the window with one live tail per running task/workload that has a log. Keyboard: m.">
+        <button type="button" id="multitail-toggle" class="multitail-btn"
+                aria-pressed="false" aria-controls="multitail"
+                title="Toggle multitail mode (m)">multitail</button>
+      </span>
       {#- DENSITY TOGGLE (botchat #1944): a "density" pill that flips the whole
           view between comfortable and a vertically-DENSE (compact) layout,
           condensing each queue row so q-site aligns row-by-row with the
@@ -344,6 +357,15 @@
           {% if is_workload %}data-workload-label="{{ it.workload_label }}"{% endif %}
           {% if is_hostjob %}data-hostjob-label="{{ it.hostjob_label }}"{% endif %}
           data-log-mode="{{ log_mode }}"
+          {#- MULTITAIL ELIGIBILITY: present ONLY when the server says this row
+              has something to tail right now (app.py `live_log_mode`). Narrower
+              than data-log-mode above — every running card is clickable, but a
+              `starting` item with no agent write yet, or one whose owner cannot
+              be identified, has no log, and multitail.js must not open an empty
+              pane for it. MUST be mirrored by renderRunningItem() in
+              static/refresh.js: this subtree is rebuilt on every 5s tick, so an
+              attribute that exists only here disappears after one tick. -#}
+          {% if it.live_log_mode %}data-live-log-mode="{{ it.live_log_mode }}"{% endif %}
           tabindex="0"
           role="button"
           aria-label="View {% if is_hostjob %}hostjob{% elif is_workload %}workload{% elif is_starting %}live (polling — waiting for first event){% else %}live{% endif %} log for {{ it.id }}"
@@ -1216,6 +1238,50 @@
     </div>
   </div>
 
+  {# ---------- MULTITAIL MODE (hidden by default) ----------
+
+       A whole-window mode that stacks one live tail per RUNNING item that
+       actually has a log, so one glance answers "what is everything doing"
+       instead of opening N single-item modals in turn.
+
+       Toggled on by the `multitail` pill in the header or the `m` key; off
+       again by `m`, Esc, or the exit button. Individual panes are dismissed
+       with their own × without leaving the mode.
+
+       `data-no-morph` keeps the 5s morphdom merge out of this subtree — the
+       panes hold live EventSource connections and scroll positions a
+       re-render would destroy. multitail.js reconciles the pane list itself
+       against the rendered queue rows. The same attribute makes keyboard.js
+       treat the mode as "a modal owns the keyboard", so j/k stop moving the
+       row selection hidden behind the overlay.
+
+       Panes are built entirely by static/multitail.js; the markup here is
+       only the frame, so there is no server/JS render parity to keep.
+   #}
+  <section
+    id="multitail"
+    class="multitail"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="multitail-title"
+    data-no-morph
+    hidden>
+    <header class="multitail-head">
+      <h2 id="multitail-title" class="multitail-title">multitail</h2>
+      <span id="multitail-count" class="multitail-count"></span>
+      <span class="multitail-hint"><kbd>m</kbd> or <kbd>Esc</kbd> to exit</span>
+      <button
+        type="button"
+        id="multitail-exit"
+        class="multitail-exit"
+        aria-label="Exit multitail mode">exit</button>
+    </header>
+    <div id="multitail-panes" class="multitail-panes"></div>
+    <p id="multitail-empty" class="multitail-empty" hidden>
+      Nothing to tail — no running task or workload has a log yet.
+    </p>
+  </section>
+
   {% if site_brand %}
   <footer class="brand-footer" role="contentinfo">
     <span class="brand">{{ site_brand }}</span>
@@ -1232,5 +1298,6 @@
   <script src="{{ url_for('static', filename='live-log.js') }}" defer></script>
   <script src="{{ url_for('static', filename='keyboard.js') }}" defer></script>
   <script src="{{ url_for('static', filename='copy-cmd.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='multitail.js') }}" defer></script>
 </body>
 </html>
