@@ -2520,6 +2520,29 @@ body.multitail-open { overflow: hidden; }
 }
 .multitail-exit:hover { background: var(--bg-alt); color: var(--fg-emph); }
 
+/* Display toggles in the overlay header (`wrap` / `time`). They live INSIDE
+   the data-no-morph overlay, so unlike the topbar multitail pill they are
+   never rebuilt by the 5s tick and need no render parity. Same pill shape as
+   the exit button, tinted like the topbar pill when engaged. */
+.multitail-display {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border: 1px solid var(--fg-mute);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--fg-mute);
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.multitail-display:hover { background: var(--bg-alt); color: var(--fg-emph); }
+.multitail-display[aria-pressed="true"] {
+  border-color: var(--running);
+  background: var(--running);
+  color: var(--bg);
+}
+
 /* The stack. `min-height: 0` on a flex child is what lets the panes actually
    shrink inside the column instead of overflowing it. */
 .multitail-panes {
@@ -2601,6 +2624,22 @@ body.multitail-open { overflow: hidden; }
 .mt-pane-status.mt-idle { color: var(--pending); }
 .mt-pane-status.mt-err { color: var(--critical); }
 .mt-pane-status.mt-done { color: var(--done); }
+
+/* "This source carries no per-line timestamps" marker. Shown only while the
+   timestamp column is ON — it exists to explain an empty column, so with the
+   column off there is nothing to explain. multitail.js toggles [hidden]. */
+.mt-pane-nots {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 1px dashed var(--line);
+  border-radius: 3px;
+  font-size: 0.58rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-mute);
+  cursor: help;
+}
+.mt-pane-nots[hidden] { display: none; }
 .mt-pane-close {
   flex: 0 0 auto;
   width: 20px;
@@ -2633,10 +2672,14 @@ body.multitail-open { overflow: hidden; }
 }
 .mt-pane-stream:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
 
-/* One event = one line, clipped rather than wrapped: a wrapped 400-character
-   tool result would swallow a whole short pane. */
+/* One event = one line, clipped rather than wrapped BY DEFAULT: a wrapped
+   400-character tool result would swallow a whole short pane. The `w` toggle
+   (.mt-wrap on the overlay) opts into the other tradeoff — see the WRAP block
+   below. align-items keeps the timestamp + sigil on the FIRST visual row of a
+   wrapped body instead of centring them against a six-row block. */
 .mt-line {
   display: flex;
+  align-items: flex-start;
   gap: 5px;
   white-space: pre;
   overflow: hidden;
@@ -2644,6 +2687,15 @@ body.multitail-open { overflow: hidden; }
 .mt-line .mt-sigil {
   flex: 0 0 auto;
   color: var(--fg-mute);
+}
+/* Source timestamp cell (`t` toggle). Present only on lines whose SOURCE
+   carried a timestamp — never a client-side arrival time, so a pane with no
+   source timestamps simply has no cells here and says so in its header. */
+.mt-line .mt-ts {
+  flex: 0 0 auto;
+  color: var(--fg-mute);
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
 }
 .mt-line .mt-body {
   flex: 1 1 auto;
@@ -2661,6 +2713,33 @@ body.multitail-open { overflow: hidden; }
 .mt-line.mt-note .mt-body { color: var(--pending); }
 .mt-line.mt-plain .mt-body,
 .mt-line.mt-raw .mt-body { color: var(--fg); }
+
+/* ---- LINE WRAP (`w`) ----
+ *
+ * Wrap off (default): white-space: pre + overflow hidden + an ellipsis, so one
+ * event is exactly one visual row and the pane's line count is its row count.
+ *
+ * Wrap on: the body flows over as many rows as it needs. `overflow-wrap:
+ * anywhere` is load-bearing — the long lines in these panes are file paths,
+ * JSON blobs and base64, i.e. single tokens with no break opportunity, which
+ * `break-word` alone leaves overflowing. The ellipsis affordance is dropped
+ * here because nothing is being visually truncated any more (multitail.js
+ * still clips at MAX_LINE_CHARS_WRAPPED, which produces a real "…" in the
+ * text).
+ *
+ * The pane stays vertically scrollable, so "more rows" means "scroll", never
+ * "squeeze the pane" — same principle as the pane-height floor.
+ */
+.multitail.mt-wrap .mt-line {
+  white-space: pre-wrap;
+  overflow: visible;
+}
+.multitail.mt-wrap .mt-line .mt-body {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  text-overflow: clip;
+}
 
 /* Phones: the header hint costs a line it cannot afford, and the floor drops
    so three tails still fit above the fold. */

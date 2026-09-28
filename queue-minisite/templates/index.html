@@ -1256,7 +1256,10 @@
        row selection hidden behind the overlay.
 
        Panes are built entirely by static/multitail.js; the markup here is
-       only the frame, so there is no server/JS render parity to keep.
+       only the frame, so there is no server/JS render parity to keep. That
+       also covers the `wrap` / `time` display pills below: they sit inside the
+       data-no-morph subtree, so unlike the topbar multitail pill (which
+       refresh.js must re-emit every tick) they are rendered once and survive.
    #}
   <section
     id="multitail"
@@ -1269,7 +1272,23 @@
     <header class="multitail-head">
       <h2 id="multitail-title" class="multitail-title">multitail</h2>
       <span id="multitail-count" class="multitail-count"></span>
-      <span class="multitail-hint"><kbd>m</kbd> or <kbd>Esc</kbd> to exit</span>
+      <span class="multitail-hint">
+        <kbd>w</kbd> wrap · <kbd>t</kbd> time · <kbd>m</kbd>/<kbd>Esc</kbd> exit
+      </span>
+      {#- Display toggles. Both default OFF (off == the behaviour before they
+          existed) and both are keyboard-reachable: `w` wrap, `t` timestamps. -#}
+      <button
+        type="button"
+        id="multitail-wrap"
+        class="multitail-display"
+        aria-pressed="false"
+        title="Wrap long lines instead of clipping them (w)">wrap</button>
+      <button
+        type="button"
+        id="multitail-ts"
+        class="multitail-display"
+        aria-pressed="false"
+        title="Show each line's own source timestamp where the log has one (t). Plain-text workload and hostjob logs carry none — those panes show no time rather than your browser's arrival time.">time</button>
       <button
         type="button"
         id="multitail-exit"

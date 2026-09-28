@@ -186,8 +186,15 @@ modal N times in a row.
   owns the keyboard.
 * **Dismiss one pane**: the `×` in that pane's header. It does not leave the
   mode, and the pane does not come back while the mode stays open.
+* **Line wrap**: the `wrap` pill, or the **`w`** key. Off by default.
+* **Timestamps**: the `time` pill, or the **`t`** key. Off by default.
+* `w` and `t` are mode-local — inert while the overlay is closed, while you are
+  typing in a field, and while another dialog owns the keyboard. Modified
+  chords pass straight through, so `Ctrl`/`Cmd`+`W` still closes the tab.
 * Nothing is persisted. A full-window takeover that survived a reload would
-  be a surprise rather than a convenience.
+  be a surprise rather than a convenience. The `w` / `t` preferences live as
+  long as the page does — they outlast leaving and re-entering the mode, which
+  is the scope a preference for a non-persisted mode can honestly have.
 
 **Which items get a pane — and why some do not.** Exactly the rows the server
 marks with a non-empty `live_log_mode` (`hostjob` / `workload` / `live`),
@@ -222,8 +229,70 @@ not the row.
 transcript: the modal is where a single item gets read properly, and a rich
 renderer inside a 132px pane shows one tool call. Agent transcript records
 collapse to `▸ Bash <command>` / `← <first line of result>` / `· <text>`;
-plain-text workload and hostjob logs pass through verbatim. Lines are clipped
-rather than wrapped, and each pane retains the last 400.
+plain-text workload and hostjob logs pass through verbatim. Each pane retains
+the last 400 lines.
+
+**Line wrap (`w`).** Off by default: one event is one visual row, clipped at 400
+characters with an ellipsis and cut off at the pane's right edge. On: the whole
+line flows over as many rows as it needs (`overflow-wrap: anywhere`, because
+these long lines are paths, JSON and base64 — single tokens that `break-word`
+alone leaves overflowing). Because the toggle has to change lines that are
+*already* on screen — including in a pane whose job has ended and will never
+emit another line — each pane keeps its lines as records and the DOM is a
+projection of them; `w` re-renders from the records. Two budgets, and they are
+different: the 400-**line** retention is deliberately unchanged by wrap (how
+much history a pane keeps should not depend on a display toggle, and dropping
+200 lines of scrollback the moment someone presses `w` would be the worse
+surprise), while per-line **storage** is bounded at 2000 characters so "show the
+full line" cannot make the retained buffer unbounded. A longer line still ends
+in an ellipsis even when wrapped; the single-item modal remains the place for the
+genuinely complete payload. Auto-scroll's near-bottom slack is measured in
+pixels, so it widens from 40px to 96px while wrapped — a wrapped line can be
+taller than the unwrapped slack, and a reader who scrolled back to one row from
+the bottom would otherwise never re-arm auto-scroll and the pane would look
+stuck.
+
+**Timestamps (`t`) show the log's OWN time, or nothing.** The three sources do
+not carry the same information. Agent transcripts are JSONL and every record
+has a real ISO8601 `timestamp`, rendered in the viewer's local timezone by the
+same helper the single-item modal uses. Workload `.output` and hostjob logs are
+plain text: their frames carry **no** timestamp of any kind, and whatever the
+producer printed inside the line text is the producer's business — we do not
+parse prose looking for something clock-shaped. For those panes the timestamp
+column is simply empty and the pane header says `no ts`. It does **not** fall
+back to the browser's arrival time. Arrival time answers a different question
+("when did my browser receive this frame"), and for the 200-line backfill the
+server replays the moment a pane opens it is uniformly wrong — every historical
+line would read as roughly "now", flattening the very timing you opened the pane
+to see. In a window that stacks both kinds of source at once, a real-timestamp
+column and an arrival-time column look identical and invite exactly the
+side-by-side comparison that is invalid. An empty column that explains itself
+beats a plausible fabrication.
+
+**A pane whose log does not exist yet keeps trying.** Eligibility and
+log-existence are different instants, routinely: a `workload:` / `hostjob:` row
+is eligible as soon as its scope is on the queue record, which is *before* the
+runner creates `<label>.output` / `<label>/log`; a `live` row is eligible as soon
+as an owner record names an `agent_id`, which is *before* that agent writes the
+first line of its transcript. The server reports both as a one-shot in-stream
+error and closes — `open-failed` / `read-failed` for a missing plain-text log,
+`no-jsonl` for a transcript that does not exist yet, `no-agent` for a queue id
+the active-agents map has not caught up with. All four mean "not there **yet**",
+so the pane backs off and reconnects (3s, 6s, 12s, 24s, then every 30s) until
+the log appears or its row stops being eligible. There is no attempt cap: the
+bound is eligibility, and a job that finished before its log ever appeared
+settles as `ended` (terminal) instead of retrying forever. Three states that
+look identical in a blank pane are kept distinct — *log not there yet* (retrying,
+with a countdown in the status), *log there and empty* (`live · no output yet`,
+then `idle · no output yet` when the server's idle cap recycles the stream; not
+an error), and *stream genuinely broke* (an error kind outside the retryable
+set — terminal, and named). Retrying does not fight the connection cap: a pane
+in backoff releases its slot immediately, so "waiting for a stream slot" and
+"waiting for log · retry Ns" are different states and only the latter is on a
+timer. Backfill suppression keys on whether the pane has ever **shown data**,
+not on whether it has seen a `stream-start` — the plain-text tails emit
+`stream-start` *before* they try to open the file, so a stream-start rule would
+silently swallow the first content a successful retry receives.
 
 **A job that finishes while the mode is open keeps its pane.** Removing it
 would delete the output the operator was reading at the exact moment it became
@@ -239,11 +308,24 @@ the attribute. `data-no-morph` on the overlay keeps that merge away from the
 panes, whose live connections and scroll positions a re-render would destroy.
 
 `test_multitail.py` pins the server-side eligibility rules, the rendered
-attributes, and (by grep, since it is the CI-gating suite) the fact that
-`refresh.js` mirrors both the attribute and the toggle.
+attributes and display pills, and (by grep, since it is the CI-gating suite)
+the fact that `refresh.js` mirrors both the attribute and the toggle. It also
+holds the two **cross-side** contracts the client cannot pin by itself: what the
+stream endpoint actually emits when a log does not exist yet (asserted against
+the real endpoint for all three shapes, then matched against the client's
+retryable-kind set, so renaming one server-side fails here rather than quietly
+producing a pane that never streams), and which sources carry a per-line
+timestamp — that an agent record's `timestamp` survives the parse, and that
+`workload_line` frames carry no time field at all, which is what makes the `no
+ts` marker honest.
+
 `static/multitail.test.js` drives the module itself under jsdom — pane
-construction, the connection cap and slot promotion, manual close, the
-toggles, the terminal-event handling and the compact formatter — plus the same
+construction, the connection cap and slot promotion, manual close, the mode
+toggles, the terminal-event handling, the compact formatter, both display
+toggles (including that they re-render lines already on screen, that the line
+budget is unaffected by wrap, and that a plain-text pane gets no timestamp
+cells) and the retry path (backoff shape, slot release, the replayed-backfill
+regression guard, and `ended` winning over a pending retry) — plus the same
 parity checks against the real `refresh.js` builders.
 
 ## Layout

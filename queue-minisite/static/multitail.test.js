@@ -18,6 +18,18 @@
 //   6. The compact one-line formatter handles agent JSONL records and
 //      plain-text workload lines, and never uses innerHTML.
 //   7. The per-pane retained-line cap actually trims.
+//   8. LINE WRAP (`w`): off by default, retroactive (already-rendered lines
+//      change too, which is only possible because panes keep records), and it
+//      does NOT shrink the retained-line budget.
+//   9. TIMESTAMPS (`t`): SOURCE timestamps only. An agent record's own
+//      `timestamp` is shown; a plain-text workload/hostjob line gets NO cell
+//      and its pane says `no ts` instead of borrowing arrival time.
+//  10. STREAM RETRY: a pane whose log does not exist YET (`open-failed` /
+//      `no-jsonl` / `no-agent` / `read-failed`) backs off and reconnects
+//      instead of dying until the mode is toggled — the bug that made a
+//      just-started job's pane permanently blank. Plus: it must not
+//      reintroduce the replayed-backfill suppression bug, must not fight the
+//      slot cap, and must lose to `ended`.
 //
 // Usage:   node multitail.test.js
 // Exit 0 on success, 1 on first failure.
@@ -61,10 +73,14 @@ const initialHTML = `<!doctype html>
     ${card('q-d', 'live', 'agent two')}
     ${card('q-e', 'live', 'agent three')}
   </main>
-  <section id="multitail" data-no-morph hidden>
+  <section id="multitail" class="multitail" data-no-morph hidden>
     <header class="multitail-head">
       <h2 id="multitail-title">multitail</h2>
       <span id="multitail-count"></span>
+      <button type="button" id="multitail-wrap" class="multitail-display"
+              aria-pressed="false">wrap</button>
+      <button type="button" id="multitail-ts" class="multitail-display"
+              aria-pressed="false">time</button>
       <button type="button" id="multitail-exit">exit</button>
     </header>
     <div id="multitail-panes"></div>
@@ -99,6 +115,17 @@ function openStreams() {
 function streamFor(qid) {
   return openStreams().find((s) => s.url.indexOf(qid) !== -1);
 }
+// The MOST RECENT stream for a qid, open or not — the retry tests need the
+// connection made by the latest attempt, not the first one ever made.
+function latestStreamFor(qid) {
+  for (let i = streams.length - 1; i >= 0; i--) {
+    if (streams[i].url.indexOf(qid) !== -1) return streams[i];
+  }
+  return undefined;
+}
+function streamCountFor(qid) {
+  return streams.filter((s) => s.url.indexOf(qid) !== -1).length;
+}
 
 window.eval(src);
 const mt = window.__multitail;
@@ -122,11 +149,19 @@ function statusOf(qid) {
   const p = paneFor(qid);
   return p ? p.querySelector('.mt-pane-status').textContent : null;
 }
-function key(k) {
-  const ev = new window.KeyboardEvent('keydown', {
+function key(k, init) {
+  const ev = new window.KeyboardEvent('keydown', Object.assign({
     key: k, bubbles: true, cancelable: true,
-  });
+  }, init || {}));
   document.dispatchEvent(ev);
+  return ev;
+}
+function paneRecord(qid) {
+  return mt.panes.get(qid);
+}
+function bodyOf(qid, idx) {
+  const rows = paneFor(qid).querySelectorAll('.mt-line .mt-body');
+  return rows[idx === undefined ? rows.length - 1 : idx].textContent;
 }
 
 // ==========================================================================
@@ -190,7 +225,10 @@ assert(
 console.log('\n-- streaming: stream-start, lines, and the retained-line cap');
 // ==========================================================================
 streamFor('q-a').emit({ type: 'meta', kind: 'stream-start', path: '/x.jsonl' });
-assert('pane reads live after stream-start', statusOf('q-a') === 'live');
+// "connected but nothing has arrived" is its OWN state: the log exists and is
+// (so far) empty, which must not read the same as a log that is producing.
+assert('a connected-but-silent pane says the log is empty so far',
+  statusOf('q-a') === 'live · no output yet', statusOf('q-a'));
 
 streamFor('q-a').emit({
   type: 'event',
@@ -208,6 +246,8 @@ assert(
     lines[0].textContent.indexOf('ls -la /tmp') !== -1,
   lines[0].textContent,
 );
+assert('once data arrives the pane reads plain live', statusOf('q-a') === 'live',
+  statusOf('q-a'));
 
 streamFor('q-b').emit({ type: 'meta', kind: 'stream-start', mode: 'workload' });
 streamFor('q-b').emit({ type: 'event', kind: 'workload_line', text: 'rsync: 42% done' });
@@ -242,9 +282,11 @@ console.log('\n-- a reconnect must not re-print the backfill');
   streamFor('q-c').emit({ type: 'meta', kind: 'stream-start', mode: 'hostjob' });
   streamFor('q-c').emit({ type: 'event', kind: 'workload_line', text: 'first' });
   const n1 = before.querySelectorAll('.mt-line').length;
-  // Second stream-start = the server recycled the stream (idle cap) and is
-  // replaying its tail. Plain-text tails carry no resume cursor, so without
-  // suppression a quiet job re-prints its whole backfill every 30s.
+  // Second stream-start on a pane that HAS already shown data = the server
+  // recycled the stream (idle cap) and is replaying its tail. Plain-text tails
+  // carry no resume cursor, so without suppression a quiet job re-prints its
+  // whole backfill every 30s. (The gate is "has shown data", not "has seen a
+  // stream-start" — see the retry section for why that distinction matters.)
   streamFor('q-c').emit({ type: 'meta', kind: 'stream-start', mode: 'hostjob' });
   streamFor('q-c').emit({ type: 'meta', kind: 'backfill-begin' });
   streamFor('q-c').emit({ type: 'event', kind: 'workload_line', text: 'first' });
@@ -515,6 +557,405 @@ console.log('\n-- refresh.js parity (the 5s tick rebuilds both of these)');
     get('q-none') && !get('q-none').hasAttribute('data-live-log-mode'));
   assert('a row with no log is still clickable after the rebuild',
     get('q-none') && get('q-none').classList.contains('log-clickable'));
+}
+
+// ==========================================================================
+// From here on the suite drives the two display toggles and the stream-retry
+// path. Reset the queue list to a known shape first — the sections above
+// deliberately mutate it (a row removed, a row gaining a log).
+// ==========================================================================
+function resetQueue(cards) {
+  mt.closeMode();
+  document.getElementById('queue-root').innerHTML = cards.join('\n');
+}
+
+// ==========================================================================
+console.log('\n-- line wrap (`w`)');
+// ==========================================================================
+{
+  resetQueue([card('q-a', 'live', 'agent one'), card('q-b', 'workload', 'wl one')]);
+  mt.openMode();
+
+  assert('wrap is OFF by default (the pre-existing behaviour)',
+    mt.isWrap() === false);
+  assert('the overlay carries no wrap class while off',
+    document.getElementById('multitail').classList.contains('mt-wrap') === false);
+  assert('the wrap pill reads unpressed',
+    document.getElementById('multitail-wrap').getAttribute('aria-pressed') === 'false');
+  assert('the wrapped slack is wider than the unwrapped one',
+    mt.NEAR_BOTTOM_PX_WRAPPED > mt.NEAR_BOTTOM_PX,
+    mt.NEAR_BOTTOM_PX + ' -> ' + mt.NEAR_BOTTOM_PX_WRAPPED);
+  assert('the wrapped store bound is larger than the clipped one',
+    mt.MAX_LINE_CHARS_WRAPPED > mt.MAX_LINE_CHARS);
+
+  // A line longer than the unwrapped clip, appended while wrap is OFF.
+  const long = 'y'.repeat(mt.MAX_LINE_CHARS + 900);
+  streamFor('q-a').emit({ type: 'event', kind: 'workload_line', text: long });
+  assert('with wrap off a long line is clipped as before',
+    bodyOf('q-a').length === mt.MAX_LINE_CHARS + 1 && bodyOf('q-a').endsWith('…'),
+    'len=' + bodyOf('q-a').length);
+
+  // THE POINT of keeping records: turning wrap on must change a line that was
+  // already rendered, not just future ones. A pane whose job has ended emits
+  // nothing more, so a future-lines-only toggle would do nothing at all there.
+  mt.setWrap(true);
+  assert('turning wrap on re-renders an ALREADY-rendered line in full',
+    bodyOf('q-a').length > mt.MAX_LINE_CHARS + 1, 'len=' + bodyOf('q-a').length);
+  assert('the wrapped line shows the whole stored text',
+    bodyOf('q-a') === long, 'len=' + bodyOf('q-a').length);
+  assert('the overlay carries the wrap class so CSS can switch',
+    document.getElementById('multitail').classList.contains('mt-wrap') === true);
+  assert('the wrap pill reads pressed',
+    document.getElementById('multitail-wrap').getAttribute('aria-pressed') === 'true');
+
+  mt.setWrap(false);
+  assert('turning wrap off clips that same line again',
+    bodyOf('q-a').length === mt.MAX_LINE_CHARS + 1, 'len=' + bodyOf('q-a').length);
+
+  // Storage IS bounded — "show the full line" must not mean "retain an
+  // unbounded line", or one 400 KB tool result lives in four panes at once.
+  const huge = 'z'.repeat(mt.MAX_LINE_CHARS_WRAPPED + 5000);
+  streamFor('q-b').emit({ type: 'event', kind: 'workload_line', text: huge });
+  mt.setWrap(true);
+  assert('a line past the wrapped bound is still clipped when wrapped',
+    bodyOf('q-b').length === mt.MAX_LINE_CHARS_WRAPPED + 1 && bodyOf('q-b').endsWith('…'),
+    'len=' + bodyOf('q-b').length);
+
+  // The retained-LINE budget is not a retained-ROW budget: wrapping changes how
+  // tall the history renders, never how much of it is kept.
+  for (let i = 0; i < mt.MAX_LINES_PER_PANE + 40; i++) {
+    streamFor('q-b').emit({ type: 'event', kind: 'workload_line', text: 'w' + i });
+  }
+  assert('the line budget is unchanged by wrap',
+    paneFor('q-b').querySelectorAll('.mt-line').length === mt.MAX_LINES_PER_PANE,
+    'kept ' + paneFor('q-b').querySelectorAll('.mt-line').length);
+  mt.setWrap(false);
+  assert('and unchanged again after wrapping back off',
+    paneFor('q-b').querySelectorAll('.mt-line').length === mt.MAX_LINES_PER_PANE);
+
+  // Keyboard + pill.
+  key('w');
+  assert('`w` turns wrap on', mt.isWrap() === true);
+  key('w');
+  assert('`w` turns wrap off again', mt.isWrap() === false);
+  document.getElementById('multitail-wrap').dispatchEvent(
+    new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+  assert('the wrap pill toggles too', mt.isWrap() === true);
+  mt.setWrap(false);
+
+  // Ctrl+W must still close the tab.
+  const ev = key('w', { ctrlKey: true });
+  assert('Ctrl+W is passed through, not swallowed',
+    mt.isWrap() === false && ev.defaultPrevented === false);
+
+  // Typing an `w` into a field types a w.
+  {
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
+    key('w');
+    assert('`w` is inert while typing in an input', mt.isWrap() === false);
+    input.blur();
+    document.body.removeChild(input);
+  }
+  // Another dialog owns the keyboard.
+  {
+    const other = document.createElement('div');
+    other.setAttribute('data-no-morph', '');
+    document.body.appendChild(other);
+    key('w');
+    assert('`w` is inert while another dialog is open', mt.isWrap() === false);
+    document.body.removeChild(other);
+  }
+
+  // The preference outlives closing and reopening the mode (it is a display
+  // preference for this page, not part of the takeover).
+  mt.setWrap(true);
+  mt.closeMode();
+  mt.openMode();
+  assert('wrap survives leaving and re-entering the mode', mt.isWrap() === true);
+  mt.setWrap(false);
+  mt.closeMode();
+}
+
+// ==========================================================================
+console.log('\n-- timestamps (`t`): SOURCE time only, never arrival time');
+// ==========================================================================
+{
+  resetQueue([
+    card('q-a', 'live', 'agent one'),
+    card('q-b', 'workload', 'wl one'),
+    card('q-c', 'hostjob', 'hj one'),
+  ]);
+  mt.openMode();
+
+  const ISO = '2026-09-28T15:28:44.618Z';
+  const agentLine = (ts) => ({
+    type: 'event',
+    kind: 'assistant_text',
+    rec: {
+      type: 'assistant',
+      timestamp: ts,
+      message: { content: [{ type: 'text', text: 'hello there' }] },
+    },
+  });
+
+  assert('timestamps are OFF by default', mt.isTimestamps() === false);
+  assert('only the agent-transcript source has per-line timestamps',
+    mt.paneHasSourceTimestamps(paneRecord('q-a')) === true &&
+    mt.paneHasSourceTimestamps(paneRecord('q-b')) === false &&
+    mt.paneHasSourceTimestamps(paneRecord('q-c')) === false);
+
+  streamFor('q-a').emit(agentLine(ISO));
+  streamFor('q-b').emit({ type: 'event', kind: 'workload_line', text: 'plain line' });
+  assert('no timestamp cell while the column is off',
+    paneFor('q-a').querySelector('.mt-ts') === null);
+  assert('the no-ts marker is hidden while the column is off',
+    paneFor('q-b').querySelector('.mt-pane-nots').hidden === true);
+
+  mt.setTimestamps(true);
+  // Retroactive, for the same reason wrap is.
+  const tsCell = paneFor('q-a').querySelector('.mt-ts');
+  assert('turning timestamps on stamps an ALREADY-rendered agent line',
+    tsCell !== null);
+  assert('the cell shows the RECORD\'s own time, not "now"',
+    tsCell && tsCell.textContent === '15:28:44', tsCell && tsCell.textContent);
+  assert('the raw source timestamp is kept as the cell tooltip',
+    tsCell && tsCell.title === ISO, tsCell && tsCell.title);
+
+  // The whole judgment call: a plain-text source gets NOTHING, not the
+  // browser's arrival time dressed up as the log's own.
+  assert('a plain-text workload line gets NO timestamp cell',
+    paneFor('q-b').querySelector('.mt-ts') === null);
+  assert('its pane explains the empty column instead',
+    paneFor('q-b').querySelector('.mt-pane-nots').hidden === false);
+  assert('the hostjob pane says the same',
+    paneFor('q-c').querySelector('.mt-pane-nots').hidden === false);
+  assert('the agent pane does NOT claim to be missing timestamps',
+    paneFor('q-a').querySelector('.mt-pane-nots').hidden === true);
+
+  // An agent record with no timestamp of its own (transcript bookkeeping
+  // lines carry none) gets no cell either — same rule, applied per record.
+  streamFor('q-a').emit(agentLine(undefined));
+  assert('an agent record with no timestamp gets no cell',
+    paneFor('q-a').querySelectorAll('.mt-line').length === 2 &&
+    paneFor('q-a').querySelectorAll('.mt-ts').length === 1,
+    paneFor('q-a').querySelectorAll('.mt-ts').length + ' cells');
+
+  mt.setTimestamps(false);
+  assert('turning the column off removes the cells again',
+    paneFor('q-a').querySelector('.mt-ts') === null);
+  assert('and hides the explanation with it',
+    paneFor('q-b').querySelector('.mt-pane-nots').hidden === true);
+
+  // Keyboard + pill + the same inertness rules as `w`.
+  key('t');
+  assert('`t` turns timestamps on', mt.isTimestamps() === true);
+  key('t');
+  assert('`t` turns them off again', mt.isTimestamps() === false);
+  document.getElementById('multitail-ts').dispatchEvent(
+    new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+  assert('the time pill toggles too', mt.isTimestamps() === true);
+  mt.setTimestamps(false);
+  const ev = key('t', { metaKey: true });
+  assert('Cmd/Ctrl+T is passed through, not swallowed',
+    mt.isTimestamps() === false && ev.defaultPrevented === false);
+  {
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
+    key('t');
+    assert('`t` is inert while typing in an input', mt.isTimestamps() === false);
+    input.blur();
+    document.body.removeChild(input);
+  }
+  mt.closeMode();
+  key('t');
+  assert('`t` is inert while the mode is closed (it is a mode-local control)',
+    mt.isTimestamps() === false);
+  key('w');
+  assert('`w` is inert while the mode is closed', mt.isWrap() === false);
+  assert('neither key opened the mode', mt.isOpen() === false);
+}
+
+// ==========================================================================
+console.log('\n-- a log that does not exist YET is retried, not written off');
+// ==========================================================================
+// The reported bug: a just-started job's row becomes eligible BEFORE its log
+// file exists (a workload row is eligible as soon as its scope is on the queue
+// record; an agent row as soon as an owner record names an agent_id). The
+// server answers with a one-shot error frame and closes. Treating that as
+// terminal left the pane permanently blank — only toggling the whole mode off
+// and on rebuilt it.
+{
+  assert('the retryable set names exactly the "not there yet" errors',
+    ['no-agent', 'no-jsonl', 'open-failed', 'read-failed']
+      .every((k) => mt.RETRYABLE_ERROR_KINDS[k] === true) &&
+    Object.keys(mt.RETRYABLE_ERROR_KINDS).length === 4,
+    Object.keys(mt.RETRYABLE_ERROR_KINDS).join(','));
+
+  assert('the backoff grows and then plateaus',
+    mt.retryDelayMs(1) === mt.STREAM_RETRY_BASE_MS &&
+    mt.retryDelayMs(2) === mt.STREAM_RETRY_BASE_MS * 2 &&
+    mt.retryDelayMs(3) === mt.STREAM_RETRY_BASE_MS * 4 &&
+    mt.retryDelayMs(9) === mt.STREAM_RETRY_MAX_MS &&
+    mt.retryDelayMs(9999) === mt.STREAM_RETRY_MAX_MS,
+    [1, 2, 3, 9, 9999].map(mt.retryDelayMs).join(','));
+
+  resetQueue([card('q-new', 'workload', 'just started')]);
+  mt.openMode();
+  const first = latestStreamFor('q-new');
+  assert('the new row got a pane and a stream', paneFor('q-new') !== null && !!first);
+
+  // The workload/hostjob tails emit stream-start BEFORE they try to open the
+  // log file, so the failure arrives AFTER a stream-start. That ordering is
+  // exactly what made the naive "suppress backfill on the 2nd stream-start"
+  // rule dangerous here.
+  first.emit({ type: 'meta', kind: 'stream-start', mode: 'workload' });
+  first.emit({
+    type: 'error',
+    kind: 'open-failed',
+    error: "[Errno 2] No such file or directory: '/w/just-started.output'",
+  });
+
+  const p = paneRecord('q-new');
+  assert('a missing log does NOT make the pane terminal', p.terminal === false);
+  assert('the pane says it is waiting for the log, with a countdown',
+    /waiting for log · retry \d+s/.test(statusOf('q-new')), statusOf('q-new'));
+  assert('the failed connection was closed', first.closed === true);
+  assert('the pane is NOT holding a stream slot while it backs off',
+    p.streaming === false && p.es === null);
+  assert('a pane in backoff does not want a slot yet', mt.wantsSlot(p) === false);
+  assert('the overlay count surfaces the wait',
+    /waiting for a log/.test(document.getElementById('multitail-count').textContent),
+    document.getElementById('multitail-count').textContent);
+  const notes = paneFor('q-new').querySelectorAll('.mt-line.mt-note').length;
+  assert('the reason is noted in the pane once', notes === 1, notes + ' notes');
+
+  // Fire the backoff. (pumpSlots is the retry clock, driven by the existing
+  // 2s reconcile tick in the real page; here we just move the deadline.)
+  const before = streamCountFor('q-new');
+  p.retryAt = Date.now() - 1;
+  assert('once the backoff expires the pane wants a slot again',
+    mt.wantsSlot(p) === true);
+  mt.pumpSlots();
+  assert('the pane reconnected on its own',
+    streamCountFor('q-new') === before + 1,
+    before + ' -> ' + streamCountFor('q-new'));
+
+  // A SECOND failure must back off further, and must not stack notes.
+  const second = latestStreamFor('q-new');
+  second.emit({ type: 'meta', kind: 'stream-start', mode: 'workload' });
+  second.emit({ type: 'error', kind: 'open-failed', error: 'still missing' });
+  assert('the second failure waits longer than the first',
+    p.retryAt - Date.now() > mt.STREAM_RETRY_BASE_MS,
+    'in ' + (p.retryAt - Date.now()) + 'ms');
+  assert('the note is not repeated per attempt',
+    paneFor('q-new').querySelectorAll('.mt-line.mt-note').length === notes);
+
+  // THE REGRESSION GUARD. The retry has now seen three stream-starts. If
+  // backfill suppression keyed on "seen a stream-start before" the pane would
+  // silently drop the first content it ever receives.
+  p.retryAt = Date.now() - 1;
+  mt.pumpSlots();
+  const third = latestStreamFor('q-new');
+  third.emit({ type: 'meta', kind: 'stream-start', mode: 'workload' });
+  third.emit({ type: 'meta', kind: 'backfill-begin', lines: 2 });
+  third.emit({ type: 'event', kind: 'workload_line', text: 'stv-promote: starting' });
+  third.emit({ type: 'event', kind: 'workload_line', text: 'stv-promote: 1 of 3' });
+  third.emit({ type: 'meta', kind: 'backfill-end' });
+  const texts = Array.from(paneFor('q-new').querySelectorAll('.mt-line .mt-body'))
+    .map((n) => n.textContent);
+  assert('the backfill the retry finally got is RENDERED, not suppressed',
+    texts.indexOf('stv-promote: starting') !== -1 &&
+    texts.indexOf('stv-promote: 1 of 3') !== -1,
+    texts.join(' | '));
+  assert('the pane reads live once real output lands', statusOf('q-new') === 'live',
+    statusOf('q-new'));
+  assert('a successful attempt clears the backoff', p.retryAt === 0);
+
+  // ...and the already-fixed bug stays fixed: NOW that data has been shown, a
+  // recycled stream's replayed backfill IS suppressed.
+  const n1 = paneFor('q-new').querySelectorAll('.mt-line').length;
+  third.emit({ type: 'meta', kind: 'stream-start', mode: 'workload' });
+  third.emit({ type: 'meta', kind: 'backfill-begin', lines: 2 });
+  third.emit({ type: 'event', kind: 'workload_line', text: 'stv-promote: starting' });
+  third.emit({ type: 'meta', kind: 'backfill-end' });
+  assert('a replayed backfill is still suppressed once data has been shown',
+    paneFor('q-new').querySelectorAll('.mt-line').length === n1);
+  mt.closeMode();
+}
+
+// ==========================================================================
+console.log('\n-- the other two "nothing is showing" states are NOT retries');
+// ==========================================================================
+{
+  resetQueue([card('q-empty', 'live', 'log exists, empty')]);
+  mt.openMode();
+  const s = latestStreamFor('q-empty');
+  s.emit({ type: 'meta', kind: 'stream-start', path: '/x.jsonl' });
+  const p = paneRecord('q-empty');
+  assert('an existing-but-empty log reads as connected, not as an error',
+    statusOf('q-empty') === 'live · no output yet', statusOf('q-empty'));
+  assert('and is not in a retry backoff', p.retryAt === 0 && p.terminal === false);
+  s.emit({ type: 'meta', kind: 'idle-timeout', idle_seconds: 30 });
+  assert('the server recycling an empty stream is not an error either',
+    statusOf('q-empty') === 'idle · no output yet', statusOf('q-empty'));
+  assert('still not terminal — EventSource reconnects on its own',
+    p.terminal === false);
+
+  // An error shape we cannot reason about is still terminal, and named.
+  s.emit({ type: 'error', kind: 'schema-drift', error: 'unexpected frame' });
+  assert('an unrecognised error kind stays terminal', p.terminal === true);
+  assert('and is named in the status', statusOf('q-empty') === 'schema-drift',
+    statusOf('q-empty'));
+  mt.closeMode();
+}
+
+// ==========================================================================
+console.log('\n-- retries lose to `ended`, and do not fight the slot cap');
+// ==========================================================================
+{
+  // A job that finished before its log ever appeared must settle, not retry
+  // forever.
+  resetQueue([card('q-gone', 'workload', 'finished before logging')]);
+  mt.openMode();
+  latestStreamFor('q-gone').emit({ type: 'error', kind: 'open-failed', error: 'nope' });
+  const p = paneRecord('q-gone');
+  assert('the pane is retrying', p.retryAt > 0 && p.terminal === false);
+  document.getElementById('queue-root').innerHTML = '';
+  mt.reconcile();
+  assert('an item that stopped running is marked ended', p.ended === true);
+  assert('ended is terminal, so the retry stops', p.terminal === true);
+  assert('and no expired backoff can revive it',
+    mt.wantsSlot(p) === false && p.retryAt === 0);
+  const n = streamCountFor('q-gone');
+  p.retryAt = Date.now() - 1;
+  mt.pumpSlots();
+  assert('pumpSlots opens no further stream for an ended pane',
+    streamCountFor('q-gone') === n, n + ' -> ' + streamCountFor('q-gone'));
+  mt.closeMode();
+
+  // A pane in backoff releases its slot, so the cap is spent on panes that can
+  // actually use it — and the freed slot goes to the next waiter immediately.
+  resetQueue([
+    card('q-1', 'workload', 'one'), card('q-2', 'live', 'two'),
+    card('q-3', 'live', 'three'), card('q-4', 'live', 'four'),
+    card('q-5', 'live', 'five'),
+  ]);
+  mt.openMode();
+  assert('five panes, four streams', paneEls().length === 5 &&
+    openStreams().length === mt.MAX_LIVE_STREAMS, 'open=' + openStreams().length);
+  assert('the fifth is waiting for a SLOT (a distinct state from a backoff)',
+    /waiting for a stream slot/.test(statusOf('q-5')), statusOf('q-5'));
+  latestStreamFor('q-1').emit({ type: 'error', kind: 'open-failed', error: 'nope' });
+  assert('the backing-off pane handed its slot to the waiter',
+    streamFor('q-5') !== undefined);
+  assert('still exactly at the cap',
+    openStreams().length === mt.MAX_LIVE_STREAMS, 'open=' + openStreams().length);
+  assert('and the backing-off pane is labelled as such, not as slot-starved',
+    /waiting for log/.test(statusOf('q-1')), statusOf('q-1'));
+  mt.closeMode();
 }
 
 console.log(
