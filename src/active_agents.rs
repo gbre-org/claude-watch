@@ -205,14 +205,16 @@ pub const DEFAULT_AGENT_ALIVE_MAX_AGE_SECS: u64 = 300;
 /// was a `tool_use` — direct evidence of "waiting on a tool", not
 /// "died".
 ///
-/// 900s = the Bash tool's 600s ceiling plus headroom for a large result
-/// to be written back. Past that, even a pending tool call is suspect
+/// 1200s (20 min) = the Bash tool's 600s ceiling plus generous headroom
+/// for a large result to be written back and for back-to-back long
+/// foreground waits (kubectl/helm/warm/CI) that keep a transcript quiet.
+/// Past that, even a pending tool call is suspect
 /// and we let the normal staleness verdict stand, so a genuinely dead
 /// agent is still reported dead — just later. The OTHER death mode (the
 /// model turn itself dying: API 5xx / dropped stream) leaves a
 /// `tool_result` as the last record, so it is NOT covered by this grace
 /// and still trips the 120s window on schedule.
-pub const DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS: u64 = 900;
+pub const DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS: u64 = 1200;
 
 /// How many bytes of transcript tail we read to decide whether the last
 /// record is a pending `tool_use`. Only read when the plain mtime check

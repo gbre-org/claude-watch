@@ -1152,6 +1152,65 @@ fn run_hard_gate(
 /// item with no active-agent binding is flagged orphaned (never-spawned
 /// case). Resolved by the caller: `--no-binding-grace-secs` CLI flag wins,
 /// else `[queue_check] no_binding_grace_secs`, else the built-in default.
+/// Outcome of the soft-orphan corroboration pass: the sightings ledger to
+/// persist for the next tick, and the qids held back this tick.
+pub struct CorroborationOutcome {
+    /// qid -> first-seen ISO timestamp for every qid that read
+    /// transcript-stale THIS tick (preserving the first-seen value across
+    /// ticks). Persisted as the next `queue-check-orphan-sightings.json`; a
+    /// qid absent here has stopped reading stale and its counter resets.
+    pub next_sightings: State,
+    /// qids seen transcript-stale for the FIRST time this run and therefore
+    /// withheld from the soft event (they emit only if they persist to the
+    /// next tick). Audit/log only.
+    pub held_for_corroboration: Vec<String>,
+}
+
+/// Pure: apply the two-consecutive-ticks corroboration rule to the soft
+/// `queue-orphaned` candidate set, mutating `qualifying` in place to drop
+/// first-sighting transcript-stale orphans.
+///
+/// A candidate is a SOFT transcript-stale orphan iff it is
+/// `Condition::Orphaned` AND carries a bound `agent_id` (the active-agents
+/// `Dead` join path). Those are the ONLY items gated: an authoritative
+/// orphan (owning-pid dead / no-agent-binding-past-grace, `agent_id=None`)
+/// and every `Stuck` item are always retained. A soft candidate is retained
+/// only when `prior_sightings` already recorded its qid (i.e. it read stale
+/// on the previous tick too); otherwise it is dropped and recorded so the
+/// NEXT tick can corroborate it. See the call site in `cmd_queue_check` for
+/// the operational rationale (#9791 false positives on live long-wait
+/// agents).
+pub fn corroborate_soft_orphans(
+    qualifying: &mut Vec<Qualifying>,
+    prior_sightings: &State,
+    sighting_ts: &str,
+) -> CorroborationOutcome {
+    let mut next_sightings: State = State::new();
+    let mut held_for_corroboration: Vec<String> = Vec::new();
+    qualifying.retain(|q| {
+        let soft_transcript_orphan =
+            q.condition == Condition::Orphaned && q.agent_id.is_some();
+        if !soft_transcript_orphan {
+            return true; // authoritative orphan or stuck — never gated
+        }
+        let first_seen = prior_sightings
+            .get(&q.id)
+            .cloned()
+            .unwrap_or_else(|| sighting_ts.to_string());
+        next_sightings.insert(q.id.clone(), first_seen);
+        if prior_sightings.contains_key(&q.id) {
+            true // corroborated — read stale on a previous tick too
+        } else {
+            held_for_corroboration.push(q.id.clone());
+            false // first sighting — hold; emit only if it persists
+        }
+    });
+    CorroborationOutcome {
+        next_sightings,
+        held_for_corroboration,
+    }
+}
+
 pub fn cmd_queue_check(
     stale_heartbeat_min: u64,
     no_binding_grace_secs: u64,
@@ -1191,7 +1250,7 @@ pub fn cmd_queue_check(
     // Build the active-agents join once (reads <state-dir>/active-agents.json).
     let (agent_map, state_present) = build_agent_liveness(&state_dir);
 
-    let qualifying = compute_qualifying(
+    let mut qualifying = compute_qualifying(
         &all_items,
         &pruned,
         now_epoch,
@@ -1218,6 +1277,50 @@ pub fn cmd_queue_check(
         &cli,
         dry_run,
     );
+
+    // --- Corroboration gate for transcript-stale SOFT orphans ------------
+    // The soft `queue-orphaned` EVENT (the operator-facing alert; the hard
+    // gate above is separate and load-bearing) false-positives on a LIVE
+    // Agent-tool subagent doing a long external wait (kubectl / helm / warm
+    // / CI). Liveness is transcript-JSONL-mtime based; a `Dead` verdict with
+    // `in_flight_tool_use=false` is already excluded from the HARD gate but
+    // still drives the soft event. When the tail-parse MISSES the pending
+    // `tool_use` (a huge tool result past TRANSCRIPT_TAIL_BYTES, or a wait
+    // exceeding the tool-call window) a demonstrably alive agent — agent-msg
+    // still binds it, no failure notification ever arrives — reads "dead" on
+    // a SINGLE snapshot. Measured 3+ times in one day against working agents
+    // (#9791). To stop alerting on one quiet snapshot, require the SAME qid
+    // to read transcript-stale on TWO CONSECUTIVE ticks (~5 min apart under
+    // the cron cadence) before the soft event fires.
+    //
+    // Scope: this gates ONLY the soft-event `Dead`-transcript orphan
+    // (Condition::Orphaned WITH a bound agent_id). Authoritative orphans —
+    // owning-pid dead and no-agent-binding-past-grace — carry agent_id=None
+    // and are NEVER gated (they fire on the first tick, unchanged). The
+    // hard gate (`run_hard_gate`) has already run above with its own,
+    // longer `hard_gate_grace_secs` and is untouched.
+    let sightings_file = state_dir.join("queue-check-orphan-sightings.json");
+    let prior_sightings = load_state(&sightings_file);
+    let sighting_ts = chrono::Local::now().to_rfc3339();
+    let CorroborationOutcome {
+        next_sightings,
+        held_for_corroboration,
+    } = corroborate_soft_orphans(&mut qualifying, &prior_sightings, &sighting_ts);
+    if !held_for_corroboration.is_empty() {
+        eprintln!(
+            "queue-check: {} transcript-stale orphan(s) held one tick for corroboration: {}",
+            held_for_corroboration.len(),
+            held_for_corroboration.join(", ")
+        );
+    }
+    // Persist the sightings ledger (best-effort; a qid that stops reading
+    // stale drops out here, resetting its counter). Skip on dry-run so a
+    // preview never mutates real state.
+    if !dry_run && next_sightings != prior_sightings {
+        if let Err(e) = save_state(&sightings_file, &next_sightings) {
+            eprintln!("queue-check: orphan-sightings save failed ({e}); continuing");
+        }
+    }
 
     // Always persist the pruned state (cleans up finished items).
     let mut next_state = pruned.clone();
@@ -1988,4 +2091,85 @@ mod tests {
         assert!(parse_iso_epoch_secs("2026-06-03T12:00:00").is_some());
         assert!(parse_iso_epoch_secs("garbage").is_none());
     }
+
+    fn soft_orphan(id: &str) -> Qualifying {
+        Qualifying {
+            id: id.to_string(),
+            summary: "s".to_string(),
+            condition: Condition::Orphaned,
+            detail: "agent a-1 transcript stale 6m (died after spawn)".to_string(),
+            agent_id: Some("a-1".to_string()),
+        }
+    }
+    fn authoritative_orphan(id: &str) -> Qualifying {
+        Qualifying {
+            id: id.to_string(),
+            summary: "s".to_string(),
+            condition: Condition::Orphaned,
+            detail: "owning pid 123 not alive".to_string(),
+            agent_id: None,
+        }
+    }
+    fn stuck_item(id: &str) -> Qualifying {
+        Qualifying {
+            id: id.to_string(),
+            summary: "s".to_string(),
+            condition: Condition::Stuck,
+            detail: "heartbeat stale".to_string(),
+            agent_id: None,
+        }
+    }
+
+    #[test]
+    fn corroborate_holds_first_sighting_soft_orphan() {
+        let mut q = vec![soft_orphan("q-1")];
+        let out = corroborate_soft_orphans(&mut q, &State::new(), "2026-09-28T00:00:00Z");
+        // First tick: held back, not emitted, but recorded for next tick.
+        assert!(q.is_empty(), "first sighting must be withheld");
+        assert_eq!(out.held_for_corroboration, vec!["q-1".to_string()]);
+        assert!(out.next_sightings.contains_key("q-1"));
+    }
+
+    #[test]
+    fn corroborate_emits_on_second_consecutive_sighting() {
+        let mut prior = State::new();
+        prior.insert("q-1".to_string(), "2026-09-28T00:00:00Z".to_string());
+        let mut q = vec![soft_orphan("q-1")];
+        let out = corroborate_soft_orphans(&mut q, &prior, "2026-09-28T00:05:00Z");
+        // Second consecutive tick: retained (emitted).
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, "q-1");
+        assert!(out.held_for_corroboration.is_empty());
+        // First-seen timestamp is preserved across ticks (audit).
+        assert_eq!(out.next_sightings.get("q-1").unwrap(), "2026-09-28T00:00:00Z");
+    }
+
+    #[test]
+    fn corroborate_never_gates_authoritative_or_stuck() {
+        let mut q = vec![
+            authoritative_orphan("q-pid"),
+            stuck_item("q-stuck"),
+        ];
+        let out = corroborate_soft_orphans(&mut q, &State::new(), "2026-09-28T00:00:00Z");
+        // Both retained on the very first tick — never gated.
+        assert_eq!(q.len(), 2);
+        assert!(out.held_for_corroboration.is_empty());
+        // Neither is recorded in the transcript-stale sightings ledger.
+        assert!(out.next_sightings.is_empty());
+    }
+
+    #[test]
+    fn corroborate_resets_counter_when_orphan_clears() {
+        // A qid seen last tick but NOT stale this tick simply doesn't appear
+        // in the candidate set, so it drops out of next_sightings (counter
+        // reset). A fresh recurrence must be held again.
+        let mut prior = State::new();
+        prior.insert("q-old".to_string(), "2026-09-28T00:00:00Z".to_string());
+        let mut q = vec![soft_orphan("q-new")];
+        let out = corroborate_soft_orphans(&mut q, &prior, "2026-09-28T00:05:00Z");
+        assert!(q.is_empty(), "a different qid is a first sighting");
+        assert!(!out.next_sightings.contains_key("q-old"), "cleared qid resets");
+        assert!(out.next_sightings.contains_key("q-new"));
+    }
+
 }
