@@ -3,8 +3,10 @@
 
 Performs a clean context reset:
   1. Injects /clear via vim mode send-keys
-  2. Polls tmux state until /clear completes (tokens drop + prompt visible)
-  3. Injects the resume prompt
+  2. Detects + confirms the v2.1.283+ "Rewind" picker /clear now opens
+     (Enter on its "(current)" default -- see confirm_clear_picker())
+  3. Polls tmux state until /clear completes (tokens drop + prompt visible)
+  4. Injects the resume prompt
 
 Called as the final step of a compact-prep procedure. Eliminates the wait
 for the daemon's resume-injection path to fire on its own.
@@ -584,6 +586,83 @@ def ensure_main_loop_focus(pane, max_attempts=3):
     return False
 
 
+_REWIND_PICKER_FOOTER = ("Enter to continue", "Esc to cancel")
+
+
+def _rewind_picker_visible(pane_text):
+    """Pure: does the captured pane show the v2.1.283+ `/clear` Rewind picker?
+
+    Since Claude Code v2.1.283, `/clear` no longer clears directly -- it opens
+    an interactive picker listing `/resume <id> (previous)`, `/clear`, and
+    `(current)`, with an `Enter to continue · Esc to cancel` footer.
+    Detected by that footer text, which is unique to this picker (not shown
+    by the pre-2.1.283 direct-clear behavior, so this is a strict no-op on
+    older versions rather than a version-string check).
+    """
+    return all(marker in pane_text for marker in _REWIND_PICKER_FOOTER)
+
+
+def _rewind_picker_default_is_current(pane_text):
+    """Pure: within a detected Rewind picker, is the cursor on `(current)`?
+
+    Guards against confirming into `/resume <id> (previous)`, which would
+    FORK the conversation instead of clearing it. The picker's documented
+    default selection is `(current)`, but this checks the cursor-marked
+    (`❯`) line explicitly rather than trusting that default blindly --
+    a future reorder of the picker's entries fails SAFE (no Enter sent)
+    instead of silently forking onto `(previous)`.
+    """
+    for raw in pane_text.splitlines():
+        t = raw.strip()
+        if t.startswith(_FLEETVIEW_CURSOR):
+            rest = t[len(_FLEETVIEW_CURSOR):].strip()
+            return "(current)" in rest and "(previous)" not in rest
+    return False
+
+
+def confirm_clear_picker(pane, max_wait=3, poll_interval=0.2):
+    """Confirm the v2.1.283+ `/clear` Rewind picker by sending Enter.
+
+    Since v2.1.283, `/clear` opens an interactive picker (see
+    `_rewind_picker_visible`) instead of clearing directly. Without this
+    step self-clear injects `/clear` and then hangs forever polling for a
+    clear that never lands, because the session is sitting on the open
+    picker waiting for a keypress.
+
+    This waits briefly for the picker to render, verifies the cursor sits on
+    the safe `(current)` entry (never `(previous)`, which would fork the
+    conversation via `/resume`), and sends a single Enter to accept it.
+
+    Detection-gated rather than version-gated: on the pre-2.1.283
+    direct-clear behavior the picker footer never appears, so the wait loop
+    below finds nothing and returns WITHOUT sending any key -- a strict
+    no-op on old behavior. (A blind confirming Enter would likely also be
+    harmless post-clear-2.1.283, since `/clear` returns to an empty prompt
+    line where Enter just submits an empty no-op message -- but detection
+    is strictly safer and is what we ship: it also lets us verify the
+    cursor is on `(current)`, not `(previous)`, before confirming.)
+    """
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        if rc == 0 and out and _rewind_picker_visible(out):
+            if _rewind_picker_default_is_current(out):
+                log("  confirm_clear_picker: Rewind picker detected, cursor on "
+                    "(current) -- sending Enter to confirm")
+                run(["tmux", "send-keys", "-t", pane, "Enter"])
+                time.sleep(0.3)
+            else:
+                log("  confirm_clear_picker: WARNING Rewind picker detected but "
+                    "cursor NOT on (current) -- refusing to send Enter (would "
+                    "risk landing on /resume <previous> and forking the "
+                    f"conversation). pane: {capture_pane_text(pane)}")
+            return
+        time.sleep(poll_interval)
+    log(f"  confirm_clear_picker: no Rewind picker detected within {max_wait}s "
+        "(pre-2.1.283 direct-clear behavior, or picker not yet rendered) -- "
+        "no Enter sent")
+
+
 def interrupt_and_wait(pane, timeout=60, poll_interval=0.5):
     """Actively interrupt Claude Code and wait for idle prompt.
 
@@ -713,6 +792,46 @@ def _stamp_handoff_marker():
         log(f"  WARNING: could not stamp handoff marker {HANDOFF_FILE}: {e}")
 
 
+def plan_argv(pane, args):
+    """Build the planned send-keys/inject argv sequence as printable lines.
+
+    Pure (no subprocess calls) -- used by `--print` for a dry-run proof that
+    the confirming Enter for the v2.1.283+ Rewind picker is wired in at the
+    right point: AFTER the `/clear` inject, BEFORE the completion poll and
+    the resume-prompt inject.
+    """
+    lines = [f"PANE: {pane}"]
+    lines.append("STEP 1: ensure_main_loop_focus")
+    lines.append(f"  argv: ['tmux', 'select-pane', '-t', {pane!r}]")
+    lines.append("STEP 2: interrupt_and_wait (Escape blast until idle)")
+    lines.append(f"  argv: ['tmux', 'send-keys', '-t', {pane!r}, 'Escape']  (repeated up to --timeout)")
+    lines.append("STEP 3: inject /clear")
+    lines.append(
+        "  argv: ['claude-watch', 'inject', '--pane', "
+        f"{pane!r}, '--submit', '/clear', '--slash-command', '--escape']"
+    )
+    lines.append("STEP 4: confirm_clear_picker  <-- NEW (v2.1.283+ Rewind picker fix)")
+    lines.append(
+        f"  argv: ['tmux', 'send-keys', '-t', {pane!r}, 'Enter']"
+        "  # sent ONLY if picker footer ('Enter to continue' + 'Esc to cancel')"
+        " is detected AND cursor is on the '(current)' entry -- never on"
+        " '(previous)'. No-op (no Enter sent) on pre-2.1.283 direct-clear"
+        " behavior, where the footer never appears."
+    )
+    lines.append("STEP 5: poll for /clear completion (tokens drop + idle) -- up to --delay seconds")
+    lines.append("STEP 6: dismiss_feedback_prompt (if 'How is Claude doing' visible)")
+    lines.append(f"  argv: ['tmux', 'send-keys', '-t', {pane!r}, '-l', '0']  (conditional)")
+    if args.no_resume:
+        lines.append("STEP 7: (skipped -- --no-resume)")
+    else:
+        lines.append("STEP 7: inject resume prompt")
+        lines.append(
+            "  argv: ['claude-watch', 'inject', '--pane', "
+            f"{pane!r}, '--submit', {RESUME_PROMPT!r}, '--escape']"
+        )
+    return lines
+
+
 def child_main(pane, args):
     """Main logic for the forked child process.
 
@@ -746,6 +865,15 @@ def child_main(pane, args):
         # not glued onto leftover text and submitted as ordinary text.
         inject(pane, "/clear", label=f"/clear-{attempt}", slash_command=True,
                escape=True)
+
+        # v2.1.283+: `/clear` opens an interactive Rewind picker instead of
+        # clearing directly (lists /resume <id> (previous), /clear,
+        # (current), footer "Enter to continue · Esc to cancel"). Confirm
+        # it here, BEFORE the completion poll below -- otherwise the poll
+        # spins for the full `--delay` window against an open menu that will
+        # never resolve on its own. No-op (detection-gated) on the
+        # pre-2.1.283 direct-clear behavior.
+        confirm_clear_picker(pane)
 
         if args.no_resume:
             log("DONE: /clear injected (--no-resume)")
@@ -836,6 +964,11 @@ def main():
                         help="Override the post-/clear resume-prompt text "
                              "(default: $CLAUDE_SELF_CLEAR_RESUME_PROMPT or "
                              "the built-in placeholder)")
+    parser.add_argument("--print", action="store_true", dest="print_only",
+                        help="Dry-run: resolve the Claude Code pane and print "
+                             "the planned INSTALL+TMUX send-keys/inject argv "
+                             "sequence, then exit. Does NOT fork, does NOT "
+                             "send any keys to the pane.")
     args = parser.parse_args()
 
     # Bind config from CLI flags (overrides) → env (defaults).
@@ -858,6 +991,11 @@ def main():
     if not pane:
         print("ERROR: Could not find Claude Code tmux pane", file=sys.stderr)
         sys.exit(1)
+
+    if args.print_only:
+        for line in plan_argv(pane, args):
+            print(line)
+        return
 
     # Daemonize: fork so the parent returns immediately. This lets the
     # calling Bash tool call complete, allowing Claude Code to finish its

@@ -202,6 +202,117 @@ class FleetViewDetectionTest(unittest.TestCase):
                     os.environ["CLAUDE_WATCH_CONFIG"] = saved
 
 
+class RewindPickerTest(unittest.TestCase):
+    """Pure-function tests for the v2.1.283+ `/clear` Rewind-picker detection
+    and confirming-Enter guard. No live tmux needed.
+
+    Since v2.1.283, `/clear` opens an interactive picker (/resume <id>
+    (previous), /clear, (current)) instead of clearing directly. self-clear
+    must detect it and confirm it with Enter -- but ONLY when the cursor
+    sits on the safe `(current)` entry, never `(previous)` (which would fork
+    the conversation via /resume instead of clearing it)."""
+
+    def setUp(self):
+        self.mod = _import_self_clear()
+
+    def test_picker_visible_with_footer(self):
+        pane = "\n".join([
+            "  /resume 8f2a1c (previous)",
+            "  /clear",
+            "❯ (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        self.assertTrue(self.mod._rewind_picker_visible(pane))
+
+    def test_picker_not_visible_pre_2_1_283(self):
+        # Old direct-clear behavior: no picker footer at all.
+        pane = "\n".join([
+            "❯ ",
+            "  bypass permissions on · 12k tokens",
+        ])
+        self.assertFalse(self.mod._rewind_picker_visible(pane))
+
+    def test_default_selection_is_current(self):
+        pane = "\n".join([
+            "  /resume 8f2a1c (previous)",
+            "  /clear",
+            "❯ (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        self.assertTrue(self.mod._rewind_picker_default_is_current(pane))
+
+    def test_cursor_on_previous_is_not_current(self):
+        # Guard case: cursor moved off the default -- must NOT confirm.
+        pane = "\n".join([
+            "❯ /resume 8f2a1c (previous)",
+            "  /clear",
+            "  (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        self.assertFalse(self.mod._rewind_picker_default_is_current(pane))
+
+    def test_confirm_sends_enter_when_picker_on_current(self):
+        calls = []
+        self.mod.run = lambda cmd, timeout=None: (calls.append(cmd), ("", 0))[1]
+        self.mod.log = lambda *a, **k: None
+        self.mod.capture_pane_text = lambda pane: ""
+        pane_text = "\n".join([
+            "  /resume 8f2a1c (previous)",
+            "  /clear",
+            "❯ (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        # First run() call inside confirm_clear_picker is the capture-pane
+        # poll; return the picker text for it, then Enter should follow.
+        def fake_run(cmd, timeout=None):
+            calls.append(cmd)
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return (pane_text, 0)
+            return ("", 0)
+        self.mod.run = fake_run
+        self.mod.confirm_clear_picker("sess:0.0", max_wait=1, poll_interval=0.05)
+        enter_calls = [c for c in calls if c[:2] == ["tmux", "send-keys"] and c[-1] == "Enter"]
+        self.assertEqual(len(enter_calls), 1, calls)
+
+    def test_confirm_does_not_send_enter_when_no_picker(self):
+        calls = []
+        def fake_run(cmd, timeout=None):
+            calls.append(cmd)
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return ("❯ \n  bypass permissions on · 12k tokens", 0)
+            return ("", 0)
+        self.mod.run = fake_run
+        self.mod.log = lambda *a, **k: None
+        self.mod.confirm_clear_picker("sess:0.0", max_wait=0.2, poll_interval=0.05)
+        enter_calls = [c for c in calls if c[:2] == ["tmux", "send-keys"] and c[-1] == "Enter"]
+        self.assertEqual(enter_calls, [])
+
+    def test_confirm_refuses_enter_when_cursor_on_previous(self):
+        calls = []
+        pane_text = "\n".join([
+            "❯ /resume 8f2a1c (previous)",
+            "  /clear",
+            "  (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        def fake_run(cmd, timeout=None):
+            calls.append(cmd)
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return (pane_text, 0)
+            return ("", 0)
+        self.mod.run = fake_run
+        self.mod.log = lambda *a, **k: None
+        self.mod.capture_pane_text = lambda pane: ""
+        self.mod.confirm_clear_picker("sess:0.0", max_wait=1, poll_interval=0.05)
+        enter_calls = [c for c in calls if c[:2] == ["tmux", "send-keys"] and c[-1] == "Enter"]
+        self.assertEqual(enter_calls, [], "must never confirm onto (previous) -- would fork via /resume")
+
+
 class InjectCommandTest(unittest.TestCase):
     """The argv `inject()` hands to `claude-watch inject`.
 
