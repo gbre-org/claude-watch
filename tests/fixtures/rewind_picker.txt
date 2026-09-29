@@ -1,0 +1,8 @@
+  ⎿  Interrupted · What should Claude do instead?
+──────────────────────────────────────────────────────────────────
+  Rewind                                                          
+  Restore and fork the conversation to the point before…          
+    /resume 00000000-0000-0000-0000-000000000000 (previous      
+    /clear
+  ❯ (current)
+  Enter to continue · Esc to cancel

@@ -5946,6 +5946,82 @@ async fn run_auto_update_clean_relaunch(
     );
 }
 
+/// Poll up to `max_wait` for the Claude Code 2.1.283+ Rewind picker and, if it
+/// is up, cancel it with Escape (`tmux::REWIND_PICKER_CANCEL_KEY`). Returns
+/// whether a picker was seen and an Escape sent.
+///
+/// A strict no-op when the picker never appears — on a pre-2.1.283 Claude Code
+/// it cannot appear at all, so this is detection-gated rather than
+/// version-gated. Verifies the dismissal instead of assuming it, and re-sends
+/// Escape on the next pass if the modal is still there (the picker can absorb a
+/// key while it is mid-render), bounded by the same deadline.
+///
+/// The whole `max_wait` is spent when NO picker shows, deliberately: the picker
+/// can lag the interrupt that popped it, and a window that expires before it
+/// renders is the same bug in slower clothes. Auto-update runs once per version
+/// bump, so the seconds are free.
+async fn dismiss_rewind_picker(pane: &str, max_wait: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    let mut sent = false;
+    while tokio::time::Instant::now() < deadline {
+        if tmux::rewind_picker_on_pane(pane).await {
+            info!(
+                pane = %pane,
+                "rewind picker detected on the pane — cancelling it with Escape \
+                 (no fork, no restore)"
+            );
+            tmux::cancel_rewind_picker(pane).await;
+            sent = true;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        if sent {
+            // Cancelled and confirmed gone.
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if sent {
+        warn!(
+            pane = %pane,
+            "rewind picker still visible after Escape within the dismissal window"
+        );
+    }
+    sent
+}
+
+/// What the auto-update sequence must do about the modal (if any) standing
+/// between the injected `/exit` and Claude Code actually exiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitModalAction {
+    /// The 2.1.283+ Rewind picker is up. It is not a reply to `/exit` — it is a
+    /// modal that SWALLOWED it — so cancel it with Escape and re-inject.
+    CancelRewindPicker,
+    /// The "Background work is running" dialog is up. It IS the `/exit` flow
+    /// asking for confirmation, so Enter ("Exit anyway") completes the exit.
+    ConfirmBackgroundWorkExit,
+    /// Nothing in the way.
+    None,
+}
+
+/// Pure: classify the pane after a `/exit` inject.
+///
+/// The Rewind picker is checked FIRST and wins any tie. The two dialogs take
+/// OPPOSITE keys, and getting the precedence wrong is not symmetric: an Enter
+/// sent at the Rewind picker commits a "Restore and fork the conversation"
+/// (or, if the highlight has moved, a `/resume` of a previous session), while
+/// an Escape at the background-work dialog merely cancels an exit we then
+/// retry.
+fn exit_modal_action(pane_output: &str) -> ExitModalAction {
+    if tmux::rewind_picker_visible(pane_output) {
+        return ExitModalAction::CancelRewindPicker;
+    }
+    if tmux::background_work_exit_dialog_visible(pane_output) {
+        return ExitModalAction::ConfirmBackgroundWorkExit;
+    }
+    ExitModalAction::None
+}
+
 /// Execute the auto-update sequence: interrupt → /exit → wait → relaunch → resume.
 async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, config: &Config) {
     // Before anything else: record the Bypass-Permissions acceptance in
@@ -5998,38 +6074,111 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         return;
     }
 
-    // Step 2: Inject /exit
-    info!("auto-update: injecting /exit...");
-    inject_dispatch::inject_to_agent(pane, "/exit").await;
-
-    // Step 2b: Dismiss the 2.1.x "Background work is running" exit dialog.
+    // Step 1c: Cancel the 2.1.283+ "Rewind" picker that Step 1's OWN interrupt
+    // pops, BEFORE anything is typed at the pane.
     //
-    // Claude Code 2.1.x renders a "Background work is running" confirmation on
-    // the interactive `/exit` flow whenever a worktree is checked out OR
-    // background tasks are running (#1411). Our sessions always have
-    // backgrounded watchers, so the dialog ALWAYS eats the `/exit` submit and
-    // `wait_for_exit` below would time out, false-alarming "Claude Code
-    // crashed". Poll briefly for the dialog; if it appears, send a bare Enter
-    // to select the default-highlighted option 1 ("Exit anyway") — the right
-    // choice here, since the process is relaunching anyway and watchers restart
-    // fresh in the new session. Bounded short loop matching the file's polling
-    // idioms; if the dialog never shows (host / non-2.1.x claude), this is a
-    // no-op and we fall through to wait_for_exit unchanged.
-    {
+    // Since Claude Code 2.1.283 the repeated `Escape` that `interrupt_and_wait`
+    // uses can open a modal offering to rewind/fork the conversation
+    // (`Rewind` / `Restore and fork the conversation to the point before…` /
+    // `/resume <id> (previous)` / `/clear` / `❯ (current)`, footer
+    // `Enter to continue · Esc to cancel`). Unlike the "Background work is
+    // running" dialog handled below — which is CAUSED BY `/exit` and so can
+    // only be dismissed after it — this one is already up before the inject,
+    // and it makes the inject a no-op: `operator_typing_in_progress` reads the
+    // picker's `❯ (current)` row as unsubmitted prompt-line text and REFUSES to
+    // type (`residue=Some("(current)")` in the 2026-09-29 capture), so `/exit`
+    // is never sent at all, `wait_for_exit` burns its full 45s, and the run
+    // ends in a HIGH-severity `auto-update-failed` alert — every cooldown,
+    // forever, leaving the pane parked on the picker.
+    //
+    // Escape, not Enter: see `tmux::REWIND_PICKER_CANCEL_KEY`. We want the
+    // modal gone and the conversation untouched — the process is about to exit
+    // and be relaunched with `--resume <session-id>` (Step 4), and a fork would
+    // move the session out from under that.
+    if dismiss_rewind_picker(pane, std::time::Duration::from_secs(5)).await {
+        info!("auto-update: Rewind picker cancelled before injecting /exit");
+    }
+
+    // Step 2 + 2b: Inject /exit and get past whichever modal fronts the exit.
+    //
+    // Two DIFFERENT dialogs, two different keys:
+    //
+    //   * "Background work is running" (#1411) — Claude Code 2.1.x renders this
+    //     confirmation on the interactive `/exit` flow whenever a worktree is
+    //     checked out OR background tasks are running. Our sessions always have
+    //     backgrounded watchers, so it ALWAYS eats the `/exit` submit and
+    //     `wait_for_exit` below would time out, false-alarming "Claude Code
+    //     crashed". Send a bare Enter to take the default-highlighted option 1
+    //     ("Exit anyway") — right here, since the process is relaunching anyway
+    //     and watchers restart fresh in the new session. The `/exit` is
+    //     CONFIRMED, so the exit proceeds and we are done.
+    //
+    //   * the 2.1.283+ Rewind picker — Step 1c already cancelled the one the
+    //     interrupt popped, but `inject_text_no_submit` leads with its own
+    //     Escape→NORMAL coercion ("ALWAYS at least two Escapes"), so it can
+    //     re-open the picker mid-choreography and swallow the `/exit` it was
+    //     about to type. Escaping it is not enough on its own: the `/exit`
+    //     went into the modal, so it has to be RE-INJECTED. Hence the retry —
+    //     dismissing without re-sending would just be a quieter version of the
+    //     same wedge.
+    //
+    // Bounded at 2 attempts: one to cover a single re-open, and then we stop
+    // rather than loop on a pane that keeps re-rendering the picker (Step 3's
+    // timeout + alert is the correct outcome for that, and an unbounded retry
+    // would hold the updater indefinitely). If neither dialog ever shows (host
+    // with a pre-2.1.x claude), both polls are no-ops and this behaves exactly
+    // like the original single inject.
+    const EXIT_INJECT_ATTEMPTS: u32 = 2;
+    for attempt in 1..=EXIT_INJECT_ATTEMPTS {
+        info!(attempt, "auto-update: injecting /exit...");
+        inject_dispatch::inject_to_agent(pane, "/exit").await;
+
+        let mut picker_ate_exit = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             if let Some(out) = tmux::capture_pane(pane).await {
-                if tmux::background_work_exit_dialog_visible(&out) {
-                    info!(
-                        "auto-update: 'Background work is running' exit dialog detected, \
-                         sending Enter to select 'Exit anyway'"
-                    );
-                    tmux::send_keys(pane, &["Enter"]).await;
-                    break;
+                // Which modal (if either) is in the way, and therefore which
+                // key. Rewind picker takes precedence — see `exit_modal_action`.
+                match exit_modal_action(&out) {
+                    ExitModalAction::CancelRewindPicker => {
+                        warn!(
+                            attempt,
+                            "auto-update: Rewind picker re-opened after the /exit inject \
+                             (the inject's own Escape coercion can pop it) — cancelling it \
+                             with Escape; the /exit was swallowed by the modal"
+                        );
+                        tmux::cancel_rewind_picker(pane).await;
+                        picker_ate_exit = true;
+                        break;
+                    }
+                    ExitModalAction::ConfirmBackgroundWorkExit => {
+                        info!(
+                            "auto-update: 'Background work is running' exit dialog detected, \
+                             sending Enter to select 'Exit anyway'"
+                        );
+                        tmux::send_keys(pane, &["Enter"]).await;
+                        break;
+                    }
+                    ExitModalAction::None => {}
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+
+        if !picker_ate_exit {
+            break;
+        }
+        if attempt == EXIT_INJECT_ATTEMPTS {
+            warn!(
+                attempts = EXIT_INJECT_ATTEMPTS,
+                "auto-update: Rewind picker kept fronting the /exit inject — proceeding \
+                 to the exit wait anyway"
+            );
+            break;
+        }
+        // Let the pane redraw the normal prompt after the Escape before
+        // retyping, so the retry's own guard doesn't read picker residue.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 
     // Step 3: Wait for Claude to exit
@@ -9786,6 +9935,61 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 mod tests {
     use super::*;
     use crate::credentials::{AccessTokenState, CredentialExpiry};
+
+    // ---- auto-update: which modal is fronting the injected /exit ----
+
+    /// The pane captured during the auto-update that failed on 2026-09-29:
+    /// the Step-1 interrupt popped the 2.1.283+ Rewind picker, so the `/exit`
+    /// inject was refused and `wait_for_exit` timed out into a high-severity
+    /// alert.
+    const REWIND_PICKER_PANE: &str = include_str!("../tests/fixtures/rewind_picker.txt");
+
+    const BACKGROUND_WORK_EXIT_PANE: &str = "  Background work is running\n\
+         The following will stop when you exit:\n\
+         \u{276f} 1. Exit anyway\n\
+           2. Move to background and exit\n\
+           3. Stay";
+
+    #[test]
+    fn exit_modal_action_cancels_the_rewind_picker() {
+        assert_eq!(
+            exit_modal_action(REWIND_PICKER_PANE),
+            ExitModalAction::CancelRewindPicker
+        );
+    }
+
+    #[test]
+    fn exit_modal_action_confirms_the_background_work_dialog() {
+        assert_eq!(
+            exit_modal_action(BACKGROUND_WORK_EXIT_PANE),
+            ExitModalAction::ConfirmBackgroundWorkExit
+        );
+    }
+
+    #[test]
+    fn exit_modal_action_is_none_on_a_plain_pane() {
+        // No modal: the `/exit` went through and nothing should be pressed.
+        // (A stray Enter here would submit an empty prompt; a stray Escape
+        // would cancel the exit we just asked for.)
+        let idle = "\u{25cf} Brewed for 3s\n\u{276f} \n\
+                    \u{23f5}\u{23f5} bypass permissions on \u{00b7} esc to interrupt";
+        assert_eq!(exit_modal_action(idle), ExitModalAction::None);
+        let exiting = "  Goodbye!\n$ ";
+        assert_eq!(exit_modal_action(exiting), ExitModalAction::None);
+    }
+
+    #[test]
+    fn exit_modal_action_prefers_the_rewind_picker_over_the_background_dialog() {
+        // Precedence is load-bearing and asymmetric: Enter at the Rewind
+        // picker COMMITS a restore/fork of the conversation, while Escape at
+        // the background-work dialog only cancels an exit we re-inject. So if
+        // a pane ever shows both signatures, the picker must win.
+        let both = format!("{BACKGROUND_WORK_EXIT_PANE}\n{REWIND_PICKER_PANE}");
+        assert_eq!(
+            exit_modal_action(&both),
+            ExitModalAction::CancelRewindPicker
+        );
+    }
 
     // ---- Proactive login-expiry decision ----
 

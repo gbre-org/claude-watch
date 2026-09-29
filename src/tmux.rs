@@ -590,6 +590,122 @@ pub(crate) fn background_work_exit_dialog_visible(pane_output: &str) -> bool {
     false
 }
 
+/// The key that DISMISSES the Claude Code 2.1.283+ "Rewind" picker without
+/// touching the conversation — the picker's own footer offers it
+/// (`Enter to continue · Esc to cancel`).
+///
+/// Exposed as a constant (like `BYPASS_PERMISSIONS_ACCEPT_KEYS`) so the
+/// Escape-not-Enter choice is unit-assertable rather than an inline literal at
+/// the send site. **Escape, deliberately, never Enter**: the picker's body
+/// reads "Restore and fork the conversation to the point before…", so Enter
+/// COMMITS a restore/fork, while Escape cancels outright and leaves the
+/// session exactly as it was. Every caller in this codebase that meets this
+/// picker uninvited (the auto-update `/exit` sequence) wants only the modal
+/// gone; it does not want a rewind. Escape also needs no cursor-position
+/// guard: it is safe wherever the highlight happens to be sitting, whereas
+/// Enter would have to prove the cursor is not on `/resume … (previous)`
+/// first.
+pub(crate) const REWIND_PICKER_CANCEL_KEY: &str = "Escape";
+
+/// Pure function: does the pane show Claude Code's 2.1.283+ "Rewind" picker?
+///
+/// Since 2.1.283 an interrupt (repeated `Escape`, which is exactly how
+/// `interrupt_and_wait` brings a busy pane to idle) can pop a modal offering
+/// to rewind the conversation:
+///
+/// ```text
+///   ⎿  Interrupted · What should Claude do instead?
+/// ──────────────────────────────────────────────────────────────────
+///   Rewind
+///   Restore and fork the conversation to the point before…
+///     /resume <session-id> (previous
+///     /clear
+///   ❯ (current)
+///   Enter to continue · Esc to cancel
+/// ```
+///
+/// ## Why the daemon needs this
+///
+/// It is a modal, so it swallows anything typed at it — and it is opened by
+/// the daemon's OWN interrupt, not by a user action. On the auto-update path
+/// that is a self-inflicted deadlock: `run_auto_update` interrupts, the picker
+/// opens, the `/exit` inject that follows is refused by
+/// `operator_typing_in_progress` (the picker's `❯ (current)` row reads as
+/// unsubmitted prompt-line text, observed verbatim as
+/// `residue=Some("(current)")`), `wait_for_exit` then burns its full 45s and
+/// the run ends in a HIGH-severity `auto-update-failed` alert — every cooldown,
+/// forever, with the pane left parked on the picker. The capture from that
+/// failure is checked in as `tests/fixtures/rewind_picker.txt`.
+///
+/// ## Signature: footer AND identity
+///
+/// Both are required, for the same reason `bypass_permissions_dialog_visible`
+/// requires two markers: the footer pair `Enter to continue` / `Esc to cancel`
+/// is generic dialog chrome that another modal could plausibly render, while
+/// the picker's own title (`Rewind`) / body (`Restore and fork the
+/// conversation`) names THIS dialog. Requiring both keeps the detector — and
+/// the log line that quotes it — honest about what it found.
+///
+/// Note the pane-width truncation in the capture: `(previous` has no closing
+/// paren. Nothing here keys on the option rows precisely because they are the
+/// part Claude Code truncates and reorders; the title/body/footer are stable.
+///
+/// Scoped to the recent tail, like every sibling detector, so a scrollback
+/// mention — this doc read into a pane, a transcript quoting the picker — does
+/// not trip it.
+pub(crate) fn rewind_picker_visible(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    let mut saw_continue_footer = false;
+    let mut saw_cancel_footer = false;
+    let mut saw_identity = false;
+    for line in &lines[start..] {
+        let lower = line.trim().to_lowercase();
+        if lower.contains("enter to continue") {
+            saw_continue_footer = true;
+        }
+        if lower.contains("esc to cancel") {
+            saw_cancel_footer = true;
+        }
+        // The box title is its own line (`Rewind`, padded to the box width),
+        // so match it as a whole trimmed line rather than a substring — the
+        // word "rewind" appears in ordinary prose too. The body line is
+        // matched as a substring because it is the one Claude Code truncates
+        // with an ellipsis.
+        if lower == "rewind" || lower.contains("restore and fork the conversation") {
+            saw_identity = true;
+        }
+    }
+    saw_continue_footer && saw_cancel_footer && saw_identity
+}
+
+/// Capture the pane and report whether the 2.1.283+ Rewind picker is on it.
+///
+/// Companion to `rewind_picker_visible` for callers (policy's auto-update
+/// sequence) that poll the live pane.
+pub async fn rewind_picker_on_pane(pane: &str) -> bool {
+    capture_pane(pane)
+        .await
+        .map(|out| rewind_picker_visible(&out))
+        .unwrap_or(false)
+}
+
+/// Send the cancel key for the 2.1.283+ Rewind picker.
+///
+/// Wrapper (mirroring `accept_bypass_permissions_dialog`) so the key itself
+/// lives in exactly one place — `REWIND_PICKER_CANCEL_KEY` — and no call site
+/// can quietly substitute an Enter, which would COMMIT the rewind instead of
+/// cancelling it. Callers must have confirmed the picker is up first
+/// (`rewind_picker_visible` / `rewind_picker_on_pane`); this only presses the
+/// key.
+pub async fn cancel_rewind_picker(pane: &str) {
+    send_keys(pane, &[REWIND_PICKER_CANCEL_KEY]).await;
+}
+
 /// Keys that move the Bypass-Permissions launch dialog's selection from its
 /// default ("No, exit") onto the confirm option ("Yes, I accept") and submit.
 ///
@@ -5263,6 +5379,102 @@ mod tests {
     fn background_work_exit_dialog_not_fired_on_idle() {
         let output = "Claude Code is running\nTokens: 50000\n\u{276f} ";
         assert!(!background_work_exit_dialog_visible(output));
+    }
+
+    // rewind_picker_visible — the Claude Code 2.1.283+ "Rewind" modal that an
+    // INTERRUPT (repeated Escape) pops. `policy::run_auto_update` cancels it
+    // with Escape BEFORE injecting `/exit`, because while it is up the inject
+    // is refused (its `❯ (current)` row reads as unsubmitted prompt text) and
+    // `wait_for_exit` burns its whole budget into a false "Claude Code did not
+    // exit" alert.
+    //
+    // Verbatim capture of the pane from the failed auto-update on 2026-09-29
+    // (Claude Code 2.1.284 → 2.1.285), taken from the daemon's own pane-capture
+    // log line with the /resume session UUID replaced by an all-zero
+    // placeholder and the unrelated conversation lines above the box elided.
+    // Note the pane-width truncation it preserves: `(previous` with no closing
+    // paren.
+    const REWIND_PICKER_PANE: &str = include_str!("../tests/fixtures/rewind_picker.txt");
+
+    #[test]
+    fn rewind_picker_matches_the_captured_pane() {
+        assert!(rewind_picker_visible(REWIND_PICKER_PANE));
+    }
+
+    #[test]
+    fn rewind_picker_needs_both_the_footer_and_the_identity() {
+        // Footer chrome alone is NOT the picker: another modal could render
+        // "Enter to continue · Esc to cancel", and Escaping a dialog we have
+        // not actually identified is not a claim this detector should make.
+        let footer_only = "  Some other dialog\n\
+                           \u{276f} (current)\n\
+                           \u{00a0} Enter to continue \u{00b7} Esc to cancel";
+        assert!(!rewind_picker_visible(footer_only));
+        // Identity alone is not enough either — the picker has been dismissed
+        // and its title is just scrollback text now.
+        let identity_only =
+            "  Rewind\n  Restore and fork the conversation to the point before\u{2026}\n\u{276f} ";
+        assert!(!rewind_picker_visible(identity_only));
+    }
+
+    #[test]
+    fn rewind_picker_not_fired_on_idle_or_on_the_word_rewind_in_prose() {
+        // A normal idle pane.
+        let idle = "\u{25cf} Brewed for 12s\n\u{276f} \n\
+                    \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        assert!(!rewind_picker_visible(idle));
+        // The hard near-miss: SOME OTHER dialog's footer chrome, above
+        // conversation text that happens to discuss rewinding. A substring
+        // match on "rewind" would fire here and Escape a modal this detector
+        // never actually identified — which is why the title match is
+        // whole-line.
+        let prose_plus_foreign_footer =
+            "  I could rewind the conversation here, but Rewind is a big hammer.\n\
+                     \u{276f} Some unrelated choice\n\
+                     \u{00a0} Enter to continue \u{00b7} Esc to cancel";
+        assert!(!rewind_picker_visible(prose_plus_foreign_footer));
+    }
+
+    #[test]
+    fn rewind_picker_not_confused_with_the_background_work_exit_dialog() {
+        // The two dialogs the auto-update sequence must tell apart: the
+        // background-work dialog is CONFIRMED (Enter, "Exit anyway"), the
+        // Rewind picker is CANCELLED (Escape). Cross-matching either way would
+        // send the wrong key — an Enter into the Rewind picker forks the
+        // conversation.
+        // The footer line here is a deliberately PESSIMISTIC assumption: the
+        // captured background-work dialog shows no footer, but if a future
+        // build renders the same generic `Enter … · Esc to cancel` chrome on
+        // it, the two panes must still not be confused — which only holds
+        // because the identity marker names the Rewind box.
+        let bg = "  Background work is running\n\
+                  The following will stop when you exit:\n\
+                  \u{276f} 1. Exit anyway\n\
+                    2. Move to background and exit\n\
+                    3. Stay\n\
+                  \u{00a0} Enter to continue \u{00b7} Esc to cancel";
+        assert!(!rewind_picker_visible(bg));
+        assert!(!background_work_exit_dialog_visible(REWIND_PICKER_PANE));
+    }
+
+    #[test]
+    fn rewind_picker_scoped_to_the_recent_tail() {
+        // The picker box scrolled far up into history is not a live modal.
+        let mut output = String::from(REWIND_PICKER_PANE);
+        for i in 0..30 {
+            output.push_str(&format!("\nscrollback line {i}"));
+        }
+        assert!(!rewind_picker_visible(&output));
+    }
+
+    #[test]
+    fn rewind_picker_cancel_key_is_escape_not_enter() {
+        // Load-bearing: Enter would commit the picker's "Restore and fork the
+        // conversation" action (and, if the highlight had moved, a /resume of a
+        // PREVIOUS session). The auto-update path wants the modal gone and the
+        // conversation untouched, which is what the footer's Esc does.
+        assert_eq!(REWIND_PICKER_CANCEL_KEY, "Escape");
+        assert_ne!(REWIND_PICKER_CANCEL_KEY, "Enter");
     }
 
     // bypass_permissions_dialog_visible — the launch-time consent dialog
