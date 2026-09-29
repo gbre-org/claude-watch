@@ -61,9 +61,15 @@ def _add(env: dict, queue_actual: Path, desc: str, scopes: list[str]) -> dict:
     return json.loads(r.stdout)
 
 
-def _register(env: dict, qid: str) -> None:
-    """Flip a queue item from pending -> running via session-task register."""
+def _register(env: dict, qid: str, agent_id: str | None = None) -> None:
+    """Flip a queue item from pending -> running via session-task register.
+
+    ``agent_id`` stamps the owning agent on the row — the documented way to
+    resume an already-running agent onto a NEW queue item.
+    """
     cmd = [sys.executable, str(SESSION_TASK), "queue", "register", qid, "--json"]
+    if agent_id:
+        cmd.extend(["--agent-id", agent_id])
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=15)
     if r.returncode != 0:
         raise RuntimeError(f"register failed: {r.stderr}")
@@ -145,6 +151,11 @@ class LiveStreamEndpointTest(unittest.TestCase):
         os.environ["QUEUE_LOG_ARCHIVE_DIR"] = str(cls.archive_dir)
         os.environ["WORKLOAD_LOG_DIR"] = str(Path(cls.tmp) / "no-workloads")
         os.environ["SESSION_TASK_BIN"] = str(SESSION_TASK)
+        # Arm-hook bindings (agent_id -> queue_id). Point at a scratch file
+        # so the owner ladder is deterministic instead of reading whatever
+        # the host happens to have at the production default path.
+        cls.bindings_path = Path(cls.tmp) / "agent-queue-bindings.json"
+        os.environ["AGENT_QUEUE_BINDINGS_JSON"] = str(cls.bindings_path)
 
         sys.path.insert(0, str(HERE))
         for mod in list(sys.modules):
@@ -167,6 +178,8 @@ class LiveStreamEndpointTest(unittest.TestCase):
             self.agent_state.unlink()
         if self.jsonl_root.exists():
             shutil.rmtree(self.jsonl_root)
+        if self.bindings_path.exists():
+            self.bindings_path.unlink()
         self.appmod._cache.fetched_at = 0.0
 
     # ---------- helpers ----------
@@ -382,6 +395,185 @@ class LiveStreamEndpointTest(unittest.TestCase):
         # Must be the one-level hit, not the two-level fallback.
         self.assertIn(f"/{sess_a}/", str(resolved))
         self.assertNotIn("-some-project", str(resolved))
+
+    # ---------- resumed agent: owner stamped on the queue row ----------
+
+    def test_stream_resolves_resumed_agent_via_queue_stamp(self):
+        """A RESUMED agent's pane must tail its transcript.
+
+        The agent -> queue mapping in active-agents.json comes from the
+        ``Queue item: q-XXXX`` marker in the agent's first user message, so
+        it names the queue id the agent was SPAWNED with, forever. Resuming
+        a live agent onto a new queue item (``queue register <new-qid>
+        --agent-id <agent_id>``) updates the QUEUE side only, so a lookup
+        keyed on the new queue id finds no agent claiming it — which is how
+        every resumed agent became unwatchable: the multitail pane sat on
+        "no active agent record found" while the agent was alive and writing.
+
+        Shape reproduced here (measured on the real box, 2026-09-28):
+          queue row      q-NEW  -> agent_id A   (agent_id_source=register)
+          active-agents  A      -> queue_id q-OLD
+
+        The stream must resolve A from the queue row and emit stream-start +
+        backfill, with NO error frame.
+        """
+        agent_id = "aresumed123456789"
+        session_uuid = "e1e2e3e4-e5e6-7890-abcd-ef1234567890"
+
+        old = _add(self.env, self.queue_actual,
+                   "original spawn item", ["repo:resume-old"])
+        _register(self.env, old["id"])
+        new = _add(self.env, self.queue_actual,
+                   "resumed onto this item", ["repo:resume-new"])
+        _register(self.env, new["id"], agent_id=agent_id)
+
+        # active-agents still keys the agent under its ORIGINAL queue id.
+        _seed_agent_state(self.agent_state, agent_id, old["id"],
+                          alive=True, age=0)
+        _seed_jsonl(self.jsonl_root, session_uuid, agent_id, lines=[
+            {
+                "type": "user",
+                "message": {"role": "user",
+                            "content": "Queue item: " + old["id"]},
+                "uuid": "u1",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+            },
+            {
+                "type": "assistant",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text",
+                                         "text": "still working"}]},
+                "uuid": "a1",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+            },
+        ])
+        self.appmod._cache.fetched_at = 0.0
+
+        # Precondition: the old one-way lookup genuinely misses. If this
+        # ever starts resolving, the regression this test guards has moved.
+        state = self.appmod._load_state(self.appmod.AGENT_STATE_PATH)
+        self.assertIsNone(
+            self.appmod._agents_by_qid(state).get(new["id"]),
+            "queue-id-keyed lookup unexpectedly resolved — "
+            "test no longer reproduces the resumed-agent shape",
+        )
+
+        self.appmod.SSE_TAIL_MAX_IDLE_SECONDS = 0.1
+        self.appmod.SSE_TAIL_POLL_SECONDS = 0.05
+        self.appmod.SSE_TAIL_MAX_LIFETIME_SECONDS = 5.0
+
+        r = self.client.get(f"/api/queue/{new['id']}/stream")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        events = self._read_sse(r.get_data())
+        self.assertEqual(
+            [e for e in events if e.get("type") == "error"], [],
+            f"resumed-agent stream emitted an error frame: {events}",
+        )
+        self.assertEqual(events[0]["kind"], "stream-start")
+        self.assertIn(f"agent-{agent_id}.jsonl", events[0].get("path", ""),
+                      events[0])
+        line_events = [e for e in events if e.get("type") == "event"]
+        self.assertEqual(len(line_events), 2,
+                         f"expected 2 transcript events: {events}")
+
+    def test_stream_resolves_owner_via_arm_hook_binding(self):
+        """Spawn-to-poll gap: the arm-hook binding is the third rung.
+
+        ``post-tool-agent-arm-hook`` records agent_id -> queue_id the
+        instant an Agent is spawned, well before claude-watch's poller
+        publishes a transcript-derived record. An item bound but not yet
+        in active-agents (and not stamped, e.g. registered by the main
+        loop) must still tail its log instead of showing "no active agent
+        record".
+        """
+        agent_id = "abound1234567890a"
+        session_uuid = "f1f2f3f4-f5f6-7890-abcd-ef1234567890"
+        item = _add(self.env, self.queue_actual,
+                    "arm-hook bound item", ["repo:bound-test"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        # Empty active-agents (poller has not caught up) + a binding.
+        self.agent_state.write_text(json.dumps(
+            {"subagents": [], "workloads": [], "agents": []}
+        ))
+        self.bindings_path.write_text(json.dumps({
+            "bindings": {agent_id: {"queue_id": qid,
+                                    "registered_at": 1790000000}}
+        }))
+        _seed_jsonl(self.jsonl_root, session_uuid, agent_id, lines=[
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "Queue item: " + qid},
+                "uuid": "u1",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+            },
+        ])
+        self.appmod._cache.fetched_at = 0.0
+
+        self.appmod.SSE_TAIL_MAX_IDLE_SECONDS = 0.1
+        self.appmod.SSE_TAIL_POLL_SECONDS = 0.05
+        self.appmod.SSE_TAIL_MAX_LIFETIME_SECONDS = 5.0
+
+        r = self.client.get(f"/api/queue/{qid}/stream")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        events = self._read_sse(r.get_data())
+        self.assertEqual(
+            [e for e in events if e.get("type") == "error"], [],
+            f"arm-hook-bound stream emitted an error frame: {events}",
+        )
+        self.assertIn(f"agent-{agent_id}.jsonl", events[0].get("path", ""),
+                      events[0])
+
+    def test_resolve_stream_agent_id_ladder(self):
+        """Unit-level ladder check for ``_resolve_stream_agent_id``.
+
+        Precedence: active-agents record keyed on THIS queue id first (a
+        re-fired item's live agent must win over a stale stamp), then the
+        register-time stamp, then the arm-hook binding, then nothing.
+        """
+        resolve = self.appmod._resolve_stream_agent_id
+        state = {"agents": [{"agent_id": "alive000000000000",
+                             "queue_id": "q-2026-01-01-aaaa",
+                             "alive": True, "jsonl_age_seconds": 1}]}
+        by_qid = self.appmod._agents_by_qid(state)
+
+        # 1. by-queue-id wins over a stale stamp on the same row.
+        self.assertEqual(
+            resolve("q-2026-01-01-aaaa",
+                    {"id": "q-2026-01-01-aaaa",
+                     "agent_id": "adead000000000000"},
+                    by_qid, {}),
+            ("alive000000000000", "active-agents"),
+        )
+        # 2. stamp answers when no record is keyed on this queue id.
+        self.assertEqual(
+            resolve("q-2026-01-01-bbbb",
+                    {"id": "q-2026-01-01-bbbb",
+                     "agent_id": "astamp00000000000"},
+                    by_qid, {}),
+            ("astamp00000000000", "queue-stamp"),
+        )
+        # 3. arm-hook binding is the last rung.
+        self.assertEqual(
+            resolve("q-2026-01-01-cccc", {"id": "q-2026-01-01-cccc"},
+                    by_qid, {"q-2026-01-01-cccc": "abind000000000000"}),
+            ("abind000000000000", "arm-hook-binding"),
+        )
+        # 4. genuinely no owner -> empty, so the honest no-agent error fires.
+        self.assertEqual(
+            resolve("q-2026-01-01-dddd", {"id": "q-2026-01-01-dddd"},
+                    by_qid, {}),
+            ("", ""),
+        )
+        # 5. no queue row at all (queue.json reset) -> active-agents only.
+        self.assertEqual(
+            resolve("q-2026-01-01-aaaa", None, by_qid, {}),
+            ("alive000000000000", "active-agents"),
+        )
 
     # ---------- failure: no active-agents record ----------
 

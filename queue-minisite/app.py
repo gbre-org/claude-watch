@@ -1278,6 +1278,7 @@ def _classify_owner(
         age = agent.get("jsonl_age_seconds")
         return {
             "mode": "agent",
+            "owner_source": "active-agents",
             "alive": bool(agent.get("alive")),
             "agent_id": agent.get("agent_id", ""),
             "jsonl_age_seconds": age,
@@ -1313,6 +1314,7 @@ def _classify_owner(
             age = rec.get("jsonl_age_seconds")
             return {
                 "mode": "agent",
+                "owner_source": "queue-stamp",
                 "alive": bool(rec.get("alive")),
                 "agent_id": stamped_aid,
                 "jsonl_age_seconds": age,
@@ -1328,6 +1330,7 @@ def _classify_owner(
         # no orphan badge fires on an ambiguous liveness signal.
         return {
             "mode": "agent",
+            "owner_source": "queue-stamp",
             "alive": None,
             "agent_id": stamped_aid,
             "jsonl_age_seconds": None,
@@ -1363,6 +1366,7 @@ def _classify_owner(
             age = rec.get("jsonl_age_seconds")
             return {
                 "mode": "agent",
+                "owner_source": "arm-hook-binding",
                 "alive": bool(rec.get("alive")),
                 "agent_id": bound_aid,
                 "jsonl_age_seconds": age,
@@ -1374,6 +1378,7 @@ def _classify_owner(
             }
         return {
             "mode": "agent",
+            "owner_source": "arm-hook-binding",
             "alive": None,
             "agent_id": bound_aid,
             "jsonl_age_seconds": None,
@@ -1395,6 +1400,7 @@ def _classify_owner(
             is_starting = True
     return {
         "mode": "unknown",
+        "owner_source": "none",
         "alive": None,
         "agent_id": "",
         "jsonl_age_seconds": None,
@@ -1402,6 +1408,52 @@ def _classify_owner(
         "jsonl_age_epoch": None,
         "is_starting": is_starting,
     }
+
+
+def _resolve_stream_agent_id(
+    qid: str,
+    item: dict[str, Any] | None,
+    agent_by_qid: dict[str, dict[str, Any]],
+    owner_bindings: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """Resolve the agent whose transcript belongs to queue item ``qid``.
+
+    Returns ``(agent_id, source)``; ``("", "")`` when no owner resolves at
+    all. ``source`` is the rung of the ladder that answered —
+    ``active-agents`` / ``queue-stamp`` / ``arm-hook-binding``.
+
+    WHY THIS IS NOT JUST ``agent_by_qid.get(qid)``: the agent -> queue
+    mapping in claude-watch's active-agents JSON is derived from the
+    ``Queue item: q-XXXX`` marker in the agent's FIRST user message, so it
+    records the queue id the agent was SPAWNED with and never changes. When
+    the main loop resumes a live agent onto a NEW queue item (the documented
+    pattern — ``queue register <new-qid> --agent-id <agent_id>``), the queue
+    row records the new owner correctly but the agent record still reports
+    the original queue id. A lookup keyed on the new queue id therefore
+    misses, and the live-log / multitail pane showed "no active agent record
+    found" for an agent that was alive and working the whole time.
+
+    The queue row is the authoritative ownership record, so we ask it rather
+    than duplicating the current queue id back into the agent record (where
+    it could drift again). This delegates to ``_classify_owner`` so the
+    dashboard card and the log stream resolve the owner through ONE ladder:
+    active-agents by queue id, then the register-time stamp, then the
+    arm-hook spawn binding.
+    """
+    if isinstance(item, dict):
+        owner = _classify_owner(
+            item, datetime.now(timezone.utc), agent_by_qid, owner_bindings
+        )
+        aid = owner.get("agent_id") or ""
+        if aid:
+            return str(aid), str(owner.get("owner_source") or "queue-owner")
+        return "", ""
+    # No queue row at all (queue.json reset / item archived out) — the
+    # active-agents map is the only signal left.
+    rec = agent_by_qid.get(qid)
+    if rec is not None and rec.get("agent_id"):
+        return str(rec.get("agent_id")), "active-agents"
+    return "", ""
 
 
 _TASK_TOKEN_PREFIX = "task:"
@@ -5297,9 +5349,11 @@ def api_queue_stream(qid: str) -> Any:
     queue_data, _qerr = _read_queue()
     workload_label = ""
     hostjob_label = ""
+    item: dict[str, Any] | None = None
     if isinstance(queue_data, dict):
         for it in queue_data.get("items", []) or []:
             if isinstance(it, dict) and it.get("id") == qid:
+                item = it
                 scope = it.get("scope") or []
                 workload_label = _extract_workload_label(scope)
                 hostjob_label = _extract_hostjob_label(scope)
@@ -5321,22 +5375,31 @@ def api_queue_stream(qid: str) -> Any:
             direct_passthrough=True,
         )
 
+    # Owner resolution goes through the SAME ladder the dashboard card uses
+    # (active-agents by queue id -> register-time stamp on the queue row ->
+    # arm-hook spawn binding). Keying only on the agent record's own
+    # queue_id made every RESUMED agent unwatchable: that field is the
+    # spawn-time marker and never follows a `queue register --agent-id`
+    # rebind, so the pane showed "no active agent record" while the agent
+    # was alive and writing its transcript.
     agent_by_qid = _agents_by_qid(_load_state(AGENT_STATE_PATH))
-    rec = agent_by_qid.get(qid)
+    agent_id, agent_id_source = _resolve_stream_agent_id(qid, item, agent_by_qid)
 
-    if rec is None:
-        # No agent record for this queue id — emit a one-shot error
-        # event then close. Stream-shaped error keeps the client logic
-        # simple (it always opens an EventSource).
+    if not agent_id:
+        # No owner resolves on ANY rung — emit a one-shot error event then
+        # close. Stream-shaped error keeps the client logic simple (it
+        # always opens an EventSource).
         def _no_agent() -> Iterator[bytes]:
             yield _format_sse({
                 "type": "error",
                 "kind": "no-agent",
                 "queue_id": qid,
                 "error": (
-                    "No active agent record found for this queue id. "
-                    "The agent may have already exited, or the "
-                    "active-agents.json state file may be stale."
+                    "No agent could be resolved for this queue id: no "
+                    "active-agents record, no owner stamped on the queue "
+                    "item, and no spawn binding. The agent may have "
+                    "already exited, or the active-agents.json state file "
+                    "may be stale."
                 ),
             })
 
@@ -5346,8 +5409,7 @@ def api_queue_stream(qid: str) -> Any:
             direct_passthrough=True,
         )
 
-    agent_id = rec.get("agent_id", "")
-    jsonl_path = _find_agent_jsonl(agent_id) if agent_id else None
+    jsonl_path = _find_agent_jsonl(agent_id)
 
     if jsonl_path is None:
         def _no_jsonl() -> Iterator[bytes]:
@@ -5356,8 +5418,10 @@ def api_queue_stream(qid: str) -> Any:
                 "kind": "no-jsonl",
                 "queue_id": qid,
                 "agent_id": agent_id,
+                "agent_id_source": agent_id_source,
                 "error": (
-                    f"Agent transcript not found for agent_id={agent_id!r}. "
+                    f"Agent transcript not found for agent_id={agent_id!r} "
+                    f"(resolved via {agent_id_source}). "
                     "The JSONL file may not yet exist or is outside the "
                     "configured AGENTS_JSONL_ROOT."
                 ),

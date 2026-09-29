@@ -238,6 +238,27 @@ that acquires a log joins on the next reconcile pass (2s). Precedence matches
 the stream endpoint's own dispatch (hostjob → workload → agent), so a pane can
 never advertise a tail the server would not serve.
 
+**Which agent an agent-tail belongs to, and why it is not one lookup.** The
+`agent_id ↔ queue_id` pairing in `active-agents.json` is parsed out of the
+`Queue item: q-XXXX` marker in each agent's first user message, so it records
+the queue id the agent was *spawned* with and never changes. Resuming a live
+agent onto a new queue item — the normal way follow-up work is handed to an
+agent that is already running, via `queue register <new-qid> --agent-id <id>` —
+updates the **queue** side only. So a lookup keyed on the new queue id finds no
+agent claiming it, even though the queue row names the owner correctly. Both the
+card and the stream endpoint therefore resolve the owner through the same
+three-rung ladder (`_classify_owner` → `_resolve_stream_agent_id`): an
+active-agents record keyed on *this* queue id first, so a re-fired item's live
+agent beats a stale stamp; then the register-time `agent_id` stamped on the
+queue row; then the arm-hook spawn binding, which lands before the
+active-agents poller does. Keying the stream on the first rung alone is what
+made every *resumed* agent unwatchable — the card resolved the owner and
+awarded the item a pane, then the pane's own stream reported `no-agent` for an
+agent that was alive and writing. One ladder, consulted by both, is the
+invariant; the queue row stays the authority on ownership rather than the
+current queue id being copied back into the agent record, where it could drift
+out of date again.
+
 **How many panes stay legible.** Panes flex-share the viewport evenly, but only
 down to `--mt-pane-min` (146px — a header, roughly ten monospace lines and the
 footer strip; 122px under 560px wide). Both numbers grew by the footer's height
