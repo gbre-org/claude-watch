@@ -1361,10 +1361,55 @@ pub struct ContextMonitorConfig {
     /// quiet moment). Default: 300 (5 min).
     #[serde(default = "default_context_max_armed_secs")]
     pub max_armed_secs: u64,
+    /// Detect DEGENERATE OUTPUT — the model stuck in a long-context degenerate
+    /// generation loop, spewing the same short token/line over and over (the
+    /// "court court court…" filler pattern). This is a corruption signal that no
+    /// banner detector and no context-percentage heuristic catches, so it is its
+    /// own `WedgedReason` flowing through the same immediate-self-clear recovery
+    /// as the context-limit / rate-limit wedges. Defaults to enabled — it is the
+    /// single most reliable corruption signal (repeated filler is unambiguous).
+    /// See `tmux::check_lines_for_degenerate_output`.
+    #[serde(default = "default_degen_detection_enabled")]
+    pub degen_detection_enabled: bool,
+    /// Minimum number of CONSECUTIVE identical short lines (or consecutive
+    /// repeats of one short token within a line) required before the pane is
+    /// classified as degenerate. Default 6: high enough that no legitimate output
+    /// (a duplicated log line, a short repeated status) trips it, low enough that
+    /// a genuine spew loop is caught within a few lines. Combined with
+    /// `wedged_consecutive` cycles of gating in the recovery path, a false fire
+    /// requires the SAME degenerate frame to persist across multiple polls.
+    #[serde(default = "default_degen_min_repeats")]
+    pub degen_min_repeats: u32,
+    /// Maximum character length of a repeated LINE that still counts toward the
+    /// degenerate signature. Filler spew is short; legitimately-repeated
+    /// substantive content (a wrapped paragraph, a stack frame) is long and is
+    /// deliberately exempted. Default 80.
+    #[serde(default = "default_degen_max_line_len")]
+    pub degen_max_line_len: u32,
+    /// Maximum character length of a repeated TOKEN that still counts toward the
+    /// intra-line degenerate signature (`court court court…`). Default 24.
+    #[serde(default = "default_degen_max_token_len")]
+    pub degen_max_token_len: u32,
 }
 
 fn default_context_max_armed_secs() -> u64 {
     300
+}
+
+fn default_degen_detection_enabled() -> bool {
+    true
+}
+
+fn default_degen_min_repeats() -> u32 {
+    6
+}
+
+fn default_degen_max_line_len() -> u32 {
+    80
+}
+
+fn default_degen_max_token_len() -> u32 {
+    24
 }
 
 fn default_wedged_detection_enabled() -> bool {

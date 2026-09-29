@@ -3480,6 +3480,15 @@ pub enum WedgedReason {
     /// limit clears, but the only safe recovery on our side is /clear (which drops
     /// most of the prior context and lets a fresh request slip through).
     RateLimited,
+    /// DEGENERATE OUTPUT — the model has entered a long-context degenerate
+    /// generation loop, emitting the SAME short line over and over (the classic
+    /// "court court court…" filler-token spew). This is not a banner the harness
+    /// prints; it is the model's own poisoned output. It is unambiguous evidence
+    /// of context corruption, and no banner-based or token-percentage detector
+    /// catches it (the token counter keeps climbing normally and no error line is
+    /// printed). Recovery is the same as the other wedges: `/clear` to reset the
+    /// corrupted context. See `check_lines_for_degenerate_output`.
+    DegenerateOutput,
 }
 
 impl fmt::Display for WedgedReason {
@@ -3487,6 +3496,7 @@ impl fmt::Display for WedgedReason {
         match self {
             WedgedReason::ContextLimit => write!(f, "context_limit"),
             WedgedReason::RateLimited => write!(f, "rate_limited"),
+            WedgedReason::DegenerateOutput => write!(f, "degenerate_output"),
         }
     }
 }
@@ -3543,11 +3553,143 @@ pub(crate) fn check_lines_for_wedged(pane_output: &str) -> Option<WedgedReason> 
     None
 }
 
+/// Normalize a pane line for degenerate-repetition comparison: strip the
+/// leading/trailing whitespace and collapse every internal run of whitespace to
+/// a single space. Two lines that a human would read as "the same text" (the
+/// TUI may re-pad them differently across a redraw) then compare equal.
+fn normalize_degen_line(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Does `s` contain at least one alphanumeric character? A line made purely of
+/// box-drawing glyphs, dashes, dots or other punctuation (`────`, `····`,
+/// `. . .`) is TUI chrome / a separator, NOT model-emitted content, so a run of
+/// such lines must never be read as degenerate output.
+fn has_alnum(s: &str) -> bool {
+    s.chars().any(|c| c.is_alphanumeric())
+}
+
+/// Pure function: detect DEGENERATE OUTPUT — the model stuck in a long-context
+/// degenerate generation loop, emitting the same short token/phrase over and
+/// over (the "court court court…" filler spew Andrew hit 2026-09-28). This is
+/// the reliable, unambiguous corruption signal: unlike the context-percentage
+/// heuristic it does not cry wolf, and unlike the banner detectors it fires on
+/// output the harness prints no error for.
+///
+/// Two independent signatures, either of which trips it (both bounded so normal
+/// output never matches):
+///
+///  1. **Line-level repetition.** `min_repeats` or more CONSECUTIVE lines in the
+///     recent tail that are byte-identical after `normalize_degen_line`, where
+///     the repeated line carries actual alphanumeric content (not blank / not a
+///     pure separator) and is at most `max_line_len` chars. Real work does not
+///     print the same short substantive line six times in a row; a degenerate
+///     loop fills the pane with it. Longer identical lines are exempted because
+///     legitimately-repeated substantive content (a duplicated stack frame, a
+///     wrapped paragraph) tends to be long, whereas filler spew is short.
+///
+///  2. **Intra-line token repetition.** A single line where one short token
+///     (≤ `max_token_len` chars, alphanumeric) repeats `min_repeats` or more
+///     times CONSECUTIVELY (`court court court court court court`). This catches
+///     the same degeneration when the TUI renders it as one wrapped run rather
+///     than as separate lines.
+///
+/// Only the last ~40 lines are inspected (same window as `check_lines_for_wedged`)
+/// so a repeated block scrolled up in history cannot trip it. The caller still
+/// requires multiple consecutive CYCLES (`wedged_consecutive`) before acting, so
+/// a one-frame fluke never fires a clear.
+pub(crate) fn check_lines_for_degenerate_output(
+    pane_output: &str,
+    min_repeats: usize,
+    max_line_len: usize,
+    max_token_len: usize,
+) -> bool {
+    if min_repeats < 2 {
+        return false;
+    }
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = lines.len().saturating_sub(40);
+    let tail = &lines[start..];
+
+    // --- Signature 1: consecutive identical substantive lines. ---
+    let mut run_key: Option<String> = None;
+    let mut run_len: usize = 0;
+    for line in tail {
+        let norm = normalize_degen_line(line);
+        // Blank / pure-separator / oversized lines break and do not extend a
+        // run: they are chrome or legitimately-long content, never filler spew.
+        if norm.is_empty() || !has_alnum(&norm) || norm.chars().count() > max_line_len {
+            run_key = None;
+            run_len = 0;
+            continue;
+        }
+        if run_key.as_deref() == Some(norm.as_str()) {
+            run_len += 1;
+        } else {
+            run_key = Some(norm);
+            run_len = 1;
+        }
+        if run_len >= min_repeats {
+            return true;
+        }
+    }
+
+    // --- Signature 2: one short token repeated consecutively within a line. ---
+    for line in tail {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() < min_repeats {
+            continue;
+        }
+        let mut tok_key: Option<&str> = None;
+        let mut tok_run: usize = 0;
+        for t in toks {
+            let is_candidate = t.chars().count() <= max_token_len && has_alnum(t);
+            if is_candidate && tok_key == Some(t) {
+                tok_run += 1;
+            } else {
+                tok_key = if is_candidate { Some(t) } else { None };
+                tok_run = if is_candidate { 1 } else { 0 };
+            }
+            if tok_run >= min_repeats {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Capture the pane and check whether Claude Code is wedged (context limit /
-/// persistent rate limit). Returns the reason on detection.
-pub async fn detect_wedged(pane: &str) -> Option<WedgedReason> {
+/// persistent rate limit / degenerate-output loop). Returns the reason on
+/// detection.
+///
+/// `degen_enabled` gates the degenerate-output signature (signatures + rationale
+/// in `check_lines_for_degenerate_output`); when off, only the banner-based
+/// context-limit / rate-limit wedges are reported (legacy behaviour). The banner
+/// wedges take precedence — a pane that shows BOTH a context-limit banner and
+/// repeated filler is reported as `ContextLimit`.
+pub async fn detect_wedged(
+    pane: &str,
+    degen_enabled: bool,
+    degen_min_repeats: usize,
+    degen_max_line_len: usize,
+    degen_max_token_len: usize,
+) -> Option<WedgedReason> {
     let out = capture_pane_history(pane, 80).await?;
-    check_lines_for_wedged(&out)
+    if let Some(reason) = check_lines_for_wedged(&out) {
+        return Some(reason);
+    }
+    if degen_enabled
+        && check_lines_for_degenerate_output(
+            &out,
+            degen_min_repeats,
+            degen_max_line_len,
+            degen_max_token_len,
+        )
+    {
+        return Some(WedgedReason::DegenerateOutput);
+    }
+    None
 }
 
 /// Pure function: detect whether the pane shows a MALFORMED tool call — the
@@ -6557,6 +6699,127 @@ API Error: Request rejected (429)\n";
     fn test_wedged_reason_display() {
         assert_eq!(format!("{}", WedgedReason::ContextLimit), "context_limit");
         assert_eq!(format!("{}", WedgedReason::RateLimited), "rate_limited");
+        assert_eq!(
+            format!("{}", WedgedReason::DegenerateOutput),
+            "degenerate_output"
+        );
+    }
+
+    // --- check_lines_for_degenerate_output tests ---
+
+    // Defaults mirror the config defaults so the tests exercise the real
+    // production behaviour.
+    const DEGEN_MIN: usize = 6;
+    const DEGEN_MAX_LINE: usize = 80;
+    const DEGEN_MAX_TOK: usize = 24;
+
+    fn is_degen(s: &str) -> bool {
+        check_lines_for_degenerate_output(s, DEGEN_MIN, DEGEN_MAX_LINE, DEGEN_MAX_TOK)
+    }
+
+    #[test]
+    fn test_degen_consecutive_identical_short_lines() {
+        // Six identical short substantive lines in a row — the classic spew.
+        let output = "court\ncourt\ncourt\ncourt\ncourt\ncourt\n";
+        assert!(is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_below_threshold_not_flagged() {
+        // Five repeats — under the default 6 — must NOT trip.
+        let output = "court\ncourt\ncourt\ncourt\ncourt\n";
+        assert!(!is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_intra_line_token_repetition() {
+        // The same short token repeated within one wrapped line.
+        let output = "\u{25cf} court court court court court court court\n\u{276f} ";
+        assert!(is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_intra_line_below_threshold() {
+        let output = "the cat sat on the mat and then left\n";
+        assert!(!is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_normalizes_whitespace_padding() {
+        // The TUI may re-pad the same line differently across a redraw; after
+        // whitespace normalization they are the same line.
+        let output = "court \ncourt\n  court  \ncourt\n\tcourt\ncourt \n";
+        assert!(is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_ignores_blank_lines() {
+        // Blank lines are not content and must not count toward a run.
+        let output = "\n\n\n\n\n\n\n";
+        assert!(!is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_ignores_pure_separators() {
+        // Box-drawing / punctuation separators are chrome, not model output.
+        let output = "\u{2500}\u{2500}\u{2500}\u{2500}\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{2500}\u{2500}\u{2500}\u{2500}\n";
+        assert!(!is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_long_repeated_lines_exempt() {
+        // Legitimately-repeated LONG content (e.g. a duplicated wrapped line)
+        // is exempt — filler spew is short.
+        let long = "this is a legitimately long line of substantive content that wraps and might repeat in a diff";
+        let output = format!("{long}\n{long}\n{long}\n{long}\n{long}\n{long}\n");
+        assert!(!is_degen(&output));
+    }
+
+    #[test]
+    fn test_degen_normal_conversation_not_flagged() {
+        let output = "\u{276f} Hello world\nNormal Claude Code conversation\nRunning a tool now\nHere are the results\nAll done\n";
+        assert!(!is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_run_must_be_consecutive() {
+        // The same short line six times but INTERLEAVED with other content is
+        // not a degenerate run.
+        let output = "court\nok\ncourt\nok\ncourt\nok\ncourt\nok\ncourt\nok\ncourt\nok\n";
+        assert!(!is_degen(output));
+    }
+
+    #[test]
+    fn test_degen_only_checks_recent_tail() {
+        // A degenerate block scrolled far up in history (beyond the 40-line
+        // window) must not trip on stale scrollback.
+        let mut lines: Vec<String> = Vec::new();
+        for _ in 0..8 {
+            lines.push("court".to_string());
+        }
+        for i in 0..60 {
+            lines.push(format!("normal line {i}"));
+        }
+        let output = lines.join("\n");
+        assert!(!is_degen(&output));
+    }
+
+    #[test]
+    fn test_degen_disabled_min_repeats_guard() {
+        // A degenerate min_repeats (<2) can never fire — guards against a
+        // misconfiguration turning every line into a "match".
+        let output = "court\ncourt\ncourt\ncourt\ncourt\ncourt\n";
+        assert!(!check_lines_for_degenerate_output(
+            output,
+            1,
+            DEGEN_MAX_LINE,
+            DEGEN_MAX_TOK
+        ));
+    }
+
+    #[test]
+    fn test_degen_empty_input() {
+        assert!(!is_degen(""));
     }
 
     // --- check_lines_for_malformed_tool_call tests ---

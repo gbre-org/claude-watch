@@ -384,6 +384,31 @@ cooldown = 300
 # waiting on is the stuck one. After this long armed, fire regardless of the
 # subagent count. 0 disables the deadline (wait indefinitely).
 max_armed_secs = 300
+# --- Degenerate-output corruption detector ---
+# Detect the model stuck in a long-context DEGENERATE GENERATION loop, spewing
+# the same short token/line over and over (the "court court court…" filler
+# pattern Andrew hit 2026-09-28). This is the single most RELIABLE corruption
+# signal: repeated filler is unambiguous degeneration, and — unlike the
+# context-% heuristic — it never cries wolf, and — unlike the context-limit /
+# 429 banner detectors — it fires on output the harness prints no error for.
+# When tripped it is treated as a wedge (WedgedReason::degenerate_output) and
+# flows through the SAME immediate-self-clear recovery (with wedged_consecutive
+# cycles of gating + wedged_cooldown) as the other wedges. Default on.
+degen_detection_enabled = true
+# Minimum consecutive identical short lines — or consecutive repeats of one
+# short token within a line — required to classify the pane as degenerate.
+# High enough that no legitimate repeated output trips it; low enough to catch a
+# real spew within a few lines. Combined with wedged_consecutive polls of
+# gating, a false fire would need the same degenerate frame across multiple
+# cycles.
+degen_min_repeats = 6
+# Max character length of a repeated LINE that still counts. Filler spew is
+# short; legitimately-repeated substantive content (a wrapped paragraph, a
+# duplicated stack frame) is long and is deliberately exempted.
+degen_max_line_len = 80
+# Max character length of a repeated TOKEN for the intra-line signature
+# (`court court court…` rendered as one wrapped run).
+degen_max_token_len = 24
 
 [malformed_tool_call]
 # Detect MALFORMED tool calls — the model emitting raw, NON-namespaced

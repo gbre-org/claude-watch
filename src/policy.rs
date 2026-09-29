@@ -2623,7 +2623,14 @@ async fn handle_wedged_pane(
         return false;
     }
 
-    let wedged = tmux::detect_wedged(pane).await;
+    let wedged = tmux::detect_wedged(
+        pane,
+        config.context_monitor.degen_detection_enabled,
+        config.context_monitor.degen_min_repeats as usize,
+        config.context_monitor.degen_max_line_len as usize,
+        config.context_monitor.degen_max_token_len as usize,
+    )
+    .await;
 
     let Some(reason) = wedged else {
         // Pane is no longer wedged — reset the counter.
@@ -7327,8 +7334,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // which rests on independent banner-text evidence (not a token-count
     // misparse) and has its own consecutive-cycle + cooldown gating inside
     // `handle_wedged_pane`.
-    let wedged_now =
-        !effective_pane.is_empty() && tmux::detect_wedged(&effective_pane).await.is_some();
+    let wedged_now = !effective_pane.is_empty()
+        && tmux::detect_wedged(
+            &effective_pane,
+            config.context_monitor.degen_detection_enabled,
+            config.context_monitor.degen_min_repeats as usize,
+            config.context_monitor.degen_max_line_len as usize,
+            config.context_monitor.degen_max_token_len as usize,
+        )
+        .await
+        .is_some();
 
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
@@ -8275,15 +8290,33 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             &now,
         );
     }
-    if config.context_monitor.enabled && tokens > 0 {
+    // Trigger on the JSONL-transcript-derived `context_tokens`, NOT the raw
+    // tmux-scraped `tokens`. The status-bar scrape freezes at a stale-HIGH
+    // reading whenever an overlay (auto-update banner, dialog, an error banner)
+    // clobbers the status line — so the threshold trigger fired a spurious
+    // "SELF-CLEAR NOW" on a session that was actually fine (Andrew 2026-09-28:
+    // the % alert cried wolf repeatedly while the session was healthy). The
+    // reset path (maybe_reset_context_clear) and the wedged path
+    // (handle_wedged_pane) already switched to `context_tokens` for exactly this
+    // reason; the trigger was the last consumer left on the fragile source. The
+    // JSONL read is the active session's own usage record and can't be clobbered
+    // by an overlay. `compact_remaining` still comes from the pane scrape (it is
+    // only PRESENT when the status line is intact, and it is gated behind the
+    // real-usage danger zone inside check_context_threshold_with_margin, so a
+    // stale/absent value cannot fire early on its own).
+    if config.context_monitor.enabled && context_tokens > 0 {
         if let Some((pct, _by_compact)) = check_context_threshold_with_margin(
-            tokens,
+            context_tokens,
             config.claude.max_context_tokens,
             cs.compact_remaining,
             config.context_monitor.threshold_percent,
             config.context_monitor.compact_trigger_percent,
             config.context_monitor.threshold_margin,
         ) {
+            // Diagnostic logs below record the value that actually crossed the
+            // threshold. Shadow `tokens` with `context_tokens` so the logs never
+            // print the stale tmux scrape we deliberately stopped triggering on.
+            let tokens = context_tokens;
             if !state.context_clear_triggered {
                 // Check cooldown
                 let can_trigger = match &state.last_context_clear {
