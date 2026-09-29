@@ -1292,12 +1292,12 @@ console.log('\n-- stamped plain-text lines (source_ts): a real time, or none');
 }
 
 // ==========================================================================
-console.log('\n-- per-pane footer bar: read off the row, never invented');
+console.log('\n-- per-pane metrics: on the title line, read off the row');
 // ==========================================================================
 {
   // A card shaped like the real thing: the model chip and the agent-stats cell
   // live in the item HEAD, carrying the SERVER-FORMATTED strings as data
-  // attributes. The footer reads those; it computes nothing.
+  // attributes. The pane reads those; it computes nothing.
   function richCard(qid, mode, summary, opts) {
     const o = opts || {};
     const model = o.model === undefined ? 'opus' : o.model;
@@ -1320,9 +1320,10 @@ console.log('\n-- per-pane footer bar: read off the row, never invented');
       `<p class="summary">${summary}</p></article>`;
   }
   const footCells = (qid) =>
-    Array.from(paneFor(qid).querySelectorAll('.mt-pane-foot > *'))
+    Array.from(paneFor(qid).querySelectorAll('.mt-pane-meta > *'))
       .map((n) => n.textContent);
-  const footBar = (qid) => paneFor(qid).querySelector('.mt-pane-foot');
+  const footBar = (qid) => paneFor(qid).querySelector('.mt-pane-meta');
+  const titleBar = (qid) => paneFor(qid).querySelector('.mt-pane-titlebar');
 
   resetQueue([
     richCard('q-f1', 'live', 'an agent'),
@@ -1332,15 +1333,15 @@ console.log('\n-- per-pane footer bar: read off the row, never invented');
   ]);
   mt.openMode();
 
-  assert('every pane has a footer element', paneEls().every(
-    (p) => p.querySelector('.mt-pane-foot') !== null));
+  assert('every pane has a metrics element', paneEls().every(
+    (p) => p.querySelector('.mt-pane-meta') !== null));
   assert('an agent pane prints model, calls, ctx, out, age and last tool',
     footCells('q-f1').join(' | ') === 'opus | 41 calls | 118K ctx | 9.1K out | 12m | last Bash',
     footCells('q-f1').join(' | '));
   assert('the model chip keeps the row\'s own title (the raw id)',
-    footBar('q-f1').querySelector('.mt-foot-model').title === 'model: claude-opus-5',
-    footBar('q-f1').querySelector('.mt-foot-model').title);
-  assert('the footer is visible when it has something to say',
+    footBar('q-f1').querySelector('.mt-meta-model').title === 'model: claude-opus-5',
+    footBar('q-f1').querySelector('.mt-meta-model').title);
+  assert('the metrics are visible when they have something to say',
     footBar('q-f1').hidden === false);
 
   // A workload pane runs no model and has no agent counters. It says the one
@@ -1348,8 +1349,8 @@ console.log('\n-- per-pane footer bar: read off the row, never invented');
   assert('a workload pane shows its label and nothing invented',
     footCells('q-f2').join(' | ') === 'promote-thing', footCells('q-f2').join(' | '));
 
-  // Nothing known at all -> no empty bar.
-  assert('a pane with nothing known at all hides its footer (no empty bar)',
+  // Nothing known at all -> the title simply keeps the whole line.
+  assert('a pane with nothing known at all hides its metrics (no empty cells)',
     footBar('q-f3').hidden === true, footCells('q-f3').join(' | '));
 
   // `–` and `?` are the server formatter's "not known" markers, never values.
@@ -1358,7 +1359,7 @@ console.log('\n-- per-pane footer bar: read off the row, never invented');
     footCells('q-f4').join(' | '));
 
   // The counters move on their own: refresh.js rebuilds the row every 5s and
-  // the footer re-reads it on the reconcile tick.
+  // the pane re-reads it on the reconcile tick.
   document.getElementById('queue-root').innerHTML = [
     richCard('q-f1', 'live', 'an agent', { calls: '58', ctx: '140K', out: '11K', age: '14m', lastTool: 'Read' }),
     richCard('q-f2', 'workload', 'a workload', { model: '', stats: false, label: 'promote-thing' }),
@@ -1366,11 +1367,11 @@ console.log('\n-- per-pane footer bar: read off the row, never invented');
     richCard('q-f4', 'live', 'partial', { out: '–', lastTool: '', age: '?' }),
   ].join('\n');
   mt.reconcile();
-  assert('the footer follows the row on the next tick',
+  assert('the metrics follow the row on the next tick',
     footCells('q-f1').join(' | ') === 'opus | 58 calls | 140K ctx | 11K out | 14m | last Read',
     footCells('q-f1').join(' | '));
 
-  // A snapshot that catches up later fills the footer in rather than leaving
+  // A snapshot that catches up later fills the metrics in rather than leaving
   // a stale blank.
   document.getElementById('queue-root').innerHTML = [
     richCard('q-f3', 'live', 'nothing known yet'),
@@ -1381,13 +1382,42 @@ console.log('\n-- per-pane footer bar: read off the row, never invented');
     footCells('q-f3').join(' | ').indexOf('41 calls') !== -1,
     footCells('q-f3').join(' | '));
 
-  // The footer is chrome, not log content: it must not consume a line of the
-  // stream, and the stream element stays the pane's flexible child.
-  assert('the footer sits AFTER the stream, so it cannot push lines out',
-    paneFor('q-f3').lastElementChild.className === 'mt-pane-foot');
+  // WHERE THE METRICS LIVE (botchat #4997). They used to be a footer strip
+  // appended to the pane after the stream — a whole row of chrome per pane.
+  // They are now the right-hand half of the pane's TITLE line, which is a row
+  // the header was spending anyway, so the pane got a log row back.
+  //
+  // Each half of that is asserted, because either one alone is the change
+  // half-made: a metrics element inside the header that the pane ALSO keeps a
+  // footer for reclaims nothing, and a pane with no footer whose metrics went
+  // somewhere other than the title line loses the numbers.
+  assert('the metrics are inside the pane HEADER, not a row of their own',
+    paneFor('q-f1').querySelector('.mt-pane-head .mt-pane-meta') !== null);
+  assert('the pane is exactly header + stream — no footer row left',
+    Array.from(paneFor('q-f1').children).map((n) => n.className).join(',') ===
+      'mt-pane-head,mt-pane-stream',
+    Array.from(paneFor('q-f1').children).map((n) => n.className).join(','));
+  assert('the stream is still the pane\'s LAST child, so nothing clips it',
+    paneFor('q-f1').lastElementChild.className === 'mt-pane-stream');
+  // Title left, metrics right: the title is the titlebar's FIRST child and the
+  // metrics its last, and both are in the same box so a wrapping header cannot
+  // separate them.
+  assert('title and metrics share one titlebar, title first',
+    titleBar('q-f1').children.length === 2 &&
+    titleBar('q-f1').children[0].className === 'mt-pane-summary' &&
+    titleBar('q-f1').children[1].className === 'mt-pane-meta',
+    titleBar('q-f1').innerHTML);
+  assert('and the title itself still says what the task is',
+    titleBar('q-f1').querySelector('.mt-pane-summary').textContent === 'an agent',
+    titleBar('q-f1').querySelector('.mt-pane-summary').textContent);
+  // A pane whose metrics are hidden still shows its title — the whole point of
+  // sharing the row is that an empty right half costs nothing.
+  assert('a pane with no metrics keeps a visible title',
+    footBar('q-f3').hidden === false ||
+    titleBar('q-f3').querySelector('.mt-pane-summary').textContent.length > 0);
   assert('textContent only — no markup from a queue record ever',
-    paneFor('q-f3').querySelector('.mt-pane-foot').innerHTML.indexOf('<span') !== -1 &&
-    paneFor('q-f3').querySelector('.mt-pane-foot').querySelectorAll('script').length === 0);
+    paneFor('q-f3').querySelector('.mt-pane-meta').innerHTML.indexOf('<span') !== -1 &&
+    paneFor('q-f3').querySelector('.mt-pane-meta').querySelectorAll('script').length === 0);
   mt.closeMode();
 }
 

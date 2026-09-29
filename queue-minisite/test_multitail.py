@@ -167,6 +167,19 @@ def _decls(rules: list[tuple[list[str], str]], selector: str) -> str | None:
     return "\n".join(found) if found else None
 
 
+def _multitail_phone_block(css: str) -> str:
+    """The 560px block that belongs to MULTITAIL, not the site-wide one.
+
+    The stylesheet carries two `@media (max-width: 560px)` blocks and the
+    site-wide one comes first, so a plain `index()` slice starts hundreds of
+    lines above the multitail rules and picks up the desktop values — which
+    is how a phone assertion passes while reading a desktop number.
+    """
+    block = css[css.rindex("@media (max-width: 560px)") :]
+    assert ".mt-pane-titlebar" in block, "multitail's phone block moved"
+    return block
+
+
 class MultitailTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -551,6 +564,10 @@ class MultitailTest(unittest.TestCase):
         pushed onto a third line). This asserts the absence, because the
         element is rendered either way and only CSS decides whether a human
         can see it.
+
+        The reordered element is the TITLEBAR, not the title: since the
+        metrics moved onto this line they have to wrap with it, or the phone
+        gets a title on one row and its own numbers on another.
         """
         css = (HERE / "static" / "style.css").read_text()
         # The declaration itself, in any spacing.
@@ -558,11 +575,15 @@ class MultitailTest(unittest.TestCase):
             re.search(r"\.mt-pane-summary[^{}]*\{[^}]*display:\s*none", css),
             ".mt-pane-summary is hidden by a rule — the pane title is invisible",
         )
+        self.assertIsNone(
+            re.search(r"\.mt-pane-titlebar[^{}]*\{[^}]*display:\s*none", css),
+            ".mt-pane-titlebar is hidden by a rule — the pane title goes with it",
+        )
         # And the wrap treatment that replaced it is actually shipped.
         self.assertIn(".mt-pane-head { flex-wrap: wrap; }", css)
         self.assertIsNotNone(
-            re.search(r"\.mt-pane-summary\s*\{[^}]*order:\s*1", css),
-            "the title must be ordered last so it wraps alone onto line 2",
+            re.search(r"\.mt-pane-titlebar\s*\{[^}]*order:\s*1", css),
+            "the title line must be ordered last so it wraps alone onto line 2",
         )
 
     # -- ended-pane retention ---------------------------------------------
@@ -740,7 +761,7 @@ class MultitailTest(unittest.TestCase):
         for taken in ("'j'", "'k'", "'g'", "'G'", "'/'"):
             self.assertNotIn(f"ev.key === {taken}", src, f"{taken} is already bound")
 
-    # -- per-pane footer bar (botchat #4935) -------------------------------
+    # -- per-pane metrics (botchat #4935, moved to the title line by #4997) --
 
     #: What the footer prints, as (data attribute, ``_shape_agent_stat`` key).
     #: The attribute carries the SERVER-FORMATTED string; the footer never
@@ -800,7 +821,7 @@ class MultitailTest(unittest.TestCase):
         is attributable.
         """
         src = (HERE / "static" / "multitail.js").read_text()
-        self.assertIn("function footValue(", src)
+        self.assertIn("function metaValue(", src)
         # The three markers the server can produce for "no value".
         self.assertIn("'?'", src)
         self.assertIn("'–'", src)
@@ -817,34 +838,105 @@ class MultitailTest(unittest.TestCase):
         for pinned in ("claude-opus", "claude-sonnet", "claude-haiku"):
             self.assertNotIn(pinned, src, f"multitail.js pins a model id: {pinned}")
 
-    def test_footer_styles_shipped_and_do_not_eat_the_log_area(self):
-        """The strip needs CSS, and the pane floor had to grow by its height.
-
-        Panes already stop shrinking at a legibility floor (a header plus ~10
-        monospace lines). Adding a footer without raising that floor would have
-        taken the space out of the log rows instead of out of the window.
-        """
+    def test_metrics_styles_shipped(self):
+        """The cells need CSS, and `hidden` has to beat `display: flex`."""
         css = (HERE / "static" / "style.css").read_text()
         for cls in (
-            ".mt-pane-foot",
-            ".mt-foot-model",
-            ".mt-foot-cell",
-            ".mt-foot-tool",
-            ".mt-foot-label",
+            ".mt-pane-meta",
+            ".mt-meta-model",
+            ".mt-meta-cell",
+            ".mt-meta-tool",
+            ".mt-meta-label",
         ):
-            self.assertIn(cls, css, f"missing footer style {cls}")
-        self.assertIn(".mt-pane-foot[hidden] { display: none; }", css)
-        # The floor: 132px was the pre-footer value on desktop, 108px on phones.
-        desktop = int(
-            re.search(r"--mt-pane-min:\s*(\d+)px", css).group(1)
-        )
-        self.assertGreater(
-            desktop, 132, "--mt-pane-min must grow with the footer strip"
-        )
-        # Phones drop the two narrowest-value cells rather than wrapping.
-        phone_block = css[css.index("@media (max-width: 560px)") :]
-        self.assertIn(".mt-foot-out", phone_block)
-        self.assertIn(".mt-foot-tool", phone_block)
+            self.assertIn(cls, css, f"missing metrics style {cls}")
+        self.assertIn(".mt-pane-meta[hidden] { display: none; }", css)
+        # Phones drop the two narrowest-value cells rather than crowding the
+        # title they now share a line with.
+        phone_block = _multitail_phone_block(css)
+        self.assertIn(".mt-meta-out", phone_block)
+        self.assertIn(".mt-meta-tool", phone_block)
+
+    def test_metrics_sit_on_the_title_line_and_give_the_row_back(self):
+        """botchat #4997: title left, metrics right, ONE row for both.
+
+        The metrics were a footer strip under the stream — a whole row of
+        chrome per pane, which with five or six panes open is five or six rows
+        the logs do not get. Three things have to hold together, and each is
+        asserted separately because any one of them alone leaves the change
+        half-made:
+
+          renderer   the metrics element is built inside the pane HEADER, not
+                     appended to the pane after the stream.
+          geometry   inside the title line the TITLE is the only flexible
+                     item, which is what pushes the metrics against the far
+                     edge — the same mechanism the timestamp cell uses, rather
+                     than a third way of aligning something right. It is also
+                     the half that GIVES: the title ellipsises, while a
+                     shrinking metrics group would clip a number in half and
+                     print `12` where the agent is 12 minutes old. The
+                     wrapper clips, so a pane too narrow even for the title's
+                     floor cannot spill into the status and close button.
+          budget     the pane's legibility floor has to come back DOWN by the
+                     strip's height, or the reclaimed row is spent on nothing.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        # Renderer: the metrics go into the header's title line.
+        self.assertIn("titlebar.appendChild(meta);", src)
+        self.assertIn("head.appendChild(titlebar);", src)
+        self.assertNotRegex(
+            src, r"wrap\.appendChild\(\s*(meta|foot)\s*\)",
+            "the metrics are appended to the pane again — that is the footer "
+            "row this change removed")
+        self.assertNotIn("el('footer', 'mt-pane-meta')", src)
+
+        css = (HERE / "static" / "style.css").read_text()
+        rules = _css_rules(css)
+
+        title = _decls(rules, ".mt-pane-summary")
+        self.assertIsNotNone(title, ".mt-pane-summary rule not found")
+        self.assertRegex(
+            title, r"flex\s*:\s*1\s+1\s",
+            "the title must be the flexible item, or nothing pushes the "
+            "metrics right")
+
+        self.assertRegex(
+            title, r"min-width\s*:\s*[1-9]",
+            "the title needs a floor, or the metrics can squeeze it to nothing")
+        self.assertRegex(
+            title, r"text-overflow\s*:\s*ellipsis",
+            "the title is the half that gives, so it has to say it was cut")
+
+        meta = _decls(rules, ".mt-pane-meta")
+        self.assertIsNotNone(meta, ".mt-pane-meta rule not found")
+        self.assertRegex(
+            meta, r"flex\s*:\s*0\s+0\s",
+            "the metrics must NOT shrink: a clipped number reads as a "
+            "different number, while a clipped title reads as a clipped title")
+
+        bar = _decls(rules, ".mt-pane-titlebar")
+        self.assertIsNotNone(bar, ".mt-pane-titlebar rule not found")
+        self.assertRegex(bar, r"display\s*:\s*flex", "the title line is a flex row")
+        self.assertRegex(
+            bar, r"min-width\s*:\s*0",
+            "without min-width:0 the title cannot ellipsise inside the header")
+        self.assertRegex(
+            bar, r"overflow\s*:\s*hidden",
+            "a pane too narrow for the title's floor plus the metrics must "
+            "clip inside the title line, not spill onto the close button")
+
+        # Budget: 132px / 108px were the values before the footer strip was
+        # added; it cost 14px at both breakpoints and the strip is now gone.
+        desktop = int(re.search(r"--mt-pane-min:\s*(\d+)px", css).group(1))
+        self.assertEqual(
+            desktop, 132,
+            "--mt-pane-min must drop back by the strip's height, or the "
+            "reclaimed row is not handed to the window budget")
+        phone_block = _multitail_phone_block(css)
+        phone = int(re.search(r"--mt-pane-min:\s*(\d+)px", phone_block).group(1))
+        self.assertEqual(
+            phone, 122,
+            "the phone floor keeps the title line (+14px over the 108px base) "
+            "and drops the strip's")
 
     def test_agent_records_reach_the_client_with_their_timestamp(self):
         """Agent JSONL: the record's OWN timestamp survives the parse.

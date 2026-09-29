@@ -194,8 +194,10 @@ modal N times in a row.
   `clear 1m` → `clear 5m` → `clear 15m` → `keep`, default **1m**. If finished
   panes are *not* clearing, check first whether the tab predates the deploy that
   added this — see **Is this page stale?** below.
-* **Per-pane footer bar**: model · tool calls · context · output · age · last
-  tool, under each pane's stream.
+* **Per-pane metrics**: model · tool calls · context · output · age · last
+  tool, right-aligned on each pane's title line (task title left, numbers
+  right). They used to be a footer strip under the stream; moving them onto a
+  row the header was spending anyway gives every pane a log line back.
 * **All four settings are remembered** per viewer (localStorage), and the pills
   show the remembered state before the mode is first opened. A fresh viewer gets
   the original defaults: wrap off, timestamps off, verbose off, `clear 1m`.
@@ -270,10 +272,11 @@ current queue id being copied back into the agent record, where it could drift
 out of date again.
 
 **How many panes stay legible.** Panes flex-share the viewport evenly, but only
-down to `--mt-pane-min` (146px — a header, roughly ten monospace lines and the
-footer strip; 122px under 560px wide). Both numbers grew by the footer's height
-when it was added, so the strip costs one pane's worth of window before the
-stack scrolls rather than costing every pane a log line. Below that a tail shows a line or two and stops being
+down to `--mt-pane-min` (132px — a header and roughly ten monospace lines;
+122px under 560px wide, where the header wraps onto two rows). Both numbers had
+grown by 14px when the metrics were a footer strip, and both came back down by
+it when the metrics moved onto the title line — the reclaimed row goes to the
+window budget (one more pane before the stack scrolls), not quietly kept. Below that a tail shows a line or two and stops being
 information, so past that point the stack **scrolls** instead of shrinking
 further. On a laptop viewport that is an even split up to about five or six
 tails and a scrolling stack beyond.
@@ -339,25 +342,37 @@ column and an arrival-time column look identical and invite exactly the
 side-by-side comparison that is invalid. An empty column that explains itself
 beats a plausible fabrication.
 
-**The footer bar answers "whose agent is this, and what is it costing".** The
-mode is a whole-window takeover, so the queue rows that normally carry an
-agent's counters are not on screen; without the strip you can see what an agent
-is *doing* and nothing about what it is spending. Each pane's footer prints the
-model chip, tool calls, context tokens, output tokens, age since the agent's
-first transcript entry and its last tool — **read off that pane's own queue row**
+**The per-pane metrics answer "whose agent is this, and what is it costing".**
+The mode is a whole-window takeover, so the queue rows that normally carry an
+agent's counters are not on screen; without them you can see what an agent is
+*doing* and nothing about what it is spending. Each pane prints the model chip,
+tool calls, context tokens, output tokens, age since the agent's first
+transcript entry and its last tool — **read off that pane's own queue row**
 (`.model-tag`, `.agent-stats`) as the strings the server already formatted for
-the row cell and the header popover. Nothing is re-derived, so a footer and a
-row can never disagree about a count, and the values move on their own because
+the row cell and the header popover. Nothing is re-derived, so a pane and a row
+can never disagree about a count, and the values move on their own because
 `refresh.js` rebuilds those rows every 5s. A value that is not known is ABSENT:
 the server's formatters print `?` and `–` for "unknown" and those cells are
-skipped, because a footer that confidently shows a wrong context size is worse
-than a shorter one. A workload or hostjob pane runs no model and has no agent
-counters, so its footer carries the workload/hostjob label (which the pane
-header does not show) and stops there; a pane with nothing true to say hides the
-strip entirely rather than leaving an empty bar. The model is whatever the row
-says — never a pinned id, since an alias like `opus` tracks whichever model is
-newest and a hardcoded id would go stale silently. Under 560px the output-token
-and last-tool cells drop out first, leaving model / calls / ctx / age.
+skipped, because confidently showing a wrong context size is worse than showing
+less. A workload or hostjob pane runs no model and has no agent counters, so it
+carries the workload/hostjob label (which the rest of the header does not show)
+and stops there; a pane with nothing true to say hides them entirely rather than
+leaving empty cells. The model is whatever the row says — never a pinned id,
+since an alias like `opus` tracks whichever model is newest and a hardcoded id
+would go stale silently.
+
+**They sit on the title line, not on a row of their own.** A strip under the
+stream is a whole row of chrome per pane, and with five or six panes open that
+is five or six rows the logs do not get. The pane header already had a row with
+spare width, so the two share it: title flush left, metrics flush right. The
+push-right mechanism is the one the timestamp cell already uses — in a flex row,
+make the item that should absorb the slack the *only* flexible one and whatever
+follows lands against the far edge by itself, with no `margin-left: auto` and no
+absolute positioning. The title is that item and keeps a floor width, so long
+metrics ellipsise the numbers rather than the task name. Under 560px the header
+wraps, the title line becomes the second row (title and metrics together — they
+are one box, so a wrap cannot separate them) and the output-token and last-tool
+cells drop out, leaving model / calls / ctx / age beside a readable title.
 
 **A pane whose log does not exist yet keeps trying.** Eligibility and
 log-existence are different instants, routinely: a `workload:` / `hostjob:` row
@@ -447,10 +462,11 @@ fresh pane, and the three storage boots: a restored choice, an unrecognised
 stored value, and storage that throws) — plus the same parity checks against the
 real `refresh.js` builders. It also covers a stamped plain-text line (a real
 time in the column, the prefix gone from the body, and the pane's `no ts` marker
-coming down for that pane only) and the footer bar (the cells it prints, the
-unknown values it omits rather than placeholders, the workload label as the one
-thing a workload pane can truthfully add, a footer hidden when nothing is known,
-and the counters following the row on the next tick).
+coming down for that pane only) and the per-pane metrics (the cells they print,
+the unknown values they omit rather than placeholders, the workload label as the
+one thing a workload pane can truthfully add, metrics hidden when nothing is
+known, the counters following the row on the next tick, and where the group
+lives in the pane — inside the title line, with no footer row left behind).
 
 `static/multitail-refresh.test.js` loads **both** modules in one page, which is
 the only place the handover between them can be tested: a running item moved to

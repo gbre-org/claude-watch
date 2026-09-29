@@ -239,41 +239,60 @@
 // unavailable the mode works exactly as it did before it remembered anything.
 //
 // ---------------------------------------------------------------------------
-// PER-PANE FOOTER BAR — WHOSE AGENT IS THIS, AND WHAT IS IT COSTING
+// PER-PANE METRICS — WHOSE AGENT IS THIS, AND WHAT IS IT COSTING
 // ---------------------------------------------------------------------------
-// Each pane carries a footer strip under its stream: the model that is running
-// the item, its tool-call count, its context size, output tokens, last tool and
-// age. This mode is a whole-window takeover, so the queue rows that normally
-// carry those numbers are not on screen — without the strip, the reader can see
-// what an agent is DOING and nothing about what it is costing.
+// Every pane reports the model that is running the item, its tool-call count,
+// its context size, output tokens, last tool and age. This mode is a
+// whole-window takeover, so the queue rows that normally carry those numbers
+// are not on screen — without them, the reader can see what an agent is DOING
+// and nothing about what it is costing.
+//
+// THEY LIVE ON THE PANE'S TITLE LINE, NOT ON A ROW OF THEIR OWN. They started
+// as a footer strip under the stream, and a strip is a whole row of chrome per
+// pane — with five or six panes open that is five or six rows the logs do not
+// get (reported from botchat: "move the footer line in multitail up to the
+// title line (maybe right aligned for legibility). so left side is task title,
+// right side is calls/ctx/runtime/model"). The header already had a row and
+// spare width on it, so the title and the metrics share one: title flush left,
+// metrics flush right.
+//
+// The mechanism is the one the timestamp placement already uses a few hundred
+// lines down — in a flex row, make the thing that should fill the space the
+// ONLY flexible item and everything after it lands against the far edge. Here
+// the title is that item inside `.mt-pane-titlebar`, so the metrics need no
+// `margin-left: auto`, no absolute positioning and no second alignment idiom.
+// The title keeps a floor width and ellipsises; the metrics clip from their
+// own right, shedding the two cells that already know how to give way.
 //
 // EVERY FIELD IS READ, NEVER DERIVED. The values come off the pane's own queue
 // row (`.model-tag`, `.agent-stats`) as the strings the SERVER already
 // formatted for the row cell and the header popover (app.py
-// `_shape_agent_stat`), so a footer and a row can never disagree about a count,
+// `_shape_agent_stat`), so a pane and a row can never disagree about a count,
 // and nothing here re-implements a formatter. refresh.js rebuilds those rows
-// every 5s and the footer repaints on the reconcile tick, so the numbers move
+// every 5s and the metrics repaint on the reconcile tick, so the numbers move
 // on their own.
 //
 // A field with no value is ABSENT, not zeroed. The server's formatters use `?`
-// and `–` for "not known", and a footer cell is skipped for those exactly as it
-// is for an empty string: a confident wrong context size is worse than a
-// shorter strip. Whole classes of pane legitimately have nothing to show —
-// a workload or hostjob pane runs no model and has no agent counters, so its
-// footer carries the workload/hostjob LABEL (which the pane header does not
-// show) and stops there; an agent pane whose stats snapshot has not caught up
-// yet shows only the model, then fills in. A footer with nothing at all in it
-// is hidden outright rather than left as an empty bar.
+// and `–` for "not known", and a cell is skipped for those exactly as it is
+// for an empty string: a confident wrong context size is worse than a shorter
+// line. Whole classes of pane legitimately have nothing to show — a workload
+// or hostjob pane runs no model and has no agent counters, so it carries the
+// workload/hostjob LABEL (which the rest of the header does not show) and
+// stops there; an agent pane whose stats snapshot has not caught up yet shows
+// only the model, then fills in. Metrics with nothing at all in them are
+// hidden outright, and because they sit inside the title line that costs the
+// pane no space at all rather than leaving an empty bar.
 //
 // The model is whatever the row says — never a pinned id. An alias like `opus`
 // tracks whichever model is newest, so hardcoding one here would go stale
 // silently and lie about what actually ran.
 //
-// Space: the strip is one line of 0.62rem text, and --mt-pane-min grew by its
-// height so it comes out of the WINDOW budget (more scrolling past ~5 panes),
-// never out of the ~10 log lines a pane is meant to show. Below 560px the
-// output-token and last-tool cells drop out first — the phone keeps model,
-// calls, ctx and age.
+// Space: --mt-pane-min came back DOWN by the strip's height when the strip
+// went away, so the reclaimed row goes to the window budget (one more pane
+// before the stack scrolls) rather than being quietly kept. Below 560px the
+// header wraps and the title line is the second row — the metrics ride along
+// on it, still right-aligned, and the output-token and last-tool cells drop
+// out so what is left (model, calls, ctx, age) fits beside a readable title.
 //
 // ---------------------------------------------------------------------------
 // A PANE WHOSE JOB FINISHES WHILE THE MODE IS OPEN
@@ -523,16 +542,16 @@
       qid: row.getAttribute('data-queue-id') || '',
       mode: (row.getAttribute('data-live-log-mode') || '').toLowerCase(),
       summary: row.getAttribute('data-queue-summary') || '',
-      foot: rowFooterInfo(row),
+      meta: rowMetaInfo(row),
     };
   }
 
-  // Values for the pane footer, read off the rendered row. `.agent-stats` and
-  // `.model-tag` live in the row's HEAD — the one part of a card compact
-  // density never elides — and both are rebuilt by refresh.js every 5s, which
-  // is what keeps the footer live. Missing element or missing attribute means
-  // missing value, and a missing value is simply not rendered.
-  function rowFooterInfo(row) {
+  // Values for the pane's title-line metrics, read off the rendered row.
+  // `.agent-stats` and `.model-tag` live in the row's HEAD — the one part of a
+  // card compact density never elides — and both are rebuilt by refresh.js
+  // every 5s, which is what keeps the numbers live. Missing element or missing
+  // attribute means missing value, and a missing value is simply not rendered.
+  function rowMetaInfo(row) {
     const head = row.querySelector('.item-head') || row;
     const model = head.querySelector('.model-tag');
     const stats = head.querySelector('.agent-stats');
@@ -553,8 +572,8 @@
 
   // The server's formatters print `?` for a counter it could not read and `–`
   // for an absent one. Neither is a value, so neither gets a cell — see the
-  // header comment on why a footer says less rather than guessing.
-  function footValue(v) {
+  // header comment on why a pane says less rather than guessing.
+  function metaValue(v) {
     const s = String(v === undefined || v === null ? '' : v).trim();
     if (!s || s === '?' || s === '–' || s === '-') return '';
     return s;
@@ -914,20 +933,21 @@
     pane.noTsEl.hidden = !(tsOn && !paneHasSourceTimestamps(pane));
   }
 
-  // Repaint one pane's footer from `foot` (a rowFooterInfo shape). Cells are
-  // appended in a fixed order and only for values that exist; the whole strip
-  // is hidden when nothing does, so a workload pane with no label and an agent
-  // pane with no snapshot both get no empty bar. textContent only.
-  function paintPaneFooter(pane, foot) {
-    const bar = pane.footEl;
+  // Repaint one pane's title-line metrics from `meta` (a rowMetaInfo shape).
+  // Cells are appended in a fixed order and only for values that exist; the
+  // whole group is hidden when nothing does, so a workload pane with no label
+  // and an agent pane with no snapshot both leave the title line to the title.
+  // textContent only.
+  function paintPaneMeta(pane, meta) {
+    const bar = pane.metaEl;
     if (!bar) return;
     while (bar.firstChild) bar.removeChild(bar.firstChild);
-    const f = foot || {};
+    const f = meta || {};
     let cells = 0;
 
-    const model = footValue(f.model);
+    const model = metaValue(f.model);
     if (model) {
-      const chip = el('span', 'mt-foot-model', model);
+      const chip = el('span', 'mt-meta-model', model);
       // The row's own title is already `model: <raw id>`; pass it through
       // rather than composing a second wording for the same fact.
       if (f.modelTitle) chip.title = f.modelTitle;
@@ -939,9 +959,9 @@
     // and checking after turns the formatter's `–` ("not known") into a cell
     // reading just `out`, which is a placeholder wearing a unit.
     const add = (cls, raw, decorate, title) => {
-      const value = footValue(raw);
+      const value = metaValue(raw);
       if (!value) return;
-      const cell = el('span', 'mt-foot-cell ' + cls,
+      const cell = el('span', 'mt-meta-cell ' + cls,
         decorate ? decorate(value) : value);
       if (title) cell.title = title;
       bar.appendChild(cell);
@@ -949,20 +969,20 @@
     };
     // `calls_text` / `ctx_text` / `out_text` / `age_text` are the server's
     // strings; the unit words are ours and match the header popover's columns.
-    add('mt-foot-calls', f.calls, (v) => v + ' calls',
+    add('mt-meta-calls', f.calls, (v) => v + ' calls',
       'Tool calls this agent has made');
-    add('mt-foot-ctx', f.ctx, (v) => v + ' ctx',
+    add('mt-meta-ctx', f.ctx, (v) => v + ' ctx',
       'Context size (tokens) at the agent\'s last transcript write');
-    add('mt-foot-out', f.out, (v) => v + ' out',
+    add('mt-meta-out', f.out, (v) => v + ' out',
       'Output tokens this agent has produced');
-    add('mt-foot-age', f.age, null,
+    add('mt-meta-age', f.age, null,
       'Age since this agent\'s first transcript entry');
-    add('mt-foot-tool', f.lastTool, (v) => 'last ' + v,
+    add('mt-meta-tool', f.lastTool, (v) => 'last ' + v,
       'The last tool this agent invoked');
     // A workload / hostjob pane runs no model and has no agent counters; its
-    // label is the one thing it can truthfully add, and the pane header does
-    // not carry it.
-    add('mt-foot-label', f.label, null,
+    // label is the one thing it can truthfully add, and the rest of the pane
+    // header does not carry it.
+    add('mt-meta-label', f.label, null,
       'The workload / hostjob label being tailed');
 
     bar.hidden = cells === 0;
@@ -981,7 +1001,23 @@
     const head = el('header', 'mt-pane-head');
     head.appendChild(el('span', 'mt-pane-badge mt-badge-' + info.mode, modeBadgeText(info.mode)));
     head.appendChild(el('code', 'mt-pane-id', info.qid));
-    head.appendChild(el('span', 'mt-pane-summary', info.summary));
+    // THE TITLE LINE: title left, metrics right, one row for both. The title
+    // is the only flexible item in this little flex row, so it takes every
+    // pixel the metrics do not and the metrics end up against the far edge
+    // without an alignment rule of their own — the same trick the timestamp
+    // cell uses inside a log row. Wrapping the pair in one element is what
+    // keeps them TOGETHER when the header wraps on a phone: the wrap moves one
+    // box, and the title does not end up on a line the metrics left behind.
+    const titlebar = el('div', 'mt-pane-titlebar');
+    const summary = el('span', 'mt-pane-summary', info.summary);
+    titlebar.appendChild(summary);
+    // Metrics: whose agent this is and what it is costing. Filled from the row
+    // below, hidden while there is nothing true to put in it — and hidden here
+    // costs the pane nothing, because the row belongs to the title either way.
+    const meta = el('div', 'mt-pane-meta');
+    meta.hidden = true;
+    titlebar.appendChild(meta);
+    head.appendChild(titlebar);
     const noTs = el('span', 'mt-pane-nots', 'no ts');
     noTs.title =
       'This log is plain text and carries no per-line timestamps. ' +
@@ -1002,12 +1038,6 @@
     stream.tabIndex = 0;
     wrap.appendChild(stream);
 
-    // Footer strip: whose agent this is and what it is costing. Filled from
-    // the row below, hidden while there is nothing true to put in it.
-    const foot = el('footer', 'mt-pane-foot');
-    foot.hidden = true;
-    wrap.appendChild(foot);
-
     const pane = {
       qid: info.qid,
       mode: info.mode,
@@ -1015,7 +1045,7 @@
       streamEl: stream,
       statusEl: status,
       noTsEl: noTs,
-      footEl: foot,
+      metaEl: meta,
       es: null,
       streaming: false,   // holds a connection right now
       terminal: false,    // stream reported a real end; never reconnect
@@ -1073,7 +1103,7 @@
     });
 
     syncPaneTsMarker(pane);
-    paintPaneFooter(pane, info.foot);
+    paintPaneMeta(pane, info.meta);
     return pane;
   }
 
@@ -1512,7 +1542,7 @@
       // agent-stats cell) since the last tick, so re-read it. An ENDED pane is
       // not in `rows` at all, so its footer keeps the last values it had —
       // which is the honest answer for an agent that has returned.
-      paintPaneFooter(existing, info.foot);
+      paintPaneMeta(existing, info.meta);
     }
     // A pane whose row stopped being eligible (finished, abandoned, moved out
     // of the running section) is marked ENDED, never removed — see the header
