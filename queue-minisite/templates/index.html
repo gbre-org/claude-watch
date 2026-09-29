@@ -50,7 +50,7 @@
   })();
   </script>
 </head>
-<body>
+<body data-asset-version="{{ asset_version }}">
   {#- ---------- RECURSIVE SUBAGENT NODE MACRO ----------
       Renders ONE subagent node (and, recursively, its genuine spawn-children).
       The node shape is produced by app.py _build_subagent_tree:
@@ -131,6 +131,31 @@
   {%- macro model_tag(it) -%}
     {%- if it.model_label %}<span class="model-tag" title="model: {{ it.model or it.model_label }}">{{ it.model_label }}</span>{% endif -%}
   {%- endmacro -%}
+  {#- ---------- STALE-BUILD BANNER (botchat #4947) ----------
+      This page updates itself by polling /api/queue and morphing the result
+      in, so an open tab NEVER reloads and keeps running the HTML/JS/CSS it
+      fetched when it was opened. A deploy therefore does not reach it, and the
+      live-updating rows give no hint: a front-end feature can be merged,
+      deployed and verified on the server while the one browser that matters is
+      still running last week's file. That is how the multitail auto-close was
+      reported as broken when it was merely absent from a 30-minute-old tab.
+
+      So the server stamps the build that rendered this page on <body>
+      (data-asset-version, from app.py _asset_version) and ships the same value
+      in every /api/queue payload; static/refresh.js compares them each tick and
+      unhides this banner when they differ. It never reloads by itself — that
+      would throw away open panes, scroll position and any dialog in flight.
+
+      It is `position: fixed` with a z-index above the multitail overlay, so it
+      is visible in the whole-window mode too — the mode this bug was reported
+      from. NOTE: it deliberately does NOT carry `data-no-morph`; it sits
+      outside both merge roots so it needs no exemption, and multitail.js treats
+      any VISIBLE [data-no-morph] element as an open dialog that owns the
+      keyboard, which would silently kill its w/t/c keys. -#}
+  <div id="stale-build" class="stale-build" role="status" hidden>
+    <span class="stale-build-text">This page is running an older build than the server.</span>
+    <button type="button" id="stale-build-reload" class="stale-build-btn">Reload</button>
+  </div>
   <header class="topbar">
     <div class="title">
       {#- HEADER COLLAPSE (botchat #1762): a caret button that folds the header
@@ -393,8 +418,18 @@
                 html.density-compact. Rendered ONLY when a live agent matched
                 (it.agent_stats is None when the feature is off, the snapshot
                 is absent / stale, or no agent carries this id). Mirrored in
-                static/refresh.js renderRunningItem(). #}
-            {% if it.agent_stats %}<span class="agent-stats" title="{{ it.agent_stats.title }}" data-tool-calls="{{ it.agent_stats.tool_calls }}" data-context-tokens="{{ it.agent_stats.context_tokens }}"><span class="agent-stats-full">{{ it.agent_stats.full_label }}</span><span class="agent-stats-short">{{ it.agent_stats.short_label }}</span></span>{% endif %}
+                static/refresh.js renderRunningItem().
+
+                The data-* attributes carry the SERVER-FORMATTED strings
+                (app.py _shape_agent_stat) for consumers that lay the same
+                numbers out differently — currently multitail.js, whose
+                per-pane footer bar prints model / calls / ctx / out / last
+                tool / age while the whole-window mode hides these rows. They
+                are read, never re-derived, so the two surfaces can never
+                disagree about a count. `–` / `?` mean "not known" (the
+                formatter's own markers) and the footer omits those cells
+                rather than printing a placeholder. #}
+            {% if it.agent_stats %}<span class="agent-stats" title="{{ it.agent_stats.title }}" data-tool-calls="{{ it.agent_stats.tool_calls }}" data-context-tokens="{{ it.agent_stats.context_tokens }}" data-calls-text="{{ it.agent_stats.calls_text }}" data-ctx-text="{{ it.agent_stats.ctx_text }}" data-out-text="{{ it.agent_stats.out_text }}" data-last-tool="{{ it.agent_stats.last_tool }}" data-age-text="{{ it.agent_stats.age_text }}"><span class="agent-stats-full">{{ it.agent_stats.full_label }}</span><span class="agent-stats-short">{{ it.agent_stats.short_label }}</span></span>{% endif %}
             <button
               type="button"
               class="action-btn stop-btn"

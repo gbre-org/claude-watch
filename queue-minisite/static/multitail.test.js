@@ -1181,6 +1181,166 @@ console.log('\n-- retries lose to `ended`, and do not fight the slot cap');
   mt.closeMode();
 }
 
+// ==========================================================================
+console.log('\n-- stamped plain-text lines (source_ts): a real time, or none');
+// ==========================================================================
+{
+  // A workload log whose producer stamped every line reaches the client with
+  // the prefix ALREADY split off into `source_ts` (app.py _plain_line_event).
+  // The pane must render it in the same column an agent record's timestamp
+  // uses — and stop claiming the source has no timestamps, because it does.
+  resetQueue([card('q-st', 'workload', 'stamped workload'),
+    card('q-un', 'workload', 'unstamped workload')]);
+  mt.openMode();
+  mt.setTimestamps(true);
+
+  assert('a plain-text pane starts out assumed timestamp-less',
+    paneFor('q-st').querySelector('.mt-pane-nots').hidden === false);
+
+  streamFor('q-st').emit({
+    type: 'event',
+    kind: 'workload_line',
+    text: 'promoting Gundam',
+    source_ts: '2026-09-28T22:53:35-04:00',
+    transient: false,
+  });
+  const cell = paneFor('q-st').querySelector('.mt-ts');
+  assert('a stamped workload line gets a timestamp cell', cell !== null);
+  assert('showing the LINE\'s own time', cell && /^\d\d:\d\d:\d\d$/.test(cell.textContent),
+    cell && cell.textContent);
+  assert('with the raw stamp as its tooltip',
+    cell && cell.title === '2026-09-28T22:53:35-04:00', cell && cell.title);
+  assert('the line body no longer carries the prefix',
+    bodyOf('q-st') === 'promoting Gundam', bodyOf('q-st'));
+  assert('and the pane stops saying it has no timestamps',
+    paneFor('q-st').querySelector('.mt-pane-nots').hidden === true);
+  assert('the observation is per pane, not global',
+    paneFor('q-un').querySelector('.mt-pane-nots').hidden === false);
+
+  // An unstamped line in the SAME pane simply has no cell. Mixing the two is
+  // normal: a workload file spans a deploy, and the wrapper's own header lines
+  // are never stamped.
+  streamFor('q-st').emit({
+    type: 'event', kind: 'workload_line', text: '=== workload: x ===', transient: false,
+  });
+  assert('an unstamped line beside a stamped one gets no cell',
+    paneFor('q-st').querySelectorAll('.mt-line').length === 2 &&
+    paneFor('q-st').querySelectorAll('.mt-ts').length === 1,
+    paneFor('q-st').querySelectorAll('.mt-ts').length + ' cells');
+  assert('and the pane keeps the marker down (it HAS seen a real time)',
+    paneFor('q-st').querySelector('.mt-pane-nots').hidden === true);
+
+  // The toggle stays retroactive: turning the column off and on again
+  // re-projects from the records, stamps included.
+  mt.setTimestamps(false);
+  assert('column off removes the cell', paneFor('q-st').querySelector('.mt-ts') === null);
+  mt.setTimestamps(true);
+  assert('column on restores it from the retained record',
+    paneFor('q-st').querySelectorAll('.mt-ts').length === 1);
+  mt.setTimestamps(false);
+  mt.closeMode();
+}
+
+// ==========================================================================
+console.log('\n-- per-pane footer bar: read off the row, never invented');
+// ==========================================================================
+{
+  // A card shaped like the real thing: the model chip and the agent-stats cell
+  // live in the item HEAD, carrying the SERVER-FORMATTED strings as data
+  // attributes. The footer reads those; it computes nothing.
+  function richCard(qid, mode, summary, opts) {
+    const o = opts || {};
+    const model = o.model === undefined ? 'opus' : o.model;
+    const modelChip = model
+      ? `<span class="model-tag" title="model: claude-${model}-5">${model}</span>`
+      : '';
+    const stats = o.stats === false ? '' :
+      `<span class="agent-stats" title="41 tool calls · 118K context tokens"` +
+      ` data-tool-calls="41" data-context-tokens="118000"` +
+      ` data-calls-text="${o.calls === undefined ? '41' : o.calls}"` +
+      ` data-ctx-text="${o.ctx === undefined ? '118K' : o.ctx}"` +
+      ` data-out-text="${o.out === undefined ? '9.1K' : o.out}"` +
+      ` data-last-tool="${o.lastTool === undefined ? 'Bash' : o.lastTool}"` +
+      ` data-age-text="${o.age === undefined ? '12m' : o.age}"></span>`;
+    const label = o.label ? ` data-workload-label="${o.label}"` : '';
+    return `<article class="item state-running log-clickable" data-queue-id="${qid}" ` +
+      `data-queue-status="running" data-queue-summary="${summary}" ` +
+      `data-log-mode="${mode}" data-live-log-mode="${mode}"${label}>` +
+      `<header class="item-head">${modelChip}${stats}</header>` +
+      `<p class="summary">${summary}</p></article>`;
+  }
+  const footCells = (qid) =>
+    Array.from(paneFor(qid).querySelectorAll('.mt-pane-foot > *'))
+      .map((n) => n.textContent);
+  const footBar = (qid) => paneFor(qid).querySelector('.mt-pane-foot');
+
+  resetQueue([
+    richCard('q-f1', 'live', 'an agent'),
+    richCard('q-f2', 'workload', 'a workload', { model: '', stats: false, label: 'promote-thing' }),
+    richCard('q-f3', 'live', 'nothing known yet', { model: '', stats: false }),
+    richCard('q-f4', 'live', 'partial', { out: '–', lastTool: '', age: '?' }),
+  ]);
+  mt.openMode();
+
+  assert('every pane has a footer element', paneEls().every(
+    (p) => p.querySelector('.mt-pane-foot') !== null));
+  assert('an agent pane prints model, calls, ctx, out, age and last tool',
+    footCells('q-f1').join(' | ') === 'opus | 41 calls | 118K ctx | 9.1K out | 12m | last Bash',
+    footCells('q-f1').join(' | '));
+  assert('the model chip keeps the row\'s own title (the raw id)',
+    footBar('q-f1').querySelector('.mt-foot-model').title === 'model: claude-opus-5',
+    footBar('q-f1').querySelector('.mt-foot-model').title);
+  assert('the footer is visible when it has something to say',
+    footBar('q-f1').hidden === false);
+
+  // A workload pane runs no model and has no agent counters. It says the one
+  // true thing it has — the label being tailed, which the head does not show.
+  assert('a workload pane shows its label and nothing invented',
+    footCells('q-f2').join(' | ') === 'promote-thing', footCells('q-f2').join(' | '));
+
+  // Nothing known at all -> no empty bar.
+  assert('a pane with nothing known at all hides its footer (no empty bar)',
+    footBar('q-f3').hidden === true, footCells('q-f3').join(' | '));
+
+  // `–` and `?` are the server formatter's "not known" markers, never values.
+  assert('unknown values are omitted, not printed as placeholders',
+    footCells('q-f4').join(' | ') === 'opus | 41 calls | 118K ctx',
+    footCells('q-f4').join(' | '));
+
+  // The counters move on their own: refresh.js rebuilds the row every 5s and
+  // the footer re-reads it on the reconcile tick.
+  document.getElementById('queue-root').innerHTML = [
+    richCard('q-f1', 'live', 'an agent', { calls: '58', ctx: '140K', out: '11K', age: '14m', lastTool: 'Read' }),
+    richCard('q-f2', 'workload', 'a workload', { model: '', stats: false, label: 'promote-thing' }),
+    richCard('q-f3', 'live', 'nothing known yet', { model: '', stats: false }),
+    richCard('q-f4', 'live', 'partial', { out: '–', lastTool: '', age: '?' }),
+  ].join('\n');
+  mt.reconcile();
+  assert('the footer follows the row on the next tick',
+    footCells('q-f1').join(' | ') === 'opus | 58 calls | 140K ctx | 11K out | 14m | last Read',
+    footCells('q-f1').join(' | '));
+
+  // A snapshot that catches up later fills the footer in rather than leaving
+  // a stale blank.
+  document.getElementById('queue-root').innerHTML = [
+    richCard('q-f3', 'live', 'nothing known yet'),
+  ].join('\n');
+  mt.reconcile();
+  assert('a pane whose stats arrive later shows them',
+    footBar('q-f3').hidden === false &&
+    footCells('q-f3').join(' | ').indexOf('41 calls') !== -1,
+    footCells('q-f3').join(' | '));
+
+  // The footer is chrome, not log content: it must not consume a line of the
+  // stream, and the stream element stays the pane's flexible child.
+  assert('the footer sits AFTER the stream, so it cannot push lines out',
+    paneFor('q-f3').lastElementChild.className === 'mt-pane-foot');
+  assert('textContent only — no markup from a queue record ever',
+    paneFor('q-f3').querySelector('.mt-pane-foot').innerHTML.indexOf('<span') !== -1 &&
+    paneFor('q-f3').querySelector('.mt-pane-foot').querySelectorAll('script').length === 0);
+  mt.closeMode();
+}
+
 console.log(
   failures === 0
     ? '\nAll multitail tests passed.'

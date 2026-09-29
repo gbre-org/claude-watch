@@ -492,10 +492,13 @@
     // Labels come pre-formatted from the server (full_label / short_label /
     // title) so both renderers print identical strings. Omitted entirely when
     // it.agent_stats is null (feature off / snapshot absent or stale / no
-    // matching agent) — never a frozen or placeholder number.
+    // matching agent) — never a frozen or placeholder number. The data-*
+    // attributes carry the server's formatted strings for multitail.js's
+    // per-pane footer bar, which reads them off this row rather than
+    // re-deriving them; MUST stay in step with templates/index.html.
     const agentStats = it.agent_stats;
     if (agentStats) {
-      head += `<span class="agent-stats" title="${attr(agentStats.title || '')}" data-tool-calls="${attr(agentStats.tool_calls ?? '')}" data-context-tokens="${attr(agentStats.context_tokens ?? '')}">` +
+      head += `<span class="agent-stats" title="${attr(agentStats.title || '')}" data-tool-calls="${attr(agentStats.tool_calls ?? '')}" data-context-tokens="${attr(agentStats.context_tokens ?? '')}" data-calls-text="${attr(agentStats.calls_text || '')}" data-ctx-text="${attr(agentStats.ctx_text || '')}" data-out-text="${attr(agentStats.out_text || '')}" data-last-tool="${attr(agentStats.last_tool || '')}" data-age-text="${attr(agentStats.age_text || '')}">` +
         `<span class="agent-stats-full">${esc(agentStats.full_label || '')}</span>` +
         `<span class="agent-stats-short">${esc(agentStats.short_label || '')}</span>` +
         '</span>';
@@ -1525,6 +1528,50 @@
   }
 
   // ---------------------------------------------------------------------
+  // STALE-BUILD BANNER (botchat #4947)
+  //
+  // This page never reloads on its own — it polls /api/queue and morphs the
+  // result in — so an open tab keeps running whatever JS it loaded, for as long
+  // as it stays open. A deploy is invisible to it. The server stamps the build
+  // that rendered the page on <body data-asset-version> and ships the live
+  // build in each payload's `asset_version`; a difference means THIS PAGE is
+  // out of date, and the only honest thing to do is say so.
+  //
+  // We do not reload automatically. A tab that reloaded itself would discard
+  // open multitail panes, scroll position, dismissed panes and any confirm
+  // dialog mid-flight; the viewer picks the moment.
+  //
+  // Both values must be non-empty to count as a mismatch: an older server that
+  // ships no version at all, or a page rendered before the stamp existed, must
+  // not make every tab shout about a difference it cannot actually establish.
+  // ---------------------------------------------------------------------
+  function pageAssetVersion() {
+    const body = document.body;
+    return (body && body.getAttribute('data-asset-version')) || '';
+  }
+
+  function applyBuildVersion(state) {
+    const banner = document.getElementById('stale-build');
+    if (!banner) return;
+    const mine = pageAssetVersion();
+    const served = (state && typeof state.asset_version === 'string')
+      ? state.asset_version
+      : '';
+    banner.hidden = !(mine && served && mine !== served);
+  }
+
+  // The banner is server-rendered once and never morphed, so a direct listener
+  // is safe here (unlike the topbar pills, which are rebuilt every tick).
+  (function bindStaleBuildReload() {
+    const btn = document.getElementById('stale-build-reload');
+    if (!btn) return;
+    btn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      try { window.location.reload(); } catch (_) { /* nothing else to try */ }
+    });
+  })();
+
+  // ---------------------------------------------------------------------
   // Tick — fetch + merge. After a successful merge re-hydrate local-time
   // so any new timestamp elements are converted to the viewer's tz.
   // ---------------------------------------------------------------------
@@ -1536,6 +1583,9 @@
 
       mergeQueueRoot(j);
       mergeTopbarMeta(j);
+
+      // Is the build this page is running still the one the server serves?
+      applyBuildVersion(j);
 
       // Re-apply the active source filter to the freshly-merged cards.
       // New/changed cards default to visible; this hides any that don't
@@ -1620,6 +1670,8 @@
   // exercise buildQueueDOM + the merge with synthetic JSON snapshots.
   window.__queueRefresh = {
     relAge,
+    applyBuildVersion,
+    pageAssetVersion,
     buildQueueDOM,
     buildTopbarMetaDOM,
     buildSourceFilterHTML,

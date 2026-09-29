@@ -157,6 +157,43 @@
 // itself is strictly better than a plausible fabrication.
 //
 // ---------------------------------------------------------------------------
+// PER-PANE FOOTER BAR — WHOSE AGENT IS THIS, AND WHAT IS IT COSTING
+// ---------------------------------------------------------------------------
+// Each pane carries a footer strip under its stream: the model that is running
+// the item, its tool-call count, its context size, output tokens, last tool and
+// age. This mode is a whole-window takeover, so the queue rows that normally
+// carry those numbers are not on screen — without the strip, the reader can see
+// what an agent is DOING and nothing about what it is costing.
+//
+// EVERY FIELD IS READ, NEVER DERIVED. The values come off the pane's own queue
+// row (`.model-tag`, `.agent-stats`) as the strings the SERVER already
+// formatted for the row cell and the header popover (app.py
+// `_shape_agent_stat`), so a footer and a row can never disagree about a count,
+// and nothing here re-implements a formatter. refresh.js rebuilds those rows
+// every 5s and the footer repaints on the reconcile tick, so the numbers move
+// on their own.
+//
+// A field with no value is ABSENT, not zeroed. The server's formatters use `?`
+// and `–` for "not known", and a footer cell is skipped for those exactly as it
+// is for an empty string: a confident wrong context size is worse than a
+// shorter strip. Whole classes of pane legitimately have nothing to show —
+// a workload or hostjob pane runs no model and has no agent counters, so its
+// footer carries the workload/hostjob LABEL (which the pane header does not
+// show) and stops there; an agent pane whose stats snapshot has not caught up
+// yet shows only the model, then fills in. A footer with nothing at all in it
+// is hidden outright rather than left as an empty bar.
+//
+// The model is whatever the row says — never a pinned id. An alias like `opus`
+// tracks whichever model is newest, so hardcoding one here would go stale
+// silently and lie about what actually ran.
+//
+// Space: the strip is one line of 0.62rem text, and --mt-pane-min grew by its
+// height so it comes out of the WINDOW budget (more scrolling past ~5 panes),
+// never out of the ~10 log lines a pane is meant to show. Below 560px the
+// output-token and last-tool cells drop out first — the phone keeps model,
+// calls, ctx and age.
+//
+// ---------------------------------------------------------------------------
 // A PANE WHOSE JOB FINISHES WHILE THE MODE IS OPEN
 // ---------------------------------------------------------------------------
 // Its header flips to `ended` (with the exit code when the stream reported
@@ -351,7 +388,41 @@
       qid: row.getAttribute('data-queue-id') || '',
       mode: (row.getAttribute('data-live-log-mode') || '').toLowerCase(),
       summary: row.getAttribute('data-queue-summary') || '',
+      foot: rowFooterInfo(row),
     };
+  }
+
+  // Values for the pane footer, read off the rendered row. `.agent-stats` and
+  // `.model-tag` live in the row's HEAD — the one part of a card compact
+  // density never elides — and both are rebuilt by refresh.js every 5s, which
+  // is what keeps the footer live. Missing element or missing attribute means
+  // missing value, and a missing value is simply not rendered.
+  function rowFooterInfo(row) {
+    const head = row.querySelector('.item-head') || row;
+    const model = head.querySelector('.model-tag');
+    const stats = head.querySelector('.agent-stats');
+    const attr = (el, name) => (el ? el.getAttribute(name) || '' : '');
+    return {
+      model: model ? String(model.textContent || '') : '',
+      modelTitle: attr(model, 'title'),
+      calls: attr(stats, 'data-calls-text'),
+      ctx: attr(stats, 'data-ctx-text'),
+      out: attr(stats, 'data-out-text'),
+      lastTool: attr(stats, 'data-last-tool'),
+      age: attr(stats, 'data-age-text'),
+      statsTitle: attr(stats, 'title'),
+      label: row.getAttribute('data-workload-label') ||
+        row.getAttribute('data-hostjob-label') || '',
+    };
+  }
+
+  // The server's formatters print `?` for a counter it could not read and `–`
+  // for an absent one. Neither is a value, so neither gets a cell — see the
+  // header comment on why a footer says less rather than guessing.
+  function footValue(v) {
+    const s = String(v === undefined || v === null ? '' : v).trim();
+    if (!s || s === '?' || s === '–' || s === '-') return '';
+    return s;
   }
 
   // --- small DOM helpers ---------------------------------------------------
@@ -396,11 +467,16 @@
     return m ? m[1] : '';
   }
 
-  // Does this pane's SOURCE carry per-line timestamps at all? See the header
-  // comment: we never substitute the client's arrival time for a source that
-  // has none.
+  // Does this pane's SOURCE carry per-line timestamps? OBSERVED, not assumed
+  // from the mode: agent transcripts always carry one, and a plain-text
+  // workload log carries one exactly when its producer stamped it — the same
+  // `workload` mode covers a stamped log and a file written before stamping
+  // existed. So the answer is "has any line in this pane arrived with a source
+  // timestamp", which starts at the mode's baseline and flips the first time a
+  // stamped line shows up. Either way we never substitute the client's arrival
+  // time for a source that has none — see the header comment.
   function paneHasSourceTimestamps(pane) {
-    return !!TS_SOURCE_MODES[pane.mode];
+    return !!(pane.sawTs || TS_SOURCE_MODES[pane.mode]);
   }
 
   // --- compact event formatting -------------------------------------------
@@ -471,12 +547,17 @@
   }
 
   // The record's OWN timestamp, or '' when the source carries none. Agent
-  // transcript records have an ISO8601 `timestamp`; plain-text workload and
-  // hostjob frames have no such field and get '' — never a synthesised one.
+  // transcript records have an ISO8601 `timestamp`; a plain-text line carries
+  // one only when its producer stamped it, in which case the server has
+  // already split the prefix off into `source_ts` (app.py `_plain_line_event`).
+  // Neither is ever synthesised: no timestamp means no time, not "now".
   function sourceTs(payload) {
     const rec = payload && payload.rec;
     if (rec && typeof rec.timestamp === 'string' && rec.timestamp) {
       return rec.timestamp;
+    }
+    if (payload && typeof payload.source_ts === 'string' && payload.source_ts) {
+      return payload.source_ts;
     }
     return '';
   }
@@ -490,9 +571,15 @@
       return { sigil: '', text: firstLine(payload.line || ''), cls: 'mt-raw', ts: '' };
     }
     if (payload.kind === 'workload_line') {
-      // Plain-text tail (workload / hostjob / archived output): verbatim, and
-      // carrying no timestamp of its own.
-      return { sigil: '', text: payload.text || '', cls: 'mt-plain', ts: '' };
+      // Plain-text tail (workload / hostjob / archived output): verbatim. A
+      // stamped producer's time arrives as `source_ts` (split off the text
+      // server-side); an unstamped line gets '' and shows no time.
+      return {
+        sigil: '',
+        text: payload.text || '',
+        cls: 'mt-plain',
+        ts: sourceTs(payload),
+      };
     }
 
     const rec = payload.rec || {};
@@ -560,6 +647,65 @@
     pane.noTsEl.hidden = !(tsOn && !paneHasSourceTimestamps(pane));
   }
 
+  // Repaint one pane's footer from `foot` (a rowFooterInfo shape). Cells are
+  // appended in a fixed order and only for values that exist; the whole strip
+  // is hidden when nothing does, so a workload pane with no label and an agent
+  // pane with no snapshot both get no empty bar. textContent only.
+  function paintPaneFooter(pane, foot) {
+    const bar = pane.footEl;
+    if (!bar) return;
+    while (bar.firstChild) bar.removeChild(bar.firstChild);
+    const f = foot || {};
+    let cells = 0;
+
+    const model = footValue(f.model);
+    if (model) {
+      const chip = el('span', 'mt-foot-model', model);
+      // The row's own title is already `model: <raw id>`; pass it through
+      // rather than composing a second wording for the same fact.
+      if (f.modelTitle) chip.title = f.modelTitle;
+      bar.appendChild(chip);
+      cells += 1;
+    }
+
+    // The value is validated BEFORE the unit word is attached. Composing first
+    // and checking after turns the formatter's `–` ("not known") into a cell
+    // reading just `out`, which is a placeholder wearing a unit.
+    const add = (cls, raw, decorate, title) => {
+      const value = footValue(raw);
+      if (!value) return;
+      const cell = el('span', 'mt-foot-cell ' + cls,
+        decorate ? decorate(value) : value);
+      if (title) cell.title = title;
+      bar.appendChild(cell);
+      cells += 1;
+    };
+    // `calls_text` / `ctx_text` / `out_text` / `age_text` are the server's
+    // strings; the unit words are ours and match the header popover's columns.
+    add('mt-foot-calls', f.calls, (v) => v + ' calls',
+      'Tool calls this agent has made');
+    add('mt-foot-ctx', f.ctx, (v) => v + ' ctx',
+      'Context size (tokens) at the agent\'s last transcript write');
+    add('mt-foot-out', f.out, (v) => v + ' out',
+      'Output tokens this agent has produced');
+    add('mt-foot-age', f.age, null,
+      'Age since this agent\'s first transcript entry');
+    add('mt-foot-tool', f.lastTool, (v) => 'last ' + v,
+      'The last tool this agent invoked');
+    // A workload / hostjob pane runs no model and has no agent counters; its
+    // label is the one thing it can truthfully add, and the pane header does
+    // not carry it.
+    add('mt-foot-label', f.label, null,
+      'The workload / hostjob label being tailed');
+
+    bar.hidden = cells === 0;
+    if (f.statsTitle) {
+      bar.title = f.statsTitle;
+    } else {
+      bar.removeAttribute('title');
+    }
+  }
+
   function buildPane(info) {
     const wrap = el('section', 'mt-pane');
     wrap.setAttribute('data-queue-id', info.qid);
@@ -589,6 +735,12 @@
     stream.tabIndex = 0;
     wrap.appendChild(stream);
 
+    // Footer strip: whose agent this is and what it is costing. Filled from
+    // the row below, hidden while there is nothing true to put in it.
+    const foot = el('footer', 'mt-pane-foot');
+    foot.hidden = true;
+    wrap.appendChild(foot);
+
     const pane = {
       qid: info.qid,
       mode: info.mode,
@@ -596,6 +748,7 @@
       streamEl: stream,
       statusEl: status,
       noTsEl: noTs,
+      footEl: foot,
       es: null,
       streaming: false,   // holds a connection right now
       terminal: false,    // stream reported a real end; never reconnect
@@ -623,6 +776,11 @@
       // open the log, so a pane that failed to open and then retried
       // successfully would otherwise suppress its very first content.
       sawData: false,
+      // Whether any line in this pane has arrived carrying a source timestamp.
+      // Plain-text logs are stamped by their producer or not at all, and both
+      // shapes are `workload` mode, so this is observed rather than assumed —
+      // it is what decides whether the `no ts` marker is telling the truth.
+      sawTs: false,
       // Stream-retry backoff. retryAt is an epoch-ms deadline (0 = none);
       // retryAttempts drives the delay and resets once data actually arrives.
       retryAt: 0,
@@ -644,6 +802,7 @@
     });
 
     syncPaneTsMarker(pane);
+    paintPaneFooter(pane, info.foot);
     return pane;
   }
 
@@ -685,6 +844,12 @@
       ts: fmt.ts || '',
     };
     pane.records.push(rec);
+    // First stamped line in a plain-text pane: the source DOES carry times
+    // after all, so the `no ts` marker has to come down.
+    if (rec.ts && !pane.sawTs) {
+      pane.sawTs = true;
+      syncPaneTsMarker(pane);
+    }
     pane.streamEl.appendChild(renderRecord(rec));
     while (pane.records.length > MAX_LINES_PER_PANE) {
       pane.records.shift();
@@ -1045,6 +1210,11 @@
       // without touching the stream.
       const sumEl = existing.el.querySelector('.mt-pane-summary');
       if (sumEl && sumEl.textContent !== info.summary) sumEl.textContent = info.summary;
+      // Same for the footer counters: refresh.js rebuilt this row (and its
+      // agent-stats cell) since the last tick, so re-read it. An ENDED pane is
+      // not in `rows` at all, so its footer keeps the last values it had —
+      // which is the honest answer for an agent that has returned.
+      paintPaneFooter(existing, info.foot);
     }
     // A pane whose row stopped being eligible (finished, abandoned, moved out
     // of the running section) is marked ENDED, never removed — see the header

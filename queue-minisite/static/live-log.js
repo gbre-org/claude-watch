@@ -998,8 +998,19 @@
   // hint. We render extra detail in a <details> wrapper so the line
   // stays compact by default.
 
-  function fmtTs(rec) {
-    const ts = rec && rec.timestamp;
+  // `rec` is the agent-transcript record (which carries its own `timestamp`);
+  // `payload` is the SSE frame around it, and for a plain-text tail — workload,
+  // hostjob, archived output — that frame is where the line's time lives. A
+  // stamping producer writes `date -Iseconds ` in front of every line and the
+  // server splits it back off into `source_ts` (app.py `_plain_line_event`), so
+  // this modal shows a workload line's own time the same way it shows an agent
+  // record's. A line with no stamp — every log written before stamping existed
+  // — still gets NO time: the arrival time in this browser is not the log's
+  // time, and for the 200-line backfill it would be uniformly "now", flattening
+  // exactly the timing the reader opened the log to see.
+  function fmtTs(rec, payload) {
+    const ts = (rec && rec.timestamp) ||
+      (payload && typeof payload.source_ts === 'string' ? payload.source_ts : '');
     if (!ts) return '';
     // Render in the viewer's local timezone via LocalTime.timeOnly().
     // Backend ships UTC ISO8601; conversion is purely frontend.
@@ -1484,6 +1495,12 @@
   // — plain stdout/stderr line, no JSONL structure. Render as a compact
   // row with no per-line label so the output looks like a terminal tail
   // rather than the rich claude-code transcript.
+  //
+  // `text` is the line WITHOUT its timestamp prefix when the producer wrote
+  // one: the server has already split that off into the frame's `source_ts`,
+  // which renderEvent renders as the row's `.log-ts` cell. So the time appears
+  // once, in the same column an agent record's timestamp uses, instead of twice
+  // (once as a column and once inside the line text).
   function fmtWorkloadLine(rec, payload) {
     const text = (payload && typeof payload.text === 'string') ? payload.text : '';
     // Workload lines are already terminal-style one-liners — the
@@ -1646,7 +1663,7 @@
     // fmtWorkloadLine) can access payload-level fields like `text` that
     // don't live under `rec`. Existing formatters ignore the 2nd arg.
     const out = fmt(rec, payload);
-    const ts = fmtTs(rec);
+    const ts = fmtTs(rec, payload);
     const tsHtml = ts ? '<span class="log-ts">' + esc(ts) + '</span> ' : '';
     const labelHtml = out.label ? '<span class="log-label">' + out.label + '</span> ' : '';
     const headlineText = (out.headline !== undefined && out.headline !== null)

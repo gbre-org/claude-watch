@@ -189,7 +189,11 @@ modal N times in a row.
 * **Line wrap**: the `wrap` pill, or the **`w`** key. Off by default.
 * **Timestamps**: the `time` pill, or the **`t`** key. Off by default.
 * **Ended-pane retention**: the `clear` pill, or the **`c`** key. Cycles
-  `clear 1m` → `clear 5m` → `clear 15m` → `keep`, default **1m**.
+  `clear 1m` → `clear 5m` → `clear 15m` → `keep`, default **1m**. If finished
+  panes are *not* clearing, check first whether the tab predates the deploy that
+  added this — see **Is this page stale?** below.
+* **Per-pane footer bar**: model · tool calls · context · output · age · last
+  tool, under each pane's stream.
 * `w`, `t` and `c` are mode-local — inert while the overlay is closed, while you
   are typing in a field, and while another dialog owns the keyboard. Modified
   chords pass straight through, so `Ctrl`/`Cmd`+`W` still closes the tab and
@@ -200,6 +204,27 @@ modal N times in a row.
   (`localStorage`, `qsite_mt_retain`) — it is a policy about how much finished
   output survives rather than a projection of the current page, so picking
   `keep` should not have to be repeated after every reload.
+
+**Is this page stale?** This dashboard is built to be left open: it refreshes
+itself by polling `/api/queue` and morphing the result in, and it never reloads.
+So a deploy does **not** reach an open tab — the HTML, JS and CSS it is running
+are the ones it fetched when it was opened, however long ago that was, and the
+live-updating rows give no hint. That is not hypothetical: the ended-pane
+retention above was merged, deployed and verified on the server, and reported as
+not working half an hour later by a tab that predated the deploy and had made
+447 API polls and zero page loads since. The feature was not broken; it was not
+in the browser doing the looking.
+
+Two halves address it. Every `url_for('static', …)` URL carries `?v=<mtime>`, so
+a page load after a deploy cannot be served a cached script — and now every
+render also stamps the front-end build that produced it on
+`<body data-asset-version>`, the same value rides each `/api/queue` payload, and
+`refresh.js` compares them on every tick. When they differ the page says so in a
+small banner with a **Reload** button, above the multitail overlay (the mode a
+stale build hides in) and below the modal band. It never reloads by itself: that
+would discard open panes, scroll position, dismissed panes and any confirm
+dialog mid-flight, so the viewer picks the moment. **When a front-end fix looks
+absent, check that banner before debugging the feature.**
 
 **Which items get a pane — and why some do not.** Exactly the rows the server
 marks with a non-empty `live_log_mode` (`hostjob` / `workload` / `live`),
@@ -214,8 +239,10 @@ the stream endpoint's own dispatch (hostjob → workload → agent), so a pane c
 never advertise a tail the server would not serve.
 
 **How many panes stay legible.** Panes flex-share the viewport evenly, but only
-down to `--mt-pane-min` (132px — a header plus roughly ten monospace lines;
-108px under 560px wide). Below that a tail shows a line or two and stops being
+down to `--mt-pane-min` (146px — a header, roughly ten monospace lines and the
+footer strip; 122px under 560px wide). Both numbers grew by the footer's height
+when it was added, so the strip costs one pane's worth of window before the
+stack scrolls rather than costing every pane a log line. Below that a tail shows a line or two and stops being
 information, so past that point the stack **scrolls** instead of shrinking
 further. On a laptop viewport that is an even split up to about five or six
 tails and a scrolling stack beyond.
@@ -257,15 +284,22 @@ taller than the unwrapped slack, and a reader who scrolled back to one row from
 the bottom would otherwise never re-arm auto-scroll and the pane would look
 stuck.
 
-**Timestamps (`t`) show the log's OWN time, or nothing.** The three sources do
-not carry the same information. Agent transcripts are JSONL and every record
-has a real ISO8601 `timestamp`, rendered in the viewer's local timezone by the
-same helper the single-item modal uses. Workload `.output` and hostjob logs are
-plain text: their frames carry **no** timestamp of any kind, and whatever the
-producer printed inside the line text is the producer's business — we do not
-parse prose looking for something clock-shaped. For those panes the timestamp
-column is simply empty and the pane header says `no ts`. It does **not** fall
-back to the browser's arrival time. Arrival time answers a different question
+**Timestamps (`t`) show the log's OWN time, or nothing.** Agent transcripts are
+JSONL and every record has a real ISO8601 `timestamp`, rendered in the viewer's
+local timezone by the same helper the single-item modal uses. A plain-text log
+carries a time exactly when its PRODUCER stamped it: `workload run` pipes its
+payload through `claude-watch workload stamp`, so every line of `<label>.output`
+begins with `date -Iseconds`, and the server splits that prefix off into the
+frame's `source_ts` — one parser, shared by the panes, the single-item modal and
+the archived-output view, so the time lands in the timestamp column instead of
+being read as part of the line. A line with **no** stamp keeps its text verbatim
+and gets no time: that is every log written before stamping existed, every
+hostjob log (nothing on the host side stamps those), and the wrapper's own
+header lines, which already print their absolute time in their text. Those panes
+leave the column empty and say `no ts` in the header — a claim made by
+OBSERVATION (has any line in this pane arrived with a stamp?) rather than by
+guessing from the pane's kind, because one `workload` pane can be stamped and
+the next one not. It does **not** fall back to the browser's arrival time. Arrival time answers a different question
 ("when did my browser receive this frame"), and for the 200-line backfill the
 server replays the moment a pane opens it is uniformly wrong — every historical
 line would read as roughly "now", flattening the very timing you opened the pane
@@ -273,6 +307,26 @@ to see. In a window that stacks both kinds of source at once, a real-timestamp
 column and an arrival-time column look identical and invite exactly the
 side-by-side comparison that is invalid. An empty column that explains itself
 beats a plausible fabrication.
+
+**The footer bar answers "whose agent is this, and what is it costing".** The
+mode is a whole-window takeover, so the queue rows that normally carry an
+agent's counters are not on screen; without the strip you can see what an agent
+is *doing* and nothing about what it is spending. Each pane's footer prints the
+model chip, tool calls, context tokens, output tokens, age since the agent's
+first transcript entry and its last tool — **read off that pane's own queue row**
+(`.model-tag`, `.agent-stats`) as the strings the server already formatted for
+the row cell and the header popover. Nothing is re-derived, so a footer and a
+row can never disagree about a count, and the values move on their own because
+`refresh.js` rebuilds those rows every 5s. A value that is not known is ABSENT:
+the server's formatters print `?` and `–` for "unknown" and those cells are
+skipped, because a footer that confidently shows a wrong context size is worse
+than a shorter one. A workload or hostjob pane runs no model and has no agent
+counters, so its footer carries the workload/hostjob label (which the pane
+header does not show) and stops there; a pane with nothing true to say hides the
+strip entirely rather than leaving an empty bar. The model is whatever the row
+says — never a pinned id, since an alias like `opus` tracks whichever model is
+newest and a hardcoded id would go stale silently. Under 560px the output-token
+and last-tool cells drop out first, leaving model / calls / ctx / age.
 
 **A pane whose log does not exist yet keeps trying.** Eligibility and
 log-existence are different instants, routinely: a `workload:` / `hostjob:` row
@@ -360,7 +414,22 @@ retention (the countdown, the exact clear boundary, `keep` holding a
 day-old pane, switching off `keep` applying at once, a requeued qid getting a
 fresh pane, and the three storage boots: a restored choice, an unrecognised
 stored value, and storage that throws) — plus the same parity checks against the
-real `refresh.js` builders.
+real `refresh.js` builders. It also covers a stamped plain-text line (a real
+time in the column, the prefix gone from the body, and the pane's `no ts` marker
+coming down for that pane only) and the footer bar (the cells it prints, the
+unknown values it omits rather than placeholders, the workload label as the one
+thing a workload pane can truthfully add, a footer hidden when nothing is known,
+and the counters following the row on the next tick).
+
+`static/multitail-refresh.test.js` loads **both** modules in one page, which is
+the only place the handover between them can be tested: a running item moved to
+`done` through the real `refresh.js` morph, and then the pane noticing its row is
+no longer eligible, going `ended`, and clearing when retention elapses. Each
+module's own suite owns half of that path and would pass while the other half was
+broken. The same file pins the stale-build banner's comparison, including that
+the banner is not a `data-no-morph` element — multitail treats any visible one as
+a dialog that owns the keyboard, so marking it would silently kill `w` / `t` /
+`c` whenever it was up.
 
 ## Layout
 

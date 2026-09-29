@@ -328,6 +328,19 @@ class AgentStatsTest(unittest.TestCase):
         self.assertIn('<span class="agent-stats-short">11·82Kt</span>', art)
         self.assertIn('data-tool-calls="11"', art)
         self.assertIn('data-context-tokens="82040"', art)
+        # The FORMATTED strings ride along as data attributes too (botchat
+        # #4935): multitail's per-pane footer bar prints model / calls / ctx /
+        # out / last tool / age while the whole-window mode hides these rows,
+        # and it READS these rather than re-deriving them, so the footer and the
+        # cell can never disagree about a number. `static/refresh.js` mirrors
+        # them — an attribute only the template emitted would vanish on the
+        # first 5s tick and the footer would blank out a few seconds after the
+        # mode opened.
+        self.assertIn('data-calls-text="11"', art)
+        self.assertIn('data-ctx-text="82K"', art)
+        self.assertIn('data-out-text="3.2K"', art)
+        self.assertIn('data-last-tool="Bash"', art)
+        self.assertIn("data-age-text=", art)
         # Title carries the hover detail (output tokens, last tool, age).
         self.assertIn("3.2K output tokens", art)
         self.assertIn("last tool Bash", art)

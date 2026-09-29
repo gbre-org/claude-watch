@@ -383,6 +383,34 @@ console.log('\nfmtWorkloadLine — terminal-style (flat, no <details>)');
     assert('workload line has NO <details> (flat)', !details);
     assert('workload line shows raw text',
       line.textContent.includes('rsync'));
+    assert('an unstamped workload line gets NO time cell',
+      !line.querySelector('.log-ts'));
+  }
+}
+
+console.log('\nfmtWorkloadLine — a STAMPED line shows the log\'s own time');
+{
+  // A workload wrapper stamps every line with `date -Iseconds`; the server
+  // splits that prefix off into the frame's `source_ts` so the modal can put it
+  // in the SAME column an agent record's timestamp uses, instead of leaving it
+  // inside the line text (where it would read as content) or showing it twice.
+  const line = render({
+    type: 'event',
+    kind: 'workload_line',
+    rec: {},
+    text: 'promoting Gundam',
+    source_ts: '2026-09-28T22:53:35-04:00',
+  });
+  assert('stamped workload line rendered', !!line);
+  if (line) {
+    const ts = line.querySelector('.log-ts');
+    assert('it gets a .log-ts cell', !!ts);
+    assert('showing a wall-clock time', !!ts && /\d\d:\d\d:\d\d/.test(ts.textContent),
+      ts && ts.textContent);
+    assert('and the body is the line WITHOUT the prefix',
+      line.textContent.includes('promoting Gundam') &&
+      !line.textContent.includes('2026-09-28T22:53:35'),
+      line.textContent);
   }
 }
 

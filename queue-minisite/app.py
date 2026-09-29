@@ -46,6 +46,7 @@ auto-refresh doesn't re-stat the queue file every tick.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -2384,6 +2385,62 @@ def _load_hostjob_command(label: str) -> dict[str, Any] | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# FRONT-END BUILD VERSION — "the page you are looking at is older than me"
+# ---------------------------------------------------------------------------
+# This dashboard is built to be LEFT OPEN. It refreshes itself by polling
+# ``/api/queue`` every 5s and morphing the result in, so a tab can sit on one
+# screen for hours — which means a deploy never reaches it. The HTML, the JS and
+# the CSS an open tab is running are the ones it fetched when it was opened, and
+# nothing about the live-updating rows hints otherwise. A front-end fix can
+# therefore be built, merged, deployed and verified on the server and still be
+# absent from the one browser that matters, which is exactly how a shipped
+# multitail feature was reported as "not working" (botchat #4947): the tab
+# predated the deploy by half an hour and had never reloaded, so the code under
+# discussion was not in it.
+#
+# The fix is to make staleness VISIBLE rather than to guess at it. Every render
+# carries the version of the front-end build that produced it, the same value
+# rides each ``/api/queue`` payload, and static/refresh.js compares the two on
+# every tick: when they differ, the page says so and offers a reload. It does
+# NOT reload by itself — a surprise reload would discard open panes, scroll
+# position, dismissals and any confirm dialog mid-flight, and a viewer who is
+# reading output deserves to choose the moment.
+#
+# The version is derived from the files the browser actually executes (the
+# templates, the scripts and the stylesheet) — not from a git SHA, which would
+# be unavailable in the container and would also change for commits that alter
+# nothing a browser loads.
+_ASSET_VERSION_GLOBS = ("templates/*.html", "static/*.js", "static/*.css")
+
+
+def _asset_version() -> str:
+    """Short id for the front-end build this process is serving.
+
+    Derived from the size + mtime of every template / script / stylesheet, so
+    it changes whenever any of them does and stays put when none do. Computed
+    per call (a dozen ``stat`` calls, next to reading queue.json) rather than
+    cached at import, so a deploy that swaps files under a running process is
+    still detected.
+
+    Fail-soft: an unreadable directory yields ``""``, and an empty version
+    means "unknown", which the front end treats as "say nothing" rather than
+    as a mismatch.
+    """
+    root = Path(__file__).resolve().parent
+    parts: list[str] = []
+    try:
+        for pattern in _ASSET_VERSION_GLOBS:
+            for path in sorted(root.glob(pattern)):
+                st = path.stat()
+                parts.append(f"{path.name}:{st.st_size}:{st.st_mtime_ns}")
+    except OSError:
+        return ""
+    if not parts:
+        return ""
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
 def _render_payload() -> dict[str, Any]:
     data, err = _cached_queue()
     items = data.get("items", []) if isinstance(data, dict) else []
@@ -2621,6 +2678,11 @@ def _render_payload() -> dict[str, Any]:
         "site_logo_default": SITE_LOGO_DEFAULT,
         "site_brand": SITE_BRAND,
         "site_favicon_url": SITE_FAVICON_URL,
+        # Which front-end build produced this payload. The template stamps it
+        # on <body>; refresh.js compares the two every tick and tells the
+        # viewer when their open tab is older than the server. See
+        # ``_asset_version``.
+        "asset_version": _asset_version(),
     }
 
 
@@ -4409,6 +4471,74 @@ def _pending_transient_frame(pending: str) -> str | None:
     return body[cut + 1:] if cut >= 0 else body
 
 
+# ---------------------------------------------------------------------------
+# PER-LINE TIMESTAMPS IN PLAIN-TEXT LOGS
+# ---------------------------------------------------------------------------
+# Workload wrappers pipe their payload through ``claude-watch workload stamp``,
+# so each line of ``<label>.output`` begins with ``date -Iseconds`` and one
+# space. We split that prefix back off HERE, server-side, and ship it as the
+# frame's ``source_ts`` — so every consumer (the multitail panes, the
+# single-item log modal, the archived-output view) gets the line's own time
+# from one parser instead of three regexes.
+#
+# BACK-COMPAT IS THE POINT. Every log file written before stamping existed —
+# and every hostjob log, whose writer lives on the host side and stamps
+# nothing — has no prefix, and those lines must render exactly as they always
+# did. So a line with no recognisable stamp keeps its text verbatim and gets
+# NO ``source_ts`` key at all, which is the same thing the front end has always
+# received. The two shapes mix freely inside one pane: a stamped line shows a
+# time, an unstamped one shows nothing, and no time is ever invented for the
+# second kind (the arrival time in a browser is not the log's time — see
+# static/multitail.js).
+#
+# The pattern is deliberately NARROW: a full RFC3339 datetime with the ``T``
+# separator AND an explicit offset (or ``Z``), followed by whitespace and a
+# non-empty remainder. Prose rarely opens that way, so a log line that happens
+# to start with a date (``2026-05-01 promoted 3 shows``) is left alone rather
+# than being silently retitled as a timestamp.
+_LINE_TS_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))[ \t]+"
+)
+
+
+def _split_line_ts(text: str) -> tuple[str, str]:
+    """``(source_ts, remaining_text)`` for one plain-text log line.
+
+    ``("", text)`` — text untouched — when the line carries no recognisable
+    per-line stamp.
+    """
+    if not text:
+        return "", text
+    m = _LINE_TS_RE.match(text)
+    if not m:
+        return "", text
+    body = text[m.end():]
+    if not body:
+        # A line whose whole content is a timestamp has no body to attach it
+        # to; keep it as text so it is still visible.
+        return "", text
+    return m.group(1), body
+
+
+def _plain_line_event(text: str, transient: bool) -> dict[str, Any]:
+    """One ``workload_line`` SSE frame for a plain-text log line.
+
+    The single constructor for this frame shape (workload tail, hostjob tail,
+    broker relay, archived output). ``source_ts`` is present only when the
+    producer actually stamped the line.
+    """
+    ts, body = _split_line_ts(text)
+    ev: dict[str, Any] = {
+        "type": "event",
+        "kind": "workload_line",
+        "text": body,
+        "transient": transient,
+    }
+    if ts:
+        ev["source_ts"] = ts
+    return ev
+
+
 def _tail_jsonl(path: Path, since: int | None = None) -> Iterator[bytes]:
     """Generator yielding SSE events for a tailed agent JSONL.
 
@@ -4658,12 +4788,7 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
                 "lines": len(backfill_segments),
             })
             for text, transient in backfill_segments:
-                yield _format_sse({
-                    "type": "event",
-                    "kind": "workload_line",
-                    "text": text,
-                    "transient": transient,
-                })
+                yield _format_sse(_plain_line_event(text, transient))
                 last_data_at = time.monotonic()
             yield _format_sse({"type": "meta", "kind": "backfill-end"})
 
@@ -4684,12 +4809,7 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
                 for text, transient in segments:
                     if transient and text == last_transient:
                         continue
-                    yield _format_sse({
-                        "type": "event",
-                        "kind": "workload_line",
-                        "text": text,
-                        "transient": transient,
-                    })
+                    yield _format_sse(_plain_line_event(text, transient))
                     last_transient = text if transient else None
                     last_data_at = time.monotonic()
                 continue
@@ -4705,12 +4825,7 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
                 for text, transient in segments:
                     if transient and text == last_transient:
                         continue
-                    yield _format_sse({
-                        "type": "event",
-                        "kind": "workload_line",
-                        "text": text,
-                        "transient": transient,
-                    })
+                    yield _format_sse(_plain_line_event(text, transient))
                     last_transient = text if transient else None
                 yield from _emit_end("exit")
                 return
@@ -4726,12 +4841,7 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
             # still idle-times-out (only CHANGED frames bump last_data_at).
             spec = _pending_transient_frame(pending)
             if spec is not None and spec != last_transient:
-                yield _format_sse({
-                    "type": "event",
-                    "kind": "workload_line",
-                    "text": spec,
-                    "transient": True,
-                })
+                yield _format_sse(_plain_line_event(spec, True))
                 last_transient = spec
                 last_data_at = time.monotonic()
             now = time.monotonic()
@@ -4861,12 +4971,7 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                 "lines": len(backfill_segments),
             })
             for text, transient in backfill_segments:
-                yield _format_sse({
-                    "type": "event",
-                    "kind": "workload_line",
-                    "text": text,
-                    "transient": transient,
-                })
+                yield _format_sse(_plain_line_event(text, transient))
                 last_data_at = time.monotonic()
             yield _format_sse({"type": "meta", "kind": "backfill-end"})
 
@@ -4894,12 +4999,7 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
             for text, transient in segments:
                 if transient and text == last_transient:
                     continue
-                yield _format_sse({
-                    "type": "event",
-                    "kind": "workload_line",
-                    "text": text,
-                    "transient": transient,
-                })
+                yield _format_sse(_plain_line_event(text, transient))
                 last_transient = text if transient else None
             yield from _emit_end("terminal")
 
@@ -4912,12 +5012,7 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
             for text, transient in segments:
                 if transient and text == last_transient:
                     continue
-                yield _format_sse({
-                    "type": "event",
-                    "kind": "workload_line",
-                    "text": text,
-                    "transient": transient,
-                })
+                yield _format_sse(_plain_line_event(text, transient))
                 last_transient = text if transient else None
                 last_data_at = time.monotonic()
 
@@ -5024,12 +5119,7 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                 for text, transient in segments:
                     if transient and text == last_transient:
                         continue
-                    yield _format_sse({
-                        "type": "event",
-                        "kind": "workload_line",
-                        "text": text,
-                        "transient": transient,
-                    })
+                    yield _format_sse(_plain_line_event(text, transient))
                     last_transient = text if transient else None
                     last_data_at = time.monotonic()
                 continue
@@ -5067,12 +5157,7 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
             # still idle-times-out (only CHANGED frames bump last_data_at).
             spec = _pending_transient_frame(pending)
             if spec is not None and spec != last_transient:
-                yield _format_sse({
-                    "type": "event",
-                    "kind": "workload_line",
-                    "text": spec,
-                    "transient": True,
-                })
+                yield _format_sse(_plain_line_event(spec, True))
                 last_transient = spec
                 last_data_at = time.monotonic()
             now = time.monotonic()
@@ -5508,12 +5593,7 @@ def _replay_workload_output(path: Path) -> Iterator[bytes]:
         # the live backfill path in _tail_workload_output.
         segments = _collapse_transient_runs(segments)
         for text, transient in segments:
-            yield _format_sse({
-                "type": "event",
-                "kind": "workload_line",
-                "text": text,
-                "transient": transient,
-            })
+            yield _format_sse(_plain_line_event(text, transient))
             line_count += 1
     except OSError as exc:
         yield _format_sse({

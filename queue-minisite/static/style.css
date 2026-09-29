@@ -2411,6 +2411,64 @@ html.density-compact .subagent-node .subagent-id,
 html.density-compact .subagent-node .subagent-label,
 html.density-compact .subagent-node .subagent-age { font-size: 0.68rem; }
 
+/* ================= STALE-BUILD BANNER (botchat #4947) =================
+ *
+ * "The page you are looking at is older than the server." This dashboard never
+ * reloads itself — it polls JSON and morphs it in — so an open tab keeps running
+ * the JS it loaded, and a deployed front-end fix can be completely absent from
+ * it with no visible sign. refresh.js unhides this strip when the build that
+ * rendered the page differs from the build the server is serving.
+ *
+ * Bottom-centre and `position: fixed`, with a z-index ABOVE the multitail
+ * overlay (60) — the whole-window mode is exactly where a stale build hides, so
+ * a banner the overlay covered would be useless. It stays BELOW the modal band
+ * (100+) so a confirm dialog still owns the screen.
+ *
+ * It is one line with one button: the viewer decides when to reload, because a
+ * reload discards open panes and scroll position. */
+.stale-build {
+  position: fixed;
+  left: 50%;
+  bottom: calc(10px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 24px);
+  padding: 6px 12px;
+  border: 1px solid var(--pending);
+  border-radius: 999px;
+  background: var(--bg-alt);
+  color: var(--fg-emph);
+  font-size: 0.74rem;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+}
+.stale-build[hidden] { display: none; }
+.stale-build-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stale-build-btn {
+  flex: 0 0 auto;
+  padding: 1px 10px;
+  border: 1px solid var(--running);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--running);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.stale-build-btn:hover { background: var(--running); color: var(--bg); }
+/* Phones: the sentence is the part that can go — the button and the fact that
+   SOMETHING is stale are what matter, and a wrapped banner covers a pane. */
+@media (max-width: 560px) {
+  .stale-build-text { font-size: 0.68rem; }
+}
+
 /* ================= MULTITAIL MODE =================
  *
  * A whole-window overlay stacking one live tail per running item that has a
@@ -2422,10 +2480,15 @@ html.density-compact .subagent-node .subagent-age { font-size: 0.68rem; }
  * a tail shows nothing you can read, so past that point the stack SCROLLS
  * instead of shrinking further. On a laptop viewport that is an even split up
  * to about five or six tails and a scrolling stack beyond.
+ *
+ * The floor counts the per-pane FOOTER strip too (botchat #4935): it was raised
+ * by that strip's height when the strip was added, so the bar comes out of the
+ * window budget (one fewer pane before the stack scrolls) rather than out of
+ * the ten log lines a pane exists to show.
  */
 
 :root {
-  --mt-pane-min: 132px;
+  --mt-pane-min: 146px;
 }
 
 /* Header toggle pill — mirrors the density pill's shape so the two read as one
@@ -2688,6 +2751,58 @@ body.multitail-open { overflow: hidden; }
 }
 .mt-pane-stream:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
 
+/* ---- PER-PANE FOOTER BAR (botchat #4935) ----
+ *
+ * `opus · 41 calls · 118K ctx · 9.1K out · 12m · last Bash · promote-gundam`.
+ * One line, smaller than the head, in the head's own surface colour so the pane
+ * reads as head / stream / foot rather than as two competing bars.
+ *
+ * Every cell is optional and multitail.js only appends the ones with a real
+ * value, so this block must not reserve space for a cell that is not there: no
+ * min-widths, no separators drawn by CSS (the gap does that job). `hidden` on
+ * the strip means the pane had nothing true to say. */
+.mt-pane-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 1px 6px;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--line);
+  font-size: 0.62rem;
+  color: var(--fg-mute);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.mt-pane-foot[hidden] { display: none; }
+.mt-foot-model {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--fg-emph);
+  font-weight: 600;
+}
+.mt-pane-foot .mt-foot-cell {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+/* The last-tool name is the only unbounded string here (a tool name, and the
+   one cell whose length is not ours), so it is the cell that gives way. */
+.mt-pane-foot .mt-foot-tool {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mt-pane-foot .mt-foot-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
 /* One event = one line, clipped rather than wrapped BY DEFAULT: a wrapped
    400-character tool result would swallow a whole short pane. The `w` toggle
    (.mt-wrap on the overlay) opts into the other tradeoff — see the WRAP block
@@ -2760,11 +2875,16 @@ body.multitail-open { overflow: hidden; }
 /* Phones: the header hint costs a line it cannot afford, and the floor drops
    so three tails still fit above the fold. */
 @media (max-width: 560px) {
-  :root { --mt-pane-min: 108px; }
+  :root { --mt-pane-min: 122px; }
   .multitail-hint { display: none; }
   .multitail-exit { margin-left: auto; }
   .mt-pane-summary { display: none; }
   /* Four pills plus the title is already tight at this width; the retention
      label can shrink to its text rather than hold a stable width. */
   .multitail-retain { min-width: 0; }
+  /* Footer: keep model / calls / ctx / age, drop the two cells that answer
+     narrower questions. Six cells on a phone wrap into a second line and eat a
+     log row, which is the one thing the strip must not do. */
+  .mt-pane-foot .mt-foot-out,
+  .mt-pane-foot .mt-foot-tool { display: none; }
 }

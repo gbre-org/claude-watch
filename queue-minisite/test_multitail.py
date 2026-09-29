@@ -40,6 +40,15 @@ Also pinned here:
     AGREE about it — the Jinja-rendered pill's default, the module's option
     table, the persistence key, and the stylesheet.
 
+  * **the per-pane FOOTER BAR contract across three files.** Each pane shows
+    the model / tool calls / context / output / age / last tool for its item,
+    read off the rendered ROW rather than re-derived — so the strings come from
+    ONE formatter (app.py ``_shape_agent_stat``) and a footer can never disagree
+    with the row cell it came from. That only works while BOTH row renderers
+    emit those values as data attributes: an attribute present in the Jinja
+    template but missing from ``static/refresh.js`` disappears after one 5s
+    tick, and the footer would go blank a few seconds after the mode opened.
+
 And the two CROSS-SIDE contracts the client cannot pin by itself:
 
   * **what the stream says when a log does not exist YET.** Eligibility and
@@ -52,10 +61,17 @@ And the two CROSS-SIDE contracts the client cannot pin by itself:
     is the bug this pins shut.
   * **which sources carry a per-line timestamp.** The ``t`` toggle shows the
     log's OWN time and deliberately shows nothing for sources that have none,
-    rather than substituting the browser's arrival time. That is only honest
-    while the frame shapes below hold: agent JSONL records reach the client
-    with their ``timestamp`` intact, and plain-text ``workload_line`` frames
-    carry no time field at all.
+    rather than substituting the browser's arrival time. Agent JSONL records
+    reach the client with their ``timestamp`` intact. A plain-text line carries
+    a time only when its PRODUCER stamped it: workload wrappers pipe their
+    payload through ``claude-watch workload stamp``, so each line starts with
+    ``date -Iseconds``, and the server splits that prefix off into the frame's
+    ``source_ts`` (``_plain_line_event``). A line with no stamp — every log
+    written before stamping existed, and every hostjob log — keeps its text
+    verbatim and gets no time field at all, which is what the pane's ``no ts``
+    marker is about. Both shapes are pinned below: strip the prefix off the
+    wrong thing and a log line loses its leading word; fail to strip it and the
+    time renders twice.
 
 Run::
 
@@ -577,6 +593,112 @@ class MultitailTest(unittest.TestCase):
         for taken in ("'j'", "'k'", "'g'", "'G'", "'/'"):
             self.assertNotIn(f"ev.key === {taken}", src, f"{taken} is already bound")
 
+    # -- per-pane footer bar (botchat #4935) -------------------------------
+
+    #: What the footer prints, as (data attribute, ``_shape_agent_stat`` key).
+    #: The attribute carries the SERVER-FORMATTED string; the footer never
+    #: re-derives a number.
+    FOOTER_ATTRS = (
+        ("data-calls-text", "calls_text"),
+        ("data-ctx-text", "ctx_text"),
+        ("data-out-text", "out_text"),
+        ("data-last-tool", "last_tool"),
+        ("data-age-text", "age_text"),
+    )
+
+    def test_shaper_provides_every_string_the_footer_prints(self):
+        """One formatter. The footer reads these; it computes nothing."""
+        shaped = self.appmod._shape_agent_stat(
+            {
+                "agent_id": "agent-x",
+                "queue_id": "q-1",
+                "tool_calls": 41,
+                "context_tokens": 118000,
+                "output_tokens": 9100,
+                "last_tool": "Bash",
+                "started_at": "2026-09-29T02:00:00+00:00",
+                "age_seconds": 12.0,
+            }
+        )
+        for _attr, key in self.FOOTER_ATTRS:
+            self.assertIn(key, shaped, f"_shape_agent_stat lost {key}")
+            self.assertIsInstance(shaped[key], str)
+        self.assertEqual(shaped["calls_text"], "41")
+        self.assertEqual(shaped["ctx_text"], "118K")
+
+    def test_both_row_renderers_emit_the_footer_attributes(self):
+        """Jinja AND refresh.js — or the footer blanks after one 5s tick.
+
+        The running-card subtree is rebuilt from ``static/refresh.js`` every
+        tick, so an attribute that exists only in the template survives exactly
+        until the first refresh. That is the failure this pins shut: a footer
+        that is populated on load and empty five seconds later.
+        """
+        tpl = (HERE / "templates" / "index.html").read_text()
+        js = (HERE / "static" / "refresh.js").read_text()
+        # (The end-to-end "a real running row ships them" assertion lives in
+        # test_agent_stats.py, which owns the snapshot fixture that cell needs.)
+        for attr, key in self.FOOTER_ATTRS:
+            self.assertIn(attr, tpl, f"template does not emit {attr}")
+            self.assertIn(attr, js, f"refresh.js does not emit {attr}")
+            self.assertIn(f"agent_stats.{key}", tpl, f"template does not read {key}")
+            self.assertIn(f"agentStats.{key}", js, f"refresh.js does not read {key}")
+
+    def test_footer_omits_unknown_values_rather_than_guessing(self):
+        """`?` / `–` are the formatter's "not known" markers, not values.
+
+        A footer that confidently printed a wrong context size would be worse
+        than one with fewer cells, so the module drops those cells — the same
+        rule the model chip already follows by rendering nothing when no model
+        is attributable.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("function footValue(", src)
+        # The three markers the server can produce for "no value".
+        self.assertIn("'?'", src)
+        self.assertIn("'–'", src)
+        self.assertIn("bar.hidden = cells === 0;", src)
+
+    def test_footer_reads_the_model_off_the_row_and_pins_nothing(self):
+        """The model comes from the row's chip — never a hardcoded id.
+
+        An alias like `opus` tracks whichever model is newest, so a pinned id
+        would go stale silently and claim the wrong model ran.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn(".model-tag", src)
+        for pinned in ("claude-opus", "claude-sonnet", "claude-haiku"):
+            self.assertNotIn(pinned, src, f"multitail.js pins a model id: {pinned}")
+
+    def test_footer_styles_shipped_and_do_not_eat_the_log_area(self):
+        """The strip needs CSS, and the pane floor had to grow by its height.
+
+        Panes already stop shrinking at a legibility floor (a header plus ~10
+        monospace lines). Adding a footer without raising that floor would have
+        taken the space out of the log rows instead of out of the window.
+        """
+        css = (HERE / "static" / "style.css").read_text()
+        for cls in (
+            ".mt-pane-foot",
+            ".mt-foot-model",
+            ".mt-foot-cell",
+            ".mt-foot-tool",
+            ".mt-foot-label",
+        ):
+            self.assertIn(cls, css, f"missing footer style {cls}")
+        self.assertIn(".mt-pane-foot[hidden] { display: none; }", css)
+        # The floor: 132px was the pre-footer value on desktop, 108px on phones.
+        desktop = int(
+            re.search(r"--mt-pane-min:\s*(\d+)px", css).group(1)
+        )
+        self.assertGreater(
+            desktop, 132, "--mt-pane-min must grow with the footer strip"
+        )
+        # Phones drop the two narrowest-value cells rather than wrapping.
+        phone_block = css[css.index("@media (max-width: 560px)") :]
+        self.assertIn(".mt-foot-out", phone_block)
+        self.assertIn(".mt-foot-tool", phone_block)
+
     def test_agent_records_reach_the_client_with_their_timestamp(self):
         """Agent JSONL: the record's OWN timestamp survives the parse.
 
@@ -595,37 +717,104 @@ class MultitailTest(unittest.TestCase):
         self.assertEqual(payload["kind"], "assistant_text")
         self.assertEqual(payload["rec"]["timestamp"], "2026-09-28T15:28:44.618Z")
 
-    def test_plain_text_frames_carry_no_timestamp(self):
-        """Workload / hostjob tails have NO time field — hence `no ts`.
-
-        The front-end shows nothing for these panes and says why. That is only
-        honest while this holds: if a time field is ever added here, the
-        client's "this source has no timestamps" claim goes stale and this
-        test is the place that notices.
-        """
-        wl_dir = Path(self.tmp) / "ts-workloads"
+    def _workload_line_frames(self, label: str, body: str) -> list[dict]:
+        """Every ``workload_line`` frame a tail of ``body`` produces."""
+        wl_dir = Path(self.tmp) / f"ts-workloads-{label}"
         wl_dir.mkdir(parents=True, exist_ok=True)
-        (wl_dir / "tsjob.output").write_text("one\ntwo\n")
-        (wl_dir / "tsjob.exit").write_text("0\n")
+        (wl_dir / f"{label}.output").write_text(body)
+        (wl_dir / f"{label}.exit").write_text("0\n")
         prev = self.appmod.WORKLOAD_LOG_DIR
         self.appmod.WORKLOAD_LOG_DIR = str(wl_dir)
         try:
             frames = [
                 json.loads(line[len("data: ") :])
-                for chunk in self.appmod._tail_workload_output("tsjob")
+                for chunk in self.appmod._tail_workload_output(label)
                 for line in chunk.decode().splitlines()
                 if line.startswith("data: ")
             ]
         finally:
             self.appmod.WORKLOAD_LOG_DIR = prev
-        lines = [f for f in frames if f.get("kind") == "workload_line"]
+        return [f for f in frames if f.get("kind") == "workload_line"]
+
+    def test_unstamped_plain_text_frames_carry_no_time(self):
+        """A log written before stamping existed renders exactly as before.
+
+        No time field of any name, and the text untouched. This is the shape
+        the pane's `no ts` marker is telling the truth about, and it is also
+        every hostjob log — nothing on the host side stamps those.
+        """
+        lines = self._workload_line_frames("tsjob", "one\ntwo\n")
         self.assertTrue(lines, "no workload_line frames produced")
         for frame in lines:
             self.assertEqual(
-                set(frame) & {"timestamp", "ts", "time", "at"},
+                set(frame) & {"timestamp", "ts", "time", "at", "source_ts"},
                 set(),
-                f"plain-text frame gained a time field: {frame}",
+                f"unstamped frame gained a time field: {frame}",
             )
+        self.assertEqual([f["text"] for f in lines], ["one", "two"])
+
+    def test_stamped_plain_text_frames_split_the_prefix_into_source_ts(self):
+        """A stamped line's time reaches the client as ``source_ts``.
+
+        ``claude-watch workload stamp`` writes ``date -Iseconds`` and one space
+        in front of every line. The server splits it off ONCE, here, so the
+        panes, the single-item modal and the archived-output view all show the
+        time in their timestamp column rather than each re-parsing the text —
+        and so the time is not rendered twice (column AND line body).
+        """
+        lines = self._workload_line_frames(
+            "tsjob2",
+            "2026-09-28T22:53:35-04:00 promoting Gundam\n"
+            "2026-09-28T22:53:36-04:00 done\n",
+        )
+        self.assertEqual([f["text"] for f in lines], ["promoting Gundam", "done"])
+        self.assertEqual(
+            [f.get("source_ts") for f in lines],
+            ["2026-09-28T22:53:35-04:00", "2026-09-28T22:53:36-04:00"],
+        )
+
+    def test_the_stamp_parser_leaves_prose_alone(self):
+        """Narrow on purpose: a line that merely BEGINS with a date is text.
+
+        ``2026-05-01 promoted 3 shows`` is a sentence, not a stamped line, and
+        eating its first word would silently corrupt the log. Only a full
+        RFC3339 datetime with the ``T`` separator and an explicit offset (what
+        the stamper writes) counts.
+        """
+        split = self.appmod._split_line_ts
+        self.assertEqual(split("2026-05-01 promoted 3 shows"), ("", "2026-05-01 promoted 3 shows"))
+        self.assertEqual(split("2026-05-01T10:00:00 no offset"), ("", "2026-05-01T10:00:00 no offset"))
+        self.assertEqual(split("rsync 2026-05-01T10:00:00Z mid-line"), ("", "rsync 2026-05-01T10:00:00Z mid-line"))
+        self.assertEqual(split(""), ("", ""))
+        # A whole line that is nothing BUT a stamp has no body to attach it to,
+        # so it stays text — a row with a time and no content says nothing.
+        self.assertEqual(
+            split("2026-05-01T10:00:00Z"), ("", "2026-05-01T10:00:00Z")
+        )
+        # The shapes that DO count: `Z`, `+HH:MM`, `+HHMM`, and sub-seconds.
+        for stamp in (
+            "2026-05-01T10:00:00Z",
+            "2026-05-01T10:00:00-04:00",
+            "2026-05-01T10:00:00+0200",
+            "2026-05-01T10:00:00.512-04:00",
+        ):
+            self.assertEqual(
+                split(f"{stamp} body"), (stamp, "body"), f"not recognised: {stamp}"
+            )
+
+    def test_both_log_views_read_source_ts(self):
+        """The panes AND the single-item modal render the parsed stamp.
+
+        Two surfaces show plain-text logs. A stamp that only one of them knew
+        about would make the same line look timed in one place and untimed in
+        the other.
+        """
+        mt = (HERE / "static" / "multitail.js").read_text()
+        ll = (HERE / "static" / "live-log.js").read_text()
+        self.assertIn("payload.source_ts", mt)
+        self.assertIn("source_ts", ll)
+        # Neither may fall back to arrival time for a source with no stamp.
+        self.assertNotIn("Date.now()", mt.split("function sourceTs")[1][:400])
 
     # -- "the log does not exist YET" -------------------------------------
 
