@@ -3,10 +3,16 @@
 
 Performs a clean context reset:
   1. Injects /clear via vim mode send-keys
-  2. Detects + confirms the v2.1.283+ "Rewind" picker /clear now opens
-     (Enter on its "(current)" default -- see confirm_clear_picker())
-  3. Polls tmux state until /clear completes (tokens drop + prompt visible)
-  4. Injects the resume prompt
+  2. Polls tmux state until /clear completes (tokens drop + prompt visible),
+     watching EVERY iteration of that poll for the v2.1.283+ "Rewind" picker
+     /clear now opens and confirming it with Enter on its "(current)" entry
+     as soon as it appears (see `_rewind_picker_confirm_once` /
+     `confirm_clear_picker`). The poll never declares /clear complete while
+     the picker footer is still visible -- that was the root cause of a
+     wedge where a one-shot pre-check window expired before the picker
+     rendered, the poll then read the (picker-idle-looking) pane as a
+     completed /clear, and injected the resume prompt into the open picker.
+  3. Injects the resume prompt
 
 Called as the final step of a compact-prep procedure. Eliminates the wait
 for the daemon's resume-injection path to fire on its own.
@@ -620,45 +626,85 @@ def _rewind_picker_default_is_current(pane_text):
     return False
 
 
+def _rewind_picker_confirm_once(pane, pane_text=None):
+    """Check ONE captured pane snapshot for the Rewind picker and, if it is
+    visible with the cursor safely on `(current)`, send a single Enter.
+
+    Returns a tuple `(picker_seen, confirmed)`:
+      * `picker_seen`  -- True iff the Rewind picker footer was visible in
+        this snapshot (regardless of whether an Enter was sent). Callers use
+        this to know the pane is NOT yet at a settled post-/clear state.
+      * `confirmed`    -- True iff an Enter was actually sent this call.
+
+    This is the single-snapshot primitive meant to be called on EVERY
+    iteration of the completion-poll loop (see `child_main`), rather than in
+    a separate one-shot pre-check window -- a fixed pre-check can expire
+    before Claude Code finishes rendering the picker, after which nothing
+    else ever confirms it and the poll below would misread the (idle-
+    looking) picker screen as a completed /clear.
+
+    `pane_text` lets a caller reuse a capture it already has for this
+    iteration instead of re-capturing; when omitted this captures itself.
+
+    Never sends Enter when the cursor sits on `/resume <id> (previous)` --
+    that would fork the conversation instead of clearing it. See
+    `_rewind_picker_default_is_current`.
+    """
+    if pane_text is None:
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        if rc != 0 or not out:
+            return False, False
+        pane_text = out
+    if not _rewind_picker_visible(pane_text):
+        return False, False
+    if _rewind_picker_default_is_current(pane_text):
+        log("  rewind_picker: Rewind picker detected, cursor on "
+            "(current) -- sending Enter to confirm")
+        run(["tmux", "send-keys", "-t", pane, "Enter"])
+        time.sleep(0.3)
+        return True, True
+    log("  rewind_picker: WARNING Rewind picker detected but cursor NOT on "
+        "(current) -- refusing to blind-Enter (would risk landing on "
+        "/resume <previous> and forking the conversation); trying Down to "
+        f"reach (current). pane: {capture_pane_text(pane)}")
+    # (current) is documented as the picker's last/default entry, so a
+    # single Down is the least-surprising nudge toward it. Best-effort only
+    # -- we re-check on the NEXT poll iteration rather than trusting this
+    # blindly, and we still report picker_seen=True so the caller does not
+    # declare completion this iteration either way.
+    run(["tmux", "send-keys", "-t", pane, "Down"])
+    time.sleep(0.2)
+    return True, False
+
+
 def confirm_clear_picker(pane, max_wait=3, poll_interval=0.2):
-    """Confirm the v2.1.283+ `/clear` Rewind picker by sending Enter.
+    """Poll briefly for the v2.1.283+ `/clear` Rewind picker and confirm it.
 
-    Since v2.1.283, `/clear` opens an interactive picker (see
-    `_rewind_picker_visible`) instead of clearing directly. Without this
-    step self-clear injects `/clear` and then hangs forever polling for a
-    clear that never lands, because the session is sitting on the open
-    picker waiting for a keypress.
-
-    This waits briefly for the picker to render, verifies the cursor sits on
-    the safe `(current)` entry (never `(previous)`, which would fork the
-    conversation via `/resume`), and sends a single Enter to accept it.
+    Thin wrapper around `_rewind_picker_confirm_once` for callers that want
+    a bounded one-shot wait (kept for test coverage / standalone use). The
+    real self-clear flow does NOT rely on this bounded pre-check alone --
+    picker confirmation is integrated into the full completion-poll loop in
+    `child_main` (via `_rewind_picker_confirm_once` on every iteration)
+    because this fixed window can expire before the picker renders.
 
     Detection-gated rather than version-gated: on the pre-2.1.283
-    direct-clear behavior the picker footer never appears, so the wait loop
+    direct-clear behavior the picker footer never appears, so the loop
     below finds nothing and returns WITHOUT sending any key -- a strict
-    no-op on old behavior. (A blind confirming Enter would likely also be
-    harmless post-clear-2.1.283, since `/clear` returns to an empty prompt
-    line where Enter just submits an empty no-op message -- but detection
-    is strictly safer and is what we ship: it also lets us verify the
-    cursor is on `(current)`, not `(previous)`, before confirming.)
+    no-op on old behavior.
     """
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
-        if rc == 0 and out and _rewind_picker_visible(out):
-            if _rewind_picker_default_is_current(out):
-                log("  confirm_clear_picker: Rewind picker detected, cursor on "
-                    "(current) -- sending Enter to confirm")
-                run(["tmux", "send-keys", "-t", pane, "Enter"])
-                time.sleep(0.3)
-            else:
-                log("  confirm_clear_picker: WARNING Rewind picker detected but "
-                    "cursor NOT on (current) -- refusing to send Enter (would "
-                    "risk landing on /resume <previous> and forking the "
-                    f"conversation). pane: {capture_pane_text(pane)}")
+        picker_seen, confirmed = _rewind_picker_confirm_once(pane)
+        if confirmed:
             return
+        if picker_seen:
+            # Seen but not confirmed (cursor was off (current)) -- keep
+            # polling within this bounded window rather than giving up
+            # immediately, since the Down-nudge above may fix it next pass.
+            time.sleep(poll_interval)
+            continue
         time.sleep(poll_interval)
-    log(f"  confirm_clear_picker: no Rewind picker detected within {max_wait}s "
+    log(f"  confirm_clear_picker: no Rewind picker confirmed within {max_wait}s "
         "(pre-2.1.283 direct-clear behavior, or picker not yet rendered) -- "
         "no Enter sent")
 
@@ -796,9 +842,10 @@ def plan_argv(pane, args):
     """Build the planned send-keys/inject argv sequence as printable lines.
 
     Pure (no subprocess calls) -- used by `--print` for a dry-run proof that
-    the confirming Enter for the v2.1.283+ Rewind picker is wired in at the
-    right point: AFTER the `/clear` inject, BEFORE the completion poll and
-    the resume-prompt inject.
+    Rewind-picker confirmation is integrated INTO the completion poll (every
+    iteration, across the whole `--delay` window) rather than a one-shot
+    pre-check, and that completion is never declared while the picker is
+    still visible.
     """
     lines = [f"PANE: {pane}"]
     lines.append("STEP 1: ensure_main_loop_focus")
@@ -810,21 +857,47 @@ def plan_argv(pane, args):
         "  argv: ['claude-watch', 'inject', '--pane', "
         f"{pane!r}, '--submit', '/clear', '--slash-command', '--escape']"
     )
-    lines.append("STEP 4: confirm_clear_picker  <-- NEW (v2.1.283+ Rewind picker fix)")
-    lines.append(
-        f"  argv: ['tmux', 'send-keys', '-t', {pane!r}, 'Enter']"
-        "  # sent ONLY if picker footer ('Enter to continue' + 'Esc to cancel')"
-        " is detected AND cursor is on the '(current)' entry -- never on"
-        " '(previous)'. No-op (no Enter sent) on pre-2.1.283 direct-clear"
-        " behavior, where the footer never appears."
-    )
-    lines.append("STEP 5: poll for /clear completion (tokens drop + idle) -- up to --delay seconds")
-    lines.append("STEP 6: dismiss_feedback_prompt (if 'How is Claude doing' visible)")
+    if args.no_resume:
+        lines.append("STEP 4: confirm_clear_picker (bounded pre-check; --no-resume has no poll to fold into)")
+        lines.append("STEP 5: (skipped -- --no-resume)")
+    else:
+        lines.append(
+            "STEP 4: poll for /clear completion (max --delay seconds) -- "
+            "PICKER-AWARE (v2.1.283+ Rewind picker fix)"
+        )
+        lines.append(
+            "  each iteration: capture-pane once, then _rewind_picker_confirm_once(pane, pane_text)"
+        )
+        lines.append(
+            f"    argv: ['tmux', 'send-keys', '-t', {pane!r}, 'Enter']"
+            "  # sent ONLY if picker footer ('Enter to continue' + 'Esc to"
+            " cancel') is visible AND cursor is on '(current)' -- never on"
+            " '(previous)'."
+        )
+        lines.append(
+            f"    argv: ['tmux', 'send-keys', '-t', {pane!r}, 'Down']"
+            "  # sent instead, best-effort, if picker visible but cursor is"
+            " NOT on '(current)' -- never blind-Enter in that case."
+        )
+        lines.append(
+            "  INVARIANT: if the picker was visible this iteration, completion"
+            " is NOT declared this iteration regardless of tokens/idle readings"
+            " (those readings are unreliable while the picker is open)."
+        )
+        lines.append(
+            "  completion requires ALL THREE: picker gone AND tokens < "
+            f"{FRESH_SESSION_MAX_TOKENS} AND prompt idle."
+        )
+        lines.append(
+            "  no-op (detection-gated, not version-gated) on pre-2.1.283"
+            " direct-clear behavior, where the picker footer never appears."
+        )
+    lines.append("STEP 5: dismiss_feedback_prompt (if 'How is Claude doing' visible)")
     lines.append(f"  argv: ['tmux', 'send-keys', '-t', {pane!r}, '-l', '0']  (conditional)")
     if args.no_resume:
-        lines.append("STEP 7: (skipped -- --no-resume)")
+        lines.append("STEP 6: (skipped -- --no-resume)")
     else:
-        lines.append("STEP 7: inject resume prompt")
+        lines.append("STEP 6: inject resume prompt")
         lines.append(
             "  argv: ['claude-watch', 'inject', '--pane', "
             f"{pane!r}, '--submit', {RESUME_PROMPT!r}, '--escape']"
@@ -866,25 +939,44 @@ def child_main(pane, args):
         inject(pane, "/clear", label=f"/clear-{attempt}", slash_command=True,
                escape=True)
 
-        # v2.1.283+: `/clear` opens an interactive Rewind picker instead of
-        # clearing directly (lists /resume <id> (previous), /clear,
-        # (current), footer "Enter to continue · Esc to cancel"). Confirm
-        # it here, BEFORE the completion poll below -- otherwise the poll
-        # spins for the full `--delay` window against an open menu that will
-        # never resolve on its own. No-op (detection-gated) on the
-        # pre-2.1.283 direct-clear behavior.
-        confirm_clear_picker(pane)
-
         if args.no_resume:
+            # No completion poll to piggyback picker-confirmation onto in
+            # this mode -- bounded wait-and-confirm is still correct here
+            # since nothing types into the pane afterward regardless.
+            confirm_clear_picker(pane)
             log("DONE: /clear injected (--no-resume)")
             return
 
-        # Poll tmux state: wait for tokens to drop AND prompt to be visible.
-        # Much faster than fixed sleep — /clear typically completes in 2-3s.
-        log(f"  polling for /clear completion (max {args.delay}s)...")
+        # v2.1.283+: `/clear` opens an interactive Rewind picker instead of
+        # clearing directly (lists /resume <id> (previous), /clear,
+        # (current), footer "Enter to continue · Esc to cancel"). A ONE-SHOT
+        # pre-check window here (the previous approach) can expire before
+        # Claude Code finishes rendering the picker -- after which nothing
+        # ever confirms it, and the poll below would misread the (idle-
+        # looking) open picker as a completed /clear and hand the resume
+        # prompt to it. So picker-confirmation is folded INTO the
+        # completion poll itself: every iteration, across the whole
+        # `--delay` window, checks for and confirms the picker. Completion
+        # requires ALL THREE: picker gone, tokens dropped, prompt idle --
+        # never just the latter two. No-op (detection-gated) on the
+        # pre-2.1.283 direct-clear behavior, where the picker never appears.
+        log(f"  polling for /clear completion (max {args.delay}s, "
+            "picker-aware)...")
         poll_end = time.time() + args.delay
         while time.time() < poll_end:
             time.sleep(0.5)
+            out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+            pane_text = out if (rc == 0 and out) else None
+            picker_seen, picker_confirmed = _rewind_picker_confirm_once(
+                pane, pane_text=pane_text)
+            if picker_seen:
+                # Picker still (or newly) open this iteration -- by
+                # definition NOT complete yet, whatever tokens/idle would
+                # otherwise read on this picker-showing snapshot. Skip the
+                # completion check entirely and re-poll next iteration.
+                log(f"  poll: Rewind picker visible "
+                    f"(confirmed_this_pass={picker_confirmed}) -- not done")
+                continue
             tokens_now = get_token_count()
             idle_now = is_idle(pane)
             log(f"  poll: tokens={tokens_now} idle={idle_now}")

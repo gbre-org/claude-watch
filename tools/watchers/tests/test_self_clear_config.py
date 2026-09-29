@@ -313,6 +313,153 @@ class RewindPickerTest(unittest.TestCase):
         self.assertEqual(enter_calls, [], "must never confirm onto (previous) -- would fork via /resume")
 
 
+class RewindPickerConfirmOnceTest(unittest.TestCase):
+    """Pure/single-snapshot tests for `_rewind_picker_confirm_once`, the
+    primitive meant to be called on EVERY iteration of the completion-poll
+    loop (not just a one-shot pre-check window) -- see the wedge this fixes:
+    a fixed pre-check can expire before Claude Code renders the picker, after
+    which nothing else ever confirms it and the poll misreads the open
+    picker as a completed /clear."""
+
+    def setUp(self):
+        self.mod = _import_self_clear()
+        self.mod.log = lambda *a, **k: None
+        self.mod.capture_pane_text = lambda pane: ""
+
+    def test_picker_on_current_confirms_and_reports_seen(self):
+        pane_text = "\n".join([
+            "  /resume 8f2a1c (previous)",
+            "  /clear",
+            "❯ (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        calls = []
+        self.mod.run = lambda cmd, timeout=None: (calls.append(cmd), ("", 0))[1]
+        picker_seen, confirmed = self.mod._rewind_picker_confirm_once(
+            "sess:0.0", pane_text=pane_text)
+        self.assertTrue(picker_seen)
+        self.assertTrue(confirmed)
+        enter_calls = [c for c in calls if c[:2] == ["tmux", "send-keys"] and c[-1] == "Enter"]
+        self.assertEqual(len(enter_calls), 1, calls)
+
+    def test_picker_on_previous_reports_seen_but_not_confirmed(self):
+        pane_text = "\n".join([
+            "❯ /resume 8f2a1c (previous)",
+            "  /clear",
+            "  (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        calls = []
+        self.mod.run = lambda cmd, timeout=None: (calls.append(cmd), ("", 0))[1]
+        picker_seen, confirmed = self.mod._rewind_picker_confirm_once(
+            "sess:0.0", pane_text=pane_text)
+        self.assertTrue(picker_seen, "picker is open -- caller must not treat this as complete")
+        self.assertFalse(confirmed)
+        enter_calls = [c for c in calls if c[:2] == ["tmux", "send-keys"] and c[-1] == "Enter"]
+        self.assertEqual(enter_calls, [], "must never confirm onto (previous)")
+
+    def test_no_picker_reports_not_seen(self):
+        pane_text = "\n".join([
+            "❯ ",
+            "  bypass permissions on · 12k tokens",
+        ])
+        calls = []
+        self.mod.run = lambda cmd, timeout=None: (calls.append(cmd), ("", 0))[1]
+        picker_seen, confirmed = self.mod._rewind_picker_confirm_once(
+            "sess:0.0", pane_text=pane_text)
+        self.assertFalse(picker_seen)
+        self.assertFalse(confirmed)
+        self.assertEqual(calls, [])
+
+    def test_captures_pane_itself_when_no_pane_text_given(self):
+        pane_text = "\n".join([
+            "  /resume 8f2a1c (previous)",
+            "  /clear",
+            "❯ (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        calls = []
+        def fake_run(cmd, timeout=None):
+            calls.append(cmd)
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return (pane_text, 0)
+            return ("", 0)
+        self.mod.run = fake_run
+        picker_seen, confirmed = self.mod._rewind_picker_confirm_once("sess:0.0")
+        self.assertTrue(picker_seen)
+        self.assertTrue(confirmed)
+
+    def test_capture_failure_reports_not_seen(self):
+        self.mod.run = lambda cmd, timeout=None: ("", 1)
+        picker_seen, confirmed = self.mod._rewind_picker_confirm_once("sess:0.0")
+        self.assertFalse(picker_seen)
+        self.assertFalse(confirmed)
+
+
+class CompletionPollNeverSucceedsWithPickerOpenTest(unittest.TestCase):
+    """Integration-shaped test for the load-bearing invariant: the
+    completion poll in `child_main` must NEVER declare /clear complete while
+    the Rewind picker footer is still visible, even if tokens/idle would
+    otherwise read as done on that same snapshot.
+
+    We don't invoke the full `child_main` (it drives a real tmux pane +
+    subprocess flow end-to-end), but we exercise the poll's core decision
+    rule directly: given a pane snapshot where the picker is visible AND
+    tokens/idle look like a fresh session, the picker check must win and
+    completion must not be signaled.
+    """
+
+    def setUp(self):
+        self.mod = _import_self_clear()
+        self.mod.log = lambda *a, **k: None
+        self.mod.capture_pane_text = lambda pane: ""
+
+    def test_picker_open_suppresses_completion_even_if_tokens_and_idle_look_done(self):
+        # This is what the wedge log looked like: picker open, but the
+        # picker screen itself reads as tokens=0 (looks fresh) and idle=True
+        # (a prompt-cursor glyph appears on the (current) row).
+        pane_text = "\n".join([
+            "  /resume 8f2a1c (previous)",
+            "  /clear",
+            "❯ (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        self.mod.run = lambda cmd, timeout=None: ("", 0)
+        picker_seen, _confirmed = self.mod._rewind_picker_confirm_once(
+            "sess:0.0", pane_text=pane_text)
+        # The poll loop in child_main is written as:
+        #   if picker_seen: continue   # never falls through to the
+        #                              # tokens/idle completion check
+        # Assert the primitive that decision depends on.
+        self.assertTrue(
+            picker_seen,
+            "picker must be detected as open on this snapshot so the poll "
+            "skips the tokens/idle completion check entirely",
+        )
+
+    def test_is_idle_alone_would_misread_the_picker_current_row(self):
+        # Documents WHY the picker check must come first: is_idle() only
+        # looks for the cursor glyph "❯" in the tail, which the picker's
+        # "❯ (current)" row also satisfies. This is the exact false-positive
+        # that caused the original wedge, and is now guarded against by
+        # checking _rewind_picker_confirm_once()'s picker_seen BEFORE
+        # trusting is_idle()/get_token_count() in the poll loop.
+        pane_text = "\n".join([
+            "  /resume 8f2a1c (previous)",
+            "  /clear",
+            "❯ (current)",
+            "",
+            "Enter to continue · Esc to cancel",
+        ])
+        self.mod.run = lambda cmd, timeout=None: (pane_text, 0)
+        self.assertTrue(self.mod.is_idle("sess:0.0"))
+        self.assertTrue(self.mod._rewind_picker_visible(pane_text))
+
+
 class InjectCommandTest(unittest.TestCase):
     """The argv `inject()` hands to `claude-watch inject`.
 
