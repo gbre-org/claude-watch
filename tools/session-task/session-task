@@ -1394,6 +1394,25 @@ def _validate_repo_scope_tokens(tokens):
 # misfire") -- the enforcing gate is spawn-time. It is deliberately
 # conservative: it only fires on a clear single target, and defers entirely
 # when the text is ambiguous (0 or >1 candidate repos).
+#
+# Three further guards keep it from firing on CORRECT input -- the failure mode
+# that matters most for a warning, because a warning that cries wolf gets
+# tuned out and then the real one is missed too:
+#
+#   * an `<org>/<repo>` reference must START a token, so an absolute path under
+#     a home directory that happens to share a name with a configured org is
+#     not read as a forge reference;
+#   * a repo named only inside a PROHIBITION ("do not reference <repo> paths")
+#     is not the work target;
+#   * and the warning never fires when a repo the scope claims is mentioned in
+#     the task text at all -- any mention corroborates the scope.
+#
+# The spawn-time gate (`tools/hooks/pre-agent-queue-gate-hook`) grew the same
+# three guards for the same shapes. They stay as separate implementations on
+# purpose: the two heuristics take different input (short prose vs a whole agent
+# prompt) and confirm candidates differently (this one requires the name to be a
+# real dir under the repos root and therefore also trusts a bare distinctive
+# name; the gate trusts only prefixed forms and never touches the filesystem).
 
 # Git-forge orgs whose repos get referred to as `<org>/<repo>` in task text.
 # CONFIGURABLE, never hardcoded to a particular user's employer/client: set
@@ -1418,13 +1437,97 @@ def _repo_orgs():
     return sorted(orgs)
 
 
+# An `<org>/<repo>` reference only counts when it STARTS a token -- optionally
+# behind a forge host (`github.com/<org>/<repo>`, `git@host:<org>/<repo>`).
+# Without this, a configured org name that is ALSO a home-directory name turns
+# every absolute path under it into an apparent repo reference: a path like
+# `/home/<org>/<leaf>/settings.json` yielded the target `<leaf>` whenever that
+# leaf happened to collide with a real repo dir name, and the heuristic warned
+# that a correctly-scoped task was mis-scoped. A path separator immediately
+# before the org is exactly the signal that this is a directory, not a forge
+# reference. (The same fix landed in the spawn-time gate; see
+# `tools/hooks/pre-agent-queue-gate-hook`.)
+_ORG_REF_BOUNDARY = r"""(?:^|[\s(\[{<>,;"'`*|@])"""
+_FORGE_HOST = r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}"
+_ORG_REF_PREFIX = _ORG_REF_BOUNDARY + r"(?:(?:https?://)?" + _FORGE_HOST + r"[:/])?"
+
+# A repo named in a clause that FORBIDS touching it is not the work target. The
+# common shape is a no-leakage instruction on an otherwise correctly-scoped
+# task ("do not reference <other-repo> paths in the PR body"): the heuristic
+# read the FORBIDDEN repo as the target and told the operator to re-scope onto
+# a repo the task never touches. Cues are prohibition/exclusion phrases that
+# take an object; bare "no" / "not" are deliberately NOT cues -- they are far
+# too common in ordinary task text to disqualify a whole clause.
+_PROHIBITION_CUE_RE = re.compile(
+    r"(?:\bdo\s+not\b|\bdon'?t\b|\bnever\b|\bmust\s+not\b|\bmay\s+not\b"
+    r"|\bshould\s+not\b|\bcannot\b|\bcan'?t\b|\bwithout\b|\bavoid\b"
+    r"|\bexcept\b|\bexclud\w*|\bother\s+than\b|\brather\s+than\b"
+    r"|\binstead\s+of\b|\bunrelated\b|\bforbidden\b|\bprohibited\b"
+    r"|\boff-limits\b|\bnothing\s+in\b|\bstay\s+out\s+of\b"
+    r"|\bnot\s+touch\b|\bleakage\b)",
+    re.IGNORECASE,
+)
+
+# Prohibition cues scope to a CLAUSE, not to a whole task description. The
+# spawn-time gate can work line-by-line because agent prompts arrive already
+# line-broken; a `queue add` description is typically one short line holding
+# several clauses ("fix the gate; do not reference <other-repo> paths"), so
+# splitting only on newlines would let one prohibition silence the real target.
+# Separators: a newline, a semicolon, or sentence-terminal punctuation followed
+# by whitespace. `.` is only a boundary when whitespace follows it, so an
+# interior dot in a repo name (`some-repo.bak.v13`) never splits a segment.
+_CLAUSE_SEP_RE = re.compile(r"(\r?\n+|;|(?<=[.!?])[ \t]+)")
+
+
+def _segment_prose(text):
+    """Split prose into (segments, carry) for the prohibition filter.
+
+    ``carry[i]`` is True when segment ``i`` merely CONTINUES segment ``i-1``
+    across a line wrap, in which case a cue in ``i-1`` governs ``i`` too (a
+    prohibition that wraps mid-phrase still covers the repo it forbids). A
+    semicolon or a sentence boundary does NOT carry: "do not touch <a>; work in
+    <b>" must leave `<b>` detectable.
+    """
+    parts = _CLAUSE_SEP_RE.split(text or "")
+    segments = parts[0::2]
+    separators = parts[1::2]
+    carry = [False]
+    for sep in separators:
+        carry.append("\n" in sep)
+    return segments, carry
+
+
+def _text_names_repo(text, repo):
+    """True when `repo` occurs as a whole word ANYWHERE in `text`.
+
+    Deliberately looser than target DETECTION: any mention counts, including
+    one inside a prohibition, and the "distinctive name" filter that guards
+    bare-mention detection does not apply. This is the corroboration test for
+    the mismatch warning, whose job is to find a reason NOT to fire.
+    """
+    return bool(
+        re.search(
+            r"(?<![A-Za-z0-9._-])" + re.escape(repo) + r"(?![A-Za-z0-9._-])",
+            text or "",
+        )
+    )
+
+
 def _build_repo_path_mention_res():
     """Path-shaped mentions: `<org>/<repo>`, `~/repos/<repo>`,
     `/Users/.../repos/<repo>`, `repo:<name>`. Captures the trailing repo
     segment. We intentionally match a small set of known org/path prefixes
-    rather than any `a/b` (which would false-positive on prose like "and/or").
+    rather than any `a/b` (which would false-positive on prose like "and/or"),
+    and the `<org>/<repo>` form must additionally START a token so a home
+    directory that shares a name with a configured org is not read as a forge
+    reference.
     """
-    res = [re.compile(re.escape(org) + r"/([A-Za-z0-9._-]+)") for org in _repo_orgs()]
+    res = [
+        re.compile(
+            _ORG_REF_PREFIX + re.escape(org) + r"/([A-Za-z0-9._-]+)", re.MULTILINE
+        )
+        for org in _repo_orgs()
+    ]
     res.append(
         re.compile(r"(?:~|/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/repos/([A-Za-z0-9._-]+)")
     )
@@ -1471,6 +1574,10 @@ def _detect_target_repos(text, valid_repos):
          short generic name like `config` or `p4` is too collision-prone with
          ordinary prose to treat a bare mention as a target.
 
+    Both modes run per CLAUSE, and a clause carrying a prohibition cue ("do not
+    reference <repo> paths") contributes no targets: a repo named only in order
+    to be ruled OUT is not what the task operates on.
+
     `valid_repos` is the list from `_list_valid_repos()` (None when the repos
     dir is absent -> caller treats that as "can't detect", no warning).
     """
@@ -1479,22 +1586,31 @@ def _detect_target_repos(text, valid_repos):
     valid_set = set(valid_repos)
     found = set()
 
-    # Mode 1: path/org-prefixed + explicit repo: mentions. Strip trailing
-    # sentence punctuation (repo names may contain interior dots -- e.g.
-    # claude-watch.bak.v13 -- but never a trailing period).
-    for rx in _REPO_PATH_MENTION_RES:
-        for m in rx.finditer(text):
-            name = m.group(1).rstrip(".,;:!?)]}'\"")
-            if name in valid_set:
-                found.add(name)
+    segments, carry = _segment_prose(text)
+    forbids = [bool(_PROHIBITION_CUE_RE.search(seg)) for seg in segments]
 
-    # Mode 2: bare whole-word mentions of distinctive repo dir names.
-    for name in valid_set:
-        if len(name) < 8 and "-" not in name and "_" not in name:
-            # Too short/generic to trust a bare mention.
+    for i, segment in enumerate(segments):
+        if forbids[i] or (carry[i] and i > 0 and forbids[i - 1]):
             continue
-        if re.search(rf"(?<![A-Za-z0-9._-]){re.escape(name)}(?![A-Za-z0-9._-])", text):
-            found.add(name)
+
+        # Mode 1: path/org-prefixed + explicit repo: mentions. Strip trailing
+        # sentence punctuation (repo names may contain interior dots -- e.g.
+        # claude-watch.bak.v13 -- but never a trailing period).
+        for rx in _REPO_PATH_MENTION_RES:
+            for m in rx.finditer(segment):
+                name = m.group(1).rstrip(".,;:!?)]}'\"")
+                if name in valid_set:
+                    found.add(name)
+
+        # Mode 2: bare whole-word mentions of distinctive repo dir names.
+        for name in valid_set:
+            if len(name) < 8 and "-" not in name and "_" not in name:
+                # Too short/generic to trust a bare mention.
+                continue
+            if re.search(
+                rf"(?<![A-Za-z0-9._-]){re.escape(name)}(?![A-Za-z0-9._-])", segment
+            ):
+                found.add(name)
 
     return found
 
@@ -1530,9 +1646,23 @@ def _scope_target_mismatch_warning(scope, description, summary):
 
     Heuristic + non-brittle (botchat #2346): warns ONLY when
       * the repos dir is available (else we can't tell real dirs from prose),
+      * NO repo the scope claims is mentioned anywhere in the task text -- any
+        mention is corroboration that the scope is right and the extractor is
+        wrong (see below),
       * the description/summary names exactly ONE unambiguous target repo dir,
+        counting only clauses that are not prohibitions,
       * `*` is NOT in scope (a universal claim covers everything), and
       * no `repo:<target>` / `path:<target>/...` token is in scope.
+
+    The corroboration veto is narrower here than in the spawn-time gate: a
+    DISTINCTIVE scoped-repo mention already surfaces as a second target and
+    collapses to "ambiguous -> silent" on its own. What it adds is the SHORT,
+    generic scoped-repo name (`config`) that bare-mention detection distrusts:
+    such a name is not trustworthy enough to be a target, but it is plenty
+    good enough to be evidence against warning.
+
+    Description and summary are scanned SEPARATELY rather than concatenated, so
+    a prohibition ending one of them cannot swallow the start of the other.
 
     Returns None (no warning) on ANY ambiguity -- 0 targets, >1 irreducible
     targets, missing repos dir. Never raises; purely advisory.
@@ -1543,12 +1673,21 @@ def _scope_target_mismatch_warning(scope, description, summary):
         valid = _list_valid_repos()
         if not valid:
             return None
-        text = " ".join(p for p in (description, summary) if p)
-        targets = _detect_target_repos(text, valid)
+        claimed = _repo_scope_names(scope)
+        parts = [p for p in (description, summary) if p]
+        # Corroboration veto. A warning that fires on correct input teaches
+        # operators to ignore it, which costs more than the occasional miss --
+        # spawn time still enforces. If the text mentions the repo the scope
+        # claims, in a path, a URL, or even inside a prohibition, then the
+        # scope is at worst ambiguous, never clearly wrong.
+        if any(_text_names_repo(p, c) for p in parts for c in claimed):
+            return None
+        targets = set()
+        for part in parts:
+            targets |= _detect_target_repos(part, valid)
         target = _longest_repo_name(targets)
         if not target:
             return None
-        claimed = _repo_scope_names(scope)
         # Covered (no warning) when a claimed repo is EXACTLY the target or
         # MORE specific than it (C == T, or C is a `T-...` sub-repo -- e.g.
         # scope repo:platform-typesense covers a bare "platform" mention).

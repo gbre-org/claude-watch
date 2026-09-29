@@ -129,6 +129,22 @@ still enqueues (rc 0).
     false-positive; the *enforcing* half is the spawn-time gate below.
   * Stays silent on ambiguity: 0 targets, >1 irreducible targets, `*` in
     scope, a short/generic bare name (`config`), or a missing repos dir.
+  * Stays silent on three shapes that are *correct* input, because a warning
+    that fires on correct input gets tuned out:
+    - an `<org>/<repo>` reference must **start a token** (optionally behind a
+      forge host), so an absolute path under a home directory that happens to
+      share a name with a configured org — `/home/<org>/<leaf>/...` — is not
+      read as a forge reference;
+    - a repo named only inside a **prohibition** (`... ; do not reference
+      <other-repo> paths in the PR body`) is not the work target. Cues scope to
+      a *clause*, so a prohibition never silences a target in a sibling clause;
+      it does carry across a bare line wrap;
+    - **corroboration** — if a repo the scope claims appears anywhere in the
+      task text, even inside a prohibition, the warning is suppressed. This
+      also covers the short/generic scoped name (`config`) that bare-mention
+      detection distrusts as a target but which is fine as evidence.
+  * Description and summary are scanned separately, so a prohibition ending one
+    cannot swallow the start of the other.
   * Coverage: a scoped repo that is the target or *more specific* than it
     (`repo:platform-typesense` covers a bare `platform` mention) suppresses
     the warning; a scoped repo *less specific* than the target
@@ -143,7 +159,14 @@ still enqueues (rc 0).
 The spawn-time enforcement lives in the `pre-agent-queue-gate-hook`
 (`tools/hooks/`): it extracts the Agent prompt's target repo (same prefixed
 forms) and **DENIES** the spawn on a clear mismatch with the queue item's repo
-scope, defaulting open on any ambiguity.
+scope, defaulting open on any ambiguity. It carries its own copy of the three
+guards above. They are deliberately *not* factored into a shared module: each
+tool ships as a single self-contained script symlinked onto `PATH` (see
+`TOOL_LINKS` in the `Makefile`), and the two heuristics differ in input (short
+prose vs a whole agent prompt), in how they confirm a candidate (this one
+requires a real dir under the repos root and therefore also trusts a bare
+distinctive name; the gate trusts only prefixed forms and never touches the
+filesystem), and in consequence (advise vs deny).
 
 ## Files
 

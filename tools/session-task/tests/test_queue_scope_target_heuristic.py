@@ -16,7 +16,13 @@ succeeds (rc 0). It must:
     case (path mention + explicit repo: scope),
   * NOT false-positive on generic prose, ambiguous multi-repo text, or when the
     scope already covers the named repo (exactly or more-specifically),
-  * stay silent when `*` is in scope or the repos dir is absent.
+  * stay silent when `*` is in scope or the repos dir is absent,
+  * stay silent on three shapes that are CORRECT input and used to warn:
+    an absolute path under a home directory sharing a configured org's name
+    (`/home/<org>/<leaf>/...`), a repo named only to be FORBIDDEN (`do not
+    reference <other-repo> paths`), and any task text that mentions a repo the
+    scope claims (corroboration) -- while still warning on a genuine mismatch,
+    including one in a clause that merely follows a prohibition.
 
 Run:
     uv run --python 3.11 --with pytest \\
@@ -270,6 +276,201 @@ def test_home_repos_path_mention_warns():
         assert r.returncode == 0, r.stderr
         assert _WARN_NEEDLE in r.stderr, r.stderr
         assert "platform-typesense" in r.stderr
+
+
+# --------------------------------------------------------------------------
+# False positives the guards exist to prevent. Each of these is CORRECT input
+# -- the scope names the repo the task really operates on -- and the heuristic
+# used to warn anyway. A warning that fires on correct input gets tuned out.
+# --------------------------------------------------------------------------
+
+
+def test_home_dir_sharing_an_org_name_is_not_a_forge_reference():
+    """`/home/<org>/<leaf>/...` must not be read as `<org>/<repo>`.
+
+    A configured forge org name can also be a home-directory name. Without a
+    token-start anchor on the org, every absolute path under that home looks
+    like a forge reference, and the leaf segment becomes the "target" whenever
+    it collides with a real repo dir name (`config` here). The task is scoped
+    correctly; there is nothing to warn about.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            f"copy the template from /home/{_ORG}/{_ORG_ONLY_TARGET}/settings.json "
+            f"into the queue tool",
+            ["repo:claude-watch"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE not in r.stderr, r.stderr
+
+
+def test_forge_host_prefixed_org_reference_still_detected():
+    """The anchor allows a forge host in front: `<host>/<org>/<repo>` counts.
+
+    Guards the other side of the anchor -- it must exclude a path separator,
+    not any prefix at all.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            f"review https://example.com/{_ORG}/platform-html-to-pdf/pull/7",
+            ["repo:platform"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE in r.stderr, r.stderr
+        assert "platform-html-to-pdf" in r.stderr
+
+
+def test_repo_named_only_in_a_prohibition_clause_is_not_a_target():
+    """A no-leakage instruction names a repo in order to FORBID it.
+
+    `... ; do not reference <other-repo> paths` used to make the FORBIDDEN repo
+    the target and demand a re-scope onto a repo the task never touches. The
+    clause split matters here: the text is one line, so splitting on newlines
+    alone would not separate the prohibition from the real work.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            "fix the spawn gate; do not reference pr-watch paths in the PR body",
+            ["repo:claude-watch"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE not in r.stderr, r.stderr
+
+
+def test_prohibition_in_a_following_sentence_is_not_a_target():
+    """Same shape across a sentence boundary rather than a semicolon."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            "Refactor the queue tool. Never mention platform-typesense in the "
+            "commit message.",
+            ["repo:claude-watch"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE not in r.stderr, r.stderr
+
+
+def test_prohibition_wrapped_across_a_newline_still_covers_its_repo():
+    """A cue and the repo it forbids may land on different lines.
+
+    A line wrap is a continuation, so the cue carries to the next segment --
+    unlike a semicolon or a sentence end, which do not.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            "fix the spawn gate\ndo not reference\npr-watch paths in the PR body",
+            ["repo:claude-watch"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE not in r.stderr, r.stderr
+
+
+def test_prohibition_does_not_silence_a_target_after_a_semicolon():
+    """A cue scopes to its CLAUSE, not to the rest of the text.
+
+    "do not touch <a>; work in <b>" must still detect `<b>`. This is why the
+    filter splits clauses instead of poisoning the whole description.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            "do not touch botchat; rework the platform-html-to-pdf renderer",
+            ["repo:platform"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE in r.stderr, r.stderr
+        assert "platform-html-to-pdf" in r.stderr
+
+
+def test_scoped_repo_mentioned_in_the_text_vetoes_the_warning():
+    """Any mention of a scoped repo is corroboration -> stay silent.
+
+    The scoped repo here (`config`) is too short/generic to be trusted as a
+    bare-mention TARGET, so it never becomes a second candidate and the
+    ambiguity check cannot save us. It is still perfectly good evidence that
+    the scope is deliberate.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            "port the retry logic from pr-watch into config",
+            [f"repo:{_ORG_ONLY_TARGET}"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE not in r.stderr, r.stderr
+
+
+def test_unmentioned_scoped_repo_does_not_veto():
+    """The veto needs an actual mention, not merely a scope token.
+
+    Pairs with the test above: same target, same shape, but the scoped repo is
+    absent from the text -- so the mismatch is still reported.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            "port the retry logic from pr-watch into the queue tool",
+            [f"repo:{_ORG_ONLY_TARGET}"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE in r.stderr, r.stderr
+        assert "pr-watch" in r.stderr
+
+
+def test_prohibition_in_the_description_does_not_reach_the_summary():
+    """Description and summary are scanned separately.
+
+    They used to be concatenated with a space, so a description ending in a
+    prohibition would have swallowed the start of the summary (and vice
+    versa). Here the summary carries the real target and must still be seen.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _run(
+            env,
+            "queue",
+            "add",
+            "tidy the queue tool, and do not touch botchat",
+            "--summary",
+            "rework the platform-html-to-pdf renderer",
+            "--scope",
+            "repo:platform",
+            "--json",
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE in r.stderr, r.stderr
+        assert "platform-html-to-pdf" in r.stderr
+
+
+def test_interior_dot_in_a_repo_name_does_not_split_a_clause():
+    """`.` is a clause boundary only when whitespace follows it.
+
+    A repo dir may carry interior dots (`claude-watch.bak.v13`); splitting on
+    every '.' would cut such a name in half and lose the target.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        repos = _REPOS + ("claude-watch.bak.v13",)
+        env = _env_for_tmp(tmp, make_repos=repos)
+        r = _add(
+            env,
+            f"restore the queue store from {_ORG}/claude-watch.bak.v13",
+            ["repo:platform"],
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE in r.stderr, r.stderr
+        assert "claude-watch.bak.v13" in r.stderr
 
 
 if __name__ == "__main__":
