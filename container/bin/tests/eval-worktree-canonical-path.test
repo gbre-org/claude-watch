@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Tests for container/bin/eval-worktree-canonical-path (the
+# worktree_canonical_path obligation evaluator).
+#
+# The evaluator DENIES a `git worktree add` whose target path is NOT under the
+# canonical worktrees root <workspace>/.worktrees/<repo>/<slug>, and is
+# AST-aware (imports shell_ast, walks every command position). These tests pin:
+#
+#   DENY (non-canonical, incl. every AST evasion position):
+#     - bare `git worktree add /tmp/x`
+#     - after `&&`:   `foo && git worktree add ../stray`
+#     - after `;`:    `true; git worktree add /tmp/z`
+#     - inside `$()`: `OUT=$(git worktree add /tmp/x)`
+#     - inside `bash -c '...'` body
+#     - nested-in-clone antipattern (<repo>/.worktrees/<repo>/...)
+#     - loose `.wt-*` dir / loose `<repo>-<name>/` sibling clone
+#     - a `-C` invocation with a RELATIVE target
+#     - host-bash tool_input JSON ({"command": ...} / {"script": ...})
+#
+#   ALLOW (canonical / non-add / data):
+#     - canonical target (with and without `-C`, `-b` before the path)
+#     - `git worktree list` / `git worktree remove <canonical>`
+#     - a `git worktree add` string that is DATA in a quoted arg
+#     - unrelated commands
+#     - host-bash JSON carrying a canonical add
+#
+#   DEFAULT-OPEN:
+#     - empty stdin => allow
+#
+# shell_ast lives next to the evaluator only inside the container image
+# (baked flat in /usr/local/bin). On the host it lives in
+# tools/obligations/shell_ast.py, so we put that dir on PYTHONPATH.
+#
+# Run:  ./eval-worktree-canonical-path.test
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL="${HERE}/../eval-worktree-canonical-path"
+REPO_ROOT="$(cd "${HERE}/../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/tools/obligations:${PYTHONPATH:-}"
+
+PASS=0
+FAIL=0
+ok()  { PASS=$((PASS + 1)); echo "ok   - $1"; }
+bad() { FAIL=$((FAIL + 1)); echo "FAIL - $1"; }
+
+# run_eval <stdin>  -> sets $rc, $out
+run_eval() {
+    set +e
+    out="$(printf '%s' "$1" | python3 "$EVAL" 2>&1)"
+    rc=$?
+    set -e
+}
+
+# expect_deny <desc> <stdin>
+expect_deny() {
+    run_eval "$2"
+    if [ "$rc" -eq 1 ] && echo "$out" | grep -q "DENIED"; then
+        ok "$1"
+    else
+        bad "$1 (expected DENY; got rc=$rc, out=$out)"
+    fi
+}
+
+# expect_allow <desc> <stdin>
+expect_allow() {
+    run_eval "$2"
+    if [ "$rc" -eq 0 ]; then
+        ok "$1"
+    else
+        bad "$1 (expected ALLOW; got rc=$rc, out=$out)"
+    fi
+}
+
+CW=/Users/hallandrew/repos/claude-watch
+WT=/Users/hallandrew/repos/.worktrees/claude-watch
+
+# --- DENY: non-canonical, every AST position ---------------------------
+expect_deny "bare non-canonical add"            "git worktree add /tmp/x"
+expect_deny "add after && (compound)"           "foo && git worktree add ../stray"
+expect_deny "add after ; (statement sep)"       "true; git worktree add /tmp/z"
+expect_deny 'add inside $() command sub'        'OUT=$(git worktree add /tmp/x)'
+expect_deny "add inside bash -c body"           "bash -c 'git worktree add /tmp/y'"
+expect_deny "nested-in-clone antipattern"       "git -C ${CW} worktree add ${CW}/.worktrees/claude-watch/n"
+expect_deny "loose .wt-* dir"                   "git -C ${CW} worktree add /Users/hallandrew/repos/.wt-cw-foo"
+expect_deny "loose <repo>-<name> sibling"       "git -C ${CW} worktree add /Users/hallandrew/repos/claude-watch-foo"
+expect_deny "-C with a RELATIVE target"         "git -C ${CW} worktree add ../stray br"
+
+# --- DENY: host-bash tool_input JSON -----------------------------------
+expect_deny "host-bash run_command JSON"        '{"command":"git worktree add /tmp/x"}'
+expect_deny "host-bash run_script JSON"         '{"script":"foo && git worktree add /tmp/x"}'
+
+# --- ALLOW: canonical / non-add / data ---------------------------------
+expect_allow "canonical add with -C and -b"     "git -C ${CW} worktree add ${WT}/foo -b ah/foo"
+expect_allow "canonical add no -C"              "git worktree add ${WT}/foo"
+expect_allow "canonical add -b before path"     "git -C ${CW} worktree add -b ah/x ${WT}/x"
+expect_allow "worktree list"                    "git worktree list"
+expect_allow "worktree remove (canonical)"      "git -C ${CW} worktree remove ${WT}/foo"
+expect_allow "git status (non-worktree)"        "git -C /r status"
+expect_allow "add string as quoted DATA"        "echo 'git worktree add /tmp/x'"
+expect_allow "unrelated command"                "ls -la /tmp"
+expect_allow "host-bash JSON canonical add"     '{"script":"git -C '"${CW}"' worktree add '"${WT}"'/ok"}'
+
+# --- DEFAULT-OPEN ------------------------------------------------------
+expect_allow "empty stdin => default-open allow" ""
+
+echo
+echo "eval-worktree-canonical-path: ${PASS} passed, ${FAIL} failed"
+[ "$FAIL" -eq 0 ]

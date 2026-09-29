@@ -1172,6 +1172,18 @@ COPY container/bin/eval-orphaned-running-hard-gate /usr/local/bin/eval-orphaned-
 # before doing anything else. Default-open on errors.
 COPY container/bin/eval-queue-ready-unspawned /usr/local/bin/eval-queue-ready-unspawned
 
+# eval-worktree-canonical-path — obligations evaluator that DENIES a
+# `git worktree add` whose target path is NOT under the canonical worktrees
+# root <workspace>/.worktrees/<repo>/<slug>. AST-aware: imports shell_ast
+# (baked flat in /usr/local/bin/shell_ast.py, same dir) and walks every
+# command position, so a `git worktree add` after && / ; / |, inside $(...),
+# or behind a bash -c / env wrapper is caught, while a quoted-arg / heredoc
+# occurrence is ignored. Seeded (three rows: Bash + host-bash run_command +
+# run_script) by obligations-init. Points agents at the `new-worktree` skill.
+# Default-open on parse/spawn errors (exit 0) so a gate bug never blackholes
+# the loop.
+COPY container/bin/eval-worktree-canonical-path /usr/local/bin/eval-worktree-canonical-path
+
 # agent-ack — CLI to manage the agent completion acknowledgment state.
 # Subcommands: register, done, list, clear, status. Manages the state
 # file at ~/.config/claude/agent-ack-pending.json used by the
@@ -1425,6 +1437,7 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
              /usr/local/bin/eval-event-must-act \
              /usr/local/bin/eval-agent-ack-pending \
              /usr/local/bin/eval-queue-ready-unspawned \
+             /usr/local/bin/eval-worktree-canonical-path \
              /usr/local/bin/agent-ack \
              /usr/local/bin/event-ack \
              /usr/local/bin/event-classify \

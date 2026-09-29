@@ -71,7 +71,7 @@
 .PHONY: test-agent-psi-exporter
 # Tests — container image
 .PHONY: test-trust-workspace test-claude-tmux-env test-cron-toggle
-.PHONY: test-eval-queue-ready-unspawned
+.PHONY: test-eval-queue-ready-unspawned test-eval-worktree-canonical-path
 .PHONY: test-cw-theme-sync
 .PHONY: test-hooks-shim test-entrypoint
 # Tests — compose stack + host shims
@@ -376,6 +376,14 @@ test-cron-toggle: ## cw-cron-run / cw-cron-toggle tests
 # with a JSON-fixture stub; no real queue state is touched.
 test-eval-queue-ready-unspawned: ## eval-queue-ready-unspawned obligation evaluator tests
 	container/bin/tests/eval-queue-ready-unspawned.test
+
+# Run the eval-worktree-canonical-path tests (the worktree_canonical_path
+# obligation evaluator). AST-aware DENY of a `git worktree add` whose target
+# is NOT under <workspace>/.worktrees/<repo>/<slug>; imports shell_ast from
+# tools/obligations/ (put on PYTHONPATH by the .test). No queue/container state
+# touched.
+test-eval-worktree-canonical-path: ## eval-worktree-canonical-path obligation evaluator tests
+	container/bin/tests/eval-worktree-canonical-path.test
 
 # Tests for cw-theme-sync's idle gate. Claude Code renders a suggestion inside
 # an EMPTY input box as DIM (SGR 2) ghost text; capturing the pane without

@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""eval-worktree-canonical-path — obligations evaluator that DENIES a
+``git worktree add`` whose target path is NOT under the canonical worktrees
+root ``<workspace>/.worktrees/<repo>/<slug>``.
+
+WHY
+---
+Agents kept scattering git worktrees across non-canonical locations
+(``<workspace>/<repo>-worktrees/``, ``<repo>/.worktrees/`` nested INSIDE the
+read-only bind-mounted clone, loose ``<workspace>/.wt-<x>`` dirs, loose
+``<workspace>/<repo>-<name>/`` clones, ...). The canonical convention is a
+single hidden root ``<workspace>/.worktrees/<repo>/<slug>``. This gate makes
+the convention structurally enforced instead of merely documented, and points
+the agent at the ``new-worktree`` skill / helper for the right way.
+
+AST-AWARE (the whole point)
+---------------------------
+A raw ``^\\s*git\\s+worktree\\s+add`` regex only sees the invocation at the
+very START of the command string. It MISSES every real evasion:
+
+    foo && git worktree add ../stray        # after &&
+    true; git worktree add /tmp/x           # after ;
+    x=$(git worktree add y)                 # inside a command substitution
+    bash -c 'git worktree add z'            # inside a -c script body
+    env FOO=1 git -C /r worktree add /tmp/x # behind an env-assignment / -C
+
+This evaluator imports the SAME ``shell_ast`` module the native obligations
+predicates use and walks EVERY command position (each top-level segment head,
+plus every ``$(...)`` / backtick / ``<(...)`` process-sub / ``sh -c`` body),
+so a ``git worktree add`` in any of those positions is caught, while an
+occurrence inside a quoted argument or heredoc BODY (data, never a command
+head) is correctly ignored (``echo 'git worktree add /tmp/x'`` => ALLOW).
+
+PROTOCOL (obligations evaluator predicate, decision_mode=exit_code)
+------------------------------------------------------------------
+  - stdin: the command text. For the ``Bash`` tool this is the literal
+    command; for the ``mcp__host-bash__run_command`` / ``run_script`` tools
+    the gate hook renders the tool_input as JSON, so we JSON-parse it back to
+    the real ``command`` / ``script`` body first (mirroring the obligations
+    CLI's ``_hostbash_command_text``).
+  - exit 0: ALLOW
+  - exit 1: DENY
+  - stderr: diagnostic shown verbatim in the deny banner.
+
+DEFAULT-OPEN (a gate bug must never blackhole the loop)
+-------------------------------------------------------
+Empty stdin, no ``git worktree add`` present, an unparseable command, a
+missing ``shell_ast`` module, or any uncaught exception => ALLOW. The only
+path that DENIES is an unambiguously-detected ``git worktree add`` with a
+NON-canonical target.
+
+CANONICAL RULE
+--------------
+For each detected ``git worktree add`` invocation:
+  * Determine the repo dir from git's global ``-C <dir>`` option when present
+    (git semantics: last ``-C`` wins). The canonical worktrees root is then
+    ``<dirname(repo)>/.worktrees/<basename(repo)>`` — EXACTLY what the
+    ``new-worktree.sh`` helper computes. The target must be at or under it.
+  * When no ``-C`` is present we cannot know the repo, so we fall back to a
+    lexical check: the absolute, normalized target must contain a
+    ``.worktrees`` path component followed by ``<repo>/<slug>`` (>=2 trailing
+    components), and must NOT exhibit the nested-inside-a-clone antipattern
+    (``.../<repo>/.worktrees/<repo>/...``). A RELATIVE target with no ``-C``
+    is treated as non-canonical (the helper always emits absolute paths).
+"""
+import json
+import os
+import sys
+
+# Import shell_ast from the same dir this script is baked into
+# (/usr/local/bin/shell_ast.py), mirroring how the obligations CLI resolves
+# it. On the host (tests) PYTHONPATH points at tools/obligations/.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import shell_ast as sa  # noqa: E402
+except Exception:  # noqa: BLE001 -- any import failure => default-open
+    sa = None
+
+# git global options that consume the following word as their argument, so we
+# skip that word when scanning for the ``worktree`` subcommand.
+_GIT_GLOBAL_OPTS_WITH_ARG = {
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--super-prefix", "--exec-path",
+}
+
+# ``git worktree add`` options that consume the following word as an argument.
+_ADD_OPTS_WITH_ARG = {"-b", "-B", "--reason"}
+
+
+def _read_command_text() -> str:
+    """Read stdin and, if it is a host-bash MCP tool_input JSON object,
+    extract the real shell ``command`` / ``script`` body. FAIL-SAFE: a raw
+    (non-JSON) payload is returned unchanged."""
+    raw = sys.stdin.read()
+    if not raw:
+        return ""
+    stripped = raw.lstrip()
+    if stripped[:1] in ("{", "["):
+        try:
+            obj = json.loads(raw)
+        except (ValueError, TypeError):
+            return raw
+        if isinstance(obj, dict):
+            for field in ("command", "script"):
+                val = obj.get(field)
+                if isinstance(val, str) and val:
+                    return val
+            return raw
+    return raw
+
+
+def _iter_command_wordlists(cmd: str, _depth: int = 0):
+    """Yield the stripped word-list of every command position in ``cmd`` —
+    each top-level segment head AND every command-substitution / process-sub /
+    ``sh -c`` body — walking the SAME structural model the AST predicates use.
+
+    Raises ``shell_ast.ShellParseError`` on parse failure (caller fails OPEN).
+    """
+    if _depth > 40:
+        return
+    parsed = sa.parse(cmd)
+    for seg in parsed.segments:
+        words = sa._strip_command_prefix(seg.words)
+        if words:
+            yield words
+        for word in seg.words:
+            for inner in sa._substitution_bodies(word):
+                yield from _iter_command_wordlists(inner, _depth + 1)
+            for inner in sa._procsub_bodies(word):
+                yield from _iter_command_wordlists(inner, _depth + 1)
+        for inner in sa._dash_c_bodies(seg.words):
+            yield from _iter_command_wordlists(inner, _depth + 1)
+
+
+def _parse_worktree_add(words):
+    """Given a stripped command word-list, return ``(repo_dir, target)`` if it
+    is a ``git ... worktree add <target>`` invocation, else ``None``.
+
+    ``repo_dir`` is the value of the last git global ``-C <dir>`` (or ``None``)
+    and ``target`` is the ``<path>`` positional of ``worktree add`` (or
+    ``None`` if the invocation carries no path yet — an incomplete add we do
+    not judge).
+    """
+    if not words:
+        return None
+    if os.path.basename(words[0]) != "git":
+        return None
+
+    repo_dir = None
+    i = 1
+    n = len(words)
+    # Walk git global options up to the subcommand.
+    while i < n:
+        w = words[i]
+        if not w.startswith("-"):
+            break  # this is the subcommand
+        # inline form: --opt=value / -Cvalue not standard; handle --opt=value
+        if "=" in w and w.startswith("--"):
+            key = w.split("=", 1)[0]
+            if key == "--git-dir" or key == "--work-tree":
+                pass
+            i += 1
+            continue
+        if w in _GIT_GLOBAL_OPTS_WITH_ARG:
+            if w == "-C" and i + 1 < n:
+                repo_dir = words[i + 1]
+            i += 2
+            continue
+        # a lone flag with no argument (e.g. --bare, --no-pager, -p)
+        i += 1
+
+    if i >= n or words[i] != "worktree":
+        return None
+    i += 1
+    if i >= n or words[i] != "add":
+        return None
+    i += 1
+
+    # Parse ``worktree add`` args: first non-option word is the target path.
+    target = None
+    while i < n:
+        w = words[i]
+        if w == "--":
+            i += 1
+            if i < n:
+                target = words[i]
+            break
+        if w.startswith("-"):
+            if "=" in w and w.startswith("--"):
+                i += 1
+                continue
+            if w in _ADD_OPTS_WITH_ARG:
+                i += 2
+                continue
+            i += 1
+            continue
+        target = w
+        break
+    return (repo_dir, target)
+
+
+def _norm_abs(path: str) -> str:
+    """normpath, expanding a leading ~. Does NOT resolve against a real CWD
+    (we have no reliable CWD for host-bash calls); a relative path stays
+    relative and is judged non-canonical by the caller."""
+    p = os.path.expanduser(path)
+    return os.path.normpath(p)
+
+
+def _components(path: str):
+    return [c for c in path.split(os.sep) if c and c != "."]
+
+
+def _is_canonical(repo_dir, target) -> bool:
+    """True iff ``target`` is a canonical worktree path for ``repo_dir``.
+
+    PRIMARY (``-C`` present): canonical root is
+    ``<dirname(repo)>/.worktrees/<basename(repo)>`` and target must be under
+    it — the exact rule ``new-worktree.sh`` implements.
+
+    FALLBACK (no ``-C``): a relative target is non-canonical; an absolute
+    target is canonical iff it has a ``.worktrees`` component with >=2 trailing
+    components and does NOT nest ``.worktrees`` inside a clone
+    (``.../<repo>/.worktrees/<repo>/...``, parent==child).
+    """
+    if not target:
+        # No path yet — an incomplete add; do not deny.
+        return True
+
+    if repo_dir:
+        repo_abs = _norm_abs(repo_dir)
+        canonical_root = os.path.join(
+            os.path.dirname(repo_abs), ".worktrees", os.path.basename(repo_abs)
+        )
+        canonical_root = os.path.normpath(canonical_root)
+        # Resolve a relative target against the repo dir's PARENT is wrong;
+        # git resolves it against CWD. The helper always uses absolute paths,
+        # so a relative target here is non-canonical.
+        if not os.path.isabs(os.path.expanduser(target)):
+            return False
+        tgt = _norm_abs(target)
+        return tgt == canonical_root or tgt.startswith(canonical_root + os.sep)
+
+    # --- fallback: no -C -------------------------------------------------
+    if not os.path.isabs(os.path.expanduser(target)):
+        return False
+    tgt = _norm_abs(target)
+    comps = _components(tgt)
+    if ".worktrees" not in comps:
+        return False
+    idx = comps.index(".worktrees")
+    # need <repo>/<slug> after .worktrees
+    if len(comps) < idx + 3:
+        return False
+    # nested-inside-a-clone antipattern: .../<repo>/.worktrees/<repo>/...
+    if idx >= 1 and comps[idx - 1] == comps[idx + 1]:
+        return False
+    return True
+
+
+def main() -> int:
+    if sa is None:
+        # shell_ast unavailable — cannot parse safely; default-open.
+        return 0
+    cmd = _read_command_text()
+    if not cmd.strip():
+        return 0
+
+    try:
+        wordlists = list(_iter_command_wordlists(cmd))
+    except sa.ShellParseError:
+        # Unparseable — default-open (an unparseable command is not a
+        # confidently-detected violation; the loop must never be blackholed).
+        return 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+    violations = []
+    for words in wordlists:
+        try:
+            parsed = _parse_worktree_add(words)
+        except Exception:  # noqa: BLE001
+            continue
+        if parsed is None:
+            continue
+        repo_dir, target = parsed
+        if not _is_canonical(repo_dir, target):
+            violations.append(target or "<no-path>")
+
+    if violations:
+        joined = ", ".join(repr(v) for v in violations)
+        sys.stderr.write(
+            "DENIED: non-canonical `git worktree add` target(s): "
+            f"{joined}.\n"
+            "All host worktrees MUST live under the canonical root "
+            "<workspace>/.worktrees/<repo>/<slug> (e.g. "
+            "~/repos/.worktrees/claude-watch/my-fix) — NEVER a nested "
+            "<repo>/.worktrees/, a loose <repo>-worktrees/, a <workspace>/"
+            ".wt-* dir, or a top-level <repo>-<name>/ clone.\n"
+            "Use the canonical helper instead of a bare `git worktree add`: "
+            "invoke the `new-worktree` skill (/claude-container:new-worktree), "
+            "or run the identity-stamping helper it wraps "
+            "(scripts/new-worktree.sh <repo-path> <slug> [branch]).\n"
+            "Override (rare, deliberate): `obligations override \"<reason>\" "
+            "--duration <N>`.\n"
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

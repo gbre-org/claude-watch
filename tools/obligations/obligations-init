@@ -125,6 +125,7 @@ ORPHANED_RUNNING_HARD_GATE_TAG = "[default-seed] orphaned_running_hard_gate"
 QUEUE_READY_UNSPAWNED_TAG = "[default-seed] queue_ready_unspawned"
 NO_BACKGROUNDED_WATCHER_TAG = "[default-seed] no_backgrounded_watcher"
 SUBAGENT_QUEUE_MUTATING_BANNED_TAG = "[default-seed] subagent_queue_mutating_banned"
+WORKTREE_CANONICAL_PATH_TAG = "[default-seed] worktree_canonical_path"
 
 # Default in-container path where the operator's bind-mounted, USER-MANAGED
 # obligation manifest dir lands (the entrypoint mounts
@@ -938,6 +939,100 @@ def seed_subagent_queue_mutating_banned(cli: str, *, dry_run: bool = False,
     return 0
 
 
+def seed_worktree_canonical_path(cli: str, *, dry_run: bool = False,
+                                  force: bool = False,
+                                  verbose: bool = False) -> int:
+    """Add the worktree_canonical_path obligation. DENIES a ``git worktree
+    add`` whose target path is NOT under the canonical worktrees root
+    ``<workspace>/.worktrees/<repo>/<slug>``, steering agents at the
+    ``new-worktree`` skill / helper instead of a bare ``git worktree add``.
+
+    Uses the ``evaluator`` predicate shelling out to
+    ``eval-worktree-canonical-path`` (baked at /usr/local/bin), which imports
+    ``shell_ast`` and walks EVERY command position — so a ``git worktree add``
+    after ``&&`` / ``;`` / ``|``, inside ``$(...)``, or behind a ``bash -c`` /
+    ``env`` wrapper is caught, while an occurrence in a quoted arg / heredoc is
+    ignored. Default-open on parse/spawn errors (the evaluator returns exit 0),
+    so a gate bug never blackholes the loop.
+
+    SCOPING: NOT main-loop-only. Subagents (via the Bash tool) and the main
+    loop (via the host-bash MCP bridge) BOTH create worktrees, so this gate
+    must fire in both contexts — hence a bare ``evaluator`` predicate with no
+    ``is_main_loop`` guard. Three rows are seeded, one per tool surface that
+    can run a ``git worktree add``:
+      - ``Bash``                          (in-container shell)
+      - ``mcp__host-bash__run_command``   (host shell, single command)
+      - ``mcp__host-bash__run_script``    (host shell, script body)
+    The evaluator reads the command from stdin; for the two host-bash tools
+    the gate hook renders tool_input as JSON and the evaluator JSON-parses the
+    real ``command`` / ``script`` body back out itself.
+    """
+    if not force and _row_already_present(cli, WORKTREE_CANONICAL_PATH_TAG):
+        if verbose:
+            print("worktree_canonical_path: already seeded -- skipping",
+                  file=sys.stderr)
+        return 0
+
+    eval_cmd = _eval_bin("eval-worktree-canonical-path")
+    # Per-tool stdin field: Bash carries the literal command; the host-bash
+    # MCP tools carry a JSON tool_input the evaluator parses itself. The
+    # _resolve_evaluator_stdin aliases (command/script) all collapse to
+    # "pass command_string verbatim", so "command" is fine for all three.
+    tool_patterns = (
+        "Bash",
+        "mcp__host-bash__run_command",
+        "mcp__host-bash__run_script",
+    )
+    rc_total = 0
+    for tool_pattern in tool_patterns:
+        predicate_params = {
+            "cmd": eval_cmd,
+            "timeout_ms": 5000,
+            "stdin_field": "tool_input.command",
+            "decision_mode": "exit_code",
+        }
+        cmd = [
+            cli, "add",
+            "--tool-pattern", tool_pattern,
+            "--predicate", "evaluator",
+            "--params", json.dumps(predicate_params),
+            "--ttl", "0",  # non-expiring
+            "--enforcement", "gate",
+            "--deny-msg", WORKTREE_CANONICAL_PATH_TAG,
+            "--created-by", "obligations-init",
+            "--json",
+        ]
+        if dry_run:
+            print("DRY-RUN: " + " ".join(cmd))
+            continue
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+            rc_total = 1
+            continue
+        if proc.returncode != 0:
+            print("obligations-init: obligations add failed "
+                  f"rc={proc.returncode} (tool={tool_pattern})",
+                  file=sys.stderr)
+            if proc.stderr:
+                print(proc.stderr, file=sys.stderr)
+            rc_total = 1
+            continue
+        if verbose:
+            try:
+                row = json.loads(proc.stdout)
+                print(f"worktree_canonical_path: seeded "
+                      f"id={row.get('id', '?')} tool={tool_pattern}",
+                      file=sys.stderr)
+            except (json.JSONDecodeError, ValueError):
+                print(f"worktree_canonical_path: seeded tool={tool_pattern} "
+                      f"(rc={proc.returncode})", file=sys.stderr)
+    return rc_total
+
+
 def _existing_user_manifest_rows(cli: str) -> list[dict]:
     """Return the active obligation rows that were applied from a user
     manifest, identified by created_by carrying the user-manifest marker.
@@ -1291,6 +1386,7 @@ SEEDERS = {
     "orphaned_running_hard_gate": seed_orphaned_running_hard_gate,
     "no_backgrounded_watcher": seed_no_backgrounded_watcher,
     "subagent_queue_mutating_banned": seed_subagent_queue_mutating_banned,
+    "worktree_canonical_path": seed_worktree_canonical_path,
 }
 
 
@@ -1387,6 +1483,10 @@ def main() -> int:
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
 
+    rc_wt = seed_worktree_canonical_path(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+
     # User-managed obligation manifests from the bind-mounted, operator-owned
     # config dir. Applied AFTER all baked default-seed rows so an operator
     # manifest can layer on top of (never displace) the container-policy
@@ -1402,7 +1502,8 @@ def main() -> int:
     )
 
     # Return first non-zero exit code (if any)
-    return rc or rc2 or rc3 or rc4 or rc5 or rc_orphan or rc6 or rc7 or rc8
+    return (rc or rc2 or rc3 or rc4 or rc5 or rc_orphan or rc6 or rc7
+            or rc_wt or rc8)
 
 
 if __name__ == "__main__":

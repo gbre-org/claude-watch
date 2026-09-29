@@ -247,6 +247,9 @@ jobs:
       - name: Run eval-queue-ready-unspawned obligation evaluator tests
         run: make test-eval-queue-ready-unspawned
 
+      - name: Run eval-worktree-canonical-path obligation evaluator tests
+        run: make test-eval-worktree-canonical-path
+
       - name: Run exec-hook shim tests
         run: make test-hooks-shim
 
