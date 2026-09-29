@@ -54,6 +54,21 @@ Emergency bypass: set ``QUEUE_GATE_BYPASS=1`` in the environment. Bypass
 events are logged to ``~/.config/claude/queue-gate-bypass.log`` for later
 auditing.
 
+Scope/target-repo check: besides the marker, the hook compares the repo the
+prompt says it will work on against the queue item's ``repo:``/``path:`` scope,
+and denies a CLEAR mismatch. Inference is deliberately conservative, because a
+gate that denies correct spawns gets routed around:
+
+- an explicit ``Repo: <name>`` line near the top of the prompt wins over prose;
+- otherwise only org/path-prefixed prose forms count, and an ``<org>/<repo>``
+  reference must start a token (optionally behind a forge host) so an org name
+  that doubles as a home-directory name can't turn ``/home/<org>/NOTES.md``
+  into a repo called ``NOTES.md``;
+- a repo named on a line that forbids touching it ("do not reference <repo>'s
+  paths") is not a target;
+- and the check never denies when the scoped repo is mentioned anywhere in the
+  prompt. Any ambiguity defaults open.
+
 Configuration: ``CLAUDE_REPO_ORGS`` (comma/whitespace-separated) lists the
 git-forge orgs whose repos the scope/target check should recognise in
 ``<org>/<repo>`` form, e.g. ``CLAUDE_REPO_ORGS="acme-sf,acme-labs"``. The
@@ -109,6 +124,19 @@ def _repo_orgs() -> list[str]:
     return sorted(orgs)
 
 
+# An `<org>/<repo>` reference only counts when it STARTS a token -- optionally
+# behind a forge host (`github.com/<org>/<repo>`, `git@host:<org>/<repo>`).
+# Without this, an org name that is also a home-directory name turns every
+# absolute path under it into an apparent repo reference: a path like
+# `/home/<org>/NOTES.md` yielded a "repo" called `NOTES.md`, and the gate
+# demanded the queue item be re-scoped to it. A path separator immediately
+# before the org is exactly the signal that this is a directory, not a forge
+# reference.
+_ORG_REF_BOUNDARY = r"""(?:^|[\s(\[{<>,;"'`*|@])"""
+_FORGE_HOST = r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}"
+_ORG_REF_PREFIX = _ORG_REF_BOUNDARY + r"(?:(?:https?://)?" + _FORGE_HOST + r"[:/])?"
+
+
 def _build_target_repo_res() -> list[re.Pattern]:
     """Target-repo extraction patterns for the Agent prompt.
 
@@ -119,7 +147,10 @@ def _build_target_repo_res() -> list[re.Pattern]:
     must be conservative about what counts as a "clear target".
     """
     res = [
-        re.compile(re.escape(org) + r"/([A-Za-z0-9._-]+)") for org in _repo_orgs()
+        re.compile(
+            _ORG_REF_PREFIX + re.escape(org) + r"/([A-Za-z0-9._-]+)", re.MULTILINE
+        )
+        for org in _repo_orgs()
     ]
     res.append(
         re.compile(r"(?:~|/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/repos/([A-Za-z0-9._-]+)")
@@ -132,6 +163,44 @@ TARGET_REPO_RES = _build_target_repo_res()
 # Path segments that are NOT repo names (they follow the org/path prefix but
 # name a subtree/meta path, or are the worktree root). Excluded from targets.
 _NON_REPO_SEGMENTS = {".worktrees", ".git", ".", ".."}
+
+# Suffixes that make a captured segment a FILE, not a repo checkout. Repo dirs
+# DO carry interior dots (`some-repo.bak.v13`), so dots can't be rejected
+# outright -- but nothing named `*.md` / `*.json` / `*.py` is a repo.
+_FILE_LIKE_SUFFIXES = {
+    "bash", "cfg", "conf", "csv", "css", "diff", "html", "ini", "jpeg", "jpg",
+    "js", "json", "jsonl", "log", "md", "patch", "pdf", "png", "py", "rs",
+    "service", "sh", "sql", "svg", "timer", "toml", "ts", "tsv", "tsx", "txt",
+    "xml", "yaml", "yml", "zsh",
+}
+
+# A repo named on a line that FORBIDS touching it is not the work target. One
+# observed false deny was a no-leakage instruction ("do not reference
+# <other-repo>'s paths in the PR body") on a correctly-scoped item: the gate
+# read the FORBIDDEN repo as the target and demanded a re-scope to a repo the
+# agent never touches. Cues are prohibition/exclusion phrases that take an
+# object; bare "no" / "not" are deliberately NOT cues -- they are far too
+# common in ordinary instructions to disqualify a whole line.
+_PROHIBITION_CUE_RE = re.compile(
+    r"(?:\bdo\s+not\b|\bdon'?t\b|\bnever\b|\bmust\s+not\b|\bmay\s+not\b"
+    r"|\bshould\s+not\b|\bcannot\b|\bcan'?t\b|\bwithout\b|\bavoid\b"
+    r"|\bexcept\b|\bexclud\w*|\bother\s+than\b|\brather\s+than\b"
+    r"|\binstead\s+of\b|\bunrelated\b|\bforbidden\b|\bprohibited\b"
+    r"|\boff-limits\b|\bnothing\s+in\b|\bstay\s+out\s+of\b"
+    r"|\bnot\s+touch\b|\bleakage\b)",
+    re.IGNORECASE,
+)
+
+# An explicit, structured target line beats loose prose. Only honoured near the
+# TOP of the prompt: a brief states its repo up front, whereas a `Repo:` line
+# deeper down is usually quoted material describing someone else's work.
+_STRUCTURED_TARGET_RE = re.compile(
+    r"^\s*(?:[-*+]\s*)?(?:\*\*)?"
+    r"(?:repo|repository|target\s+repo|target\s+repository|worktree\s+repo)"
+    r"(?:\*\*)?\s*:\s*`?([A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
+_STRUCTURED_TARGET_MAX_LINES = 40
 
 BYPASS_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 BYPASS_LOG_PATH = BYPASS_LOG_DIR / "queue-gate-bypass.log"
@@ -396,26 +465,91 @@ def _queue_status(queue_id: str) -> tuple[str | None, bool, list[str]]:
     return (None, True, scope)
 
 
-def _prompt_target_repos(prompt: str) -> set[str]:
-    """Extract org/path-prefixed repo references from the Agent prompt.
+def _clean_repo_name(raw: str) -> str | None:
+    """Normalise a captured segment, or None when it isn't a repo name.
 
-    Only PREFIXED forms (`<configured-org>/<repo>`, `~/repos/<repo>`,
-    `/Users/x/repos/<repo>`, `repo:<name>`) count -- never a bare word -- so
-    the gate never invents a target from prose. Returns the set of distinct
-    repo names named. Segments that are clearly not repos (worktree roots,
-    `.git`) are dropped.
+    Repo names may contain interior dots (e.g. claude-watch.bak.v13) so '.' is
+    in the capture class -- but trailing sentence punctuation is stripped
+    ('some-org/foo.' at the end of a sentence), and a segment whose suffix
+    marks it a FILE (`CONTRIBUTING.md`) is not a repo.
     """
+    name = (raw or "").rstrip(".,;:!?)]}'\"")
+    if not name or name in _NON_REPO_SEGMENTS:
+        return None
+    if "." in name and name.rsplit(".", 1)[-1].lower() in _FILE_LIKE_SUFFIXES:
+        return None
+    return name
+
+
+def _structured_target_repo(prompt: str) -> str | None:
+    """The repo named by an explicit `Repo:` / `Target repo:` line, if any.
+
+    Returns a name only when the top of the prompt states exactly ONE such
+    repo; none, or two that disagree, falls through to prose extraction.
+    """
+    names: set[str] = set()
+    for line in (prompt or "").splitlines()[:_STRUCTURED_TARGET_MAX_LINES]:
+        m = _STRUCTURED_TARGET_RE.match(line)
+        if not m:
+            continue
+        name = _clean_repo_name(m.group(1))
+        if name:
+            names.add(name)
+    return next(iter(names)) if len(names) == 1 else None
+
+
+def _prompt_target_repos(prompt: str) -> set[str]:
+    """Extract the repo(s) the Agent prompt says it will operate on.
+
+    Three narrow rules, applied in order:
+
+      1. An explicit structured line (`Repo: <name>`, `Target repo: <name>`)
+         near the top of the prompt IS the target; loose prose is then ignored
+         entirely.
+      2. Otherwise only PREFIXED prose forms count (`<configured-org>/<repo>`
+         at a token boundary or behind a forge host, `~/repos/<repo>`,
+         `/Users/x/repos/<repo>`, `repo:<name>`) -- never a bare word -- so the
+         gate cannot invent a target from prose.
+      3. A reference on a line carrying a prohibition cue ("do not reference
+         <repo>'s paths") is NOT a target. The cue is checked on the
+         reference's own line and on the line before it, so a prohibition that
+         wraps across a line break still covers the repo it forbids.
+
+    Returns the set of distinct repo names. Segments that are clearly not repos
+    (worktree roots, `.git`, file names) are dropped.
+    """
+    text = prompt or ""
+    structured = _structured_target_repo(text)
+    if structured:
+        return {structured}
+
+    lines = text.splitlines()
+    forbids = [bool(_PROHIBITION_CUE_RE.search(ln)) for ln in lines]
     found: set[str] = set()
-    for rx in TARGET_REPO_RES:
-        for m in rx.finditer(prompt or ""):
-            # Repo names may contain interior dots (e.g. claude-watch.bak.v13)
-            # so '.' is in the char class -- but strip trailing sentence
-            # punctuation ('some-org/foo.' at end of a sentence) which is
-            # never part of a real dir name.
-            name = m.group(1).rstrip(".,;:!?)]}'\"")
-            if name and name not in _NON_REPO_SEGMENTS:
-                found.add(name)
+    for i, line in enumerate(lines):
+        if forbids[i] or (i > 0 and forbids[i - 1]):
+            continue
+        for rx in TARGET_REPO_RES:
+            for m in rx.finditer(line):
+                name = _clean_repo_name(m.group(1))
+                if name:
+                    found.add(name)
     return found
+
+
+def _prompt_names_repo(prompt: str, repo: str) -> bool:
+    """True when `repo` occurs as a whole word ANYWHERE in the prompt.
+
+    Deliberately loose: any mention counts, including one inside a
+    prohibition. It is the corroboration test for the mismatch check, whose
+    job is to find a reason NOT to deny.
+    """
+    return bool(
+        re.search(
+            r"(?<![A-Za-z0-9._-])" + re.escape(repo) + r"(?![A-Za-z0-9._-])",
+            prompt or "",
+        )
+    )
 
 
 def _scope_repo_names(scope: list[str]) -> set[str]:
@@ -462,11 +596,14 @@ def _scope_target_mismatch(prompt: str, scope: list[str]) -> str | None:
 
     DENY only when ALL hold (an unambiguous, load-bearing mismatch):
       * `*` is NOT in scope (a universal claim covers everything),
-      * the prompt names exactly ONE clear target repo (after collapsing
-        prefix/sub-repo pairs),
       * the scope names at least one repo (`repo:`/`path:` token) -- if the
         item has no repo scope at all (e.g. `resource:` / free-form only) we
         can't judge intent, so default-open,
+      * NO scoped repo is mentioned anywhere in the prompt -- a prompt that
+        really operates on the scoped repo names it somewhere, so any mention
+        is corroboration that the scope is right and the extractor is wrong,
+      * the prompt names exactly ONE clear target repo (after collapsing
+        prefix/sub-repo pairs),
       * no scoped repo covers the target (== target, or a `target-...`
         sub-repo of it).
 
@@ -475,13 +612,20 @@ def _scope_target_mismatch(prompt: str, scope: list[str]) -> str | None:
     try:
         if any(t == "*" for t in (scope or [])):
             return None
+        claimed = _scope_repo_names(scope)
+        if not claimed:
+            return None  # item has no repo scope to compare against
+        # Corroboration veto. A false deny is worse than a false allow here: a
+        # gate that cries wolf gets routed around. If the prompt mentions the
+        # repo the item claims -- in a heading, a URL, a path, even inside a
+        # prohibition -- then the scope is at worst ambiguous, never clearly
+        # wrong, so we allow.
+        if any(_prompt_names_repo(prompt, c) for c in claimed):
+            return None
         targets = _prompt_target_repos(prompt)
         target = _collapse_to_single_target(targets)
         if not target:
             return None  # 0 or ambiguous >1 targets -> default-open
-        claimed = _scope_repo_names(scope)
-        if not claimed:
-            return None  # item has no repo scope to compare against
         # Covered when a claimed repo is the target or MORE specific than it
         # (claimed `target-...` sub-repo). A claimed repo LESS specific than
         # the target (scope repo:platform, target platform-html-to-pdf) is the

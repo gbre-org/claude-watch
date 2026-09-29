@@ -18,6 +18,11 @@ Also verifies:
     matches on come from `CLAUDE_REPO_ORGS` (config) rather than being
     hardcoded -- unsetting it drops the target, the built-in default org
     keeps working without it.
+  - Target inference does NOT read a repo out of (a) a file path that merely
+    contains an org name as a directory component, (b) a line that FORBIDS
+    touching a repo, or (c) a prompt that mentions the scoped repo at all --
+    all three denied correctly-scoped spawns in the field. An explicit
+    `Repo:` line beats loose prose, and a genuine mismatch still denies.
 
 Uses the real session-task queue tool. We create test queue items with
 disjoint scopes (repo:queue-gate-hook-test) to avoid colliding with the
@@ -460,6 +465,137 @@ def main() -> int:
     rc, out, _err = _run_hook(payload, extra_env={"CLAUDE_REPO_ORGS": None})
     results.append(_check(
         "S7. default org prefix still resolves without CLAUDE_REPO_ORGS",
+        rc == 0 and _is_deny(out),
+        f"rc={rc} out={out}",
+    ))
+
+    print("=== Target-inference false-positive tests ===")
+
+    # Two shapes of prompt below denied CORRECTLY-scoped spawns in the field.
+    # A gate that fires on correct input teaches operators to bypass it, so
+    # each is pinned here as an ALLOW.
+
+    # S8a. An org name can also be a home-directory component, so any path
+    # under it looked like a `<org>/<repo>` forge reference and the next path
+    # segment became the "target". A path separator immediately before the org
+    # means directory, not forge reference. (No `/repos/` here, so the org
+    # pattern is the only one in play and the boundary rule alone must carry
+    # this case. Neither scoped repo is mentioned either.)
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Check the checkout at /home/{_TEST_ORG}/{spec_repo}/src is clean, "
+                "then fix the flaky test.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S8a. org name inside a file path is not a target -> allow",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S8b. A FILE sitting directly under a repos dir is not a repo: the field
+    # case extracted a repo named after an operator instructions file and
+    # demanded the item be re-scoped to it. Nothing named `*.md` is a checkout.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                "Follow the checklist in ~/repos/INSTRUCTIONS.md, then fix the "
+                "flaky test.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S8b. file name under a repos dir is not a target -> allow",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S9. A repo named in a PROHIBITION is not the work target. The cue here
+    # wraps onto the previous line, which is why the check looks at the
+    # reference's line AND the one before it. The scoped repo is not mentioned
+    # anywhere, so the prohibition rule alone has to carry this.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                "Fix the renderer and open a PR.\n"
+                "Nothing in the PR body may reference\n"
+                f"~/repos/{spec_repo}/ paths.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S9. repo named in a prohibition is not a target -> allow",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S10. The field shape, end to end: correctly-scoped item, an explicit
+    # `Repo:` line naming that repo, and a no-leakage instruction naming a
+    # DIFFERENT repo's paths. Must allow.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Repo: {spec_repo} (public).\n\n"
+                f"Do NOT reference ~/repos/{mono_repo}/ paths in the PR body.\n\n"
+                f"Queue item: {spec_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S10. prohibition on another repo, correct scope -> allow",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S11. Corroboration veto: the prompt DOES name the scoped repo (here in
+    # prose) alongside a path in another repo. Any mention of the scoped repo
+    # makes the scope at worst ambiguous, never clearly wrong -> allow.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Port the {mono_repo} fix forward.\n"
+                f"Reference implementation: ~/repos/{spec_repo}/src/render.ts\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S11. scoped repo mentioned in prompt -> allow (corroboration veto)",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S12. Enforcement is intact where it matters: an explicit `Repo:` line
+    # naming a repo the item's scope does not cover, with no mention of the
+    # scoped repo anywhere -> still DENY.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Repo: {spec_repo}\n\n"
+                "Fix the renderer and open a PR.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S12. explicit Repo: line mismatching the scope -> deny",
         rc == 0 and _is_deny(out),
         f"rc={rc} out={out}",
     ))
