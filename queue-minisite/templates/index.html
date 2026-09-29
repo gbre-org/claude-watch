@@ -1257,8 +1257,8 @@
 
        Panes are built entirely by static/multitail.js; the markup here is
        only the frame, so there is no server/JS render parity to keep. That
-       also covers the `wrap` / `time` display pills below: they sit inside the
-       data-no-morph subtree, so unlike the topbar multitail pill (which
+       also covers the `wrap` / `time` / `clear` pills below: they sit inside
+       the data-no-morph subtree, so unlike the topbar multitail pill (which
        refresh.js must re-emit every tick) they are rendered once and survive.
    #}
   <section
@@ -1273,7 +1273,8 @@
       <h2 id="multitail-title" class="multitail-title">multitail</h2>
       <span id="multitail-count" class="multitail-count"></span>
       <span class="multitail-hint">
-        <kbd>w</kbd> wrap · <kbd>t</kbd> time · <kbd>m</kbd>/<kbd>Esc</kbd> exit
+        <kbd>w</kbd> wrap · <kbd>t</kbd> time · <kbd>c</kbd> clear ·
+        <kbd>m</kbd>/<kbd>Esc</kbd> exit
       </span>
       {#- Display toggles. Both default OFF (off == the behaviour before they
           existed) and both are keyboard-reachable: `w` wrap, `t` timestamps. -#}
@@ -1289,6 +1290,19 @@
         class="multitail-display"
         aria-pressed="false"
         title="Show each line's own source timestamp where the log has one (t). Plain-text workload and hostjob logs carry none — those panes show no time rather than your browser's arrival time.">time</button>
+      {#- Ended-pane retention. A VALUE, not a toggle, so no aria-pressed: the
+          label IS the state and `c` cycles it (clear 1m → 5m → 15m → keep).
+          Rendered with multitail.js's DEFAULT_RETENTION_KEY; the module
+          overwrites the label at load from the viewer's stored choice (the
+          overlay is hidden until then, so nothing flashes), and
+          test_multitail.py pins this default against the module's. -#}
+      <button
+        type="button"
+        id="multitail-retain"
+        class="multitail-display multitail-retain"
+        data-retention="1m"
+        aria-label="Ended tails are cleared 1 minute after they end. Activate to change (c)."
+        title="How long a finished tail stays in the window (c). Cycles clear 1m → clear 5m → clear 15m → keep. Your choice is remembered in this browser.">clear 1m</button>
       <button
         type="button"
         id="multitail-exit"

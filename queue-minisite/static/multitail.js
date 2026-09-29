@@ -9,6 +9,7 @@
 //   dismiss one    the × in that pane's header (stays in the mode)
 //   line wrap      the `wrap` pill, or the `w` key
 //   timestamps     the `time` pill, or the `t` key
+//   ended-retention the `clear` pill, or the `c` key
 //
 // ---------------------------------------------------------------------------
 // WHICH ITEMS GET A PANE
@@ -158,16 +159,49 @@
 // ---------------------------------------------------------------------------
 // A PANE WHOSE JOB FINISHES WHILE THE MODE IS OPEN
 // ---------------------------------------------------------------------------
-// It is NOT removed. Yanking a pane away is guaranteed to delete the output
-// the operator was reading at the moment it became final, which is the worst
-// possible time. The pane keeps its content, its header flips to `ended` (with
-// the exit code when the stream reported one), and its stream slot is released
-// so a waiting pane can connect. Closing it is the operator's call.
+// Its header flips to `ended` (with the exit code when the stream reported
+// one), its stream slot is released so a waiting pane can connect, and it then
+// GETS CLEARED once the retention delay has elapsed — because a window that
+// only ever accumulates finished panes squeezes the running ones it exists to
+// show. The delay is the reader's, not ours:
 //
-// Nothing here is persisted: a full-window takeover that survived a reload
-// would be a surprise, not a convenience. The wrap / timestamp preferences
-// live as long as the page does — they outlast closing and reopening the mode,
-// which is the scope a preference for a non-persisted mode can honestly have.
+//   RETENTION_OPTIONS  1m (default) · 5m · 15m · keep
+//
+// A timed value counts from the moment the pane became ended, and the pane
+// SAYS SO: its status reads `ended · exit 0 · clears in 42s`, so the pane about
+// to go is the one announcing it, and anyone mid-read has a whole grace period
+// to press `c` (or the `clear` pill) and switch to `keep`, which retains ended
+// panes until they are closed by hand. Below a minute the grace stops being a
+// grace, so no sub-minute option exists; above a quarter of an hour `keep` is
+// the honest answer, so nothing between 15m and forever exists either.
+//
+// The sweep rides the existing RECONCILE_MS tick — there is no second timer —
+// and it is careful in two ways:
+//
+//   * An auto-clear is NOT a manual dismissal. It never touches `dismissed`,
+//     so a qid that becomes eligible again (a requeued job reusing it) gets a
+//     fresh pane on the next pass. What it touches is `cleared`, which
+//     suppresses an immediate rebuild ONLY while the row that pane came from
+//     stays continuously eligible; the moment that row leaves the eligible set
+//     the suppression is dropped, so it can never outlive the job it was for.
+//     Without the suppression, a pane whose stream reported `workload-end`
+//     while its queue row was still running would be cleared and rebuilt every
+//     2 seconds.
+//   * An ended pane holds no stream slot (markEnded released it), so clearing
+//     one cannot disturb the 4-slot pump.
+//
+// The retention CHOICE is the one thing in this module that is persisted
+// (localStorage, `qsite_mt_retain`, per viewer — the same mechanism as the
+// density and header-collapse pills). It is a policy about how much finished
+// output survives, not a projection of the current page, and someone who picked
+// `keep` because they read finished output carefully should not have to pick it
+// again after every reload. Storage can throw or come back empty, so every
+// access is guarded and an unreadable or unrecognised value simply means the
+// default.
+//
+// The MODE itself is still not persisted: a full-window takeover that survived
+// a reload would be a surprise, not a convenience. The wrap / timestamp
+// preferences are display projections, and live as long as the page does.
 
 (function () {
   'use strict';
@@ -181,6 +215,7 @@
   const exitBtn = document.getElementById('multitail-exit');
   const wrapBtn = document.getElementById('multitail-wrap');
   const tsBtn = document.getElementById('multitail-ts');
+  const retainBtn = document.getElementById('multitail-retain');
 
   // Rows the server marked as having a tailable log, in render order.
   const ROW_SELECTOR = '.item[data-live-log-mode]';
@@ -234,6 +269,22 @@
   // transcripts are JSONL with a `timestamp` on each record; workload and
   // hostjob tails are plain text and carry none.
   const TS_SOURCE_MODES = { live: true };
+  // How long an ENDED pane is kept before it is cleared, in the order the
+  // `clear` pill cycles. `ms: 0` means "never clear" — see the header comment
+  // for why the set stops at 15m and has nothing below a minute.
+  const RETENTION_OPTIONS = [
+    { key: '1m', ms: 60 * 1000, label: 'clear 1m', aria: 'cleared 1 minute after they end' },
+    { key: '5m', ms: 5 * 60 * 1000, label: 'clear 5m', aria: 'cleared 5 minutes after they end' },
+    { key: '15m', ms: 15 * 60 * 1000, label: 'clear 15m', aria: 'cleared 15 minutes after they end' },
+    { key: 'keep', ms: 0, label: 'keep', aria: 'kept until you close them' },
+  ];
+  const RETENTION_BY_KEY = {};
+  for (const opt of RETENTION_OPTIONS) RETENTION_BY_KEY[opt.key] = opt;
+  // The default is the one that was asked for. It is stated here rather than
+  // implied by array position, and templates/index.html renders the pill with
+  // this same key — test_multitail.py pins the two together.
+  const DEFAULT_RETENTION_KEY = '1m';
+  const RETENTION_STORAGE_KEY = 'qsite_mt_retain';
 
   let open = false;
   let reconcileTimer = null;
@@ -247,6 +298,47 @@
   // Panes the operator dismissed by hand. They must NOT come back on the next
   // reconcile pass — "I closed that" has to stick while the mode is open.
   const dismissed = new Set();
+  // Panes RETENTION cleared while their row was still eligible. Deliberately a
+  // different set from `dismissed`: an auto-clear is not a decision, so its
+  // suppression lasts only as long as that row's current eligibility streak
+  // (reconcile drops the entry the first pass the row is not eligible). Without
+  // it, a pane whose stream said `workload-end` while the queue row was still
+  // running would be cleared and rebuilt on every tick.
+  const cleared = new Set();
+
+  // --- ended-pane retention ------------------------------------------------
+
+  // Persisted per viewer. Every access is guarded: storage throws in some
+  // privacy modes, and an unrecognised value (an older/newer build's key, hand
+  // editing) means the default rather than an unhandled state.
+  function readStoredRetention() {
+    try {
+      const v = window.localStorage.getItem(RETENTION_STORAGE_KEY);
+      if (v && RETENTION_BY_KEY[v]) return v;
+    } catch (_) {
+      /* storage unavailable — the default applies for this page */
+    }
+    return DEFAULT_RETENTION_KEY;
+  }
+
+  function storeRetention(key) {
+    try {
+      window.localStorage.setItem(RETENTION_STORAGE_KEY, key);
+    } catch (_) {
+      /* storage unavailable — the choice still applies to this page */
+    }
+  }
+
+  let retentionKey = readStoredRetention();
+
+  function retentionOption() {
+    return RETENTION_BY_KEY[retentionKey] || RETENTION_BY_KEY[DEFAULT_RETENTION_KEY];
+  }
+
+  // 0 = keep forever.
+  function retentionMs() {
+    return retentionOption().ms;
+  }
 
   // --- eligibility ---------------------------------------------------------
 
@@ -508,6 +600,13 @@
       streaming: false,   // holds a connection right now
       terminal: false,    // stream reported a real end; never reconnect
       ended: false,       // item is no longer running / stream finished
+      // When the pane became ended (epoch ms, 0 = still live), plus the status
+      // it settled on. Retention counts from endedAt, and the countdown suffix
+      // is recomposed from the label each tick rather than parsed back out of
+      // the rendered status.
+      endedAt: 0,
+      endedLabel: '',
+      endedCls: '',
       autoscroll: true,
       // The pane's lines, as records. The DOM is a projection of these, so
       // toggling wrap / timestamps can re-render lines that have already
@@ -788,8 +887,62 @@
     // ever appeared settles here instead of retrying forever.
     pane.retryAt = 0;
     pane.el.classList.add('mt-ended');
-    setPaneStatus(pane, label, cls || 'mt-done');
+    // First end wins the clock. A stream can report `workload-end` and then
+    // have its row leave the running section a tick later; the retention delay
+    // is measured from when the reader first saw `ended`, not from the last
+    // bookkeeping event about it.
+    if (!pane.endedAt) pane.endedAt = Date.now();
+    pane.endedLabel = label;
+    pane.endedCls = cls || 'mt-done';
+    paintEndedStatus(pane);
     releaseSlot(pane);
+  }
+
+  // When this ended pane is due to be cleared (epoch ms), or 0 when it never
+  // is — either because retention is `keep` or because it has not ended.
+  function endedClearAt(pane) {
+    const ms = retentionMs();
+    if (!ms || !pane.ended || !pane.endedAt) return 0;
+    return pane.endedAt + ms;
+  }
+
+  // `ended · exit 0 · clears in 42s`. The countdown is what makes the clear
+  // predictable instead of startling: the pane that is about to go is the one
+  // saying so, in time to switch the pill to `keep`.
+  function paintEndedStatus(pane) {
+    if (!pane.ended) return;
+    const base = pane.endedLabel || 'ended';
+    const due = endedClearAt(pane);
+    if (!due) {
+      setPaneStatus(pane, base, pane.endedCls);
+      return;
+    }
+    const left = Math.max(0, Math.ceil((due - Date.now()) / 1000));
+    setPaneStatus(pane, base + ' · clears in ' + left + 's', pane.endedCls);
+  }
+
+  // Remove every ended pane whose retention has elapsed, and refresh the
+  // countdown on the ones that are still within it. Driven by reconcile()'s
+  // existing tick — see the header comment. `seen` is the set of currently
+  // eligible qids; it decides whether a clear needs the rebuild suppression.
+  function sweepEndedPanes(seen) {
+    const now = Date.now();
+    let removed = 0;
+    for (const pane of Array.from(panes.values())) {
+      if (!pane.ended) continue;
+      const due = endedClearAt(pane);
+      if (due && now >= due) {
+        // Only a row that is STILL eligible could be rebuilt on the next pass,
+        // and only that case needs suppressing. `dismissed` is not touched:
+        // this was a timer, not the operator saying "I closed that".
+        if (seen && seen.has(pane.qid)) cleared.add(pane.qid);
+        destroyPane(pane);
+        removed += 1;
+        continue;
+      }
+      paintEndedStatus(pane);
+    }
+    return removed;
   }
 
   // A pane that would take a connection right now: not already streaming, not
@@ -864,12 +1017,23 @@
 
   function reconcile() {
     if (!open) return;
+    const rows = eligibleRows();
     const seen = new Set();
-    for (const row of eligibleRows()) {
+    for (const row of rows) {
+      const info = rowInfo(row);
+      if (info.qid && info.mode) seen.add(info.qid);
+    }
+    // An auto-clear suppresses a rebuild only for as long as the row it came
+    // from stays continuously eligible. The moment it is not, the entry goes,
+    // so a requeued job that reuses the qid gets a fresh pane rather than being
+    // permanently suppressed by a stale clear.
+    for (const qid of Array.from(cleared)) {
+      if (!seen.has(qid)) cleared.delete(qid);
+    }
+    for (const row of rows) {
       const info = rowInfo(row);
       if (!info.qid || !info.mode) continue;
-      seen.add(info.qid);
-      if (dismissed.has(info.qid)) continue;
+      if (dismissed.has(info.qid) || cleared.has(info.qid)) continue;
       const existing = panes.get(info.qid);
       if (!existing) {
         const pane = buildPane(info);
@@ -885,11 +1049,14 @@
     // A pane whose row stopped being eligible (finished, abandoned, moved out
     // of the running section) is marked ENDED, never removed — see the header
     // comment. Its slot goes back to the pool.
-    for (const pane of panes.values()) {
+    for (const pane of Array.from(panes.values())) {
       if (!seen.has(pane.qid) && !pane.ended) {
         markEnded(pane, 'ended · no longer running', 'mt-done');
       }
     }
+    // Ended-pane retention rides this tick too — an ended pane holds no stream
+    // slot, so clearing one cannot disturb the pump below.
+    sweepEndedPanes(seen);
     // pumpSlots is also what expires stream-retry backoffs, which is why this
     // tick is the retry clock and no second timer exists.
     pumpSlots();
@@ -906,6 +1073,52 @@
     if (tsBtn) tsBtn.setAttribute('aria-pressed', tsOn ? 'true' : 'false');
     overlay.classList.toggle('mt-wrap', wrapOn);
     overlay.classList.toggle('mt-show-ts', tsOn);
+    syncRetainButton();
+  }
+
+  // The retention pill shows a VALUE, so it is not an aria-pressed toggle: the
+  // label is the state, and the accessible name spells out what that state
+  // means rather than leaving `clear 5m` to be guessed at.
+  function syncRetainButton() {
+    if (!retainBtn) return;
+    const opt = retentionOption();
+    retainBtn.textContent = opt.label;
+    retainBtn.setAttribute('data-retention', opt.key);
+    retainBtn.setAttribute(
+      'aria-label', 'Ended tails are ' + opt.aria + '. Activate to change (c).');
+    retainBtn.title =
+      'How long a finished tail stays in the window (c). Cycles ' +
+      RETENTION_OPTIONS.map((o) => o.label).join(' → ') +
+      '. Your choice is remembered in this browser.';
+  }
+
+  function setRetention(key) {
+    const next = RETENTION_BY_KEY[key] ? key : DEFAULT_RETENTION_KEY;
+    if (next !== retentionKey) {
+      retentionKey = next;
+      storeRetention(next);
+    }
+    syncRetainButton();
+    // Apply at once instead of waiting up to RECONCILE_MS: switching to `keep`
+    // must drop a visible countdown immediately, and switching to a shorter
+    // delay must clear what that delay has already elapsed for.
+    if (open) {
+      const seen = new Set();
+      for (const row of eligibleRows()) {
+        const qid = row.getAttribute('data-queue-id');
+        if (qid) seen.add(qid);
+      }
+      sweepEndedPanes(seen);
+      paintCount();
+    }
+  }
+
+  function cycleRetention() {
+    let idx = 0;
+    for (let i = 0; i < RETENTION_OPTIONS.length; i++) {
+      if (RETENTION_OPTIONS[i].key === retentionKey) { idx = i; break; }
+    }
+    setRetention(RETENTION_OPTIONS[(idx + 1) % RETENTION_OPTIONS.length].key);
   }
 
   function setWrap(on) {
@@ -931,6 +1144,7 @@
     if (open) return;
     open = true;
     dismissed.clear();
+    cleared.clear();
     overlay.hidden = false;
     document.body.classList.add('multitail-open');
     syncToggleButton();
@@ -954,6 +1168,7 @@
     for (const pane of Array.from(panes.values())) destroyPane(pane);
     panes.clear();
     dismissed.clear();
+    cleared.clear();
     if (panesEl) panesEl.textContent = '';
     overlay.hidden = true;
     document.body.classList.remove('multitail-open');
@@ -978,6 +1193,13 @@
   if (tsBtn) {
     tsBtn.addEventListener('click', (ev) => { ev.preventDefault(); toggleTimestamps(); });
   }
+  if (retainBtn) {
+    retainBtn.addEventListener('click', (ev) => { ev.preventDefault(); cycleRetention(); });
+  }
+  // The pill is server-rendered with the DEFAULT label, so a stored choice has
+  // to be reflected before the mode is ever opened. The overlay is hidden until
+  // then, so there is nothing to flash.
+  syncRetainButton();
 
   // Delegated toggle click: #topbar-meta is rebuilt by refresh.js every tick,
   // so a listener bound to the button itself would die on the first merge
@@ -1036,6 +1258,15 @@
       toggleTimestamps();
       return;
     }
+    // `c` cycles the ended-pane retention. Also mode-local, also a free key
+    // (nothing on the site binds it), and Ctrl/Cmd+C is returned above
+    // untouched so copying selected log text still works.
+    if (ev.key === 'c' || ev.key === 'C') {
+      if (!open || otherDialogOpen()) return;
+      ev.preventDefault();
+      cycleRetention();
+      return;
+    }
     // `m` is the mode toggle. Chosen because it is a free single key, and
     // unlike `/` — which is Firefox's quick-find — a bare `m` has no default
     // browser action to swallow.
@@ -1061,6 +1292,7 @@
     eligibleRows,
     panes,
     dismissed,
+    cleared,
     isOpen: () => open,
     setWrap,
     setTimestamps,
@@ -1068,6 +1300,14 @@
     toggleTimestamps,
     isWrap: () => wrapOn,
     isTimestamps: () => tsOn,
+    setRetention,
+    cycleRetention,
+    sweepEndedPanes,
+    retention: () => retentionKey,
+    retentionMs,
+    RETENTION_OPTIONS,
+    DEFAULT_RETENTION_KEY,
+    RETENTION_STORAGE_KEY,
     retryDelayMs,
     wantsSlot,
     paneHasSourceTimestamps,

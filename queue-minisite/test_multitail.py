@@ -32,7 +32,13 @@ Also pinned here:
     every 5s tick, so an attribute present only in the Jinja template would
     vanish after one tick and the mode would quietly lose its panes;
   * the overlay frame, the toggle button (in BOTH renderers), the ``wrap`` /
-    ``time`` display pills and the script tag are all actually served.
+    ``time`` / ``clear`` pills and the script tag are all actually served;
+  * **the ended-pane retention contract across three files.** Finished panes
+    are cleared after a configurable delay (``1m`` default, ``keep`` = the old
+    keep-forever behaviour). The behaviour is client-side and driven under
+    jsdom in ``static/multitail.test.js``; what is pinned here is what has to
+    AGREE about it — the Jinja-rendered pill's default, the module's option
+    table, the persistence key, and the stylesheet.
 
 And the two CROSS-SIDE contracts the client cannot pin by itself:
 
@@ -400,17 +406,171 @@ class MultitailTest(unittest.TestCase):
         self.assertIn(".mt-line .mt-ts", css)
         self.assertIn(".mt-pane-nots", css)
         self.assertIn(".multitail-display", css)
+        # The retention pill is a VALUE, so it never takes the aria-pressed
+        # tint; it has its own rule (stable width + the `keep` outline).
+        self.assertIn(".multitail-retain", css)
+        self.assertIn('.multitail-retain[data-retention="keep"]', css)
+
+    # -- ended-pane retention ---------------------------------------------
+    #
+    # Ended panes are cleared after a configurable delay, `keep` (forever)
+    # being one of the choices. The behaviour itself is client-side and pinned
+    # under jsdom in static/multitail.test.js; what belongs HERE — the suite
+    # CI actually runs — is the contract between the three files that have to
+    # agree about it: the Jinja-rendered pill, the module's option table, and
+    # the stylesheet.
+
+    def _retention_options(self) -> list[tuple[str, str]]:
+        """[(key, ms-expression)] parsed out of the module's option table."""
+        src = (HERE / "static" / "multitail.js").read_text()
+        m = re.search(r"const RETENTION_OPTIONS = \[(.*?)\n  \];", src, re.S)
+        self.assertIsNotNone(m, "RETENTION_OPTIONS not declared")
+        return re.findall(r"\{\s*key:\s*'([^']+)',\s*ms:\s*([^,]+),", m.group(1))
+
+    def test_retention_control_rendered(self):
+        """The `clear` pill and its key hint are actually served.
+
+        It lives inside the ``data-no-morph`` overlay next to `wrap` / `time`,
+        so like them it is rendered once and survives the 5s tick — a control
+        placed outside that subtree would vanish on the next merge.
+        """
+        self._seed_mixed()
+        html = self._html()
+        overlay = re.search(r'<section\s+id="multitail".*?</section>', html, re.S)
+        self.assertIsNotNone(overlay)
+        self.assertIn('id="multitail-retain"', overlay.group(0))
+        btn = re.search(
+            r'<button[^>]*id="multitail-retain".*?</button>', html, re.S
+        )
+        self.assertIsNotNone(btn, "retention pill not rendered")
+        # A value, not a toggle: aria-pressed would claim a binary state that
+        # does not exist. The accessible name spells the value out instead.
+        self.assertNotIn("aria-pressed", btn.group(0))
+        self.assertIn("aria-label=", btn.group(0))
+        # Keyboard-reachable and discoverable without reading the source.
+        self.assertIn("<kbd>c</kbd>", html)
+
+    def test_rendered_retention_default_matches_the_module(self):
+        """THE CROSS-FILE PIN: the served pill and the module agree.
+
+        The pill's label/attribute are Jinja text; the default that actually
+        governs behaviour is ``DEFAULT_RETENTION_KEY`` in multitail.js. Drift
+        between them ships a header that lies about what the window will do
+        (and the module only rewrites the label when a *stored* choice exists).
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        m = re.search(r"DEFAULT_RETENTION_KEY = '([^']+)'", src)
+        self.assertIsNotNone(m, "DEFAULT_RETENTION_KEY not declared")
+        default_key = m.group(1)
+        # What was asked for, stated rather than implied by array position.
+        self.assertEqual(default_key, "1m")
+        keys = [k for k, _ in self._retention_options()]
+        self.assertIn(default_key, keys)
+
+        self._seed_mixed()
+        btn = re.search(
+            r'<button[^>]*id="multitail-retain".*?</button>',
+            self._html(),
+            re.S,
+        )
+        self.assertIsNotNone(btn)
+        self.assertIn(f'data-retention="{default_key}"', btn.group(0))
+        # ...and the visible label is that option's label, not a stale string.
+        label = re.search(r"key: '%s'.*?label: '([^']+)'" % default_key, src, re.S)
+        self.assertIsNotNone(label)
+        self.assertIn(f">{label.group(1)}</button>", btn.group(0))
+
+    def test_retention_options_are_a_small_set_including_keep_forever(self):
+        """Four values, ascending, and one of them never clears.
+
+        `keep` is the behaviour that existed before the delay did, kept as a
+        real choice rather than deleted — ``ms: 0`` is what the sweep reads as
+        "no deadline". Nothing below a minute is offered: a grace period
+        shorter than that stops being a grace period, which is the whole point
+        of not yanking a pane the instant it goes final.
+        """
+        opts = self._retention_options()
+        self.assertEqual([k for k, _ in opts], ["1m", "5m", "15m", "keep"], opts)
+        as_ms = {}
+        for key, expr in opts:
+            # Expressions are plain arithmetic on literals (`5 * 60 * 1000`).
+            self.assertRegex(expr.strip(), r"^[\d\s*]+$", expr)
+            as_ms[key] = eval(expr, {"__builtins__": {}}, {})  # noqa: S307
+        self.assertEqual(as_ms["keep"], 0)
+        timed = [as_ms[k] for k, _ in opts if k != "keep"]
+        self.assertEqual(timed, sorted(timed), as_ms)
+        self.assertTrue(all(ms >= 60_000 for ms in timed), as_ms)
+
+    def test_retention_choice_is_persisted_per_viewer(self):
+        """Stored in localStorage, guarded, under the site's key prefix.
+
+        The MODE is deliberately not persisted; the retention choice is,
+        because it is a policy about how much finished output survives rather
+        than a projection of the current page. Storage throws in some privacy
+        modes and comes back empty in others, so both accesses are wrapped and
+        an unrecognised value resolves to the default.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("RETENTION_STORAGE_KEY = 'qsite_mt_retain'", src)
+        reader = re.search(
+            r"function readStoredRetention\(\) \{(.*?)\n  \}", src, re.S
+        )
+        self.assertIsNotNone(reader, "readStoredRetention not declared")
+        self.assertIn("try {", reader.group(1))
+        self.assertIn("catch", reader.group(1))
+        # An unknown stored value must not become live state.
+        self.assertIn("RETENTION_BY_KEY[v]", reader.group(1))
+        writer = re.search(r"function storeRetention\(key\) \{(.*?)\n  \}", src, re.S)
+        self.assertIsNotNone(writer, "storeRetention not declared")
+        self.assertIn("try {", writer.group(1))
+        # Same `qsite_` prefix as the density / header-collapse preferences, so
+        # one origin's keys stay identifiable.
+        self.assertIn("qsite_", src)
+
+    def test_retention_rides_the_existing_reconcile_tick(self):
+        """No second timer, and the sweep cannot disturb the stream pump.
+
+        multitail.js has exactly two intervals: the 2s reconcile (which is also
+        the stream-retry clock) and the 1s toggle-button re-sync. A per-pane
+        setTimeout per clear would be a third clock to leak on close.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        self.assertEqual(src.count("setInterval("), 2, "a new timer appeared")
+        self.assertNotIn("setTimeout(sweep", src)
+        self.assertIn("sweepEndedPanes(seen)", src)
+        # An ended pane already released its slot in markEnded, so clearing one
+        # returns nothing to the pump; the sweep must not be re-implementing
+        # slot bookkeeping.
+        self.assertIn("releaseSlot(pane)", src)
+
+    def test_auto_clear_is_not_a_manual_dismissal(self):
+        """A timer must never poison the qid the way the × does.
+
+        ``dismissed`` is permanent for the life of the mode ("I closed that");
+        an auto-clear uses the separate ``cleared`` set, which reconcile drops
+        the first pass the row is not eligible — so a requeued job reusing the
+        qid gets a fresh pane instead of being suppressed by a stale clear.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        # The ONLY writer of `dismissed` is the per-pane close button.
+        self.assertEqual(src.count("dismissed.add("), 1, "dismissed gained a writer")
+        self.assertIn("cleared.add(pane.qid)", src)
+        self.assertIn("cleared.delete(qid)", src)
+        # ...and the release is driven by eligibility, not by a countdown.
+        self.assertIn("if (!seen.has(qid)) cleared.delete(qid);", src)
 
     def test_multitail_js_wires_both_keys_and_keeps_chords_free(self):
-        """`w` / `t` are bound, and modified chords are still passed through.
+        """`w` / `t` / `c` are bound, and modified chords are passed through.
 
-        Ctrl+W must keep closing the tab. The guard is the module's single
-        early return on ctrl/meta/alt — assert it is still there alongside the
-        new bindings rather than trusting the comment.
+        Ctrl+W must keep closing the tab and Ctrl/Cmd+C must keep copying the
+        log text a reader just selected. The guard is the module's single early
+        return on ctrl/meta/alt — assert it is still there alongside the
+        bindings rather than trusting the comment.
         """
         src = (HERE / "static" / "multitail.js").read_text()
         self.assertIn("ev.key === 'w'", src)
         self.assertIn("ev.key === 't'", src)
+        self.assertIn("ev.key === 'c'", src)
         self.assertIn("if (ev.ctrlKey || ev.metaKey || ev.altKey) return;", src)
         # No other key the site binds may be reused. This is the map keyboard.js
         # documents (j/k/Enter/Space/g/G//) plus live-log.js's in-modal keys.

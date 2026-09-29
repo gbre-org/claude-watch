@@ -24,7 +24,12 @@
 //   9. TIMESTAMPS (`t`): SOURCE timestamps only. An agent record's own
 //      `timestamp` is shown; a plain-text workload/hostjob line gets NO cell
 //      and its pane says `no ts` instead of borrowing arrival time.
-//  10. STREAM RETRY: a pane whose log does not exist YET (`open-failed` /
+//  10. ENDED-PANE RETENTION (`c`): an ended pane is cleared once the chosen
+//      delay has elapsed (default 1m), the timing boundary is exact, `keep`
+//      genuinely keeps forever, the choice persists per viewer through
+//      localStorage (and the module still works when storage throws), and a
+//      clear is NOT a manual dismissal — a requeued qid gets a fresh pane.
+//  11. STREAM RETRY: a pane whose log does not exist YET (`open-failed` /
 //      `no-jsonl` / `no-agent` / `read-failed`) backs off and reconnects
 //      instead of dying until the mode is toggled — the bug that made a
 //      just-started job's pane permanently blank. Plus: it must not
@@ -81,6 +86,9 @@ const initialHTML = `<!doctype html>
               aria-pressed="false">wrap</button>
       <button type="button" id="multitail-ts" class="multitail-display"
               aria-pressed="false">time</button>
+      <button type="button" id="multitail-retain"
+              class="multitail-display multitail-retain"
+              data-retention="1m">clear 1m</button>
       <button type="button" id="multitail-exit">exit</button>
     </header>
     <div id="multitail-panes"></div>
@@ -776,6 +784,221 @@ console.log('\n-- timestamps (`t`): SOURCE time only, never arrival time');
   key('w');
   assert('`w` is inert while the mode is closed', mt.isWrap() === false);
   assert('neither key opened the mode', mt.isOpen() === false);
+}
+
+// ==========================================================================
+console.log('\n-- ended-pane retention (`c`): clear after a delay, or keep');
+// ==========================================================================
+{
+  const retainBtn = document.getElementById('multitail-retain');
+  resetQueue([card('q-a', 'live', 'agent one'), card('q-b', 'workload', 'wl one')]);
+  mt.openMode();
+
+  assert('retention defaults to one minute (what was asked for)',
+    mt.retention() === '1m' && mt.retentionMs() === 60 * 1000,
+    mt.retention() + ' / ' + mt.retentionMs() + 'ms');
+  assert('the option set is small and cycles in order',
+    mt.RETENTION_OPTIONS.map((o) => o.key).join(',') === '1m,5m,15m,keep',
+    mt.RETENTION_OPTIONS.map((o) => o.key).join(','));
+  assert('keep-forever is a real option, not a token entry',
+    mt.RETENTION_OPTIONS[mt.RETENTION_OPTIONS.length - 1].ms === 0);
+  assert('nothing below a minute is offered (a grace period has to be one)',
+    mt.RETENTION_OPTIONS.every((o) => o.ms === 0 || o.ms >= 60 * 1000));
+  assert('the pill shows the value rather than a pressed state',
+    retainBtn.textContent === 'clear 1m' &&
+    retainBtn.hasAttribute('aria-pressed') === false,
+    retainBtn.outerHTML);
+  assert('the pill exposes the value to CSS / assistive tech',
+    retainBtn.getAttribute('data-retention') === '1m' &&
+    /1 minute/.test(retainBtn.getAttribute('aria-label')),
+    retainBtn.getAttribute('aria-label'));
+
+  // An ended pane announces its own clear, so the pane about to disappear is
+  // the one telling you — in time to press `c`.
+  streamFor('q-b').emit({ type: 'meta', kind: 'workload-end', exit_code: 0 });
+  assert('an ended pane keeps its exit code AND gains a countdown',
+    /ended · exit 0 · clears in \d+s/.test(statusOf('q-b')), statusOf('q-b'));
+  assert('it is not yanked the moment it ends', paneFor('q-b') !== null);
+  assert('an ended pane holds no stream slot, so clearing cannot disturb the pump',
+    paneRecord('q-b').streaming === false && paneRecord('q-b').es === null);
+
+  // THE TIMING BOUNDARY. Inside the window the pane stays and counts down; at
+  // the deadline exactly (>=, not >) it goes.
+  const p = paneRecord('q-b');
+  p.endedAt = Date.now() - mt.retentionMs() + 5000;
+  mt.reconcile();
+  assert('a pane still inside its retention window is kept',
+    paneFor('q-b') !== null);
+  assert('and its countdown tracks the time left',
+    /clears in [1-5]s/.test(statusOf('q-b')), statusOf('q-b'));
+
+  p.endedAt = Date.now() - mt.retentionMs();
+  mt.reconcile();
+  assert('a pane exactly at its deadline is cleared', paneFor('q-b') === null);
+  assert('and leaves the pane map with it', mt.panes.has('q-b') === false);
+  assert('an auto-clear is NOT recorded as a manual dismissal',
+    mt.dismissed.has('q-b') === false);
+  assert('the mode stays open and other panes are untouched',
+    mt.isOpen() === true && paneFor('q-a') !== null);
+  assert('the header count drops the cleared tail',
+    /^1 tail/.test(document.getElementById('multitail-count').textContent),
+    document.getElementById('multitail-count').textContent);
+
+  // A pane cleared while its ROW is still eligible must not be rebuilt on the
+  // next tick — that would be a pane flapping every 2s.
+  mt.reconcile();
+  assert('a cleared pane is not rebuilt while its row is still eligible',
+    paneFor('q-b') === null);
+  assert('the suppression is its own set, not the dismissed set',
+    mt.cleared.has('q-b') === true && mt.dismissed.has('q-b') === false);
+
+  // ...and the suppression cannot outlive that row's eligibility streak, so a
+  // requeued job reusing the qid is NOT permanently suppressed by a stale
+  // clear.
+  document.getElementById('queue-root').innerHTML = card('q-a', 'live', 'agent one');
+  mt.reconcile();
+  assert('the suppression is dropped as soon as the row is not eligible',
+    mt.cleared.has('q-b') === false);
+  document.getElementById('queue-root').innerHTML =
+    [card('q-a', 'live', 'agent one'), card('q-b', 'workload', 'wl one again')].join('\n');
+  mt.reconcile();
+  assert('a requeued qid gets a fresh, live pane',
+    paneFor('q-b') !== null && paneRecord('q-b').ended === false &&
+    paneRecord('q-b').endedAt === 0);
+
+  // ---- keep forever ----
+  mt.setRetention('keep');
+  assert('keep means there is no deadline at all', mt.retentionMs() === 0);
+  assert('the pill says so', retainBtn.textContent === 'keep' &&
+    retainBtn.getAttribute('data-retention') === 'keep');
+  streamFor('q-b').emit({ type: 'meta', kind: 'workload-end', exit_code: 2 });
+  const p2 = paneRecord('q-b');
+  p2.endedAt = Date.now() - 24 * 60 * 60 * 1000;
+  mt.reconcile();
+  assert('with keep, a pane ended a day ago is STILL there',
+    paneFor('q-b') !== null);
+  assert('and its status carries no countdown to contradict that',
+    /ended/.test(statusOf('q-b')) && /clears in/.test(statusOf('q-b')) === false,
+    statusOf('q-b'));
+
+  // Switching to a timed value applies at once rather than on the next tick —
+  // otherwise `keep` -> `1m` would look like it did nothing for two seconds.
+  mt.setRetention('1m');
+  assert('switching off keep clears what is already overdue, immediately',
+    paneFor('q-b') === null);
+
+  // ---- the control: cycle order, pill, key ----
+  mt.setRetention('1m');
+  const seenOrder = [];
+  for (let i = 0; i < 5; i++) {
+    seenOrder.push(mt.retention());
+    mt.cycleRetention();
+  }
+  assert('cycling walks the options and wraps around',
+    seenOrder.join(',') === '1m,5m,15m,keep,1m', seenOrder.join(','));
+
+  mt.setRetention('1m');
+  retainBtn.dispatchEvent(
+    new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+  assert('the pill cycles on click', mt.retention() === '5m', mt.retention());
+  assert('and its label follows', retainBtn.textContent === 'clear 5m');
+  key('c');
+  assert('`c` cycles too', mt.retention() === '15m', mt.retention());
+
+  const ev = key('c', { ctrlKey: true });
+  assert('Ctrl/Cmd+C is passed through so copying log text still works',
+    mt.retention() === '15m' && ev.defaultPrevented === false);
+  {
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
+    key('c');
+    assert('`c` is inert while typing in an input', mt.retention() === '15m');
+    input.blur();
+    document.body.removeChild(input);
+  }
+  {
+    const other = document.createElement('div');
+    other.setAttribute('data-no-morph', '');
+    document.body.appendChild(other);
+    key('c');
+    assert('`c` is inert while another dialog owns the keyboard',
+      mt.retention() === '15m');
+    document.body.removeChild(other);
+  }
+  // The choice outlives the mode (it is a preference, not part of the takeover).
+  mt.closeMode();
+  key('c');
+  assert('`c` is inert while the mode is closed (a mode-local control)',
+    mt.retention() === '15m' && mt.isOpen() === false);
+  mt.openMode();
+  assert('the retention choice survives leaving and re-entering the mode',
+    mt.retention() === '15m');
+  mt.setRetention('1m');
+  mt.closeMode();
+
+  // An unknown value can only come from storage or a caller mistake; either
+  // way it resolves to the default rather than to a state with no delay.
+  mt.setRetention('nonsense');
+  assert('an unrecognised retention key falls back to the default',
+    mt.retention() === mt.DEFAULT_RETENTION_KEY);
+}
+
+// ==========================================================================
+console.log('\n-- retention persists per viewer, and works without storage');
+// ==========================================================================
+// The mode itself is deliberately NOT persisted; the retention choice is,
+// because it is a policy about how much finished output survives rather than a
+// projection of the current page. localStorage can throw (private mode, blocked
+// site data) or come back empty, so a fresh boot is driven three ways.
+{
+  function boot(seed) {
+    const d = new JSDOM(initialHTML, {
+      runScripts: 'outside-only',
+      url: 'https://queue.example/',
+    });
+    d.window.EventSource = class { constructor(u) { this.url = u; }
+      close() {} };
+    if (typeof seed === 'function') seed(d.window);
+    d.window.eval(src);
+    return d;
+  }
+
+  let d = boot((w) => w.localStorage.setItem('qsite_mt_retain', 'keep'));
+  assert('a stored choice is restored on a fresh page load',
+    d.window.__multitail.retention() === 'keep',
+    d.window.__multitail.retention());
+  assert('and the server-rendered pill label is corrected before first open',
+    d.window.document.getElementById('multitail-retain').textContent === 'keep',
+    d.window.document.getElementById('multitail-retain').textContent);
+
+  d = boot((w) => w.localStorage.setItem('qsite_mt_retain', 'eventually'));
+  assert('a stored value the build does not recognise means the default',
+    d.window.__multitail.retention() === '1m', d.window.__multitail.retention());
+
+  d = boot();
+  assert('an empty store means the default',
+    d.window.__multitail.retention() === '1m');
+  d.window.__multitail.setRetention('5m');
+  assert('choosing a value writes it through for the next load',
+    d.window.localStorage.getItem('qsite_mt_retain') === '5m',
+    String(d.window.localStorage.getItem('qsite_mt_retain')));
+  assert('the storage key is the documented one',
+    d.window.__multitail.RETENTION_STORAGE_KEY === 'qsite_mt_retain');
+
+  // Storage that THROWS on every access must not take the module down with it.
+  d = boot((w) => {
+    Object.defineProperty(w, 'localStorage', {
+      configurable: true,
+      get() { throw new Error('site data blocked'); },
+    });
+  });
+  assert('the module still loads when localStorage throws',
+    !!d.window.__multitail && d.window.__multitail.retention() === '1m');
+  d.window.__multitail.setRetention('keep');
+  assert('and the choice still applies to this page',
+    d.window.__multitail.retention() === 'keep' &&
+    d.window.__multitail.retentionMs() === 0);
 }
 
 // ==========================================================================

@@ -188,13 +188,18 @@ modal N times in a row.
   mode, and the pane does not come back while the mode stays open.
 * **Line wrap**: the `wrap` pill, or the **`w`** key. Off by default.
 * **Timestamps**: the `time` pill, or the **`t`** key. Off by default.
-* `w` and `t` are mode-local — inert while the overlay is closed, while you are
-  typing in a field, and while another dialog owns the keyboard. Modified
-  chords pass straight through, so `Ctrl`/`Cmd`+`W` still closes the tab.
-* Nothing is persisted. A full-window takeover that survived a reload would
-  be a surprise rather than a convenience. The `w` / `t` preferences live as
-  long as the page does — they outlast leaving and re-entering the mode, which
-  is the scope a preference for a non-persisted mode can honestly have.
+* **Ended-pane retention**: the `clear` pill, or the **`c`** key. Cycles
+  `clear 1m` → `clear 5m` → `clear 15m` → `keep`, default **1m**.
+* `w`, `t` and `c` are mode-local — inert while the overlay is closed, while you
+  are typing in a field, and while another dialog owns the keyboard. Modified
+  chords pass straight through, so `Ctrl`/`Cmd`+`W` still closes the tab and
+  `Ctrl`/`Cmd`+`C` still copies the log text you just selected.
+* The MODE is not persisted: a full-window takeover that survived a reload
+  would be a surprise rather than a convenience. The `w` / `t` preferences live
+  as long as the page does. The retention choice *is* persisted per viewer
+  (`localStorage`, `qsite_mt_retain`) — it is a policy about how much finished
+  output survives rather than a projection of the current page, so picking
+  `keep` should not have to be repeated after every reload.
 
 **Which items get a pane — and why some do not.** Exactly the rows the server
 marks with a non-empty `live_log_mode` (`hostjob` / `workload` / `live`),
@@ -294,12 +299,31 @@ not on whether it has seen a `stream-start` — the plain-text tails emit
 `stream-start` *before* they try to open the file, so a stream-start rule would
 silently swallow the first content a successful retry receives.
 
-**A job that finishes while the mode is open keeps its pane.** Removing it
-would delete the output the operator was reading at the exact moment it became
-final. The pane keeps its content, its header flips to `ended` (with the exit
-code when the stream reported one), and its stream slot returns to the pool.
-The same is true for an item that leaves the running section entirely. Closing
-it is the operator's call.
+**A job that finishes gets a grace period, then its pane is cleared.** Its
+header flips to `ended` (with the exit code when the stream reported one) and
+its stream slot returns to the pool immediately; the pane itself stays for the
+retention delay and then goes, because a window that only ever accumulates
+finished panes squeezes the running ones it exists to show. The same is true for
+an item that leaves the running section entirely.
+
+The delay is the reader's choice — `clear 1m` (default), `clear 5m`,
+`clear 15m`, or `keep`, on the `clear` pill and the `c` key. A timed value
+counts from the moment the pane became `ended`, and the pane says so:
+`ended · exit 0 · clears in 42s`, so the pane about to disappear is the one
+announcing it and there is a whole grace period in which to press `c` and switch
+to `keep`, which retains ended panes until they are closed by hand. There is no
+sub-minute option, because a grace period shorter than that is not one; and
+nothing between 15 minutes and forever, because `keep` is the honest answer
+there. Closing a pane early is still the operator's call.
+
+The sweep rides the existing 2s reconcile tick — no second timer — and an ended
+pane holds no stream slot, so clearing one cannot disturb the four-slot pump. An
+auto-clear is **not** a manual dismissal: it never touches the dismissed set, so
+a qid that becomes eligible again (a requeued job reusing it) gets a fresh pane.
+What it does touch is a separate suppression set that keeps the pane from being
+rebuilt on the very next tick — needed only when a pane ended while its queue row
+was still running — and that entry is dropped the first pass the row is not
+eligible, so it can never outlive the job it was for.
 
 The mode reads eligibility off the rendered rows rather than re-fetching
 `/api/queue`, so it is consistent with what the page is showing by
@@ -317,16 +341,26 @@ retryable-kind set, so renaming one server-side fails here rather than quietly
 producing a pane that never streams), and which sources carry a per-line
 timestamp — that an agent record's `timestamp` survives the parse, and that
 `workload_line` frames carry no time field at all, which is what makes the `no
-ts` marker honest.
+ts` marker honest. Retention is client-side, so what that suite pins is the
+contract between the three files which have to agree about it — the served
+pill's default against the module's `DEFAULT_RETENTION_KEY`, the option table
+(four values, ascending, `keep` = `ms: 0`, nothing under a minute), the
+persistence key, the CSS, and two structural facts that are easy to break by
+accident: that the sweep adds no third timer, and that the only writer of the
+dismissed set is still the pane's `×`.
 
 `static/multitail.test.js` drives the module itself under jsdom — pane
 construction, the connection cap and slot promotion, manual close, the mode
 toggles, the terminal-event handling, the compact formatter, both display
 toggles (including that they re-render lines already on screen, that the line
 budget is unaffected by wrap, and that a plain-text pane gets no timestamp
-cells) and the retry path (backoff shape, slot release, the replayed-backfill
-regression guard, and `ended` winning over a pending retry) — plus the same
-parity checks against the real `refresh.js` builders.
+cells), the retry path (backoff shape, slot release, the replayed-backfill
+regression guard, and `ended` winning over a pending retry) and ended-pane
+retention (the countdown, the exact clear boundary, `keep` holding a
+day-old pane, switching off `keep` applying at once, a requeued qid getting a
+fresh pane, and the three storage boots: a restored choice, an unrecognised
+stored value, and storage that throws) — plus the same parity checks against the
+real `refresh.js` builders.
 
 ## Layout
 

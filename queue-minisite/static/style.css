@@ -2543,6 +2543,22 @@ body.multitail-open { overflow: hidden; }
   color: var(--bg);
 }
 
+/* The ended-pane retention pill shows a VALUE (`clear 1m` … `keep`) rather
+   than being on/off, so it never takes the engaged tint — there is no "off"
+   state for it to contrast with. The fixed min-width and tabular figures keep
+   the header from shifting as the label cycles between widths. `keep` is the
+   one value that stops the window tidying itself, so it is outlined rather
+   than filled: a standing exception the eye can find. */
+.multitail-retain {
+  min-width: 5.2em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.multitail-retain[data-retention="keep"] {
+  border-style: dashed;
+  color: var(--fg);
+}
+
 /* The stack. `min-height: 0` on a flex child is what lets the panes actually
    shrink inside the column instead of overflowing it. */
 .multitail-panes {
@@ -2748,4 +2764,7 @@ body.multitail-open { overflow: hidden; }
   .multitail-hint { display: none; }
   .multitail-exit { margin-left: auto; }
   .mt-pane-summary { display: none; }
+  /* Four pills plus the title is already tight at this width; the retention
+     label can shrink to its text rather than hold a stable width. */
+  .multitail-retain { min-width: 0; }
 }
