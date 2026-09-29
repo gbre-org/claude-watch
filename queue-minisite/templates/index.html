@@ -1309,7 +1309,7 @@
       <span id="multitail-count" class="multitail-count"></span>
       <span class="multitail-hint">
         <kbd>w</kbd> wrap · <kbd>t</kbd> time · <kbd>v</kbd> all ·
-        <kbd>c</kbd> clear · <kbd>m</kbd>/<kbd>Esc</kbd> exit
+        <kbd>x</kbd> cap · <kbd>c</kbd> clear · <kbd>m</kbd>/<kbd>Esc</kbd> exit
       </span>
       {#- Display toggles. All default OFF (off == the behaviour before each
           existed) and all are keyboard-reachable: `w` wrap, `t` timestamps,
@@ -1334,6 +1334,21 @@
         class="multitail-display"
         aria-pressed="false"
         title="Show everything the panes normally elide (v): whole multi-line messages and tool results instead of their first line, full tool arguments, and attachment / image detail instead of a placeholder. Applies to lines received from now on; lines already on screen widen but cannot regain detail that was not kept. Long lines are still capped — the single-item log view has the complete payload.">all</button>
+      {#- Verbose's per-line ceiling. A VALUE like the retention pill, and
+          HIDDEN until verbose is on — the cap is verbose mode's own bound and
+          does nothing with verbose off, so it appears beside the pill that
+          turned verbose on rather than sitting inert in the header. Rendered
+          with multitail.js's DEFAULT_VERBOSE_CAP_KEY; the module overwrites
+          the label at load from the viewer's stored choice, and
+          test_multitail.py pins this default against the module's. -#}
+      <button
+        type="button"
+        id="multitail-vcap"
+        class="multitail-display multitail-vcap"
+        data-verbose-cap="8k"
+        aria-label="Verbose mode shows at most 8,000 characters of a single line. Activate to change (x)."
+        title="How much of one line verbose mode shows before clipping it (x). Cycles cap 4K → cap 8K → cap 16K → cap 32K. Raising it applies to lines received from now on; lowering it applies at once. Your choice is remembered in this browser."
+        hidden>cap 8K</button>
       {#- Ended-pane retention. A VALUE, not a toggle, so no aria-pressed: the
           label IS the state and `c` cycles it (clear 1m → 5m → 15m → keep).
           Rendered with multitail.js's DEFAULT_RETENTION_KEY; the module

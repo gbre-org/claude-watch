@@ -2626,6 +2626,20 @@ body.multitail-open { overflow: hidden; }
   color: var(--fg);
 }
 
+/* The verbose CAP pill. Also a VALUE (`cap 4K` … `cap 32K`), so it takes the
+   retention pill's treatment rather than the engaged tint. It is HIDDEN while
+   verbose is off — the cap is verbose mode's own ceiling and changes nothing
+   with verbose off, so it appears next to the pill that turned verbose on
+   instead of sitting inert. The explicit `display: none` is not decoration:
+   these pills are flex items and a later rule setting `display` on one would
+   otherwise beat the UA's `[hidden]`. */
+.multitail-vcap {
+  min-width: 4.6em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.multitail-vcap[hidden] { display: none; }
+
 /* The stack. `min-height: 0` on a flex child is what lets the panes actually
    shrink inside the column instead of overflowing it. */
 .multitail-panes {
@@ -3020,6 +3034,16 @@ body.multitail-open { overflow: hidden; }
 @media (max-width: 560px) {
   :root { --mt-pane-min: 122px; }
   .multitail-hint { display: none; }
+  /* THE OVERLAY HEADER WRAPS ONCE VERBOSE ADDS A FIFTH PILL. Measured at
+     380px: four pills fit the row exactly, five overflow it by ~33px, and the
+     item pushed off the right edge is `exit` — which on a phone is the only
+     way out of the mode, since `m` and Esc want a keyboard.
+     The rule is scoped to `.mt-verbose` rather than applied at this width
+     outright, because wrapping unconditionally costs the DEFAULT phone
+     layout a second header row (~28px of window) to prevent a break that
+     only happens in verbose. Wrapping when the fifth pill appears costs that
+     row only to the reader who asked for it. */
+  .multitail.mt-verbose .multitail-head { flex-wrap: wrap; }
   .multitail-exit { margin-left: auto; }
   /* THE PANE TITLE STAYS VISIBLE AT EVERY WIDTH (botchat #4974-era report:
      "why aren't task titles visible in multitail anymore").

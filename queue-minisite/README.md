@@ -190,6 +190,10 @@ modal N times in a row.
 * **Timestamps**: the `time` pill, or the **`t`** key. Off by default.
 * **Verbose**: the `all` pill, or the **`v`** key. Off by default. See
   **Verbose mode** below.
+* **Verbose cap**: the `cap` pill, or the **`x`** key. Cycles `cap 4K` →
+  `cap 8K` → `cap 16K` → `cap 32K`, default **8K** — how much of a single line
+  verbose mode shows before clipping it. The pill is only on screen while
+  verbose is on, since that is the only mode the cap bounds.
 * **Ended-pane retention**: the `clear` pill, or the **`c`** key. Cycles
   `clear 1m` → `clear 5m` → `clear 15m` → `keep`, default **1m**. If finished
   panes are *not* clearing, check first whether the tab predates the deploy that
@@ -198,9 +202,10 @@ modal N times in a row.
   tool, right-aligned on each pane's title line (task title left, numbers
   right). They used to be a footer strip under the stream; moving them onto a
   row the header was spending anyway gives every pane a log line back.
-* **All four settings are remembered** per viewer (localStorage), and the pills
+* **All five settings are remembered** per viewer (localStorage), and the pills
   show the remembered state before the mode is first opened. A fresh viewer gets
-  the original defaults: wrap off, timestamps off, verbose off, `clear 1m`.
+  the original defaults: wrap off, timestamps off, verbose off, `cap 8K`,
+  `clear 1m`.
   Reads are guarded *and* validated — storage throws outright in some privacy
   modes and can hold an older build's value, so anything unrecognised means the
   default rather than a wedged view, and with storage unavailable the mode
@@ -489,27 +494,41 @@ event** and elides hard. `v` turns each of those elisions off:
 | A tool call shows the first interesting argument's first line (`command`, `file_path`, …) | The whole input, indented |
 | A tool result whose content array has no text block — or has one *after* an image block — reads `[N block(s)]` | Every block described |
 | `[image]` / `[attachment]` | Count, media types and payload sizes; an attachment's path plus the rest of its record |
-| Lines clipped at 400 characters (2000 with `wrap`) | Clipped at `MAX_LINE_CHARS_VERBOSE` |
+| Lines clipped at 400 characters (2000 with `wrap`) | Clipped at the **verbose cap** — the `x` pill, 8K by default |
 
 Two things it deliberately does **not** do:
 
 * **It is not unbounded.** Four live streams can each produce hundreds of lines
   a minute and the browser lays every one of them out, so a single line is still
-  capped (`MAX_LINE_CHARS_VERBOSE`) and so is the total text one pane retains
-  (`MAX_PANE_CHARS`, evicting from the head like the line-count bound). A line
-  budget alone stops bounding memory the moment one line can be ten times its
-  normal size. The single-item log view remains the place for a genuinely
-  complete payload.
+  capped and so is the total text one pane retains (`MAX_PANE_CHARS`, evicting
+  from the head like the line-count bound). A line budget alone stops bounding
+  memory the moment one line can be ten times its normal size. The single-item
+  log view remains the place for a genuinely complete payload.
+
+  The per-line cap is the **reader's choice** (`x`), because how much of a
+  payload is worth reading in a ten-row pane depends on what the panes are full
+  of. `VERBOSE_CAP_OPTIONS` is the ladder — 4K / 8K / 16K / 32K — and 4000 was
+  the fixed value this shipped with, kept on the ladder rather than deleted.
+  `MAX_PANE_CHARS` is deliberately **not** raised alongside it: picking 32K buys
+  longer lines by retaining fewer of them, which leaves the memory bound where
+  it was.
 * **It does not inline images.** A pane is ten rows tall and a data URI is
   megabytes; what verbose owes the reader there is what the thing is and how
   big. The single-item modal renders the image itself.
 
 It is retroactive only as far as the retained records go. Lines are stored
-clipped at the verbose width, so switching `v` on immediately widens every
-retained line a narrower setting had cut — but a multi-line record was reduced
-to its first line when it *arrived*, so full detail applies to lines received
-from then on. The alternative, retaining every raw payload in every pane against
-a toggle that may never be pressed, is a memory multiplier paid by everyone.
+clipped at the *currently chosen* verbose width, so switching `v` on immediately
+widens every retained line a narrower setting had cut — but a multi-line record
+was reduced to its first line when it *arrived*, so full detail applies to lines
+received from then on. The alternative, retaining every raw payload in every
+pane against a toggle that may never be pressed, is a memory multiplier paid by
+everyone.
+
+For the same reason, **raising** the cap is the one change that is not
+retroactive: the characters past the old cap were never kept, so a bigger cap
+applies to lines received from then on. **Lowering** it takes effect at once,
+because rendering clips again. Storing every line at the largest cap on offer
+would make every viewer pay the memory of an option they did not choose.
 
 ## Colourised output (ANSI escape sequences)
 

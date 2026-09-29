@@ -1139,28 +1139,152 @@ class MultitailTest(unittest.TestCase):
         # Discoverable without reading the source.
         self.assertIn("<kbd>v</kbd>", html)
 
+    def _verbose_cap_options(self) -> list[tuple[str, int]]:
+        """[(key, chars)] parsed out of the module's option table."""
+        src = (HERE / "static" / "multitail.js").read_text()
+        m = re.search(r"const VERBOSE_CAP_OPTIONS = \[(.*?)\n  \];", src, re.S)
+        self.assertIsNotNone(m, "VERBOSE_CAP_OPTIONS not declared")
+        return [
+            (k, int(c))
+            for k, c in re.findall(
+                r"key:\s*'([^']+)',\s*chars:\s*(\d+)", m.group(1)
+            )
+        ]
+
     def test_verbose_has_a_ceiling(self):
         """Verbose stops eliding; it does not remove the bounds.
 
         Four live streams at full tilt is the shape of this mode, so the module
         must still cap a single line AND the text one pane retains — a line
         budget alone stops bounding memory once one line can be ten times its
-        normal size.
+        normal size. The per-line cap is the reader's choice now, so what is
+        pinned is that every option on the ladder is still a real ceiling.
         """
         src = (HERE / "static" / "multitail.js").read_text()
-        for name in ("MAX_LINE_CHARS_VERBOSE", "MAX_PANE_CHARS"):
-            m = re.search(rf"const {name} = (\d+);", src)
-            self.assertIsNotNone(m, f"{name} not declared")
-            self.assertGreater(int(m.group(1)), 0)
-        verbose_cap = int(re.search(r"const MAX_LINE_CHARS_VERBOSE = (\d+);", src).group(1))
-        wrapped_cap = int(re.search(r"const MAX_LINE_CHARS_WRAPPED = (\d+);", src).group(1))
-        self.assertGreater(verbose_cap, wrapped_cap)
-        # A ceiling low enough to still be a ceiling.
-        self.assertLessEqual(verbose_cap, 20000)
+        m = re.search(r"const MAX_PANE_CHARS = (\d+);", src)
+        self.assertIsNotNone(m, "MAX_PANE_CHARS not declared")
+        self.assertGreater(int(m.group(1)), 0)
+        wrapped_cap = int(
+            re.search(r"const MAX_LINE_CHARS_WRAPPED = (\d+);", src).group(1)
+        )
+        caps = [c for _k, c in self._verbose_cap_options()]
+        self.assertTrue(caps, "no verbose cap options")
+        for c in caps:
+            self.assertGreater(c, wrapped_cap, caps)
+            # Still a ceiling, at every step: "configurable" is not "unbounded".
+            self.assertLessEqual(c, 40000, caps)
+        # The pane's TEXT budget is NOT raised alongside it: a bigger per-line
+        # cap buys longer lines by retaining fewer of them, which is what keeps
+        # the memory bound where it was.
+        self.assertNotIn("MAX_PANE_CHARS = verbose", src)
         # The stylesheet half: verbose renders multi-line bodies, so it has to
         # wrap and honour newlines whether or not `w` is on.
         css = (HERE / "static" / "style.css").read_text()
         self.assertIn(".multitail.mt-verbose .mt-line", css)
+
+    def test_verbose_cap_ladder_doubles_and_keeps_the_old_value(self):
+        """botchat #4998: the cap is a choice, DEFAULTING to double the old one.
+
+        "make max output length for verbose mode configurable. double current
+        value as default." The number that was fixed is 4000; the default is
+        8000. Both are stated here as literals rather than as positions in the
+        table, because "the second entry" is exactly what a later edit changes
+        without noticing.
+        """
+        opts = self._verbose_cap_options()
+        self.assertEqual([k for k, _ in opts], ["4k", "8k", "16k", "32k"], opts)
+        chars = [c for _k, c in opts]
+        self.assertEqual(chars, sorted(chars), chars)
+        self.assertEqual(len(set(chars)), len(chars), chars)
+        as_chars = dict(opts)
+        # The value this shipped with is still offered, not deleted.
+        self.assertEqual(as_chars["4k"], 4000)
+        # ...and the new default is exactly twice it.
+        src = (HERE / "static" / "multitail.js").read_text()
+        m = re.search(r"DEFAULT_VERBOSE_CAP_KEY = '([^']+)'", src)
+        self.assertIsNotNone(m, "DEFAULT_VERBOSE_CAP_KEY not declared")
+        self.assertEqual(m.group(1), "8k")
+        self.assertEqual(as_chars[m.group(1)], 2 * as_chars["4k"])
+
+    def test_the_fifth_pill_does_not_push_exit_off_a_phone_header(self):
+        """The cap pill adds a FIFTH pill to the overlay header.
+
+        Measured in a real browser at 380px: four pills fit the header row
+        exactly and five overflow it by about 33px, and the item that lands
+        past the right edge is `exit` — which on a phone is the only way out
+        of the mode, because `m` and Esc want a keyboard. So the header wraps
+        once verbose is on.
+
+        The rule is deliberately scoped to the overlay's `mt-verbose` class
+        rather than applied at this width outright: wrapping unconditionally
+        would cost the DEFAULT phone layout a second header row to prevent a
+        break that only happens in verbose.
+        """
+        css = (HERE / "static" / "style.css").read_text()
+        phone_block = _multitail_phone_block(css)
+        m = re.search(
+            r"([^{}\n]*\.multitail-head[^{}]*)\{([^}]*flex-wrap\s*:\s*wrap[^}]*)\}",
+            phone_block,
+        )
+        self.assertIsNotNone(
+            m,
+            "nothing wraps the overlay header at phone width — the fifth pill "
+            "pushes the exit button off the right edge",
+        )
+        self.assertIn(
+            "mt-verbose", m.group(1),
+            "the header wrap must be scoped to verbose, or the default phone "
+            "layout pays a second header row it does not need",
+        )
+        # And the button it protects has to stay pinned to the edge it is
+        # tapped from, on whichever line it wraps onto.
+        self.assertIsNotNone(
+            re.search(r"\.multitail-exit\s*\{[^}]*margin-left:\s*auto", phone_block),
+            "the exit button must stay at the right edge of its line",
+        )
+
+    def test_rendered_verbose_cap_default_matches_the_module(self):
+        """THE CROSS-FILE PIN: the served pill and the module agree.
+
+        Same failure the retention pill has: the label is Jinja text while the
+        default that governs behaviour is in multitail.js, and the module only
+        rewrites the label when a *stored* choice exists — so drift ships a
+        header that states a cap the window is not using. The pill is also
+        rendered HIDDEN, because the cap only bites in verbose mode and verbose
+        defaults off.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        default_key = re.search(
+            r"DEFAULT_VERBOSE_CAP_KEY = '([^']+)'", src
+        ).group(1)
+        self.assertIn(default_key, [k for k, _ in self._verbose_cap_options()])
+
+        self._seed_mixed()
+        html = self._html()
+        btn = re.search(
+            r'<button[^>]*id="multitail-vcap".*?</button>', html, re.S
+        )
+        self.assertIsNotNone(btn, "verbose cap pill not rendered")
+        self.assertIn(f'data-verbose-cap="{default_key}"', btn.group(0))
+        label = re.search(
+            r"key: '%s'.*?label: '([^']+)'" % default_key, src, re.S
+        )
+        self.assertIsNotNone(label)
+        self.assertIn(f">{label.group(1)}</button>", btn.group(0))
+        # A VALUE, not a toggle — and named for a screen reader.
+        self.assertNotIn("aria-pressed", btn.group(0))
+        self.assertIn("aria-label=", btn.group(0))
+        # Hidden until verbose is on, and the stylesheet has to make `hidden`
+        # win over the pill's own display.
+        self.assertRegex(btn.group(0), r"\bhidden\b")
+        css = (HERE / "static" / "style.css").read_text()
+        self.assertIn(".multitail-vcap[hidden] { display: none; }", css)
+        # Keyboard-reachable and discoverable without reading the source.
+        self.assertIn("<kbd>x</kbd>", html)
+        # ...and `x` must not have been taken by anything else on the site.
+        for other in ("keyboard.js", "live-log.js", "refresh.js", "action.js"):
+            other_src = (HERE / "static" / other).read_text()
+            self.assertNotIn("key === 'x'", other_src, f"x is bound in {other}")
 
     def test_every_header_setting_is_persisted_under_its_own_key(self):
         """Wrap / time / verbose persist the way retention already did.
@@ -1171,11 +1295,11 @@ class MultitailTest(unittest.TestCase):
         """
         src = (HERE / "static" / "multitail.js").read_text()
         keys = {}
-        for name in ("RETENTION", "WRAP", "TS", "VERBOSE"):
+        for name in ("RETENTION", "WRAP", "TS", "VERBOSE", "VERBOSE_CAP"):
             m = re.search(rf"const {name}_STORAGE_KEY = '([^']+)';", src)
             self.assertIsNotNone(m, f"{name}_STORAGE_KEY not declared")
             keys[name] = m.group(1)
-        self.assertEqual(len(set(keys.values())), 4, keys)
+        self.assertEqual(len(set(keys.values())), 5, keys)
         # The retention key is LOAD-BEARING for viewers who already have a
         # stored choice; renaming it silently resets everyone.
         self.assertEqual(keys["RETENTION"], "qsite_mt_retain")

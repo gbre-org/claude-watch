@@ -93,6 +93,9 @@ const initialHTML = `<!doctype html>
               aria-pressed="false">time</button>
       <button type="button" id="multitail-verbose" class="multitail-display"
               aria-pressed="false">all</button>
+      <button type="button" id="multitail-vcap"
+              class="multitail-display multitail-vcap"
+              data-verbose-cap="8k" hidden>cap 8K</button>
       <button type="button" id="multitail-retain"
               class="multitail-display multitail-retain"
               data-retention="1m">clear 1m</button>
@@ -1562,23 +1565,24 @@ console.log('\n-- verbose (`v`): stop eliding, within a ceiling');
     f.text.indexOf('image/png') !== -1 && f.text.indexOf('the actual answer') !== -1,
     JSON.stringify(f.text));
 
-  // ---- the ceiling
-  assert('verbose raises the per-line limit to its own cap',
-    mt.lineCharLimit() === mt.MAX_LINE_CHARS_VERBOSE);
+  // ---- the ceiling (now a CHOICE — see the cap block further down)
+  assert('verbose raises the per-line limit to the chosen cap',
+    mt.lineCharLimit() === mt.verboseCapChars(),
+    mt.lineCharLimit() + ' vs ' + mt.verboseCapChars());
   assert('but it is a CAP, not "unlimited"',
-    mt.MAX_LINE_CHARS_VERBOSE > mt.MAX_LINE_CHARS_WRAPPED &&
-    mt.MAX_LINE_CHARS_VERBOSE <= 20000, String(mt.MAX_LINE_CHARS_VERBOSE));
-  const huge = 'z'.repeat(mt.MAX_LINE_CHARS_VERBOSE + 5000);
+    mt.verboseCapChars() > mt.MAX_LINE_CHARS_WRAPPED &&
+    mt.verboseCapChars() <= 40000, String(mt.verboseCapChars()));
+  const huge = 'z'.repeat(mt.verboseCapChars() + 5000);
   feedV({ type: 'event', kind: 'workload_line', text: huge });
   const shown = paneFor('q-verbose').querySelector('.mt-line:last-child .mt-body');
   assert('an oversized verbose line is still clipped',
-    shown.textContent.length <= mt.MAX_LINE_CHARS_VERBOSE + 1,
+    shown.textContent.length <= mt.verboseCapChars() + 1,
     'len=' + shown.textContent.length);
 
   // The pane's TEXT budget, not just its line count: a handful of maximal
   // lines must evict from the head rather than accumulate.
   const pane = mt.panes.get('q-verbose');
-  const need = Math.ceil(mt.MAX_PANE_CHARS / mt.MAX_LINE_CHARS_VERBOSE) + 2;
+  const need = Math.ceil(mt.MAX_PANE_CHARS / mt.verboseCapChars()) + 2;
   for (let i = 0; i < need; i++) {
     feedV({ type: 'event', kind: 'workload_line', text: huge });
   }
@@ -1589,6 +1593,104 @@ console.log('\n-- verbose (`v`): stop eliding, within a ceiling');
     pane.streamEl.children.length === pane.records.length,
     pane.streamEl.children.length + ' vs ' + pane.records.length);
 
+  mt.setVerbose(false);
+  mt.closeMode();
+}
+
+// ==========================================================================
+console.log('\n-- the verbose cap (`x`): a choice, defaulting to 8K');
+// ==========================================================================
+// "make max output length for verbose mode configurable. double current value
+// as default". 4000 was the fixed value; 8000 is the default now, and the
+// ladder brackets it in both directions so the old behaviour is still on it.
+{
+  const capBtn = document.getElementById('multitail-vcap');
+  document.getElementById('queue-root').innerHTML =
+    card('q-cap', 'live', 'cap agent');
+  mt.openMode();
+  const feedV = (payload) =>
+    mt.appendPaneLine(mt.panes.get('q-cap'), mt.formatPayload(payload));
+
+  assert('the ladder is 4K / 8K / 16K / 32K, ascending',
+    mt.VERBOSE_CAP_OPTIONS.map((o) => o.key).join(',') === '4k,8k,16k,32k',
+    mt.VERBOSE_CAP_OPTIONS.map((o) => o.key).join(','));
+  const chars = mt.VERBOSE_CAP_OPTIONS.map((o) => o.chars);
+  assert('every step is a real number of characters, in order',
+    chars.every((c, i) => c > 0 && (i === 0 || c > chars[i - 1])), String(chars));
+  assert('the previous fixed value (4000) is still a choice',
+    chars.indexOf(4000) !== -1, String(chars));
+  // THE DOUBLING, stated as a number rather than as "the second entry".
+  assert('the DEFAULT is 8000 — twice the 4000 this shipped with',
+    mt.verboseCap() === mt.DEFAULT_VERBOSE_CAP_KEY &&
+    mt.VERBOSE_CAP_OPTIONS.find((o) => o.key === mt.DEFAULT_VERBOSE_CAP_KEY)
+      .chars === 8000,
+    mt.verboseCap() + ' -> ' + mt.verboseCapChars());
+
+  // The pill: a VALUE, and only on screen while the setting it bounds is.
+  mt.openMode();
+  mt.setVerbose(false);
+  assert('the cap pill is hidden while verbose is off', capBtn.hidden === true);
+  assert('and the `x` key does nothing then, so it cannot look broken',
+    (() => {
+      const before = mt.verboseCap();
+      document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'x' }));
+      return mt.verboseCap() === before;
+    })());
+  mt.setVerbose(true);
+  assert('turning verbose on reveals it', capBtn.hidden === false);
+  assert('it shows a VALUE, not a pressed state',
+    capBtn.textContent === 'cap 8K' && !capBtn.hasAttribute('aria-pressed'),
+    capBtn.outerHTML);
+  assert('and names that value for a screen reader',
+    capBtn.getAttribute('aria-label').indexOf('8,000') !== -1,
+    capBtn.getAttribute('aria-label'));
+
+  // Cycling, from the key and from the pill, and it wraps.
+  document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'x' }));
+  assert('`x` cycles to the next step', mt.verboseCap() === '16k', mt.verboseCap());
+  assert('the pill label followed', capBtn.textContent === 'cap 16K',
+    capBtn.textContent);
+  assert('and the limit in force followed too', mt.lineCharLimit() === 16000,
+    String(mt.lineCharLimit()));
+  capBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  assert('the pill cycles too', mt.verboseCap() === '32k', mt.verboseCap());
+  capBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  assert('and it wraps round to the first step', mt.verboseCap() === '4k',
+    mt.verboseCap());
+
+  // RAISING is not retroactive, LOWERING is. Lines are stored clipped at the
+  // cap in force when they arrived, so a bigger cap cannot recover characters
+  // that were never kept — while a smaller one takes effect at once, because
+  // rendering clips again.
+  mt.setVerboseCap('4k');
+  const long = 'q'.repeat(30000);
+  feedV({ type: 'event', kind: 'workload_line', text: long });
+  const bodyOf = () =>
+    paneFor('q-cap').querySelector('.mt-line:last-child .mt-body').textContent;
+  assert('a line that arrived under a 4K cap is stored clipped to it',
+    bodyOf().length <= 4001, 'len=' + bodyOf().length);
+  mt.setVerboseCap('32k');
+  assert('raising the cap cannot widen it beyond what was retained',
+    bodyOf().length <= 4001, 'len=' + bodyOf().length);
+  feedV({ type: 'event', kind: 'workload_line', text: long });
+  assert('but the NEXT line gets the whole new cap',
+    bodyOf().length > 4001 && bodyOf().length <= 32001,
+    'len=' + bodyOf().length);
+  mt.setVerboseCap('4k');
+  assert('and lowering it clips what is already on screen, at once',
+    bodyOf().length <= 4001, 'len=' + bodyOf().length);
+
+  // An unrecognised key is the DEFAULT, never a coercion. (The PERSISTENCE
+  // half is asserted in the storage block at the end of this file: this
+  // document has no origin, so localStorage throws here by design — which is
+  // exactly the case the module's guarded accessors exist for.)
+  assert('the storage key is the documented one',
+    mt.VERBOSE_CAP_STORAGE_KEY === 'qsite_mt_vcap', mt.VERBOSE_CAP_STORAGE_KEY);
+  mt.setVerboseCap('nonsense-from-another-build');
+  assert('an unrecognised value resolves to the default, not to a coercion',
+    mt.verboseCap() === mt.DEFAULT_VERBOSE_CAP_KEY, mt.verboseCap());
+
+  mt.setVerboseCap(mt.DEFAULT_VERBOSE_CAP_KEY);
   mt.setVerbose(false);
   mt.closeMode();
 }
@@ -1661,7 +1763,32 @@ console.log('\n-- every header setting persists per viewer');
   assert('the storage keys are the documented, distinct ones',
     d.window.__multitail.WRAP_STORAGE_KEY === 'qsite_mt_wrap' &&
     d.window.__multitail.TS_STORAGE_KEY === 'qsite_mt_ts' &&
-    d.window.__multitail.VERBOSE_STORAGE_KEY === 'qsite_mt_verbose');
+    d.window.__multitail.VERBOSE_STORAGE_KEY === 'qsite_mt_verbose' &&
+    d.window.__multitail.VERBOSE_CAP_STORAGE_KEY === 'qsite_mt_vcap');
+
+  // The verbose CAP is a VALUE like the retention delay, so it persists the
+  // same way — and a fresh viewer gets the 8K default, not the 4K this used to
+  // be fixed at.
+  d = bootFlags();
+  assert('fresh viewer: the verbose cap is the 8K default',
+    d.window.__multitail.verboseCap() === '8k' &&
+    d.window.__multitail.verboseCapChars() === 8000,
+    d.window.__multitail.verboseCap());
+  d.window.__multitail.setVerboseCap('16k');
+  assert('choosing a cap writes it through',
+    d.window.localStorage.getItem('qsite_mt_vcap') === '16k',
+    String(d.window.localStorage.getItem('qsite_mt_vcap')));
+  d = bootFlags((w) => w.localStorage.setItem('qsite_mt_vcap', '32k'));
+  assert('a stored cap is restored on a fresh page load',
+    d.window.__multitail.verboseCapChars() === 32000,
+    String(d.window.__multitail.verboseCapChars()));
+  assert('and the server-rendered pill is corrected before first open',
+    d.window.document.getElementById('multitail-vcap').textContent === 'cap 32K',
+    d.window.document.getElementById('multitail-vcap').textContent);
+  d = bootFlags((w) => w.localStorage.setItem('qsite_mt_vcap', '9000k'));
+  assert('an unrecognised stored cap means the default, not a parsed number',
+    d.window.__multitail.verboseCap() === '8k',
+    d.window.__multitail.verboseCap());
 
   // Storage that throws on every access must not take the module down.
   d = bootFlags((w) => {

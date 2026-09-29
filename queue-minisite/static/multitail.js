@@ -199,23 +199,34 @@
 //                        pane is ten rows tall and a data URI is megabytes, so
 //                        what verbose owes the reader here is what it is and
 //                        how big. The single-item modal renders the image.
-//   per-line clip        400 chars, or 2000 wrapped, becomes
-//                        MAX_LINE_CHARS_VERBOSE.
+//   per-line clip        400 chars, or 2000 wrapped, becomes the VERBOSE CAP
+//                        (see below — the reader picks it).
 //
 // IT IS NOT UNBOUNDED, because a firehose is not a feature. Four live streams
 // can each produce hundreds of lines a minute, and the browser has to lay every
 // one of them out:
 //
-//   * MAX_LINE_CHARS_VERBOSE (4000) caps a single line at roughly a screenful
-//     of wrapped text — past that, reading has become searching, and the
-//     single-item modal is the place for the complete payload.
+//   * THE VERBOSE CAP caps a single line. It DEFAULTS to 8000 characters —
+//     roughly two screenfuls of wrapped text — and the `cap` pill offers
+//     4K / 8K / 16K / 32K, because how much of a payload is worth reading in a
+//     ten-row pane depends on what the panes are full of and that is the
+//     reader's call, not ours ("make max output length for verbose mode
+//     configurable. double current value as default"; 4000 was the previous
+//     fixed value and is kept on the ladder). The choice persists per viewer
+//     like every other setting in this header.
 //   * MAX_PANE_CHARS caps the TEXT one pane retains, evicting from the head
 //     like the line-count bound does. The count bound alone stops bounding
-//     memory the moment a line can be ten times its normal size.
+//     memory the moment a line can be ten times its normal size. It is NOT
+//     raised by a bigger per-line cap: choosing 32K buys longer lines by
+//     retaining fewer of them, which keeps the memory bound where it was.
 //
 // RETROACTIVE ONLY AS FAR AS THE RECORDS GO. Lines are stored clipped at the
-// verbose width, so switching verbose on immediately widens every retained line
-// that a narrower setting had cut. What it cannot recover is what the formatter
+// CURRENTLY CHOSEN verbose width, so switching verbose on immediately widens
+// every retained line that a narrower setting had cut. RAISING THE CAP is the
+// one thing that is not retroactive, and deliberately: storing every line at
+// the largest cap on offer would make every viewer pay the memory of an option
+// they did not choose. A bigger cap applies to the lines that arrive after it,
+// and a smaller one takes effect at once because rendering clips again. What it cannot recover is what the formatter
 // never kept: outside verbose mode a multi-line record is reduced to its first
 // line when it ARRIVES. So verbose shows full detail for the lines that arrive
 // after it, and the pill's title says as much. The alternative — retaining
@@ -355,6 +366,7 @@
   const tsBtn = document.getElementById('multitail-ts');
   const retainBtn = document.getElementById('multitail-retain');
   const verboseBtn = document.getElementById('multitail-verbose');
+  const vcapBtn = document.getElementById('multitail-vcap');
 
   // Rows the server marked as having a tailable log, in render order.
   const ROW_SELECTOR = '.item[data-live-log-mode]';
@@ -383,11 +395,37 @@
   // bound — see the header comment.
   const MAX_LINE_CHARS = 400;
   const MAX_LINE_CHARS_WRAPPED = 2000;
-  // VERBOSE mode's per-line ceiling. Verbose exists to stop eliding, but "no
-  // limit" is not a limit: one 2MB tool result would be the pane, the tab's
-  // memory and a layout pass. 4000 visible characters is roughly a full screen
-  // of wrapped text, which is where reading stops and searching starts.
-  const MAX_LINE_CHARS_VERBOSE = 4000;
+  // VERBOSE mode's per-line ceiling, and the one bound in this module the
+  // READER sets. Verbose exists to stop eliding, but "no limit" is not a
+  // limit: one 2MB tool result would be the pane, the tab's memory and a
+  // layout pass. What the right number is, though, is not ours to know — it
+  // depends on what the panes are full of, which is why it is a choice
+  // (botchat: "make max output length for verbose mode configurable. double
+  // current value as default").
+  //
+  // The default is 8000, twice the 4000 this shipped with, which is what was
+  // asked for. The rest of the ladder brackets it by doubling in both
+  // directions: 4000 is the old behaviour kept as a real choice rather than
+  // deleted, and 32000 is about eight screenfuls of wrapped text — past that
+  // reading has certainly become searching and the single-item log view has
+  // the complete payload anyway.
+  //
+  // Raising it does NOT raise what a pane retains in total: MAX_PANE_CHARS is
+  // unchanged, so a 32K cap on a firehose buys longer lines by keeping fewer
+  // of them. That is the right trade for a reader who went looking for one
+  // long payload, and it keeps the memory bound where it was.
+  const VERBOSE_CAP_OPTIONS = [
+    { key: '4k', chars: 4000, label: 'cap 4K', aria: '4,000 characters' },
+    { key: '8k', chars: 8000, label: 'cap 8K', aria: '8,000 characters' },
+    { key: '16k', chars: 16000, label: 'cap 16K', aria: '16,000 characters' },
+    { key: '32k', chars: 32000, label: 'cap 32K', aria: '32,000 characters' },
+  ];
+  const VERBOSE_CAP_BY_KEY = {};
+  for (const opt of VERBOSE_CAP_OPTIONS) VERBOSE_CAP_BY_KEY[opt.key] = opt;
+  // Stated here rather than implied by array position, and templates/index.html
+  // renders the pill with this same key — test_multitail.py pins the two
+  // together, exactly as it does for the retention default.
+  const DEFAULT_VERBOSE_CAP_KEY = '8k';
   // Hard ceiling on the TEXT one pane retains, across however many lines that
   // is. MAX_LINES_PER_PANE alone bounds the line COUNT, and in verbose mode a
   // line can be ten times its normal size, so the count bound stops bounding
@@ -442,6 +480,7 @@
   const WRAP_STORAGE_KEY = 'qsite_mt_wrap';
   const TS_STORAGE_KEY = 'qsite_mt_ts';
   const VERBOSE_STORAGE_KEY = 'qsite_mt_verbose';
+  const VERBOSE_CAP_STORAGE_KEY = 'qsite_mt_vcap';
 
   let open = false;
   let reconcileTimer = null;
@@ -512,6 +551,18 @@
     writeStored(RETENTION_STORAGE_KEY, key);
   }
 
+  // Same shape as the retention reader, and for the same reason: an
+  // unrecognised stored key — an older build's spelling, a hand edit — is the
+  // DEFAULT, never a number coerced out of a string.
+  function readStoredVerboseCap() {
+    const v = readStored(VERBOSE_CAP_STORAGE_KEY);
+    return (v && VERBOSE_CAP_BY_KEY[v]) ? v : DEFAULT_VERBOSE_CAP_KEY;
+  }
+
+  function storeVerboseCap(key) {
+    writeStored(VERBOSE_CAP_STORAGE_KEY, key);
+  }
+
   let retentionKey = readStoredRetention();
   // The three display toggles. A FRESH viewer gets the old defaults — wrap
   // off, timestamps off, verbose off — because off is the behaviour that
@@ -521,6 +572,20 @@
   let wrapOn = readStoredFlag(WRAP_STORAGE_KEY, false);
   let tsOn = readStoredFlag(TS_STORAGE_KEY, false);
   let verboseOn = readStoredFlag(VERBOSE_STORAGE_KEY, false);
+  let verboseCapKey = readStoredVerboseCap();
+
+  function verboseCapOption() {
+    return VERBOSE_CAP_BY_KEY[verboseCapKey] ||
+      VERBOSE_CAP_BY_KEY[DEFAULT_VERBOSE_CAP_KEY];
+  }
+
+  // The chosen verbose ceiling in characters. Read even while verbose is OFF,
+  // because it is also the STORAGE bound below: a line has to be retained at
+  // the widest width any setting can ask for, or turning verbose on would
+  // widen nothing.
+  function verboseCapChars() {
+    return verboseCapOption().chars;
+  }
 
   function retentionOption() {
     return RETENTION_BY_KEY[retentionKey] || RETENTION_BY_KEY[DEFAULT_RETENTION_KEY];
@@ -630,7 +695,7 @@
   // The per-line ceiling under the CURRENT display settings. Verbose wins over
   // wrap: it is the setting that says "stop eliding".
   function lineCharLimit() {
-    if (verboseOn) return MAX_LINE_CHARS_VERBOSE;
+    if (verboseOn) return verboseCapChars();
     return wrapOn ? MAX_LINE_CHARS_WRAPPED : MAX_LINE_CHARS;
   }
 
@@ -1158,7 +1223,7 @@
       // lines that arrive after it, not retroactively. Retaining every raw
       // payload against a toggle that may never be pressed is a memory
       // multiplier on four live streams; the pill's title says so.
-      text: clipStore(fmt.text, MAX_LINE_CHARS_VERBOSE),
+      text: clipStore(fmt.text, verboseCapChars()),
       cls: fmt.cls || '',
       ts: fmt.ts || '',
     };
@@ -1575,7 +1640,34 @@
     overlay.classList.toggle('mt-wrap', wrapOn);
     overlay.classList.toggle('mt-show-ts', tsOn);
     overlay.classList.toggle('mt-verbose', verboseOn);
+    syncVerboseCapButton();
     syncRetainButton();
+  }
+
+  // The verbose CAP pill. It is shown only while verbose is ON, because the
+  // cap is verbose mode's ceiling and does nothing at all with verbose off —
+  // the same judgment the `no ts` marker makes about explaining a column that
+  // is not there. Pressing `v` reveals it right beside the pill just pressed,
+  // which is where a reader who wants more output is already looking.
+  //
+  // A VALUE, not a toggle, so no aria-pressed: the label is the state, and the
+  // accessible name spells out what that state means rather than leaving
+  // `cap 16K` to be guessed at.
+  function syncVerboseCapButton() {
+    if (!vcapBtn) return;
+    const opt = verboseCapOption();
+    vcapBtn.hidden = !verboseOn;
+    vcapBtn.textContent = opt.label;
+    vcapBtn.setAttribute('data-verbose-cap', opt.key);
+    vcapBtn.setAttribute(
+      'aria-label',
+      'Verbose mode shows at most ' + opt.aria +
+      ' of a single line. Activate to change (x).');
+    vcapBtn.title =
+      'How much of one line verbose mode shows before clipping it (x). ' +
+      'Cycles ' + VERBOSE_CAP_OPTIONS.map((o) => o.label).join(' → ') +
+      '. Raising it applies to lines received from now on; lowering it ' +
+      'applies at once. Your choice is remembered in this browser.';
   }
 
   // The retention pill shows a VALUE, so it is not an aria-pressed toggle: the
@@ -1613,6 +1705,31 @@
       sweepEndedPanes(seen);
       paintCount();
     }
+  }
+
+  // Lowering the cap takes effect on what is already on screen (rendering
+  // clips again); raising it widens the lines that arrive after, because the
+  // stored text was bounded at the cap in force when it arrived. Either way
+  // the panes are re-projected, so the change is visible immediately rather
+  // than on the next line.
+  function setVerboseCap(key) {
+    const next = VERBOSE_CAP_BY_KEY[key] ? key : DEFAULT_VERBOSE_CAP_KEY;
+    if (next !== verboseCapKey) {
+      verboseCapKey = next;
+      storeVerboseCap(next);
+      syncVerboseCapButton();
+      rerenderAllPanes();
+      return;
+    }
+    syncVerboseCapButton();
+  }
+
+  function cycleVerboseCap() {
+    let idx = 0;
+    for (let i = 0; i < VERBOSE_CAP_OPTIONS.length; i++) {
+      if (VERBOSE_CAP_OPTIONS[i].key === verboseCapKey) { idx = i; break; }
+    }
+    setVerboseCap(VERBOSE_CAP_OPTIONS[(idx + 1) % VERBOSE_CAP_OPTIONS.length].key);
   }
 
   function cycleRetention() {
@@ -1718,6 +1835,9 @@
   if (verboseBtn) {
     verboseBtn.addEventListener('click', (ev) => { ev.preventDefault(); toggleVerbose(); });
   }
+  if (vcapBtn) {
+    vcapBtn.addEventListener('click', (ev) => { ev.preventDefault(); cycleVerboseCap(); });
+  }
   // Every pill is server-rendered in its DEFAULT state, so a stored choice has
   // to be reflected before the mode is ever opened — otherwise the header says
   // `wrap` is off while the panes wrap. The overlay is hidden until then, so
@@ -1790,6 +1910,17 @@
       toggleVerbose();
       return;
     }
+    // `x` cycles the VERBOSE CAP — "ma(x) output". Gated on verbose being on,
+    // the same condition that decides whether its pill is visible: a key that
+    // silently changes a setting whose control is not on screen is a key that
+    // looks broken. Free on this site, and Ctrl/Cmd+X is returned above
+    // untouched so cut still works.
+    if (ev.key === 'x' || ev.key === 'X') {
+      if (!open || !verboseOn || otherDialogOpen()) return;
+      ev.preventDefault();
+      cycleVerboseCap();
+      return;
+    }
     // `c` cycles the ended-pane retention. Also mode-local, also a free key
     // (nothing on the site binds it), and Ctrl/Cmd+C is returned above
     // untouched so copying selected log text still works.
@@ -1836,6 +1967,13 @@
     isTimestamps: () => tsOn,
     isVerbose: () => verboseOn,
     lineCharLimit,
+    setVerboseCap,
+    cycleVerboseCap,
+    verboseCap: () => verboseCapKey,
+    verboseCapChars,
+    VERBOSE_CAP_OPTIONS,
+    DEFAULT_VERBOSE_CAP_KEY,
+    VERBOSE_CAP_STORAGE_KEY,
     setRetention,
     cycleRetention,
     sweepEndedPanes,
@@ -1854,7 +1992,6 @@
     MAX_LINES_PER_PANE,
     MAX_LINE_CHARS,
     MAX_LINE_CHARS_WRAPPED,
-    MAX_LINE_CHARS_VERBOSE,
     MAX_PANE_CHARS,
     NEAR_BOTTOM_PX,
     NEAR_BOTTOM_PX_WRAPPED,
