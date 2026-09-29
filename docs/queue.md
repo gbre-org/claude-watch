@@ -164,6 +164,36 @@ while the agent is alive reproduces the incident, just later.
   `"READY: register-and-spawn (...)"` or `"BLOCKED: do not spawn, wait
   for ..."` — read it, don't guess.
 
+### Workload output carries a timestamp per line
+
+`workload run` pipes its payload's combined stdout+stderr through
+`claude-watch workload stamp`, so every line in `<label>.output` begins with
+`date -Iseconds` and one space. `workload log` therefore answers *when* as well
+as *what*, and the queue dashboard renders the stamp as the line's own time
+rather than leaving its timestamp column empty for plain-text tails.
+
+The filter writes the stamp when the FIRST byte of a segment arrives and passes
+bytes straight through; it never holds a segment. That matters because `ts`
+(moreutils) does hold one: reading a line at a time, it buffered a producer's
+`\r`-separated progress frames (`rsync --progress`, `curl`, `pv`) until a
+newline finally arrived, so in-flight progress reached the dashboard in batches
+between files instead of continuously. Both `\n` and `\r` open a new segment,
+an empty line stays empty, and `\r\n` gets one stamp rather than two.
+
+- The wrapper's own header / footer lines are NOT stamped — they already print
+  their absolute time in their text (`Started:`, `DONE … at`), and the
+  `Command:` echo can be multi-line.
+- `WORKLOAD_STAMP=0` opts out for one run (the payload's output then goes
+  straight to the file).
+- The wrapper probes the filter before using it: only a binary that echoes a
+  probe line back WITH a leading date gets the pipe, so an older `claude-watch`
+  on `PATH` (no `stamp` subcommand) falls back to unstamped output instead of
+  losing the run's output to a pipe that swallows it.
+- The payload's own exit code is read from `PIPESTATUS[0]`, never the filter's,
+  so the queue transition (done vs abandoned) is unaffected.
+- Old `.output` files have no prefix, and nothing needs converting: readers
+  treat an unstamped line as "no time known" and render it verbatim.
+
 ### Waiting on a long workload — use `workload babysit`, not tight-poll
 
 When an agent or the main loop has kicked off a long `workload run <label>`

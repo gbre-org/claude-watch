@@ -1358,10 +1358,18 @@ pub fn kill_workload_tree_with(
 ///
 ///   * Traps INT/TERM (fatfinger-proof against accidental Ctrl-C in the
 ///     pane).
-///   * Writes header / footer lines straight to `<label>.output` (no
-///     timestamp prefix — the SSE wrapper in queue-minisite stamps each
-///     wire frame anyway, and disk timestamps were blocking carriage-
-///     return progress; see next bullet).
+///   * Writes header / footer lines straight to `<label>.output` with no
+///     timestamp prefix — they already carry their own absolute time in
+///     their text (`Started: <iso>`, `DONE … at <iso>`), and the
+///     `Command:` echo can itself be multi-line.
+///   * Pipes the PAYLOAD's combined output through `claude-watch workload
+///     stamp`, so every log line in `<label>.output` starts with
+///     `date -Iseconds`. queue-minisite splits that prefix back off and
+///     renders it as the log's own time. `stamp` prefixes at segment
+///     START and never buffers a segment, which is what the old
+///     `ts | tee` chain got wrong (see the next bullet); `WORKLOAD_STAMP=0`
+///     opts out, and a binary whose `stamp` probe does not echo the probe
+///     line back is not given the pipe at all.
 ///   * Runs the user's command under `script -q -f -e -c '...' /dev/null`
 ///     so it sees a PTY on stdout. WITHOUT this, progress-emitting tools
 ///     like `rsync --progress`, `curl`, `wget --progress`, `pv` either
@@ -1491,10 +1499,11 @@ fn build_wrapper_script(
          # arrived, defeating the live-tail SSE path. The user command\n\
          # itself runs under `script -q -f` further down, which both\n\
          # gives it a PTY (so rsync etc. emit progress at all) and\n\
-         # flushes after every write. Header / footer lines don't need\n\
-         # timestamps — queue-minisite stamps each SSE wire frame\n\
-         # server-side, and no downstream consumer parses .output\n\
-         # timestamps.\n\
+         # flushes after every write, and is piped through `workload\n\
+         # stamp` for per-line timestamps (a prefixer that does NOT\n\
+         # buffer a segment). Header / footer lines stay unprefixed: they\n\
+         # already print their own absolute time, and the `Command:` echo\n\
+         # can be multi-line.\n\
          exec >> {out_q} 2>&1\n\
          echo '=== workload: {label} ==='\n\
          echo 'Started: '$(date -Iseconds)\n\
@@ -1700,12 +1709,50 @@ fn build_wrapper_script(
          export WORKLOAD_PGID_FILE={pgid_q}\n\
          export WORKLOAD_INNER_CMD=\"$INNER_CMD\"\n\
          WORKLOAD_RECORD_PGID='echo $$ > \"$WORKLOAD_PGID_FILE.tmp\" 2>/dev/null && mv -f \"$WORKLOAD_PGID_FILE.tmp\" \"$WORKLOAD_PGID_FILE\" 2>/dev/null || true'\n\
+         # PAYLOAD COMMAND, assembled into a variable first so the stamping\n\
+         # and non-stamping branches below run the SAME payload — the PTY\n\
+         # choice and the timestamp choice are independent. The value is a\n\
+         # literal string for the inner bash to parse, so the\n\
+         # `$WORKLOAD_INNER_CMD` inside it must NOT be expanded here; it is\n\
+         # not, because a parameter expansion is never rescanned for further\n\
+         # expansions.\n\
          if [ \"${{WORKLOAD_PTY:-1}}\" != \"0\" ] && command -v script >/dev/null 2>&1; then\n\
-             setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec script -q -f -e -c \"$WORKLOAD_INNER_CMD\" /dev/null'\n\
+             WORKLOAD_PAYLOAD='exec script -q -f -e -c \"$WORKLOAD_INNER_CMD\" /dev/null'\n\
          else\n\
-             setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec bash -c \"$WORKLOAD_INNER_CMD\"'\n\
+             WORKLOAD_PAYLOAD='exec bash -c \"$WORKLOAD_INNER_CMD\"'\n\
          fi\n\
-         EC=$?\n\
+         # PER-LINE TIMESTAMPS. Pipe the payload's output through `claude-watch\n\
+         # workload stamp`, which prefixes the first byte of every \\n / \\r\n\
+         # segment with `date -Iseconds` and NEVER buffers a segment — the one\n\
+         # property `ts | tee` lacked (it held progress frames until a newline\n\
+         # arrived, which is why the wrapper writes straight to the file\n\
+         # otherwise). queue-minisite splits that prefix back off and shows it\n\
+         # as the log's OWN time; an older unstamped file still renders, just\n\
+         # without a time column.\n\
+         #\n\
+         # The probe RUNS the filter on a known line and checks what comes\n\
+         # back, rather than asking whether the binary exists: {exe_q} is\n\
+         # always there, but an older build at that path has no `stamp`\n\
+         # subcommand and an exit-0 no-op would swallow the workload's entire\n\
+         # output. Only something that echoes the probe line back WITH a\n\
+         # leading date earns the pipe. WORKLOAD_STAMP=0 opts out.\n\
+         #\n\
+         # EC comes from PIPESTATUS[0] in the stamped branch — the payload's\n\
+         # own status, never the filter's. The queue transition (done vs\n\
+         # abandoned) is decided by it.\n\
+         WORKLOAD_STAMP_OK=0\n\
+         if [ \"${{WORKLOAD_STAMP:-1}}\" != \"0\" ]; then\n\
+             case \"$(printf 'probe\\n' | {exe_q} workload stamp 2>/dev/null)\" in\n\
+                 [0-9][0-9][0-9][0-9]-*T*' probe') WORKLOAD_STAMP_OK=1 ;;\n\
+             esac\n\
+         fi\n\
+         if [ \"$WORKLOAD_STAMP_OK\" = \"1\" ]; then\n\
+             setsid --wait bash -c \"$WORKLOAD_RECORD_PGID; $WORKLOAD_PAYLOAD\" | {exe_q} workload stamp\n\
+             EC=${{PIPESTATUS[0]}}\n\
+         else\n\
+             setsid --wait bash -c \"$WORKLOAD_RECORD_PGID; $WORKLOAD_PAYLOAD\"\n\
+             EC=$?\n\
+         fi\n\
          echo ''\n\
          echo \"=== DONE (exit $EC) at $(date -Iseconds) ===\"\n\
          echo $EC > {exit_q}\n\
@@ -2494,6 +2541,120 @@ pub fn cmd_log(label: &str, lines: usize, follow: bool) -> i32 {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// PER-LINE TIMESTAMPS (`workload stamp`)
+// ---------------------------------------------------------------------------
+//
+// `workload stamp` is the filter the wrapper pipes the payload's combined
+// stdout+stderr through so every line in `<label>.output` carries the wall
+// clock time it was produced. Without it the file is undated prose and the
+// queue dashboard's timestamp column has nothing to show for a workload tail
+// (it will not borrow the browser's arrival time — see multitail.js).
+//
+// **Why not `ts` from moreutils.** That is what the wrapper used to do, and it
+// is why this exists. `ts` reads a LINE at a time, so a producer that emits
+// `\r`-separated progress frames (rsync --progress, curl, pv, wget) had its
+// whole in-flight progress held until a `\n` finally arrived — the dashboard
+// showed rows updating between files instead of during them. Any filter that
+// buffers a segment before it can prefix it has that bug.
+//
+// So this one NEVER buffers a segment. It writes the timestamp when the FIRST
+// byte of a new segment arrives and then passes bytes straight through, so a
+// partial line — a progress frame, a `Continue? ` prompt with no newline — is
+// on its way to the file the moment it is read, already dated. Both `\n` and
+// `\r` open a new segment (exactly the boundary queue-minisite's CR/LF
+// splitter uses), and an EMPTY segment gets no prefix, so a blank separator
+// line stays blank rather than becoming a timestamp on its own. Every read
+// chunk is flushed, so the file grows at the rate the producer writes.
+//
+// Format is `date -Iseconds` (local time, second resolution, offset kept) plus
+// one space — the same shape the wrapper's own `Started:` / `DONE` lines
+// already print, so the file reads consistently, and a form both
+// `datetime.fromisoformat` and `new Date()` parse. Seconds, not millis: the
+// column in a 10-line pane shows HH:MM:SS.
+//
+// Opt out with `WORKLOAD_STAMP=0` (the wrapper then runs the payload with its
+// stdout going straight to the file, exactly as before).
+
+/// Number of bytes read per pass. The producer writes a line (or a progress
+/// frame) at a time; anything in the 4–64 KB range is equivalent.
+const STAMP_READ_CHUNK: usize = 8192;
+
+/// Copy `input` to `out`, prefixing the first byte of every non-empty
+/// `\n`/`\r`-delimited segment with `now()`.
+///
+/// Pure (clock injected) so the segment logic is unit-testable. Never buffers
+/// a segment: bytes are written in the largest slices the prefix insertions
+/// allow, and every read pass ends in a flush.
+pub fn stamp_stream<R: std::io::Read, W: std::io::Write>(
+    mut input: R,
+    out: &mut W,
+    mut now: impl FnMut() -> String,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; STAMP_READ_CHUNK];
+    // True when the next byte would start a new segment — including at the
+    // very beginning of the stream.
+    let mut at_segment_start = true;
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        // `copied` is the start of the not-yet-written run of this chunk. We
+        // only break the run where a prefix has to be inserted.
+        let mut copied = 0usize;
+        for i in 0..n {
+            let b = buf[i];
+            if b == b'\n' || b == b'\r' {
+                // A terminator both ends a segment and leaves the next byte at
+                // a segment start. `\r\n` therefore inserts nothing between
+                // the two bytes, and an empty line stays empty.
+                at_segment_start = true;
+                continue;
+            }
+            if at_segment_start {
+                out.write_all(&buf[copied..i])?;
+                out.write_all(now().as_bytes())?;
+                copied = i;
+                at_segment_start = false;
+            }
+        }
+        out.write_all(&buf[copied..n])?;
+        out.flush()?;
+    }
+    out.flush()
+}
+
+/// The timestamp prefix one segment gets: `date -Iseconds` + one space.
+fn stamp_prefix_now() -> String {
+    format!(
+        "{} ",
+        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+    )
+}
+
+/// CLI (hidden): `workload stamp` — stdin to stdout, one timestamp per line.
+///
+/// Exit 0 on clean EOF. A broken pipe is NOT an error (the reader went away,
+/// which happens whenever a workload is killed); any other I/O error exits 1
+/// after saying so on stderr. The wrapper reads the payload's own status out
+/// of `PIPESTATUS[0]`, so this exit code never becomes a workload's exit code.
+pub fn cmd_stamp() -> i32 {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match stamp_stream(stdin.lock(), &mut out, stamp_prefix_now) {
+        Ok(()) => 0,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => 0,
+        Err(e) => {
+            eprintln!("workload stamp: {e}");
+            1
+        }
+    }
+}
 /// Exit code for "the pane is gone but something it spawned is still
 /// alive". Distinct from 1 (`no such workload`) so a caller can tell
 /// "nothing to kill" from "the kill did not fully take".
@@ -4276,14 +4437,15 @@ mod tests {
     // ----- build_wrapper_script: PTY-wrap + raw-output tests ----------------
 
     #[test]
-    fn wrapper_script_writes_output_without_ts_prefix() {
-        // The new wrapper redirects all wrapper-side output straight to
-        // .output (`exec >> OUT 2>&1`) without piping through `ts | tee`.
-        // The `ts | tee` chain block-buffered on `\n`, swallowing
-        // `\r`-separated progress frames from rsync/curl/pv until a
-        // final newline arrived — the bug behind q-2026-05-13-e6ab.
-        // Hard guards: both the `ts` prefixer AND the pure-bash
-        // `date -Is` per-line fallback must be GONE.
+    fn wrapper_script_never_uses_a_line_buffering_prefixer() {
+        // Wrapper-side output (headers, footer) goes straight to .output
+        // (`exec >> OUT 2>&1`), and the payload's per-line timestamps come
+        // from `workload stamp`, which prefixes at segment START and never
+        // holds a segment. What must stay GONE is every prefixer that reads a
+        // whole LINE first: the `ts | tee` chain block-buffered on `\n`,
+        // swallowing `\r`-separated progress frames from rsync/curl/pv until a
+        // final newline arrived — the bug behind q-2026-05-13-e6ab — and the
+        // pure-bash `date -Is` read-loop fallback had the same problem.
         let script = build_wrapper_script(
             "demo",
             "echo hi",
@@ -4342,6 +4504,278 @@ mod tests {
         );
     }
 
+
+    // --- `workload stamp` -------------------------------------------------
+
+    fn stamp_to_string(input: &str) -> String {
+        let mut out: Vec<u8> = Vec::new();
+        let mut n = 0;
+        stamp_stream(input.as_bytes(), &mut out, || {
+            n += 1;
+            format!("T{n} ")
+        })
+        .expect("stamp");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn stamp_prefixes_every_newline_segment() {
+        assert_eq!(stamp_to_string("a\nb\n"), "T1 a\nT2 b\n");
+    }
+
+    #[test]
+    fn stamp_leaves_empty_lines_empty() {
+        // A blank separator line must NOT become a line whose only content is
+        // a timestamp — the .output would grow noise and the dashboard would
+        // render a row with a time and nothing in it.
+        assert_eq!(stamp_to_string("a\n\nb\n"), "T1 a\n\nT2 b\n");
+    }
+
+    #[test]
+    fn stamp_treats_cr_as_a_segment_boundary_without_buffering() {
+        // The whole reason this filter exists: `\r`-separated progress frames
+        // (rsync --progress, curl, pv) each get their OWN timestamp, and
+        // nothing waits for a trailing newline.
+        assert_eq!(
+            stamp_to_string("10%\r20%\rdone\n"),
+            "T1 10%\rT2 20%\rT3 done\n"
+        );
+    }
+
+    #[test]
+    fn stamp_does_not_split_crlf() {
+        // A PTY turns every `\n` into `\r\n`; a prefix inserted BETWEEN those
+        // two bytes would produce a timestamp-only line for every real line.
+        assert_eq!(stamp_to_string("a\r\nb\r\n"), "T1 a\r\nT2 b\r\n");
+    }
+
+    #[test]
+    fn stamp_stamps_an_unterminated_tail() {
+        // `Continue? ` with no newline still reaches the file, dated — it is
+        // not held back waiting for a terminator.
+        assert_eq!(stamp_to_string("Continue? "), "T1 Continue? ");
+    }
+
+    #[test]
+    fn stamp_carries_segment_state_across_read_chunks() {
+        // The filter reads in chunks; a segment that straddles a chunk
+        // boundary must not get a second prefix mid-line. Drive it with a
+        // reader that hands over one byte at a time.
+        struct OneByteAtATime<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+        impl std::io::Read for OneByteAtATime<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.data.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut n = 0;
+        stamp_stream(
+            OneByteAtATime {
+                data: b"hello\nworld\n",
+                pos: 0,
+            },
+            &mut out,
+            || {
+                n += 1;
+                format!("T{n} ")
+            },
+        )
+        .expect("stamp");
+        assert_eq!(String::from_utf8(out).unwrap(), "T1 hello\nT2 world\n");
+    }
+
+    #[test]
+    fn stamp_prefix_now_is_iso8601_seconds() {
+        // The format the queue-minisite parser splits back off: `date
+        // -Iseconds` plus exactly one space.
+        let p = stamp_prefix_now();
+        assert!(p.ends_with(' '), "prefix must end in one space: {p:?}");
+        let body = p.trim_end();
+        assert!(!body.contains(' '), "prefix must be one token: {p:?}");
+        assert_eq!(body.len(), "2026-09-28T22:53:35-04:00".len(), "unexpected shape: {p:?}");
+        assert!(
+            body.as_bytes()[4] == b'-' && body.as_bytes()[10] == b'T',
+            "not ISO8601: {p:?}"
+        );
+        // Parseable back as an offset datetime.
+        chrono::DateTime::parse_from_rfc3339(body).unwrap_or_else(|e| panic!("{body:?}: {e}"));
+    }
+
+    /// Runs the GENERATED wrapper with a stub `claude-watch` whose `workload
+    /// stamp` behaves like the real one, and proves the piping is wired up:
+    /// the payload's lines land in `.output` dated, the wrapper's own header
+    /// stays undated, and `EC` is the PAYLOAD's exit code (PIPESTATUS[0]) and
+    /// not the filter's.
+    #[test]
+    fn wrapper_script_stamps_payload_lines_and_keeps_payload_rc() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("st.output");
+        let exit_path = tmp.path().join("st.exit");
+        let script_path = tmp.path().join("st.sh");
+        let fake_exe = tmp.path().join("fake-claude-watch");
+        std::fs::write(
+            &fake_exe,
+            "#!/bin/bash\n\
+             if [ \"$1\" = workload ] && [ \"$2\" = stamp ]; then\n\
+               while IFS= read -r l; do printf '%s %s\\n' \"$(date -Iseconds)\" \"$l\"; done\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+        )
+        .expect("write fake exe");
+        std::fs::set_permissions(&fake_exe, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        let script = build_wrapper_script(
+            "st",
+            "echo one; echo two; exit 7",
+            &out_path,
+            &exit_path,
+            &tmp.path().join("st.heartbeat"),
+            &tmp.path().join("st.runtime.heartbeat"),
+            &tmp.path().join("st.pgid"),
+            &fake_exe.to_string_lossy(),
+            None,
+        )
+        .replace("sleep 30\n", "sleep 0\n");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        let status = Command::new("bash")
+            .arg(&script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .status()
+            .expect("run wrapper");
+        assert!(status.success(), "wrapper own rc: {status:?}");
+        std::thread::sleep(Duration::from_millis(200));
+
+        let body = std::fs::read_to_string(&out_path).expect("read .output");
+        // Payload lines are dated.
+        for want in ["one", "two"] {
+            let line = body
+                .lines()
+                .find(|l| l.ends_with(want))
+                .unwrap_or_else(|| panic!("no {want:?} line in:\n{body}"));
+            assert!(
+                line.len() > want.len() + 20 && line.as_bytes()[4] == b'-',
+                "payload line must carry an ISO8601 prefix: {line:?}\n{body}"
+            );
+        }
+        // The wrapper's own header is written straight to the file and stays
+        // undated — it already carries `Started:` in its text.
+        assert!(
+            body.contains("\n=== workload: st ===\n") || body.starts_with("=== workload: st ==="),
+            "header must stay verbatim:\n{body}"
+        );
+        // PIPESTATUS[0], not the filter's 0.
+        assert!(
+            body.contains("=== DONE (exit 7)"),
+            "DONE line must carry the PAYLOAD rc:\n{body}"
+        );
+        let rc = std::fs::read_to_string(&exit_path).expect("read .exit");
+        assert_eq!(rc.trim(), "7", ".exit must record the payload rc");
+    }
+
+    #[test]
+    fn wrapper_script_falls_back_when_stamp_probe_fails() {
+        // A binary that exits 0 but echoes nothing (an OLDER claude-watch,
+        // whose `workload stamp` is an unknown subcommand) must NOT get the
+        // pipe — piping into it would throw the workload's entire output away.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("fb.output");
+        let exit_path = tmp.path().join("fb.exit");
+        let script_path = tmp.path().join("fb.sh");
+
+        let script = build_wrapper_script(
+            "fb",
+            "echo kept",
+            &out_path,
+            &exit_path,
+            &tmp.path().join("fb.heartbeat"),
+            &tmp.path().join("fb.runtime.heartbeat"),
+            &tmp.path().join("fb.pgid"),
+            "/bin/true",
+            None,
+        )
+        .replace("sleep 30\n", "sleep 0\n");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        Command::new("bash")
+            .arg(&script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .status()
+            .expect("run wrapper");
+        std::thread::sleep(Duration::from_millis(200));
+        let body = std::fs::read_to_string(&out_path).expect("read .output");
+        assert!(
+            body.contains("kept"),
+            "payload output must survive a failed stamp probe:\n{body}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_honours_workload_stamp_opt_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("oo.output");
+        let exit_path = tmp.path().join("oo.exit");
+        let script_path = tmp.path().join("oo.sh");
+        let fake_exe = tmp.path().join("fake-claude-watch");
+        std::fs::write(
+            &fake_exe,
+            "#!/bin/bash\n\
+             if [ \"$1\" = workload ] && [ \"$2\" = stamp ]; then\n\
+               while IFS= read -r l; do printf '%s %s\\n' \"$(date -Iseconds)\" \"$l\"; done\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+        )
+        .expect("write fake exe");
+        std::fs::set_permissions(&fake_exe, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        let script = build_wrapper_script(
+            "oo",
+            "echo plain",
+            &out_path,
+            &exit_path,
+            &tmp.path().join("oo.heartbeat"),
+            &tmp.path().join("oo.runtime.heartbeat"),
+            &tmp.path().join("oo.pgid"),
+            &fake_exe.to_string_lossy(),
+            None,
+        )
+        .replace("sleep 30\n", "sleep 0\n");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        Command::new("bash")
+            .arg(&script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .env("WORKLOAD_STAMP", "0")
+            .status()
+            .expect("run wrapper");
+        std::thread::sleep(Duration::from_millis(200));
+        let body = std::fs::read_to_string(&out_path).expect("read .output");
+        // The `Command: echo plain` header echo also contains "plain", so match
+        // the payload line exactly rather than by substring.
+        assert!(
+            body.lines().any(|l| l.trim_end() == "plain"),
+            "WORKLOAD_STAMP=0 must leave the payload line verbatim:\n{body}"
+        );
+    }
     #[test]
     fn wrapper_script_wraps_user_command_in_pty() {
         // The user command runs under `script -q -f -e -c <STR> /dev/null`
@@ -4369,10 +4803,15 @@ mod tests {
         );
         // The `script` invocation is `exec`ed from the setsid'd bash
         // that records the pgid — exec preserves the pid, so the
-        // recorded id stays valid for the whole run.
+        // recorded id stays valid for the whole run. Both the stamped
+        // and unstamped branches run the same $WORKLOAD_PAYLOAD.
         assert!(
-            script.contains("setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec script"),
-            "PTY path must go through the pgid-recording setsid bash:\n{script}"
+            script.contains("WORKLOAD_PAYLOAD='exec script -q -f -e -c"),
+            "PTY payload must be assembled into $WORKLOAD_PAYLOAD:\n{script}"
+        );
+        assert!(
+            script.contains("setsid --wait bash -c \"$WORKLOAD_RECORD_PGID; $WORKLOAD_PAYLOAD\""),
+            "payload must go through the pgid-recording setsid bash:\n{script}"
         );
         assert!(
             script.contains("WORKLOAD_PTY"),

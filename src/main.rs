@@ -564,6 +564,12 @@ enum WorkloadAction {
         #[arg(long = "queue-id")]
         queue_id: Option<String>,
     },
+    /// Internal: stdin-to-stdout filter that prefixes every output line
+    /// with `date -Iseconds`. The wrapper pipes the workload payload
+    /// through it so `<label>.output` carries per-line timestamps that
+    /// the queue dashboard can render. Hidden from `--help`.
+    #[command(hide = true, name = "stamp")]
+    Stamp,
 }
 
 #[derive(Subcommand)]
@@ -1818,6 +1824,7 @@ fn run_workload(action: WorkloadAction) -> i32 {
             lines,
         } => workload::cmd_log(&label, lines, follow),
         WorkloadAction::Kill { label, grace } => workload::cmd_kill(&label, grace),
+        WorkloadAction::Stamp => workload::cmd_stamp(),
         WorkloadAction::EmitDone {
             label,
             exit_code,
