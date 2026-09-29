@@ -216,6 +216,37 @@ if deploy_container.is_file():
         f"force-recreate, got: {first_content_line(text_dc)!r}",
     )
 
+# 3c-3. switch-main-loop-model.md present + references the confirmed
+#       mechanism: the user-tier settings.json `model` field + cwsr for a
+#       model-only switch, and make deploy-container when a daemon rebuild
+#       must ALSO land. The model is NOT a --model flag / env var / cwsr
+#       arg — this skill exists so that mechanism is never re-guessed.
+switch_model = SKILLS_DIR / "switch-main-loop-model.md"
+expect(
+    switch_model.is_file(),
+    f"{switch_model} missing — the /claude-container:switch-main-loop-model "
+    f"skill codifies switching the main-loop claude model and must ship as "
+    f"its own skill",
+)
+if switch_model.is_file():
+    text_sm = switch_model.read_text(encoding="utf-8")
+    expect(len(text_sm) > 200, f"{switch_model} suspiciously short (<200 chars)")
+    expect(
+        "cwsr" in text_sm,
+        f"{switch_model} should reference cwsr — the model-only switch rolls "
+        f"the inner process via cwsr after the settings edit",
+    )
+    expect(
+        "settings.json" in text_sm and "model" in text_sm,
+        f"{switch_model} should reference the settings.json `model` field — "
+        f"the confirmed source of the main-loop model",
+    )
+    expect(
+        "make deploy-container" in text_sm or "deploy-container" in text_sm,
+        f"{switch_model} should reference deploy-container — required when a "
+        f"daemon rebuild must land alongside the model switch",
+    )
+
 # 3d. self-clear.md present + references `self-clear` (the backing
 #     tool). self-clear injects /clear + a resume prompt into the
 #     Claude Code tmux pane for a clean CONTEXT reset — distinct from
