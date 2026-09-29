@@ -764,6 +764,22 @@ console.log('\n-- timestamps (`t`): SOURCE time only, never arrival time');
   assert('the raw source timestamp is kept as the cell tooltip',
     tsCell && tsCell.title === ISO, tsCell && tsCell.title);
 
+  // PLACEMENT. The stamp renders on the RIGHT of the entry, and it costs the
+  // body no horizontal width: in the wrapped / verbose modes the stylesheet
+  // floats it right, which shortens the FIRST line box only and leaves every
+  // continuation row the full width of the pane. A float can only do that for
+  // content that follows it in the markup, so the cell has to be the row's
+  // first child however far right it ends up looking. jsdom has no layout, so
+  // what is asserted here is the source order the stylesheet depends on — the
+  // geometry itself is a CSS assertion in test_multitail.py.
+  const tsRow = tsCell.parentNode;
+  const kids = Array.prototype.slice.call(tsRow.children);
+  assert('the timestamp cell is the FIRST child of its row',
+    kids.indexOf(tsCell) === 0, tsRow.innerHTML);
+  assert('so the body follows it and a right float can shorten line one',
+    kids.indexOf(tsRow.querySelector('.mt-body')) > kids.indexOf(tsCell),
+    tsRow.innerHTML);
+
   // The whole judgment call: a plain-text source gets NOTHING, not the
   // browser's arrival time dressed up as the log's own.
   assert('a plain-text workload line gets NO timestamp cell',

@@ -2806,8 +2806,9 @@ body.multitail-open { overflow: hidden; }
 /* One event = one line, clipped rather than wrapped BY DEFAULT: a wrapped
    400-character tool result would swallow a whole short pane. The `w` toggle
    (.mt-wrap on the overlay) opts into the other tradeoff — see the WRAP block
-   below. align-items keeps the timestamp + sigil on the FIRST visual row of a
-   wrapped body instead of centring them against a six-row block. */
+   below. In this one-row mode the row is a flex line and align-items holds the
+   cells to its top edge; the multi-row modes stop being flex rows entirely,
+   for the reason set out in the TIMESTAMP PLACEMENT block further down. */
 .mt-line {
   display: flex;
   align-items: flex-start;
@@ -2821,8 +2822,17 @@ body.multitail-open { overflow: hidden; }
 }
 /* Source timestamp cell (`t` toggle). Present only on lines whose SOURCE
    carried a timestamp — never a client-side arrival time, so a pane with no
-   source timestamps simply has no cells here and says so in its header. */
+   source timestamps simply has no cells here and says so in its header.
+
+   The cell is the FIRST child of the row in the MARKUP, because the multi-row
+   modes float it right and a float only shortens the line box it is declared
+   on — source order is load-bearing there, not cosmetic. `order: 3` is what
+   puts it visually LAST in this one-row mode without moving it in the markup:
+   the body is the only flexible item, so it takes every pixel it can and the
+   stamp lands flush against the pane's right edge. The body's box therefore
+   starts at x=0 in every mode; no timestamp gutter exists to indent it. */
 .mt-line .mt-ts {
+  order: 3;
   flex: 0 0 auto;
   color: var(--fg-mute);
   opacity: 0.85;
@@ -2881,9 +2891,9 @@ body.multitail-open { overflow: hidden; }
  * two toggles answer different questions ("this line is too wide" vs "show me
  * everything"), and verbose implies the first one.
  *
- * `mt-body` is the only part that grows; the timestamp cell and the sigil stay
- * on the first visual row so a wall of wrapped text is still scannable down
- * its left edge. */
+ * The sigil and the timestamp sit on the first visual row, and NOTHING indents
+ * the rows after it: a twenty-row JSON payload is the case where a per-entry
+ * gutter hurts most, so this is the mode the block below is written for. */
 .multitail.mt-verbose .mt-line {
   white-space: pre-wrap;
   overflow: visible;
@@ -2900,6 +2910,58 @@ body.multitail-open { overflow: hidden; }
 .multitail.mt-verbose .mt-line + .mt-line {
   border-top: 1px solid var(--line);
   padding-top: 1px;
+}
+
+/* ---- TIMESTAMP PLACEMENT: zero width cost once a row can be multi-row ----
+ *
+ * Reported from botchat: "can you make it so timestamps dont take up
+ * horizontal width? make them part of the line on the right side or smth idk",
+ * with a screenshot of a pretty-printed JSON hook payload squeezed into the
+ * right-hand three quarters of a pane.
+ *
+ * A flex ROW gives every cell a full-height column. For a one-row entry that
+ * is a slice of width off one line; for a wrapped or verbose entry it is far
+ * worse, because the stamp's column indents EVERY continuation row of the
+ * body. The body pays that width once per visual row and wraps several rows
+ * earlier than it needs to. Narrowing the column would not fix it — any
+ * column at all is the defect.
+ *
+ * So the multi-row modes are not flex rows at all. The row is a BLOCK, the
+ * sigil and body are inline content inside it, and the stamp is a right FLOAT
+ * declared before that content. A float is one line tall, so it shortens
+ * exactly one line box — the first — and every continuation row runs the full
+ * width of the pane. There is no column left to indent anything with.
+ *
+ * Why a float and not absolute positioning: an absolutely-positioned stamp is
+ * out of flow entirely, so the first row's text would run UNDER it and the
+ * reader would lose either the text or the time. The float is the one
+ * mechanism that costs the body nothing on the rows that matter while still
+ * keeping the first row's text clear of it.
+ *
+ * Long unbroken tokens are the hazard here — these panes are full of paths,
+ * JSON and base64 — and the existing `overflow-wrap: anywhere` on the body is
+ * what handles them: there is always a break opportunity, so the first row
+ * breaks BEFORE the float rather than sliding under it. Belt and braces, the
+ * stamp carries the pane's own background and is positioned, so in the
+ * pathological case (a pane too narrow to fit one character beside it) the
+ * time stays readable instead of being overprinted — inline content otherwise
+ * paints on top of floats. */
+.multitail.mt-wrap .mt-line,
+.multitail.mt-verbose .mt-line {
+  display: block;
+}
+.multitail.mt-wrap .mt-line .mt-ts,
+.multitail.mt-verbose .mt-line .mt-ts {
+  float: right;
+  position: relative;
+  margin-left: 12px;
+  padding-left: 6px;
+  background: var(--bg);
+}
+/* The flex `gap` goes with the flex row, so the sigil carries its own. */
+.multitail.mt-wrap .mt-line .mt-sigil,
+.multitail.mt-verbose .mt-line .mt-sigil {
+  margin-right: 5px;
 }
 
 /* Phones: the header hint costs a line it cannot afford, and the floor drops

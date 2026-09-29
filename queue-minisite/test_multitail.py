@@ -139,6 +139,34 @@ def _seed_agent_state(state_path: Path, mapping: dict[str, str]) -> None:
     state_path.write_text(json.dumps(state))
 
 
+# -- tiny CSS reader ------------------------------------------------------
+#
+# Some of what this suite pins is geometry that lives only in the stylesheet,
+# and `assertIn("float: right", css)` would pass on a rule for something else
+# entirely. These two helpers cut the sheet into (selectors, declarations)
+# pairs so an assertion can name the RULE it means. Comments go first, because
+# this stylesheet carries long ones and they contain braces-free prose that
+# would otherwise read as selectors. Nested at-rules are skipped rather than
+# parsed: the regex cannot cross a brace, so an `@media` header never matches
+# and the rules inside it are returned on their own, which is what a caller
+# asking for a plain selector wants anyway.
+
+
+def _css_rules(css: str) -> list[tuple[list[str], str]]:
+    body = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    out = []
+    for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", body):
+        sels = [s.strip() for s in m.group(1).split(",") if s.strip()]
+        out.append((sels, m.group(2)))
+    return out
+
+
+def _decls(rules: list[tuple[list[str], str]], selector: str) -> str | None:
+    """Every declaration written for `selector`, in source order."""
+    found = [d for sels, d in rules if selector in sels]
+    return "\n".join(found) if found else None
+
+
 class MultitailTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -426,6 +454,52 @@ class MultitailTest(unittest.TestCase):
         # tint; it has its own rule (stable width + the `keep` outline).
         self.assertIn(".multitail-retain", css)
         self.assertIn('.multitail-retain[data-retention="keep"]', css)
+
+    def test_timestamps_cost_the_body_no_horizontal_width(self):
+        """The stamp is on the right, and it never indents the body.
+
+        It used to live in a left gutter, i.e. a full-height flex column. On a
+        one-row entry that was a slice of width; on a wrapped or verbose entry
+        it was much worse, because a per-entry column indents EVERY
+        continuation row and a pretty-printed JSON payload then wrapped into
+        the right-hand fraction of the pane.
+
+        Two rules carry the fix and each one is asserted here, because either
+        alone silently restores the gutter:
+
+          one-row mode   the cell keeps its flex column but takes `order`, so
+                         the body (the only flexible item) starts at x=0 and
+                         the stamp is pushed to the pane's right edge.
+          multi-row      the row stops being a flex container at all and the
+                         stamp becomes a right FLOAT, which shortens exactly
+                         one line box. Anything that is not a float here -- a
+                         narrower column, a flex cell, an absolutely
+                         positioned box -- either keeps costing the body width
+                         on every row or prints over its first one.
+        """
+        css = (HERE / "static" / "style.css").read_text()
+        rules = _css_rules(css)
+
+        cell = _decls(rules, ".mt-line .mt-ts")
+        self.assertIsNotNone(cell, ".mt-line .mt-ts rule not found")
+        self.assertRegex(
+            cell, r"\border\s*:",
+            "the one-row timestamp cell must be re-ordered past the body, "
+            "or it is a left gutter again")
+
+        for mode in ("wrap", "verbose"):
+            row = _decls(rules, ".multitail.mt-%s .mt-line" % mode)
+            self.assertIsNotNone(row, "no .mt-%s row rule" % mode)
+            self.assertRegex(
+                row, r"display\s*:\s*block",
+                "a flex row gives the %s-mode timestamp a full-height column, "
+                "which indents every continuation row of the body" % mode)
+            stamp = _decls(rules, ".multitail.mt-%s .mt-line .mt-ts" % mode)
+            self.assertIsNotNone(stamp, "no .mt-%s timestamp rule" % mode)
+            self.assertRegex(
+                stamp, r"float\s*:\s*right",
+                "the %s-mode timestamp must float right so it shortens the "
+                "first line box only" % mode)
 
     # -- pane title (the task summary) -------------------------------------
     #

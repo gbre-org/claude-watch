@@ -153,8 +153,24 @@
 // the very timing the reader opened the pane to see. Worse, in a window that
 // stacks both kinds of source at once, a real-timestamp column and an
 // arrival-time column are visually identical and invite exactly the
-// side-by-side comparison that is invalid. An empty column that explains
-// itself is strictly better than a plausible fabrication.
+// side-by-side comparison that is invalid. An empty slot that explains itself
+// is strictly better than a plausible fabrication.
+//
+// WHERE the stamp goes is a layout question with a hard constraint: it must
+// cost the BODY no horizontal width. It used to sit in a left gutter, which
+// was a slice of width off a one-row entry and much worse than that for a
+// multi-row one, because the gutter indents every continuation row — a
+// pretty-printed JSON payload wrapped into the right-hand three quarters of
+// the pane (reported from botchat: "can you make it so timestamps dont take
+// up horizontal width? make them part of the line on the right side or smth
+// idk"). The stamp now renders on the RIGHT: flush to the pane edge in
+// one-row mode, and a right FLOAT on the first visual row in the wrapped and
+// verbose modes, where a float shortens exactly one line box and every
+// continuation row keeps the full width. The mechanism is stylesheet-side
+// (see the TIMESTAMP PLACEMENT block in style.css); what this module owes it
+// is SOURCE ORDER — the cell is appended to the row BEFORE the sigil and the
+// body, because a float can only shorten the line box it is declared on. Do
+// not reorder the appends in renderRecord to "match what you see".
 //
 // ---------------------------------------------------------------------------
 // VERBOSE (`v`) — STOP ELIDING
@@ -1064,9 +1080,18 @@
   // --- line rendering -----------------------------------------------------
 
   // Build the DOM row for one record under the CURRENT display settings. The
-  // timestamp cell is emitted only when the column is on AND this record
+  // timestamp cell is emitted only when the toggle is on AND this record
   // actually has a source timestamp — an empty cell is never padded with
   // anything borrowed.
+  //
+  // ORDER IS LOAD-BEARING, and it is not the order you see: the stamp is
+  // appended FIRST and renders on the right. In the wrapped / verbose modes
+  // the stylesheet floats it right so that it shortens only the first line
+  // box and the body's continuation rows keep the whole pane width, and a
+  // float can only do that for content that FOLLOWS it in the markup. In the
+  // one-row mode `order: 3` moves it back to the right-hand edge visually.
+  // Appending it after the body would quietly restore a full-height gutter in
+  // exactly the modes the placement exists for.
   function renderRecord(rec) {
     const row = el('div', 'mt-line ' + (rec.cls || ''));
     if (tsOn && rec.ts) {
