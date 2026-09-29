@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{TestEnv, TestEnvOptions};
+use common::{daemon_diagnostics, TestEnv, TestEnvOptions};
 
 /// A `None` status read whose pane shows a context-limit banner must be
 /// recovered as WEDGED (self-clear), NOT treated as "not running" / dead.
@@ -41,9 +41,9 @@ fn wedged_context_limit_with_unparseable_status_runs_self_clear() {
     let self_clear_log = env.read_self_clear_log();
     assert!(
         !self_clear_log.trim().is_empty(),
-        "wedged recovery should have invoked self-clear. self-clear log: {:?}, stderr: {}",
+        "wedged recovery should have invoked self-clear. self-clear log: {:?}{}",
         self_clear_log,
-        run.stderr
+        daemon_diagnostics(&env, &run),
     );
 
     // It must NOT have been misclassified as a dead / not-running process.
