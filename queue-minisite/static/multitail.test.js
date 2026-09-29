@@ -29,6 +29,11 @@
 //      genuinely keeps forever, the choice persists per viewer through
 //      localStorage (and the module still works when storage throws), and a
 //      clear is NOT a manual dismissal — a requeued qid gets a fresh pane.
+//  12. SUBAGENTS: a pane is a (kind, target) pair, not a qid. A running
+//      card's nested subagent tree is collapsed by default, expands into
+//      nested panes tailing /api/subagent/<id>/stream, indents by real tree
+//      depth, ends when the tree stops listing a node, and goes away with its
+//      parent pane.
 //  11. STREAM RETRY: a pane whose log does not exist YET (`open-failed` /
 //      `no-jsonl` / `no-agent` / `read-failed`) backs off and reconnects
 //      instead of dying until the mode is toggled — the bug that made a
@@ -175,8 +180,26 @@ function key(k, init) {
   document.dispatchEvent(ev);
   return ev;
 }
+// Panes are keyed by (kind, target), not by qid — `q:<qid>` for a queue
+// item's own tail, `s:<subagent-id>` for a nested subagent tail. These
+// helpers say which namespace they mean rather than passing a bare id.
 function paneRecord(qid) {
-  return mt.panes.get(qid);
+  return mt.panes.get(mt.paneKey('queue', qid));
+}
+function subPaneRecord(sid) {
+  return mt.panes.get(mt.paneKey('subagent', sid));
+}
+function subPaneFor(sid) {
+  return document.querySelector(
+    `#multitail-panes .mt-pane[data-subagent-id="${sid}"]`);
+}
+function subStatusOf(sid) {
+  const p = subPaneFor(sid);
+  return p ? p.querySelector('.mt-pane-status').textContent : null;
+}
+function subsBtnOf(qid) {
+  const p = paneFor(qid);
+  return p ? p.querySelector('.mt-pane-subs') : null;
 }
 function bodyOf(qid, idx) {
   const rows = paneFor(qid).querySelectorAll('.mt-line .mt-body');
@@ -887,9 +910,10 @@ console.log('\n-- ended-pane retention (`c`): clear after a delay, or keep');
   p.endedAt = Date.now() - mt.retentionMs();
   mt.reconcile();
   assert('a pane exactly at its deadline is cleared', paneFor('q-b') === null);
-  assert('and leaves the pane map with it', mt.panes.has('q-b') === false);
+  assert('and leaves the pane map with it',
+    mt.panes.has(mt.paneKey('queue', 'q-b')) === false);
   assert('an auto-clear is NOT recorded as a manual dismissal',
-    mt.dismissed.has('q-b') === false);
+    mt.dismissed.has(mt.paneKey('queue', 'q-b')) === false);
   assert('the mode stays open and other panes are untouched',
     mt.isOpen() === true && paneFor('q-a') !== null);
   assert('the header count drops the cleared tail',
@@ -902,7 +926,8 @@ console.log('\n-- ended-pane retention (`c`): clear after a delay, or keep');
   assert('a cleared pane is not rebuilt while its row is still eligible',
     paneFor('q-b') === null);
   assert('the suppression is its own set, not the dismissed set',
-    mt.cleared.has('q-b') === true && mt.dismissed.has('q-b') === false);
+    mt.cleared.has(mt.paneKey('queue', 'q-b')) === true &&
+    mt.dismissed.has(mt.paneKey('queue', 'q-b')) === false);
 
   // ...and the suppression cannot outlive that row's eligibility streak, so a
   // requeued job reusing the qid is NOT permanently suppressed by a stale
@@ -910,7 +935,7 @@ console.log('\n-- ended-pane retention (`c`): clear after a delay, or keep');
   document.getElementById('queue-root').innerHTML = card('q-a', 'live', 'agent one');
   mt.reconcile();
   assert('the suppression is dropped as soon as the row is not eligible',
-    mt.cleared.has('q-b') === false);
+    mt.cleared.has(mt.paneKey('queue', 'q-b')) === false);
   document.getElementById('queue-root').innerHTML =
     [card('q-a', 'live', 'agent one'), card('q-b', 'workload', 'wl one again')].join('\n');
   mt.reconcile();
@@ -1442,7 +1467,7 @@ console.log('\n-- ANSI colour sequences render as colour, not as escape text');
   // about RENDERING, and by this point the suite has more eligible rows than
   // stream slots, so q-b may still be waiting for one.
   const feed = (qid, payload) =>
-    mt.appendPaneLine(mt.panes.get(qid), mt.formatPayload(payload));
+    mt.appendPaneLine(paneRecord(qid), mt.formatPayload(payload));
   // The real shape from a `docker compose up --build` workload log.
   feed('q-ansi', {
     type: 'event', kind: 'workload_line',
@@ -1499,7 +1524,7 @@ console.log('\n-- verbose (`v`): stop eliding, within a ceiling');
     card('q-verbose', 'live', 'verbose agent');
   mt.openMode();
   const feedV = (payload) =>
-    mt.appendPaneLine(mt.panes.get('q-verbose'), mt.formatPayload(payload));
+    mt.appendPaneLine(paneRecord('q-verbose'), mt.formatPayload(payload));
   assert('verbose is OFF for a fresh viewer', mt.isVerbose() === false);
 
   const multi = { type: 'event', kind: 'assistant_text', rec: {
@@ -1581,7 +1606,7 @@ console.log('\n-- verbose (`v`): stop eliding, within a ceiling');
 
   // The pane's TEXT budget, not just its line count: a handful of maximal
   // lines must evict from the head rather than accumulate.
-  const pane = mt.panes.get('q-verbose');
+  const pane = paneRecord('q-verbose');
   const need = Math.ceil(mt.MAX_PANE_CHARS / mt.verboseCapChars()) + 2;
   for (let i = 0; i < need; i++) {
     feedV({ type: 'event', kind: 'workload_line', text: huge });
@@ -1609,7 +1634,7 @@ console.log('\n-- the verbose cap (`x`): a choice, defaulting to 8K');
     card('q-cap', 'live', 'cap agent');
   mt.openMode();
   const feedV = (payload) =>
-    mt.appendPaneLine(mt.panes.get('q-cap'), mt.formatPayload(payload));
+    mt.appendPaneLine(paneRecord('q-cap'), mt.formatPayload(payload));
 
   assert('the ladder is 4K / 8K / 16K / 32K, ascending',
     mt.VERBOSE_CAP_OPTIONS.map((o) => o.key).join(',') === '4k,8k,16k,32k',
@@ -1802,6 +1827,308 @@ console.log('\n-- every header setting persists per viewer');
   d.window.__multitail.setVerbose(true);
   assert('and a toggle still applies to this page',
     d.window.__multitail.isVerbose() === true);
+}
+
+
+// ==========================================================================
+console.log('\n-- subagents: nested tails under the pane of the item they belong to');
+// ==========================================================================
+// A subagent has no queue id, so a module whose panes WERE queue items could
+// not hold one. The fixture below is the real markup both row renderers emit
+// (the subagent_node macro in templates/index.html and renderSubagentNode in
+// static/refresh.js) from app.py's _build_subagent_tree shape, because reading
+// the tree off the rendered card is the contract this feature rests on.
+const SID_A = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+const SID_B = 'b2c3d4e5f60718293a4b5c6d7e8f9001';  // spawn-child of SID_A
+const SID_C = 'c3d4e5f60718293a4b5c6d7e8f900112';  // co-bound peer
+
+function subNode(sid, label, age, opts) {
+  const o = opts || {};
+  const cls = 'subagent-node subagent-log-clickable' +
+    (o.peer ? ' subagent-peer' : '');
+  return `<li class="${cls}" data-subagent-id="${sid}" ` +
+    `data-log-mode="subagent" tabindex="0" role="button" ` +
+    `aria-label="View live log for subagent ${sid}" ` +
+    `title="Click to tail this subagent's live log">` +
+    `<code class="subagent-id">${sid.slice(0, 12)}</code>` +
+    `<span class="subagent-label">${label}</span>` +
+    `<span class="subagent-age"><span class="rel-age">${age}</span></span>` +
+    (o.children
+      ? `<ul class="subagent-list subagent-children">${o.children}</ul>` : '') +
+    '</li>';
+}
+
+function treeCard(qid, summary, nodes) {
+  return `<article class="item state-running log-clickable" ` +
+    `data-queue-id="${qid}" data-queue-status="running" ` +
+    `data-queue-summary="${summary}" data-log-mode="live" ` +
+    `data-live-log-mode="live">` +
+    `<details class="prompt-toggle subagent-tree" open data-tree-key="${qid}">` +
+    `<summary class="prompt-summary">Subagents (${nodes.length})</summary>` +
+    `<ul class="subagent-list">${nodes.join('')}</ul>` +
+    '</details></article>';
+}
+
+function fullTree() {
+  return [
+    subNode(SID_A, 'investigate the flake', '4m', {
+      children: subNode(SID_B, 'grep the CI logs', '90s'),
+    }),
+    subNode(SID_C, 'co-bound dispatch', '11m', { peer: true }),
+  ];
+}
+
+function clickEl(node) {
+  node.dispatchEvent(
+    new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+}
+
+{
+  resetQueue([
+    treeCard('q-tree', 'parent item', fullTree()),
+    card('q-plain', 'live', 'no subagents'),
+  ]);
+  mt.openMode();
+
+  // --- collapsed by default -----------------------------------------------
+  assert('a card with subagents still gets exactly ONE pane by default',
+    paneEls().length === 2, paneEls().length + ' panes');
+  assert('and no nested pane is opened without being asked for',
+    subPaneFor(SID_A) === null && subPaneFor(SID_B) === null &&
+    subPaneFor(SID_C) === null);
+
+  const btn = subsBtnOf('q-tree');
+  assert('the pane carries a subagent expander', btn !== null && !btn.hidden);
+  assert('it is collapsed', btn.getAttribute('aria-expanded') === 'false');
+  assert('it counts every tail it would open, not just the top level',
+    btn.textContent.indexOf('3') !== -1 && /subagents/.test(btn.textContent),
+    btn.textContent);
+  assert('a pane whose item has no subagents carries no expander at all',
+    subsBtnOf('q-plain').hidden === true);
+
+  // --- expand --------------------------------------------------------------
+  clickEl(btn);
+
+  assert('expanding opens one pane per node in the tree',
+    paneEls().length === 5, paneEls().length + ' panes');
+  assert('the expander says so', btn.getAttribute('aria-expanded') === 'true');
+  assert('nested panes sit directly under their parent, in tree order',
+    paneEls().map((p) => p.getAttribute('data-pane-key')).join(',') ===
+      ['q:q-tree', 's:' + SID_A, 's:' + SID_B, 's:' + SID_C, 'q:q-plain'].join(','),
+    paneEls().map((p) => p.getAttribute('data-pane-key')).join(','));
+  assert('a nested pane is keyed by SUBAGENT id, never by a queue id',
+    subPaneRecord(SID_A).kind === 'subagent' &&
+    subPaneRecord(SID_A).target === SID_A &&
+    subPaneRecord(SID_A).key === 's:' + SID_A);
+  assert('and it carries its PARENT item, not a queue id of its own',
+    subPaneRecord(SID_A).qid === 'q-tree' &&
+    subPaneFor(SID_A).getAttribute('data-parent-queue-id') === 'q-tree' &&
+    subPaneFor(SID_A).hasAttribute('data-queue-id') === false);
+  assert('so the parent pane is still the only match for its qid',
+    document.querySelectorAll(
+      '#multitail-panes .mt-pane[data-queue-id="q-tree"]').length === 1);
+  assert('nested panes are badged as subagents',
+    subPaneFor(SID_A).querySelector('.mt-pane-badge').textContent === 'subagent');
+  assert('a nested pane shows the label the card gave it',
+    subPaneFor(SID_A).querySelector('.mt-pane-summary').textContent ===
+      'investigate the flake',
+    subPaneFor(SID_A).querySelector('.mt-pane-summary').textContent);
+  assert('a peer node is marked as co-bound rather than implied to be a child',
+    subPaneFor(SID_C).querySelector('.mt-meta-peer') !== null &&
+    subPaneFor(SID_A).querySelector('.mt-meta-peer') === null);
+
+  // The indent is the ONLY thing carrying the hierarchy in a flat stack, and
+  // it comes from the node's real depth in the card's tree.
+  assert('nesting depth is read from the tree, not from position',
+    subPaneFor(SID_A).style.getPropertyValue('--mt-sub-depth').trim() === '1' &&
+    subPaneFor(SID_B).style.getPropertyValue('--mt-sub-depth').trim() === '2' &&
+    subPaneFor(SID_C).style.getPropertyValue('--mt-sub-depth').trim() === '1',
+    [SID_A, SID_B, SID_C]
+      .map((s2) => subPaneFor(s2).style.getPropertyValue('--mt-sub-depth')).join(','));
+  assert('the indent is capped so a deep tree keeps its pane width',
+    mt.MAX_SUB_INDENT_DEPTH >= 2 && mt.MAX_SUB_INDENT_DEPTH <= 6,
+    String(mt.MAX_SUB_INDENT_DEPTH));
+
+  // --- the stream ----------------------------------------------------------
+  assert('a nested pane tails the per-subagent endpoint, not a queue one',
+    mt.streamUrl(subPaneRecord(SID_A)) === '/api/subagent/' + SID_A + '/stream',
+    mt.streamUrl(subPaneRecord(SID_A)));
+  assert('and that is the URL it actually opened',
+    !!latestStreamFor(SID_A) &&
+    latestStreamFor(SID_A).url === '/api/subagent/' + SID_A + '/stream',
+    latestStreamFor(SID_A) && latestStreamFor(SID_A).url);
+  assert('a queue pane is untouched by the widening',
+    mt.streamUrl(paneRecord('q-tree')) === '/api/queue/q-tree/stream',
+    mt.streamUrl(paneRecord('q-tree')));
+  assert('the cap still holds across both kinds of pane',
+    openStreams().length === mt.MAX_LIVE_STREAMS,
+    'open=' + openStreams().length);
+  // Slot order is the order panes are ON SCREEN, not the order they were
+  // created: a nested pane is inserted beside its parent, so map order and
+  // display order diverge the moment a tree is expanded.
+  assert('slot order is display order, with the tree ahead of a later card',
+    mt.panesInDisplayOrder().map((p) => p.key).join(',') ===
+      ['q:q-tree', 's:' + SID_A, 's:' + SID_B, 's:' + SID_C, 'q:q-plain'].join(','),
+    mt.panesInDisplayOrder().map((p) => p.key).join(','));
+  // What the cap does NOT do is yank a pane off a live connection to make
+  // room for one the reader just asked for — mid-read is mid-read.
+  assert('a pane already streaming keeps its connection',
+    paneRecord('q-plain').streaming === true, statusOf('q-plain'));
+  assert('so the nested pane past the cap waits, and says so',
+    /waiting for a stream slot/.test(subStatusOf(SID_C)), subStatusOf(SID_C));
+  assert('the overlay count names how much of the stack is the tree',
+    /3 subagents/.test(document.getElementById('multitail-count').textContent),
+    document.getElementById('multitail-count').textContent);
+
+  // A subagent transcript is the SAME JSONL through the same server tail, so
+  // its records carry their own timestamp - the `no ts` marker would be a lie.
+  assert('a subagent tail is a timestamped source',
+    mt.paneHasSourceTimestamps(subPaneRecord(SID_A)) === true);
+  mt.setTimestamps(true);
+  latestStreamFor(SID_A).emit({
+    type: 'event',
+    kind: 'assistant',
+    rec: {
+      type: 'assistant',
+      timestamp: '2026-09-29T18:04:05.000Z',
+      message: { content: [{ type: 'text', text: 'looking at the logs' }] },
+    },
+  });
+  assert('and its line renders the record\'s own stamp',
+    subPaneFor(SID_A).querySelector('.mt-line .mt-ts') !== null);
+  assert('with no "no ts" marker on it',
+    subPaneFor(SID_A).querySelector('.mt-pane-nots').hidden === true);
+  mt.setTimestamps(false);
+
+  // Untrusted prose: a subagent label is a first-prompt line, which is exactly
+  // the kind of string that can contain markup.
+  {
+    const evil = 'xx<img src=x onerror=alert(1)>';
+    const node = document.querySelector(`[data-subagent-id="${SID_C}"] .subagent-label`);
+    node.textContent = evil;
+    mt.reconcile();
+    const title = subPaneFor(SID_C).querySelector('.mt-pane-summary');
+    assert('a label containing markup stays inert text in the pane title',
+      title.textContent === evil && title.querySelector('img') === null,
+      title.innerHTML);
+  }
+
+  // --- a node that leaves the tree -----------------------------------------
+  // The grandchild, which is one of the panes actually holding a connection,
+  // so this also pins what its ending does for the pane behind it in the queue.
+  {
+    const gone = document.querySelector(`[data-subagent-id="${SID_B}"]`);
+    gone.parentNode.removeChild(gone);
+    mt.reconcile();
+    assert('a subagent the card stopped listing is marked ended, not yanked',
+      subPaneFor(SID_B) !== null && subPaneRecord(SID_B).ended === true,
+      subStatusOf(SID_B));
+    assert('and it says which kind of ending that was',
+      /ended . no longer listed/.test(subStatusOf(SID_B)), subStatusOf(SID_B));
+    assert('an ended nested pane keeps its output',
+      subPaneFor(SID_B).querySelectorAll('.mt-line').length >= 0 &&
+      subPaneFor(SID_B) !== null);
+    assert('an ended nested pane gives its stream slot back',
+      subPaneRecord(SID_B).streaming === false &&
+      subPaneRecord(SID_B).es === null);
+    assert('so the nested pane that was waiting gets it',
+      subPaneRecord(SID_C).streaming === true, subStatusOf(SID_C));
+    // It then clears on the ordinary retention countdown, like any other pane.
+    subPaneRecord(SID_B).endedAt = Date.now() - (mt.retentionMs() + 1000);
+    mt.sweepEndedPanes(new Set());
+    assert('and then clears on the ordinary retention countdown',
+      subPaneFor(SID_B) === null && subPaneRecord(SID_B) === undefined);
+  }
+
+  // --- collapse ------------------------------------------------------------
+  {
+    const before = openStreams().length;
+    clickEl(subsBtnOf('q-tree'));
+    assert('collapsing removes the nested panes at once',
+      subPaneFor(SID_A) === null && subPaneFor(SID_C) === null &&
+      paneFor('q-tree') !== null);
+    assert('it closes their streams rather than leaking them',
+      openStreams().length < before,
+      before + ' -> ' + openStreams().length);
+    assert('and records NO dismissal - it is not the same statement as x',
+      mt.dismissed.size === 0, Array.from(mt.dismissed).join(','));
+    mt.reconcile();
+    assert('a later reconcile does not resurrect them', subPaneFor(SID_A) === null);
+    clickEl(subsBtnOf('q-tree'));
+    assert('re-expanding brings them straight back',
+      subPaneFor(SID_A) !== null && subPaneFor(SID_C) !== null);
+  }
+
+  // --- closing the parent pane takes its tree with it ----------------------
+  {
+    clickEl(paneFor('q-tree').querySelector('.mt-pane-close'));
+    assert('x on the card pane closes its nested tails too',
+      paneFor('q-tree') === null && subPaneFor(SID_A) === null &&
+      subPaneFor(SID_C) === null);
+    assert('and leaves nothing orphaned in the pane map',
+      mt.panes.size === 1 && mt.panes.has('q:q-plain'),
+      Array.from(mt.panes.keys()).join(','));
+    mt.reconcile();
+    assert('the dismissal sticks for the whole group',
+      paneFor('q-tree') === null && subPaneFor(SID_A) === null);
+  }
+}
+
+// ==========================================================================
+console.log('\n-- subagents: the whole group ends when the item stops running');
+// ==========================================================================
+{
+  resetQueue([treeCard('q-tree2', 'parent item', fullTree())]);
+  mt.openMode();
+  clickEl(subsBtnOf('q-tree2'));
+  assert('three nested panes are up', paneEls().length === 4,
+    paneEls().length + ' panes');
+
+  // The item stops running: refresh.js rebuilds the card without the
+  // eligibility attribute (and without the tree).
+  document.querySelector('[data-queue-id="q-tree2"]')
+    .removeAttribute('data-live-log-mode');
+  mt.reconcile();
+
+  assert('the card pane ends', paneRecord('q-tree2').ended === true,
+    statusOf('q-tree2'));
+  assert('and every nested pane ends with it, keeping its output',
+    subPaneRecord(SID_A).ended === true && subPaneRecord(SID_B).ended === true &&
+    subPaneFor(SID_A) !== null);
+  assert('nothing in the group is still holding a connection',
+    openStreams().length === 0, openStreams().map((st) => st.url).join(' '));
+
+  // Retention then clears the group exactly as it clears any ended pane.
+  const past = Date.now() - (mt.retentionMs() + 1000);
+  for (const pane of mt.panes.values()) pane.endedAt = past;
+  mt.sweepEndedPanes(new Set());
+  assert('retention clears the ended group', mt.panes.size === 0,
+    Array.from(mt.panes.keys()).join(','));
+}
+
+// ==========================================================================
+console.log('\n-- subagents: expanding never exceeds the connection cap');
+// ==========================================================================
+{
+  resetQueue([
+    card('q-1', 'live', 'one'), card('q-2', 'live', 'two'),
+    card('q-3', 'live', 'three'), card('q-4', 'live', 'four'),
+    treeCard('q-tree3', 'parent item', fullTree()),
+  ]);
+  mt.openMode();
+  assert('the cap is already full before expanding',
+    openStreams().length === mt.MAX_LIVE_STREAMS);
+  clickEl(subsBtnOf('q-tree3'));
+  assert('the nested panes are still built and visible',
+    subPaneFor(SID_A) !== null && subPaneFor(SID_B) !== null &&
+    subPaneFor(SID_C) !== null);
+  assert('but no fifth connection is opened for them',
+    openStreams().length === mt.MAX_LIVE_STREAMS,
+    'open=' + openStreams().length);
+  assert('and each one SAYS it is waiting rather than looking broken',
+    [SID_A, SID_B, SID_C].every((s2) =>
+      /waiting for a stream slot/.test(subStatusOf(s2))),
+    [SID_A, SID_B, SID_C].map(subStatusOf).join(' | '));
 }
 
 console.log(

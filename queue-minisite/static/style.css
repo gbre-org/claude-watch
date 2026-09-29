@@ -2493,6 +2493,10 @@ html.density-compact .subagent-node .subagent-age { font-size: 0.68rem; }
 
 :root {
   --mt-pane-min: 132px;
+  /* Indent step for ONE level of the nested subagent tree (multitail.js sets
+     --mt-sub-depth per pane from the node's real depth, capped). A step, not a
+     total: the depth does the multiplying. Narrower on a phone, below. */
+  --mt-sub-indent: 14px;
 }
 
 /* Header toggle pill — mirrors the density pill's shape so the two read as one
@@ -2675,6 +2679,31 @@ body.multitail-open { overflow: hidden; }
 }
 .mt-pane.mt-ended { border-left-color: var(--abandoned); }
 
+/* ---- NESTED SUBAGENT PANES ----
+ *
+ * A subagent has no queue id, so it was structurally invisible in a window
+ * whose panes were queue items. Now it gets a pane of its own, tailing
+ * /api/subagent/<id>/stream, placed directly under the pane of the item it
+ * belongs to and indented by its REAL depth in that item's spawn tree — the
+ * same tree the running card shows. The indent is what carries the
+ * relationship; nothing else about the pane changes, so a nested tail wraps,
+ * stamps, colours and ends exactly like any other.
+ *
+ * The left border and the badge take ONE colour that no other pane badge in
+ * this window already uses (agent = --running, workload = --ready, hostjob =
+ * --other), so a glance down the stack separates "another item" from "inside
+ * that item" without reading a word. It is picked for being unambiguous HERE
+ * rather than for the status it names elsewhere — every pane badge in this
+ * surface borrows a palette entry the same way.
+ * The min-height floor is deliberately NOT reduced: a nested tail squeezed
+ * under the legibility floor is not a cheaper pane, it is an unreadable one,
+ * and the stack scrolls instead (which is also why expansion is per card and
+ * collapsed by default). */
+.mt-pane.mt-pane-sub {
+  margin-left: calc(var(--mt-sub-depth, 1) * var(--mt-sub-indent));
+  border-left-color: var(--blocked);
+}
+
 .mt-pane-head {
   flex: 0 0 auto;
   display: flex;
@@ -2698,6 +2727,7 @@ body.multitail-open { overflow: hidden; }
 }
 .mt-badge-workload { background: var(--ready); }
 .mt-badge-hostjob { background: var(--other); }
+.mt-badge-subagent { background: var(--blocked); }
 .mt-pane-id {
   flex: 0 0 auto;
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
@@ -2780,6 +2810,38 @@ body.multitail-open { overflow: hidden; }
   cursor: help;
 }
 .mt-pane-nots[hidden] { display: none; }
+
+/* The `N subagents` expander. Present only on a pane whose item actually has
+   a subagent tree (multitail.js toggles [hidden]), because a control for
+   nothing is chrome. The word is its own element so the phone rule below can
+   drop it and keep the caret + count, which is the whole control at a glance;
+   the button's aria-label carries the full wording at every width. */
+.mt-pane-subs {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  padding: 0 5px;
+  /* --line is the header's own background in the light theme, so an outline
+     drawn in it is invisible and a control nobody can see is a feature nobody
+     finds. The muted foreground is quiet enough not to compete with the pane
+     title and solid enough to read as a button. */
+  border: 1px solid var(--fg-mute);
+  border-radius: 3px;
+  background: none;
+  color: var(--fg-mute);
+  font: inherit;
+  font-size: 0.6rem;
+  line-height: 1.6;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mt-pane-subs:hover { border-color: var(--blocked); color: var(--fg-emph); }
+.mt-pane-subs[aria-expanded="true"] {
+  border-color: var(--blocked);
+  color: var(--blocked);
+}
+.mt-pane-subs[hidden] { display: none; }
 .mt-pane-close {
   flex: 0 0 auto;
   width: 20px;
@@ -3033,6 +3095,15 @@ body.multitail-open { overflow: hidden; }
    so three tails still fit above the fold. */
 @media (max-width: 560px) {
   :root { --mt-pane-min: 122px; }
+  /* A phone cannot spend 56px of a 380px pane on four levels of indent, and
+     the nesting is also carried by the badge, the border colour and the
+     position in the stack. Half the step keeps the relationship legible and
+     gives the log rows their width back. */
+  :root { --mt-sub-indent: 7px; }
+  /* The pane header is already sharing one line with the badge, the id, the
+     status and the close button here, so the expander keeps its caret and its
+     count and drops the word. */
+  .mt-pane-subs .mt-subs-word { display: none; }
   .multitail-hint { display: none; }
   /* THE OVERLAY HEADER WRAPS ONCE VERBOSE ADDS A FIFTH PILL. Measured at
      380px: four pills fit the row exactly, five overflow it by ~33px, and the

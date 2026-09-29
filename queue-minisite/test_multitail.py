@@ -734,14 +734,17 @@ class MultitailTest(unittest.TestCase):
         an auto-clear uses the separate ``cleared`` set, which reconcile drops
         the first pass the row is not eligible — so a requeued job reusing the
         qid gets a fresh pane instead of being suppressed by a stale clear.
+
+        Both sets are keyed by PANE KEY (`q:<qid>` / `s:<subagent-id>`), not by
+        qid, since a nested subagent pane is a pane in its own right.
         """
         src = (HERE / "static" / "multitail.js").read_text()
         # The ONLY writer of `dismissed` is the per-pane close button.
         self.assertEqual(src.count("dismissed.add("), 1, "dismissed gained a writer")
-        self.assertIn("cleared.add(pane.qid)", src)
-        self.assertIn("cleared.delete(qid)", src)
+        self.assertIn("cleared.add(pane.key)", src)
+        self.assertIn("cleared.delete(key)", src)
         # ...and the release is driven by eligibility, not by a countdown.
-        self.assertIn("if (!seen.has(qid)) cleared.delete(qid);", src)
+        self.assertIn("if (!seen.has(key)) cleared.delete(key);", src)
 
     def test_multitail_js_wires_both_keys_and_keeps_chords_free(self):
         """`w` / `t` / `c` are bound, and modified chords are passed through.
@@ -1417,6 +1420,185 @@ class MultitailTest(unittest.TestCase):
         # Panes are selected by the server-derived attribute, never by
         # re-deriving eligibility in the front-end.
         self.assertIn("data-live-log-mode", src)
+
+
+    # -- nested SUBAGENT tails ---------------------------------------------
+    #
+    # A subagent has no queue id. Multitail's panes used to BE queue items —
+    # keyed by qid, streaming `/api/queue/<qid>/stream` — so an agent that
+    # spawned children showed the parent and nothing under it, in the one
+    # window whose whole job is "what is everything doing".
+    #
+    # The panes are client-side and driven under jsdom in
+    # static/multitail.test.js. What is pinned HERE is the three-sided contract
+    # the client cannot check by itself:
+    #
+    #   * the TREE the client reads its nested panes from is emitted by BOTH
+    #     row renderers — the Jinja macro paints it once and refresh.js rebuilds
+    #     that subtree every 5s, so a tree present only in the template would
+    #     take the nested panes away a tick after the mode opened;
+    #   * the ENDPOINT those panes tail is one this server actually routes;
+    #   * a subagent tail really does carry per-record timestamps, which is why
+    #     the client lists `subagent` as a timestamped source instead of
+    #     showing the `no ts` marker over a column full of times.
+
+    SUB_SESSION = "11111111-2222-3333-4444-555555555555"
+    SUB_AGENT_ID = "abc123def4567890abc123def4567890"
+
+    def _fast_tail(self):
+        """Shrink the SSE tail loop so a streaming assertion finishes.
+
+        These endpoints TAIL: read one to the end and it never returns. The
+        same knobs test_subagent_stream.py turns down.
+        """
+        self.appmod.SSE_TAIL_MAX_IDLE_SECONDS = 0.1
+        self.appmod.SSE_TAIL_POLL_SECONDS = 0.05
+        self.appmod.SSE_TAIL_MAX_LIFETIME_SECONDS = 5.0
+
+    def test_both_row_renderers_emit_the_subagent_tree_multitail_reads(self):
+        """The nested panes are read off the card, so both painters must emit it.
+
+        static/multitail.js selects `.subagent-node[data-subagent-id]` inside a
+        tailable row. templates/index.html paints that once; static/refresh.js
+        repaints #queue-root every 5s. An attribute or class emitted by only
+        one of them disappears (or appears) after the first tick, and the
+        nested panes would end — `ended · no longer listed` — a few seconds
+        after being expanded, with nothing in the log to say why.
+        """
+        mt_src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("'.subagent-node[data-subagent-id]'", mt_src)
+        # Depth comes from the nesting element between node and card.
+        self.assertIn("subagent-children", mt_src)
+
+        tpl = (HERE / "templates" / "index.html").read_text()
+        refresh = (HERE / "static" / "refresh.js").read_text()
+        for name, src in (("index.html", tpl), ("refresh.js", refresh)):
+            for needle in (
+                "subagent-node",
+                "data-subagent-id",
+                "subagent-children",
+                "subagent-label",
+                "subagent-age",
+                "subagent-peer",
+            ):
+                self.assertIn(
+                    needle, src,
+                    "%s no longer emits %s — multitail reads the nested tree "
+                    "off the rendered card, so one renderer dropping it makes "
+                    "the nested panes flap" % (name, needle))
+
+    def test_nested_panes_tail_an_endpoint_this_server_routes(self):
+        """`/api/subagent/<id>/stream` is what the client opens — and is served.
+
+        The client picks the endpoint by pane KIND, so a server-side rename
+        would not break a queue pane and would not 404 visibly either: the
+        nested pane would simply never produce a line.
+        """
+        mt_src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("'/api/subagent/' + encodeURIComponent(pane.target)", mt_src)
+
+        self._fast_tail()
+        resp = self.client.get("/api/subagent/%s/stream" % self.SUB_AGENT_ID)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.headers.get("Content-Type", "").split(";")[0],
+            "text/event-stream")
+        body = resp.get_data(as_text=True)
+        # No transcript exists under this suite's root, so the server answers
+        # with the one-shot "not there yet" frame — which is exactly the kind
+        # the client retries rather than treating as a dead pane.
+        self.assertIn('"kind":"no-jsonl"', body.replace('"kind": "', '"kind":"'))
+        self.assertIn("no-jsonl", mt_src)
+
+    def test_a_subagent_tail_carries_per_record_timestamps(self):
+        """Why `subagent` is a timestamped source in the client's table.
+
+        The `t` toggle shows a log's OWN time and deliberately shows nothing
+        for a source that has none. A subagent transcript is JSONL through the
+        same server-side tail as an agent one, so every record reaches the
+        client with its `timestamp` — listing the mode as untimestamped would
+        put a `no ts` marker on a pane whose every line has one.
+        """
+        root = Path(os.environ["AGENTS_JSONL_ROOT"])
+        sub_dir = root / self.SUB_SESSION / "subagents"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        stamped = "2026-09-29T18:04:05.000Z"
+        path = sub_dir / ("agent-%s.jsonl" % self.SUB_AGENT_ID)
+        with open(path, "w") as f:
+            f.write(json.dumps({
+                "type": "assistant",
+                "sessionId": self.SUB_SESSION,
+                "agentId": self.SUB_AGENT_ID,
+                "uuid": "a1",
+                "timestamp": stamped,
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "hello"}]},
+            }) + "\n")
+        self._fast_tail()
+        try:
+            resp = self.client.get(
+                "/api/subagent/%s/stream" % self.SUB_AGENT_ID)
+            self.assertEqual(resp.status_code, 200)
+            body = resp.get_data(as_text=True)
+            self.assertIn(stamped, body)
+        finally:
+            path.unlink()
+
+        mt_src = (HERE / "static" / "multitail.js").read_text()
+        m = re.search(r"TS_SOURCE_MODES\s*=\s*\{([^}]*)\}", mt_src)
+        self.assertIsNotNone(m, "TS_SOURCE_MODES not declared")
+        self.assertIn("subagent", m.group(1))
+
+    def test_nested_pane_styles_shipped(self):
+        """The nesting is a stylesheet fact; without it the tree renders flat.
+
+        Two rules carry it and each is named rather than grepped for: the pane
+        indents by its REAL depth (the module sets `--mt-sub-depth` per pane,
+        so a rule with a fixed margin would put a grandchild at the same offset
+        as a child), and the expander that opens the tree exists at all.
+        """
+        css = (HERE / "static" / "style.css").read_text()
+        rules = _css_rules(css)
+
+        sub = _decls(rules, ".mt-pane.mt-pane-sub")
+        self.assertIsNotNone(sub, ".mt-pane.mt-pane-sub rule not found")
+        self.assertRegex(
+            sub, r"margin-left\s*:[^;]*--mt-sub-depth",
+            "a nested pane must indent by its own tree depth, not by a "
+            "constant — otherwise every descendant sits at one offset")
+
+        self.assertIsNotNone(_decls(rules, ".mt-pane-subs"),
+                             "no rule for the subagent expander")
+        self.assertIn(".mt-pane-subs[hidden]", css)
+        self.assertIn(".mt-badge-subagent", css)
+
+        # A phone cannot spend the pane's width on four levels of indent.
+        phone = _multitail_phone_block(css)
+        self.assertIn("--mt-sub-indent", phone,
+                      "the indent step is not reduced at phone width")
+
+    def test_the_expander_is_a_pane_control_not_a_sixth_header_pill(self):
+        """The overlay header does not grow a control for this.
+
+        Four pills already fill the header row at 380px and the fifth (verbose)
+        is what makes it wrap; a sixth would push `exit` — the only way out of
+        the mode on a phone — off the right edge. So expansion lives on the
+        PANE that has subagents, which costs the header nothing and is also
+        where the thing being expanded is.
+        """
+        tpl = (HERE / "templates" / "index.html").read_text()
+        mt_src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("mt-pane-subs", mt_src)
+        self.assertNotIn("mt-pane-subs", tpl)
+        # The header's pill set is unchanged: wrap / time / all / cap / clear.
+        self.assertEqual(
+            tpl.count('class="multitail-display'), 5,
+            "the multitail header's pill set changed — re-measure the 380px "
+            "header before adding one")
+        for pill in ("multitail-wrap", "multitail-ts", "multitail-verbose",
+                     "multitail-vcap", "multitail-retain"):
+            self.assertIn('id="%s"' % pill, tpl)
+        self.assertNotIn("multitail-subs", tpl)
 
 
 if __name__ == "__main__":

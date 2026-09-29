@@ -10,6 +10,7 @@
 //   line wrap      the `wrap` pill, or the `w` key
 //   timestamps     the `time` pill, or the `t` key
 //   ended-retention the `clear` pill, or the `c` key
+//   subagent tails  the `N subagents` button on a pane whose item has them
 //
 // ---------------------------------------------------------------------------
 // WHICH ITEMS GET A PANE
@@ -306,6 +307,86 @@
 // out so what is left (model, calls, ctx, age) fits beside a readable title.
 //
 // ---------------------------------------------------------------------------
+// SUBAGENTS — A PANE IS NOT ALWAYS A QUEUE ITEM
+// ---------------------------------------------------------------------------
+// An agent that spawns children was invisible here. Every pane used to BE a
+// queue item: the map was keyed by qid and the only stream it could open was
+// `/api/queue/<qid>/stream`. A subagent has no queue id of its own — it is
+// keyed by SUBAGENT ID under a parent session — so there was no shape in this
+// module that could hold one, and the window that answers "what is everything
+// doing" stopped at the top level of the tree.
+//
+// PANE IDENTITY IS NOW (kind, target), NOT A QID. A pane carries
+// `kind` ('queue' | 'subagent'), `target` (the id its stream is opened on) and
+// `key` (`q:<qid>` / `s:<subagent-id>`, what the map and the dismissed /
+// cleared sets are keyed by). `qid` still means "the queue item this pane
+// belongs to" for BOTH kinds — for a nested pane that is its PARENT item,
+// which is what groups it. A subagent id is deliberately NOT smuggled into the
+// qid field: two different kinds of identifier in one slot is a trap for the
+// next reader, and it would have made `data-queue-id` a lie in the DOM.
+//
+//   kind       stream endpoint                        ends when
+//   queue      /api/queue/<qid>/stream                its row stops being eligible
+//   subagent   /api/subagent/<subagent-id>/stream     its tree node stops being listed
+//
+// WHERE THE SUBAGENTS COME FROM: the rendered card, not a new fetch. Every
+// running card already carries its own nested subagent tree —
+// `.subagent-node[data-subagent-id]`, emitted by BOTH row renderers
+// (the `subagent_node` macro in templates/index.html and `renderSubagentNode`
+// in refresh.js) from the server's `it.subagents` shape, which app.py builds
+// from the real spawn graph. Reading the tree off the DOM is the same contract
+// this module already uses for row eligibility: no second poller, no second
+// source of truth, and refresh.js's 5s tick is what keeps it current. The
+// per-subagent `/api/subagent/<id>/meta` endpoint is deliberately NOT fetched
+// — the label and the age it would return are already on the tree node, from
+// the same server shaping, and a per-pane fetch would spend the connection
+// budget this module rations everywhere else to learn what it has.
+//
+// COLLAPSED BY DEFAULT, PER CARD. The card renders its tree `<details open>`,
+// because a tree node there costs one row. A PANE costs a slice of the
+// viewport and one of the browser's scarce connections, and one item can own
+// half a dozen descendants, so opening them all by default would flood the
+// stack the mode exists to make readable. Instead the pane's header carries a
+// `N subagents` button, and expanding is per CARD: the whole subtree appears
+// at once, each pane indented by its real depth in the tree, so the stack
+// mirrors the hierarchy the card shows rather than inventing a second one.
+// Collapsing removes those panes outright (the reader said "go away", which is
+// what the per-pane x means too) and does NOT record a dismissal, so expanding
+// again brings them straight back.
+//
+// The expansion is view state, not a viewer preference: it is per ITEM, it
+// dies with the mode (openMode clears it, exactly as it clears dismissals), and
+// it is not persisted. Persisting a per-qid set would accumulate keys for
+// queue items that stopped existing weeks ago, and re-opening the mode would
+// silently re-open N streams nobody asked for in this sitting.
+//
+// SLOT ORDER IS DISPLAY ORDER. Nested panes are INSERTED next to their parent
+// rather than appended, so the pane list is no longer in map-insertion order
+// and "the earliest panes get the connections" had to be restated as what it
+// always meant on screen: the order you SEE is the order slots are handed out
+// (panesInDisplayOrder). A subagent the reader just expanded therefore
+// outranks a later card's pane, which is the honest reading of having asked
+// for it — and the cap itself is unchanged, so expanding a tree cannot open a
+// fifth connection.
+//
+// What expansion does NOT do is take a connection away from a pane that
+// already has one: mid-read is mid-read, and a stack that reshuffled its live
+// streams on every click would be worse than a wait. So expanding a tree while
+// the cap is already full builds the panes, shows them, and leaves the ones
+// past the cap saying `waiting for a stream slot` until an earlier pane ends
+// or is closed — the same state, and the same wording, a sixth card's pane has
+// always had. Closing what you are not reading is how you get a slot back.
+//
+// AN ENDED SUBAGENT ENDS LIKE AN ENDED AGENT. There is no end frame on a
+// transcript tail (an agent pane's `ended` comes from its ROW leaving the
+// running section, never from the stream), so a subagent pane ends the same
+// way: when the tree stops listing it, or when its parent item stops running
+// and takes the whole group with it. Until then a finished subagent's pane
+// keeps its output and simply stops producing lines, and once ended it goes
+// through the same retention countdown as every other pane — it neither
+// lingers forever nor vanishes mid-read.
+//
+// ---------------------------------------------------------------------------
 // A PANE WHOSE JOB FINISHES WHILE THE MODE IS OPEN
 // ---------------------------------------------------------------------------
 // Its header flips to `ended` (with the exit code when the stream reported
@@ -370,6 +451,17 @@
 
   // Rows the server marked as having a tailable log, in render order.
   const ROW_SELECTOR = '.item[data-live-log-mode]';
+  // The nested subagent tree inside a running card, in tree order. Emitted by
+  // BOTH row renderers from the server's `it.subagents` shape — see the
+  // SUBAGENTS block in the header comment for why this is read off the DOM
+  // rather than fetched.
+  const SUB_NODE_SELECTOR = '.subagent-node[data-subagent-id]';
+  // How many levels of tree depth the nested panes are allowed to indent for.
+  // Depth is unbounded on the server (the spawn graph is walked to arbitrary
+  // depth); an unbounded INDENT would spend a great-great-grandchild's whole
+  // pane width on its own left margin. Past this the panes stay at the same
+  // offset and the tree order carries the hierarchy.
+  const MAX_SUB_INDENT_DEPTH = 4;
   // Max simultaneous EventSource connections — see the header comment. Four
   // leaves two of the browser's ~6 per-origin HTTP/1.1 connections for the
   // queue poll and any action POST.
@@ -457,8 +549,11 @@
   };
   // Stream modes whose frames carry a real per-entry source timestamp. Agent
   // transcripts are JSONL with a `timestamp` on each record; workload and
-  // hostjob tails are plain text and carry none.
-  const TS_SOURCE_MODES = { live: true };
+  // hostjob tails are plain text and carry none. A SUBAGENT tail is the same
+  // JSONL through the same server-side `_tail_jsonl`, so it carries the same
+  // per-record timestamp — leaving it out here would have shown `no ts` on a
+  // pane whose every line has one.
+  const TS_SOURCE_MODES = { live: true, subagent: true };
   // How long an ENDED pane is kept before it is cleared, in the order the
   // `clear` pill cycles. `ms: 0` means "never clear" — see the header comment
   // for why the set stops at 15m and has nothing below a minute.
@@ -484,11 +579,16 @@
 
   let open = false;
   let reconcileTimer = null;
-  // qid -> pane record. Insertion order is the order panes were added, which
-  // is the order they get stream slots.
+  // PANE KEY -> pane record. The key is `q:<qid>` for a queue item's own tail
+  // and `s:<subagent-id>` for a nested subagent tail (paneKey below) — a pane
+  // is a (kind, target) pair, not a qid, since a subagent has no queue id of
+  // its own. Map order is the order panes were CREATED; the order they get
+  // stream slots is the order they are on SCREEN (panesInDisplayOrder), which
+  // differs once a nested pane is inserted beside its parent.
   const panes = new Map();
-  // Panes the operator dismissed by hand. They must NOT come back on the next
-  // reconcile pass — "I closed that" has to stick while the mode is open.
+  // Panes the operator dismissed by hand, by pane key. They must NOT come back
+  // on the next reconcile pass — "I closed that" has to stick while the mode
+  // is open.
   const dismissed = new Set();
   // Panes RETENTION cleared while their row was still eligible. Deliberately a
   // different set from `dismissed`: an auto-clear is not a decision, so its
@@ -497,6 +597,12 @@
   // it, a pane whose stream said `workload-end` while the queue row was still
   // running would be cleared and rebuilt on every tick.
   const cleared = new Set();
+  // Queue items whose nested subagent tails are EXPANDED, by qid. Collapsed is
+  // the default — see the SUBAGENTS block in the header comment for why a
+  // nested pane is not treated like the card's `<details open>` tree node.
+  // Not persisted, and cleared when the mode opens, because it is view state
+  // about particular items rather than a preference about the view.
+  const expanded = new Set();
 
   // --- ended-pane retention ------------------------------------------------
 
@@ -602,12 +708,74 @@
     return Array.prototype.slice.call(document.querySelectorAll(ROW_SELECTOR));
   }
 
+  // The identity of a pane. Two namespaces, both prefixed, so neither kind of
+  // id can ever be mistaken for the other — and so a queue id is never asked
+  // to stand in for a subagent id.
+  function paneKey(kind, target) {
+    return (kind === 'subagent' ? 's:' : 'q:') + target;
+  }
+
   function rowInfo(row) {
+    const qid = row.getAttribute('data-queue-id') || '';
     return {
-      qid: row.getAttribute('data-queue-id') || '',
+      kind: 'queue',
+      key: paneKey('queue', qid),
+      // What the stream is opened on. For a queue pane that IS the qid; the
+      // two are separate fields because for a subagent pane they are not.
+      target: qid,
+      qid: qid,
+      depth: 0,
       mode: (row.getAttribute('data-live-log-mode') || '').toLowerCase(),
       summary: row.getAttribute('data-queue-summary') || '',
       meta: rowMetaInfo(row),
+      // How many subagents this card is currently showing. Drives the header
+      // button's count and whether it is shown at all.
+      subCount: row.querySelectorAll(SUB_NODE_SELECTOR).length,
+    };
+  }
+
+  // A subagent node's depth in ITS card's tree. The nodes come back from
+  // querySelectorAll in document (tree) order, flat; the nesting is carried by
+  // the `.subagent-children` lists between the node and the card, which is
+  // what this counts. Depth 1 = a direct child of the item's owner agent.
+  function subNodeDepth(row, node) {
+    let depth = 1;
+    let p = node.parentNode;
+    while (p && p !== row) {
+      if (p.classList && p.classList.contains('subagent-children')) depth += 1;
+      p = p.parentNode;
+    }
+    return depth;
+  }
+
+  // One nested pane's descriptor, read off a rendered tree node. The label and
+  // the age are the server's own strings (app.py `_list_session_subagents`),
+  // exactly as the row metrics are — nothing here re-derives either.
+  function subInfo(row, node, qid) {
+    const sid = node.getAttribute('data-subagent-id') || '';
+    const labelEl = node.querySelector('.subagent-label');
+    const ageEl = node.querySelector('.subagent-age');
+    const label = labelEl ? String(labelEl.textContent || '').trim() : '';
+    return {
+      kind: 'subagent',
+      key: paneKey('subagent', sid),
+      target: sid,
+      // The queue item this tail hangs off: its PARENT card. A subagent has no
+      // queue id of its own, and this one is never written to `data-queue-id`.
+      qid: qid,
+      depth: subNodeDepth(row, node),
+      mode: 'subagent',
+      summary: label || sid,
+      subCount: 0,
+      meta: {
+        age: ageEl ? String(ageEl.textContent || '').trim() : '',
+        // A `peer` node is co-bound to the same queue item with NO recorded
+        // spawn edge to the owner agent (app.py `_build_subagent_tree`). The
+        // card marks that distinction; a pane that dropped it would imply a
+        // parent/child relationship the data never recorded.
+        peer: (node.classList && node.classList.contains('subagent-peer'))
+          ? 'peer' : '',
+      },
     };
   }
 
@@ -982,6 +1150,7 @@
   function modeBadgeText(mode) {
     if (mode === 'workload') return 'workload';
     if (mode === 'hostjob') return 'hostjob';
+    if (mode === 'subagent') return 'subagent';
     return 'agent';
   }
 
@@ -1049,6 +1218,12 @@
     // header does not carry it.
     add('mt-meta-label', f.label, null,
       'The workload / hostjob label being tailed');
+    // Nested panes only: this subagent is co-bound to the item rather than
+    // spawned by its owner agent. Carried through from the card's own marking
+    // so the two surfaces cannot disagree about which it is.
+    add('mt-meta-peer', f.peer, null,
+      'Co-bound to this queue item, with no recorded spawn edge to its ' +
+      'owner agent — not a child of it');
 
     bar.hidden = cells === 0;
     if (f.statsTitle) {
@@ -1058,14 +1233,92 @@
     }
   }
 
+  // The `N subagents` button on a queue pane. Hidden outright when the card
+  // has no subagent tree, so a pane only carries the control when there is
+  // something behind it. The count comes from the card and moves with it.
+  //
+  // It counts EVERY node in the tree, not the card's top-level `Subagents (N)`
+  // number, because the two answer different questions: the card is counting
+  // the roots it is about to indent, and this button is counting the panes the
+  // reader is about to get. A grandchild costs a pane just like a child does.
+  //
+  // The word is a child element rather than part of the button's text because
+  // the stylesheet drops it at phone width, where the pane header is already
+  // sharing one line with the badge, the id, the status and the close button.
+  // The aria-label keeps the full wording at every width.
+  function paintPaneSubs(pane, count) {
+    const btn = pane.subsEl;
+    if (!btn) return;
+    const n = count || 0;
+    if (!n) {
+      btn.hidden = true;
+      return;
+    }
+    const on = expanded.has(pane.qid);
+    const noun = n === 1 ? 'subagent' : 'subagents';
+    btn.hidden = false;
+    btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+    btn.setAttribute('aria-label',
+      (on ? 'Collapse the ' : 'Expand the ') + n + ' ' + noun + ' of ' + pane.qid);
+    btn.title = on
+      ? 'Collapse this item\'s nested subagent tails'
+      : 'Tail this item\'s ' + n + ' ' + noun + ' as nested panes';
+    pane.subsCaretEl.textContent = on ? '\u25be' : '\u25b8';
+    pane.subsCountEl.textContent = String(n);
+    pane.subsWordEl.textContent = noun;
+  }
+
+  // Expand / collapse one card's nested subagent tails. Expanding lets the
+  // next reconcile build them (which is also what keeps a tree that GROWS
+  // while expanded up to date); collapsing removes them at once rather than
+  // waiting a tick, and records NO dismissal — see the header comment.
+  function toggleSubagents(qid) {
+    if (expanded.has(qid)) {
+      expanded.delete(qid);
+      for (const pane of subPanesOf(qid)) destroyPane(pane);
+    } else {
+      expanded.add(qid);
+    }
+    reconcile();
+  }
+
+  // Every nested pane belonging to one card, in display order.
+  function subPanesOf(qid) {
+    const out = [];
+    for (const pane of panesInDisplayOrder()) {
+      if (pane.kind === 'subagent' && pane.qid === qid) out.push(pane);
+    }
+    return out;
+  }
+
   function buildPane(info) {
-    const wrap = el('section', 'mt-pane');
-    wrap.setAttribute('data-queue-id', info.qid);
+    const isSub = info.kind === 'subagent';
+    const wrap = el('section', 'mt-pane' + (isSub ? ' mt-pane-sub' : ''));
+    wrap.setAttribute('data-pane-kind', info.kind);
+    wrap.setAttribute('data-pane-key', info.key);
+    if (isSub) {
+      // A nested pane carries its subagent id and the qid of the card it hangs
+      // off — NEVER `data-queue-id`, which would make two panes answer to the
+      // same selector and would claim this tail is that queue item's own.
+      wrap.setAttribute('data-subagent-id', info.target);
+      wrap.setAttribute('data-parent-queue-id', info.qid);
+      // Indent by real tree depth, capped. The stylesheet owns the step size
+      // (and shrinks it on a phone); this only says how deep the node is.
+      wrap.style.setProperty('--mt-sub-depth',
+        String(Math.min(info.depth || 1, MAX_SUB_INDENT_DEPTH)));
+    } else {
+      wrap.setAttribute('data-queue-id', info.qid);
+    }
     wrap.setAttribute('data-live-log-mode', info.mode);
 
     const head = el('header', 'mt-pane-head');
     head.appendChild(el('span', 'mt-pane-badge mt-badge-' + info.mode, modeBadgeText(info.mode)));
-    head.appendChild(el('code', 'mt-pane-id', info.qid));
+    // A subagent id is a 32-hex handle; the card shows its first 12 and so
+    // does the pane, with the whole thing on the title attribute. A qid is
+    // already short enough to show in full.
+    const idEl = el('code', 'mt-pane-id', isSub ? info.target.slice(0, 12) : info.qid);
+    if (isSub) idEl.title = info.target;
+    head.appendChild(idEl);
     // THE TITLE LINE: title left, metrics right, one row for both. The title
     // is the only flexible item in this little flex row, so it takes every
     // pixel the metrics do not and the metrics end up against the far edge
@@ -1083,6 +1336,30 @@
     meta.hidden = true;
     titlebar.appendChild(meta);
     head.appendChild(titlebar);
+    // Nested-tail control. Built for every queue pane and shown only when the
+    // card actually has a tree (paintPaneSubs); a subagent pane never gets one
+    // — expansion is per CARD and its descendants are already in the stack.
+    let subsBtn = null;
+    let subsCaret = null;
+    let subsCount = null;
+    let subsWord = null;
+    if (!isSub) {
+      subsBtn = el('button', 'mt-pane-subs');
+      subsBtn.type = 'button';
+      subsBtn.hidden = true;
+      subsBtn.setAttribute('aria-expanded', 'false');
+      subsCaret = el('span', 'mt-subs-caret', '\u25b8');
+      subsCount = el('span', 'mt-subs-n', '0');
+      subsWord = el('span', 'mt-subs-word', 'subagents');
+      subsBtn.appendChild(subsCaret);
+      subsBtn.appendChild(subsCount);
+      subsBtn.appendChild(subsWord);
+      subsBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        toggleSubagents(info.qid);
+      });
+      head.appendChild(subsBtn);
+    }
     const noTs = el('span', 'mt-pane-nots', 'no ts');
     noTs.title =
       'This log is plain text and carries no per-line timestamps. ' +
@@ -1094,7 +1371,7 @@
     head.appendChild(status);
     const closeBtn = el('button', 'mt-pane-close', '×');
     closeBtn.type = 'button';
-    closeBtn.setAttribute('aria-label', 'Close the ' + info.qid + ' tail');
+    closeBtn.setAttribute('aria-label', 'Close the ' + info.target + ' tail');
     closeBtn.title = 'Close this tail (stays in multitail mode)';
     head.appendChild(closeBtn);
     wrap.appendChild(head);
@@ -1104,13 +1381,24 @@
     wrap.appendChild(stream);
 
     const pane = {
+      // Identity: what this pane IS (kind + the id its stream is opened on),
+      // and which queue item it belongs to. For a queue pane target === qid;
+      // for a nested one the target is a subagent id and qid is its parent.
+      key: info.key,
+      kind: info.kind,
+      target: info.target,
       qid: info.qid,
+      depth: info.depth || 0,
       mode: info.mode,
       el: wrap,
       streamEl: stream,
       statusEl: status,
       noTsEl: noTs,
       metaEl: meta,
+      subsEl: subsBtn,
+      subsCaretEl: subsCaret,
+      subsCountEl: subsCount,
+      subsWordEl: subsWord,
       es: null,
       streaming: false,   // holds a connection right now
       terminal: false,    // stream reported a real end; never reconnect
@@ -1155,7 +1443,11 @@
     };
 
     closeBtn.addEventListener('click', () => {
-      dismissed.add(pane.qid);
+      dismissed.add(pane.key);
+      // Closing a card's pane takes its nested tails with it (destroyPane
+      // cascades): they are presented AS a detail of this pane, and leaving
+      // them behind would orphan a tail under a card that is no longer shown.
+      if (pane.kind === 'queue') expanded.delete(pane.qid);
       destroyPane(pane);
       pumpSlots();
       paintCount();
@@ -1169,6 +1461,7 @@
 
     syncPaneTsMarker(pane);
     paintPaneMeta(pane, info.meta);
+    paintPaneSubs(pane, info.subCount);
     return pane;
   }
 
@@ -1387,6 +1680,17 @@
     }
   }
 
+  // The endpoint a pane tails. Both shapes emit the IDENTICAL SSE wire format
+  // (the server tails a JSONL transcript through the same `_tail_jsonl` either
+  // way), which is why everything below this line — the formatter, the retry
+  // set, the backfill suppression — is unchanged by there being two of them.
+  function streamUrl(pane) {
+    if (pane.kind === 'subagent') {
+      return '/api/subagent/' + encodeURIComponent(pane.target) + '/stream';
+    }
+    return '/api/queue/' + encodeURIComponent(pane.target) + '/stream';
+  }
+
   function connectPane(pane) {
     if (pane.es || pane.terminal) return;
     pane.streaming = true;
@@ -1394,7 +1698,7 @@
     setPaneStatus(pane, 'connecting…', '');
     let es;
     try {
-      es = new EventSource('/api/queue/' + encodeURIComponent(pane.qid) + '/stream');
+      es = new EventSource(streamUrl(pane));
     } catch (_) {
       pane.streaming = false;
       pane.terminal = true;
@@ -1493,7 +1797,7 @@
         // Only a row that is STILL eligible could be rebuilt on the next pass,
         // and only that case needs suppressing. `dismissed` is not touched:
         // this was a timer, not the operator saying "I closed that".
-        if (seen && seen.has(pane.qid)) cleared.add(pane.qid);
+        if (seen && seen.has(pane.key)) cleared.add(pane.key);
         destroyPane(pane);
         removed += 1;
         continue;
@@ -1512,13 +1816,35 @@
     return true;
   }
 
+  // The panes in the order they appear ON SCREEN, which is the order stream
+  // slots are handed out. Map order is creation order, and a nested subagent
+  // pane is INSERTED beside its parent rather than appended, so the two
+  // diverge the moment a tree is expanded. Reading the DOM keeps one rule —
+  // "the order you see is the order slots are given" — instead of two.
+  // A pane not yet placed in the DOM still gets a turn, last.
+  function panesInDisplayOrder() {
+    const out = [];
+    const kids = panesEl ? panesEl.children : [];
+    for (let i = 0; i < kids.length; i++) {
+      const pane = panes.get(kids[i].getAttribute('data-pane-key') || '');
+      if (pane) out.push(pane);
+    }
+    if (out.length !== panes.size) {
+      for (const pane of panes.values()) {
+        if (out.indexOf(pane) === -1) out.push(pane);
+      }
+    }
+    return out;
+  }
+
   // Give connections to the earliest panes that want one, up to the cap.
   function pumpSlots() {
+    const ordered = panesInDisplayOrder();
     let live = 0;
-    for (const pane of panes.values()) {
+    for (const pane of ordered) {
       if (pane.streaming) live += 1;
     }
-    for (const pane of panes.values()) {
+    for (const pane of ordered) {
       if (live >= MAX_LIVE_STREAMS) break;
       if (!wantsSlot(pane)) continue;
       connectPane(pane);
@@ -1526,7 +1852,7 @@
     }
     // Everything still unconnected is explicitly waiting, and the two reasons
     // are different: a backoff counts down, a slot queue does not.
-    for (const pane of panes.values()) {
+    for (const pane of ordered) {
       if (pane.streaming || pane.terminal || pane.es) continue;
       if (pane.retryAt && pane.retryAt > Date.now()) {
         setPaneStatus(pane, retryStatusText(pane), 'mt-idle');
@@ -1548,7 +1874,14 @@
     }
     pane.streaming = false;
     if (pane.el.parentNode) pane.el.parentNode.removeChild(pane.el);
-    panes.delete(pane.qid);
+    panes.delete(pane.key);
+    // A card's nested tails are shown AS a detail of its pane, so they go with
+    // it however it went — dismissed by hand, cleared by retention, or torn
+    // down when the mode closes. A nested pane left behind would be a tail
+    // hanging under nothing.
+    if (pane.kind === 'queue') {
+      for (const sub of subPanesOf(pane.qid)) destroyPane(sub);
+    }
   }
 
   // --- reconcile + chrome --------------------------------------------------
@@ -1558,12 +1891,17 @@
     let live = 0;
     let ended = 0;
     let retrying = 0;
+    let nested = 0;
     for (const pane of panes.values()) {
       if (pane.streaming) live += 1;
       if (pane.ended) ended += 1;
       if (!pane.terminal && pane.retryAt) retrying += 1;
+      if (pane.kind === 'subagent') nested += 1;
     }
     const bits = [total + (total === 1 ? ' tail' : ' tails')];
+    // Named rather than folded into the total: a reader who expanded a tree
+    // should be able to see how much of the stack is the tree.
+    if (nested) bits.push(nested + (nested === 1 ? ' subagent' : ' subagents'));
     if (live < total - ended) {
       bits.push(live + ' streaming (cap ' + MAX_LIVE_STREAMS + ')');
     }
@@ -1573,48 +1911,100 @@
     if (emptyEl) emptyEl.hidden = total > 0;
   }
 
+  // Everything that should have a pane right now, in DISPLAY order: each
+  // eligible row, followed by the nested subagent tails of the cards whose
+  // trees are expanded. One pass, so the order panes are built in is the order
+  // they are placed in and the order they are given stream slots.
+  function eligibleInfos() {
+    const out = [];
+    for (const row of eligibleRows()) {
+      const info = rowInfo(row);
+      if (!info.qid || !info.mode) continue;
+      out.push(info);
+      if (!expanded.has(info.qid)) continue;
+      // A card's nested tails are eligible only while the card's OWN pane is:
+      // a nested tail under a pane the reader dismissed (or retention cleared)
+      // would be attributed to nothing on screen.
+      if (dismissed.has(info.key) || cleared.has(info.key)) continue;
+      const nodes = row.querySelectorAll(SUB_NODE_SELECTOR);
+      for (let i = 0; i < nodes.length; i++) {
+        const sub = subInfo(row, nodes[i], info.qid);
+        if (sub.target) out.push(sub);
+      }
+    }
+    return out;
+  }
+
+  // Put a new pane where it belongs: a queue pane at the end of the stack, a
+  // nested one immediately after its parent and after any nested panes that
+  // parent already has, so a card and its subtree stay one contiguous group.
+  function placePane(pane) {
+    if (pane.kind !== 'subagent') {
+      panesEl.appendChild(pane.el);
+      return;
+    }
+    const parent = panes.get(paneKey('queue', pane.qid));
+    if (!parent || parent.el.parentNode !== panesEl) {
+      panesEl.appendChild(pane.el);
+      return;
+    }
+    let anchor = parent.el;
+    let next = anchor.nextSibling;
+    while (next && next.getAttribute &&
+           next.getAttribute('data-parent-queue-id') === pane.qid) {
+      anchor = next;
+      next = anchor.nextSibling;
+    }
+    panesEl.insertBefore(pane.el, anchor.nextSibling);
+  }
+
   function reconcile() {
     if (!open) return;
-    const rows = eligibleRows();
+    const infos = eligibleInfos();
     const seen = new Set();
-    for (const row of rows) {
-      const info = rowInfo(row);
-      if (info.qid && info.mode) seen.add(info.qid);
-    }
+    for (const info of infos) seen.add(info.key);
     // An auto-clear suppresses a rebuild only for as long as the row it came
     // from stays continuously eligible. The moment it is not, the entry goes,
     // so a requeued job that reuses the qid gets a fresh pane rather than being
     // permanently suppressed by a stale clear.
-    for (const qid of Array.from(cleared)) {
-      if (!seen.has(qid)) cleared.delete(qid);
+    for (const key of Array.from(cleared)) {
+      if (!seen.has(key)) cleared.delete(key);
     }
-    for (const row of rows) {
-      const info = rowInfo(row);
-      if (!info.qid || !info.mode) continue;
-      if (dismissed.has(info.qid) || cleared.has(info.qid)) continue;
-      const existing = panes.get(info.qid);
+    for (const info of infos) {
+      if (dismissed.has(info.key) || cleared.has(info.key)) continue;
+      const existing = panes.get(info.key);
       if (!existing) {
         const pane = buildPane(info);
-        panes.set(pane.qid, pane);
-        panesEl.appendChild(pane.el);
+        panes.set(pane.key, pane);
+        placePane(pane);
         continue;
       }
       // Summary text can change (the queue record is editable); keep it fresh
       // without touching the stream.
       const sumEl = existing.el.querySelector('.mt-pane-summary');
       if (sumEl && sumEl.textContent !== info.summary) sumEl.textContent = info.summary;
-      // Same for the footer counters: refresh.js rebuilt this row (and its
+      // Same for the title-line counters: refresh.js rebuilt this row (and its
       // agent-stats cell) since the last tick, so re-read it. An ENDED pane is
-      // not in `rows` at all, so its footer keeps the last values it had —
+      // not in `infos` at all, so its metrics keep the last values they had —
       // which is the honest answer for an agent that has returned.
       paintPaneMeta(existing, info.meta);
+      // And the subagent count, which moves as the card's tree grows.
+      paintPaneSubs(existing, info.subCount);
     }
     // A pane whose row stopped being eligible (finished, abandoned, moved out
     // of the running section) is marked ENDED, never removed — see the header
-    // comment. Its slot goes back to the pool.
+    // comment. Its slot goes back to the pool. A nested pane ends the same way
+    // and for the same reason: its node left its card's tree, or the card
+    // itself stopped running and took the whole group with it.
     for (const pane of Array.from(panes.values())) {
-      if (!seen.has(pane.qid) && !pane.ended) {
-        markEnded(pane, 'ended · no longer running', 'mt-done');
+      if (!seen.has(pane.key) && !pane.ended) {
+        markEnded(
+          pane,
+          pane.kind === 'subagent'
+            ? 'ended · no longer listed'
+            : 'ended · no longer running',
+          'mt-done',
+        );
       }
     }
     // Ended-pane retention rides this tick too — an ended pane holds no stream
@@ -1781,6 +2171,10 @@
     open = true;
     dismissed.clear();
     cleared.clear();
+    // A fresh open starts collapsed, like it starts with nothing dismissed:
+    // re-opening the mode should not silently re-open N nested streams that
+    // were expanded in some earlier sitting.
+    expanded.clear();
     overlay.hidden = false;
     document.body.classList.add('multitail-open');
     syncToggleButton();
@@ -1805,6 +2199,7 @@
     panes.clear();
     dismissed.clear();
     cleared.clear();
+    expanded.clear();
     if (panesEl) panesEl.textContent = '';
     overlay.hidden = true;
     document.body.classList.remove('multitail-open');
@@ -1953,9 +2348,18 @@
     buildPane,
     appendPaneLine,
     eligibleRows,
+    eligibleInfos,
     panes,
     dismissed,
     cleared,
+    expanded,
+    paneKey,
+    streamUrl,
+    toggleSubagents,
+    subPanesOf,
+    panesInDisplayOrder,
+    SUB_NODE_SELECTOR,
+    MAX_SUB_INDENT_DEPTH,
     isOpen: () => open,
     setWrap,
     setTimestamps,
