@@ -874,6 +874,44 @@
       .replace(/>/g, '&gt;');
   }
 
+  // --- terminal escape sequences (static/ansi.js) ---
+  //
+  // Log text reaches this module with the producer's ANSI sequences intact —
+  // most of what gets tailed here is colourised CLI output (docker compose,
+  // cargo, pytest, ffmpeg), and rendered through `esc()` alone those
+  // sequences show up as literal `[32m` garbage. `ansiText()` is the
+  // drop-in replacement for `esc()` on any string that came from a log: it
+  // escapes FIRST and then wraps the escaped runs in themed spans, so a line
+  // containing `<script>` is still inert, and it strips the sequences that
+  // address a terminal grid this modal does not have (cursor movement,
+  // erase-line, OSC).
+  //
+  // `optLimit`, when given, is a budget in VISIBLE characters — escape
+  // sequences do not spend it, so a colourised line is not truncated to a
+  // handful of words by its own markup.
+  //
+  // Falls back to `esc()` when ansi.js did not load: raw sequences are ugly,
+  // an unstyled modal is broken.
+  function ansiText(str, optLimit) {
+    const A = window.AnsiText;
+    if (!A || typeof A.toHtml !== 'function') {
+      const s = String(str === null || str === undefined ? '' : str);
+      return esc(optLimit && s.length > optLimit ? s.slice(0, optLimit) + '…' : s);
+    }
+    return A.toHtml(str, optLimit ? { limit: optLimit } : undefined);
+  }
+
+  // Visible length of a log string — what the reader sees, with the escape
+  // sequences discounted. Used for the "is this long enough to collapse?"
+  // decisions, which otherwise count a heavily-coloured 60-character line as
+  // 400 characters and hide it behind a disclosure for no reason.
+  function visibleLen(str) {
+    const A = window.AnsiText;
+    const s = String(str === null || str === undefined ? '' : str);
+    if (!A || typeof A.strip !== 'function' || !A.hasCodes(s)) return s.length;
+    return A.strip(s).length;
+  }
+
   // Build a collapsed-by-default expandable view for a long text blob.
   // Reuses the .prompt-toggle / .prompt-summary / .prompt-body classes
   // that the index.html prompt section already styles in style.css —
@@ -894,8 +932,8 @@
     return (
       inlinePart +
       '<details class="prompt-toggle log-expand">' +
-      '<summary class="prompt-summary">' + esc(summaryText) + '</summary>' +
-      '<pre class="prompt-body">' + esc(fullText) + '</pre>' +
+      '<summary class="prompt-summary">' + ansiText(summaryText) + '</summary>' +
+      '<pre class="prompt-body">' + ansiText(fullText) + '</pre>' +
       '</details>'
     );
   }
@@ -909,13 +947,23 @@
   //               "args", "json")
   function bodyOrExpandable(text, threshold, teaseLen, labelKind) {
     text = String(text == null ? '' : text);
-    if (text.length <= threshold && !text.includes('\n')) {
-      return esc(text);
+    // Length decisions use the VISIBLE length: a colourised line's escape
+    // sequences are not text the reader has to scroll past.
+    const len = visibleLen(text);
+    if (len <= threshold && !text.includes('\n')) {
+      return ansiText(text);
     }
-    const tease = text.replace(/\s+/g, ' ').slice(0, teaseLen);
-    const more = text.length > teaseLen ? '…' : '';
-    const summary = (labelKind ? '[' + labelKind + ' ' + text.length + ' chars] ' : '') + tease + more;
-    return expandable(summary, text);
+    // The tease is cut to `teaseLen` VISIBLE characters with the sequences
+    // left intact, so a colourised preview keeps its colours and can never be
+    // cut mid-sequence (which is exactly how a clip turns into visible
+    // `[32m` text).
+    const A = window.AnsiText;
+    const flat = text.replace(/\s+/g, ' ');
+    const tease = (A && typeof A.clip === 'function')
+      ? A.clip(flat, teaseLen)
+      : flat.slice(0, teaseLen) + (flat.length > teaseLen ? '…' : '');
+    const label = labelKind ? '[' + labelKind + ' ' + len + ' chars] ' : '';
+    return expandable(label + tease, text);
   }
 
   // Build a "metadata" disclosure exposing the per-record fields that
@@ -1029,11 +1077,13 @@
   // Returns the (escaped) HTML string ready to drop into the headline span.
   function headlinePreview(text, maxLen) {
     if (text === null || text === undefined) return '';
+    // `\s` does not match ESC, so collapsing whitespace before rendering
+    // leaves the escape sequences intact for ansiText() to interpret; the
+    // truncation is then applied to VISIBLE characters, not to bytes the
+    // reader never sees.
     const s = String(text).replace(/\s+/g, ' ').trim();
     if (!s) return '';
-    const limit = maxLen || 100;
-    const truncated = s.length > limit ? s.slice(0, limit) + '…' : s;
-    return esc(truncated);
+    return ansiText(s, maxLen || 100);
   }
 
   function fmtUser(rec) {
@@ -1275,13 +1325,15 @@
     const lines = body.split(/\r?\n/);
     let html;
     if (body.length <= 240 && lines.length <= 4) {
-      html = '<pre class="log-inline-pre">' + esc(body) + '</pre>';
+      // A Bash tool result is a command's own stdout, so it carries the same
+      // colour sequences a workload tail does — rendered, not printed.
+      html = '<pre class="log-inline-pre">' + ansiText(body) + '</pre>';
     } else {
       const head = lines.slice(0, 4).join('\n');
       const teaseTail = lines.length > 4 ? '\n…' : '';
       const summary = '[output ' + body.length + ' chars, ' + lines.length + ' lines] click to expand';
       html =
-        '<pre class="log-inline-pre">' + esc(head + teaseTail) + '</pre>' +
+        '<pre class="log-inline-pre">' + ansiText(head + teaseTail) + '</pre>' +
         expandable(summary, body);
     }
     // Surface the matching tool_use id so the row can be correlated
@@ -1511,7 +1563,12 @@
       cls: 'log-workload-line',
       label: '',
       headline: headlinePreview(text, 200),
-      body: '<pre class="log-inline-pre">' + esc(text) + '</pre>',
+      // The plain-text tail is the surface that carries the most colour —
+      // this is a raw stdout/stderr line from docker compose / cargo /
+      // pytest, sequences and all. ansiText() escapes it and renders the SGR
+      // as colour; everything else the producer aimed at a terminal grid is
+      // dropped.
+      body: '<pre class="log-inline-pre">' + ansiText(text) + '</pre>',
       // Workload lines render inline-only — the body is identical to the
       // headline (just wrapped in <pre>), so collapsing it under a
       // disclosure adds chrome for no value. renderEvent honors this flag.
@@ -1651,7 +1708,7 @@
       return;
     }
     if (payload.type === 'raw') {
-      appendLine('<span class="log-raw">[raw] ' + esc(payload.line || '') + '</span>', 'log-raw-line');
+      appendLine('<span class="log-raw">[raw] ' + ansiText(payload.line || '') + '</span>', 'log-raw-line');
       lastTransientRow = null;
       return;
     }

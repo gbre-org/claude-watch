@@ -188,16 +188,26 @@ modal N times in a row.
   mode, and the pane does not come back while the mode stays open.
 * **Line wrap**: the `wrap` pill, or the **`w`** key. Off by default.
 * **Timestamps**: the `time` pill, or the **`t`** key. Off by default.
+* **Verbose**: the `all` pill, or the **`v`** key. Off by default. See
+  **Verbose mode** below.
 * **Ended-pane retention**: the `clear` pill, or the **`c`** key. Cycles
   `clear 1m` → `clear 5m` → `clear 15m` → `keep`, default **1m**. If finished
   panes are *not* clearing, check first whether the tab predates the deploy that
   added this — see **Is this page stale?** below.
 * **Per-pane footer bar**: model · tool calls · context · output · age · last
   tool, under each pane's stream.
-* `w`, `t` and `c` are mode-local — inert while the overlay is closed, while you
-  are typing in a field, and while another dialog owns the keyboard. Modified
-  chords pass straight through, so `Ctrl`/`Cmd`+`W` still closes the tab and
-  `Ctrl`/`Cmd`+`C` still copies the log text you just selected.
+* **All four settings are remembered** per viewer (localStorage), and the pills
+  show the remembered state before the mode is first opened. A fresh viewer gets
+  the original defaults: wrap off, timestamps off, verbose off, `clear 1m`.
+  Reads are guarded *and* validated — storage throws outright in some privacy
+  modes and can hold an older build's value, so anything unrecognised means the
+  default rather than a wedged view, and with storage unavailable the mode
+  behaves exactly as it did before it remembered anything.
+* `w`, `t`, `v` and `c` are mode-local — inert while the overlay is closed, while
+  you are typing in a field, and while another dialog owns the keyboard. Modified
+  chords pass straight through, so `Ctrl`/`Cmd`+`W` still closes the tab,
+  `Ctrl`/`Cmd`+`V` still pastes, and `Ctrl`/`Cmd`+`C` still copies the log text
+  you just selected.
 * The MODE is not persisted: a full-window takeover that survived a reload
   would be a surprise rather than a convenience. The `w` / `t` preferences live
   as long as the page does. The retention choice *is* persisted per viewer
@@ -452,6 +462,88 @@ the banner is not a `data-no-morph` element — multitail treats any visible one
 a dialog that owns the keyboard, so marking it would silently kill `w` / `t` /
 `c` whenever it was up.
 
+## Verbose mode (`v`) — stop eliding
+
+A pane's whole value is density, so the default renderer shows **one line per
+event** and elides hard. `v` turns each of those elisions off:
+
+| Elided by default | With `v` |
+|---|---|
+| A multi-line assistant message, thinking block, user message, system record or tool **result** is cut to its first line | The whole body, rendered with `pre-wrap` so the line breaks show |
+| A tool call shows the first interesting argument's first line (`command`, `file_path`, …) | The whole input, indented |
+| A tool result whose content array has no text block — or has one *after* an image block — reads `[N block(s)]` | Every block described |
+| `[image]` / `[attachment]` | Count, media types and payload sizes; an attachment's path plus the rest of its record |
+| Lines clipped at 400 characters (2000 with `wrap`) | Clipped at `MAX_LINE_CHARS_VERBOSE` |
+
+Two things it deliberately does **not** do:
+
+* **It is not unbounded.** Four live streams can each produce hundreds of lines
+  a minute and the browser lays every one of them out, so a single line is still
+  capped (`MAX_LINE_CHARS_VERBOSE`) and so is the total text one pane retains
+  (`MAX_PANE_CHARS`, evicting from the head like the line-count bound). A line
+  budget alone stops bounding memory the moment one line can be ten times its
+  normal size. The single-item log view remains the place for a genuinely
+  complete payload.
+* **It does not inline images.** A pane is ten rows tall and a data URI is
+  megabytes; what verbose owes the reader there is what the thing is and how
+  big. The single-item modal renders the image itself.
+
+It is retroactive only as far as the retained records go. Lines are stored
+clipped at the verbose width, so switching `v` on immediately widens every
+retained line a narrower setting had cut — but a multi-line record was reduced
+to its first line when it *arrived*, so full detail applies to lines received
+from then on. The alternative, retaining every raw payload in every pane against
+a toggle that may never be pressed, is a memory multiplier paid by everyone.
+
+## Colourised output (ANSI escape sequences)
+
+Most of what gets tailed here is colourised CLI output — `docker compose`,
+`cargo`, `pytest`, `ffmpeg` — and those producers write SGR escape sequences
+into their stdout, which the workload wrapper stamps and appends verbatim. Both
+log views (multitail panes and the single-item modal) render line text through
+one converter, `static/ansi.js`, so a colourised line looks the same in both.
+
+* **Escaping comes first.** A log line is untrusted text. The tokenizer splits
+  the raw string into text runs plus a style state, escapes each run (or writes
+  it with `textContent`), and only then wraps it in a span whose classes come
+  from the module's own tables. A line containing `<script>` stays inert and
+  visible, and no line content ever reaches an attribute.
+* **SGR is rendered**: the 8 base colours and their bright variants,
+  256-colour and 24-bit truecolor (including the colon-delimited spellings),
+  bold, dim, italic, underline, strike and inverse.
+* **Everything else is dropped, not printed**: cursor movement, cursor
+  show/hide, erase-line, OSC strings (an OSC-8 hyperlink keeps its text and
+  loses the URL wrapper), charset designators, stray C0 controls. They address a
+  terminal grid the page does not have.
+* **A carriage return redraws the line**, so a progress bar collapses to its
+  final frame — what the terminal would have left on screen. (Most `\r`s never
+  reach the client: the server already splits plain-text tails on `\r` and marks
+  each frame `transient` so the front end replaces the row in place.)
+* **Colour state does not carry across lines.** Each frame renders from a clean
+  state, because panes trim their head and join a stream mid-flight, so there is
+  no reliable previous line to inherit from — and a sticky unterminated colour
+  would paint the rest of the pane. A producer that opens a colour on one line
+  and closes it on the next loses it on the continuation line: a wrong-but-
+  bounded line beats a wrong-forever pane.
+* **Both themes.** A palette chosen against a dark terminal background is
+  regularly unreadable on a light page, so the 16 base colours map to CSS custom
+  properties defined once per theme at contrast that reads on that theme's
+  background — the hues are Solarized's, not its canonical terminal mapping
+  (which turns `bright green`, a success marker in most CLI output, into body
+  text). Indexed-cube and truecolor values have no such table, so the module
+  computes a light and a dark variant per colour, memoised, and the stylesheet
+  picks.
+* **Cost**: one left-to-right pass per line, no re-parse of the buffer, and a
+  single regex test for the common case of a line with no sequences at all.
+  Adjacent runs sharing a style collapse into one span. Because the sequences
+  are gone rather than hidden, selecting and copying a rendered line yields
+  clean text.
+
+`static/ansi.test.js` pins the converter (plain node, no jsdom — `make
+test-minisite-ansi`, and it runs in CI): the escaping guarantee, SGR coverage,
+the dropped sequences, `\r` collapsing, visible-character clipping, and the real
+`docker compose` output shape taken from a live workload log.
+
 ## Layout
 
 | Path | Purpose |
@@ -459,7 +551,7 @@ a dialog that owns the keyboard, so marking it would silently kill `w` / `t` /
 | `app.py` | Single-file Flask app (read endpoints + Stop/Abandon/Force-start writers + SSE live-log stream). |
 | `claude_agents.py` | Shared helpers for parsing `claude-watch active-agents` JSON state (agent\_id, queue-id join, dedup). |
 | `templates/index.html` | Solarized-themed queue view. |
-| `static/` | JS modules (`refresh.js`, `live-log.js`, `multitail.js`, `keyboard.js`, etc.), CSS, icons. |
+| `static/` | JS modules (`refresh.js`, `live-log.js`, `multitail.js`, `ansi.js`, `keyboard.js`, etc.), CSS, icons. |
 | `claude-event` | Vendored event-emitter CLI used by `session-task` lifecycle hooks. |
 | `obligations` | Vendored obligations-gate CLI used by the force-start endpoint. |
 | `Dockerfile` | Build (python:3.12-alpine + gunicorn). |
@@ -566,3 +658,24 @@ they rewrite `os.environ` and reload the `app` module at class setup.
 
 These suites run in CI (`Queue-minisite Python tests` job) and gate
 merges to `main`.
+
+The browser-side modules have their own suites in `static/*.test.js`. One of
+them needs no DOM and therefore no dependency, so it runs in that same CI job:
+
+```bash
+make test-minisite-ansi      # static/ansi.test.js, plain node
+```
+
+The rest drive the modules under jsdom and are local-only — point
+`QM_NODE_MODULES` at a directory with `jsdom` installed and run the file:
+
+```bash
+QM_NODE_MODULES=/tmp/queue-minisite-test/node_modules \
+  node static/multitail.test.js
+```
+
+Because CI does not execute those, anything a jsdom suite proves that must not
+regress silently gets a second, grep-or-render assertion in a `test_*.py` file —
+which is why `test_multitail.py` checks things like "no stylesheet rule hides the
+pane title" and "the ANSI palette is defined in both themes" rather than leaving
+them to the client suites alone.

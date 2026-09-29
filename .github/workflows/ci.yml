@@ -152,6 +152,16 @@ jobs:
         run: make test-queue-minisite
         timeout-minutes: 10
 
+      - name: Run queue-minisite ANSI renderer tests
+        # static/ansi.js converts a producer's terminal escape sequences into
+        # themed markup for both log views, and the escaping guarantee (an
+        # untrusted log line containing markup stays inert AND visible) is the
+        # part that must not regress unnoticed. Runs on the runner's bundled
+        # node with no dependency to install — the suite is deliberately
+        # DOM-free, unlike the jsdom suites beside it, so it can live in CI.
+        run: make test-minisite-ansi
+        timeout-minutes: 5
+
       - name: Run cw-agent-stats producer tests (agentstats library + CLI)
         # The host-side producer of the agent-stats.json snapshot the
         # minisite suites above consume. Lives in the same job on purpose:

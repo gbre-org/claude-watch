@@ -50,6 +50,11 @@ const { JSDOM } = require(path.join(NODE_MODULES, 'jsdom'));
 
 const STATIC_DIR = path.dirname(path.resolve(__filename));
 const src = fs.readFileSync(path.join(STATIC_DIR, 'multitail.js'), 'utf8');
+// index.html loads ansi.js before multitail.js: pane lines are rendered through
+// window.AnsiText so terminal colour sequences come out as colour. Loaded here
+// too, or the module silently takes its no-AnsiText fallback path and the
+// colour assertions below would be testing nothing.
+const ansiSrc = fs.readFileSync(path.join(STATIC_DIR, 'ansi.js'), 'utf8');
 
 // One running card per interesting shape. `q-start` is the "no log yet" case:
 // clickable like every running card, but with no data-live-log-mode.
@@ -86,6 +91,8 @@ const initialHTML = `<!doctype html>
               aria-pressed="false">wrap</button>
       <button type="button" id="multitail-ts" class="multitail-display"
               aria-pressed="false">time</button>
+      <button type="button" id="multitail-verbose" class="multitail-display"
+              aria-pressed="false">all</button>
       <button type="button" id="multitail-retain"
               class="multitail-display multitail-retain"
               data-retention="1m">clear 1m</button>
@@ -135,6 +142,7 @@ function streamCountFor(qid) {
   return streams.filter((s) => s.url.indexOf(qid) !== -1).length;
 }
 
+window.eval(ansiSrc);
 window.eval(src);
 const mt = window.__multitail;
 
@@ -985,6 +993,7 @@ console.log('\n-- retention persists per viewer, and works without storage');
     d.window.EventSource = class { constructor(u) { this.url = u; }
       close() {} };
     if (typeof seed === 'function') seed(d.window);
+    d.window.eval(ansiSrc);
     d.window.eval(src);
     return d;
   }
@@ -1364,6 +1373,262 @@ console.log('\n-- per-pane footer bar: read off the row, never invented');
     paneFor('q-f3').querySelector('.mt-pane-foot').innerHTML.indexOf('<span') !== -1 &&
     paneFor('q-f3').querySelector('.mt-pane-foot').querySelectorAll('script').length === 0);
   mt.closeMode();
+}
+
+// ==========================================================================
+console.log('\n-- ANSI colour sequences render as colour, not as escape text');
+// ==========================================================================
+// Most of what these panes tail is colourised CLI output (docker compose,
+// cargo, pytest). The conversion lives in static/ansi.js and is pinned there;
+// what belongs HERE is that the pane's own rendering path goes through it — and
+// that it does so WITHOUT innerHTML, which is this module's standing invariant.
+{
+  const E = '\u001b';
+  // Own row: an earlier block replaced #queue-root wholesale, so the fixture's
+  // original cards are long gone by now.
+  document.getElementById('queue-root').innerHTML =
+    card('q-ansi', 'workload', 'colourful workload');
+  mt.openMode();
+  // Fed straight into the pane rather than through a stream: this block is
+  // about RENDERING, and by this point the suite has more eligible rows than
+  // stream slots, so q-b may still be waiting for one.
+  const feed = (qid, payload) =>
+    mt.appendPaneLine(mt.panes.get(qid), mt.formatPayload(payload));
+  // The real shape from a `docker compose up --build` workload log.
+  feed('q-ansi', {
+    type: 'event', kind: 'workload_line',
+    text: E + '[32m✔' + E + '[0m Image queue-minisite   ' +
+      E + '[34m0.9s' + E + '[0m',
+  });
+  const body = paneFor('q-ansi').querySelector('.mt-line .mt-body');
+  assert('a colourised line renders colour spans',
+    !!body.querySelector('span.ansi-fg-green') &&
+    !!body.querySelector('span.ansi-fg-blue'), body.innerHTML);
+  assert('and no escape text is left in the pane',
+    body.textContent.indexOf('[32m') === -1 &&
+    body.textContent.indexOf(E) === -1, JSON.stringify(body.textContent));
+  assert('the visible text is the line without its sequences',
+    body.textContent.indexOf('✔ Image queue-minisite') === 0,
+    JSON.stringify(body.textContent));
+
+  // Cursor movement / cursor show-hide address a terminal grid this pane does
+  // not have: dropped, not printed.
+  feed('q-ansi', {
+    type: 'event', kind: 'workload_line',
+    text: E + '[?25h' + E + '[1A' + E + '[0G[+] Building 0.3s (2/3)',
+  });
+  const frame = paneFor('q-ansi').querySelector('.mt-line:last-child .mt-body');
+  assert('a compose redraw frame renders as just its text',
+    frame.textContent === '[+] Building 0.3s (2/3)',
+    JSON.stringify(frame.textContent));
+
+  // ESCAPING. Untrusted line text wrapped in a colour must stay inert, and the
+  // module must still not be using innerHTML to do it.
+  feed('q-ansi', {
+    type: 'event', kind: 'workload_line',
+    text: E + '[31m<img src=x onerror=alert(1)>' + E + '[0m',
+  });
+  const evil = paneFor('q-ansi').querySelector('.mt-line:last-child');
+  assert('markup inside a coloured line never becomes an element',
+    evil.querySelector('img') === null, evil.innerHTML);
+  assert('and it is still visible as text',
+    evil.textContent.indexOf('<img src=x onerror=alert(1)>') !== -1,
+    JSON.stringify(evil.textContent));
+  assert('the module still contains no innerHTML assignment',
+    !/\.innerHTML\s*=/.test(src));
+  mt.closeMode();
+}
+
+// ==========================================================================
+console.log('\n-- verbose (`v`): stop eliding, within a ceiling');
+// ==========================================================================
+// The default renderer is one line per event and elides hard. Verbose turns
+// every one of those elisions off — not just the two that were reported — and
+// keeps a ceiling so four live streams cannot take the tab down.
+{
+  document.getElementById('queue-root').innerHTML =
+    card('q-verbose', 'live', 'verbose agent');
+  mt.openMode();
+  const feedV = (payload) =>
+    mt.appendPaneLine(mt.panes.get('q-verbose'), mt.formatPayload(payload));
+  assert('verbose is OFF for a fresh viewer', mt.isVerbose() === false);
+
+  const multi = { type: 'event', kind: 'assistant_text', rec: {
+    message: { content: [{ type: 'text', text: 'first line\nsecond line\nthird' }] },
+  } };
+  const toolCall = { type: 'event', kind: 'tool_use', rec: {
+    message: { content: [{ type: 'tool_use', name: 'Bash', input: {
+      command: 'make deploy\n  --flag', description: 'deploy it' } }] },
+  } };
+  const attach = { type: 'event', kind: 'attachment', rec: {
+    attachment: { type: 'file', path: '/tmp/x.png', size: 1234 } } };
+  const image = { type: 'event', kind: 'user_image', rec: {
+    message: { content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+    ] } } };
+  const blocky = { type: 'event', kind: 'tool_result', rec: {
+    message: { content: [{ type: 'tool_result', content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA' } },
+      { type: 'text', text: 'the actual answer' },
+    ] }] } } };
+
+  // ---- elided (default)
+  let f = mt.formatPayload(multi);
+  assert('default: a multi-line message is cut to its first line',
+    f.text === 'first line', JSON.stringify(f.text));
+  f = mt.formatPayload(toolCall);
+  assert('default: a tool call shows one argument\'s first line',
+    f.text === 'Bash make deploy', JSON.stringify(f.text));
+  f = mt.formatPayload(attach);
+  assert('default: an attachment shows its path',
+    f.text.indexOf('[attachment]') === 0, JSON.stringify(f.text));
+  f = mt.formatPayload(image);
+  assert('default: an image is a placeholder', f.text === '[image]',
+    JSON.stringify(f.text));
+  f = mt.formatPayload(blocky);
+  assert('default: a result\'s text block is found past the image',
+    f.text === 'the actual answer', JSON.stringify(f.text));
+
+  // ---- verbose
+  mt.setVerbose(true);
+  assert('the pill reflects verbose',
+    document.getElementById('multitail-verbose').getAttribute('aria-pressed') === 'true');
+  assert('and the overlay carries the class the stylesheet keys on',
+    document.getElementById('multitail').classList.contains('mt-verbose'));
+
+  f = mt.formatPayload(multi);
+  assert('verbose: the whole multi-line body is kept',
+    f.text === 'first line\nsecond line\nthird', JSON.stringify(f.text));
+  f = mt.formatPayload(toolCall);
+  assert('verbose: the whole tool input is shown, indented',
+    f.text.indexOf('"command"') !== -1 && f.text.indexOf('"description"') !== -1 &&
+    f.text.indexOf('\n') !== -1, JSON.stringify(f.text));
+  f = mt.formatPayload(attach);
+  assert('verbose: the attachment record is shown, path first',
+    f.text.indexOf('/tmp/x.png') !== -1 && f.text.indexOf('"size"') !== -1,
+    JSON.stringify(f.text));
+  f = mt.formatPayload(image);
+  assert('verbose: the image is described by type and size',
+    f.text.indexOf('image/png') !== -1 && f.text.indexOf('base64 chars') !== -1,
+    JSON.stringify(f.text));
+  f = mt.formatPayload(blocky);
+  assert('verbose: every result block is described, not just the text one',
+    f.text.indexOf('image/png') !== -1 && f.text.indexOf('the actual answer') !== -1,
+    JSON.stringify(f.text));
+
+  // ---- the ceiling
+  assert('verbose raises the per-line limit to its own cap',
+    mt.lineCharLimit() === mt.MAX_LINE_CHARS_VERBOSE);
+  assert('but it is a CAP, not "unlimited"',
+    mt.MAX_LINE_CHARS_VERBOSE > mt.MAX_LINE_CHARS_WRAPPED &&
+    mt.MAX_LINE_CHARS_VERBOSE <= 20000, String(mt.MAX_LINE_CHARS_VERBOSE));
+  const huge = 'z'.repeat(mt.MAX_LINE_CHARS_VERBOSE + 5000);
+  feedV({ type: 'event', kind: 'workload_line', text: huge });
+  const shown = paneFor('q-verbose').querySelector('.mt-line:last-child .mt-body');
+  assert('an oversized verbose line is still clipped',
+    shown.textContent.length <= mt.MAX_LINE_CHARS_VERBOSE + 1,
+    'len=' + shown.textContent.length);
+
+  // The pane's TEXT budget, not just its line count: a handful of maximal
+  // lines must evict from the head rather than accumulate.
+  const pane = mt.panes.get('q-verbose');
+  const need = Math.ceil(mt.MAX_PANE_CHARS / mt.MAX_LINE_CHARS_VERBOSE) + 2;
+  for (let i = 0; i < need; i++) {
+    feedV({ type: 'event', kind: 'workload_line', text: huge });
+  }
+  assert('the pane text budget evicts from the head',
+    pane.records.length < need, 'records=' + pane.records.length);
+  assert('and the pane is never emptied by it', pane.records.length >= 1);
+  assert('the rendered rows match the retained records',
+    pane.streamEl.children.length === pane.records.length,
+    pane.streamEl.children.length + ' vs ' + pane.records.length);
+
+  mt.setVerbose(false);
+  mt.closeMode();
+}
+
+// ==========================================================================
+console.log('\n-- every header setting persists per viewer');
+// ==========================================================================
+// Wrap and timestamps were page-lifetime only; they now persist the same way
+// the retention value already did, through the same guarded accessors. The
+// defaults for a FRESH viewer are unchanged (all off), a stored value the build
+// does not recognise means the default, and storage that throws is survivable.
+{
+  function bootFlags(seed) {
+    const d = new JSDOM(initialHTML, {
+      runScripts: 'outside-only', url: 'https://queue.example/',
+    });
+    d.window.EventSource = class { constructor(u) { this.url = u; } close() {} };
+    if (typeof seed === 'function') seed(d.window);
+    d.window.eval(ansiSrc);
+    d.window.eval(src);
+    return d;
+  }
+
+  let d = bootFlags();
+  assert('fresh viewer: wrap off, time off, verbose off',
+    d.window.__multitail.isWrap() === false &&
+    d.window.__multitail.isTimestamps() === false &&
+    d.window.__multitail.isVerbose() === false);
+
+  d = bootFlags((w) => {
+    w.localStorage.setItem('qsite_mt_wrap', '1');
+    w.localStorage.setItem('qsite_mt_ts', '1');
+    w.localStorage.setItem('qsite_mt_verbose', '1');
+  });
+  const M = d.window.__multitail;
+  assert('stored toggles are restored on a fresh page load',
+    M.isWrap() && M.isTimestamps() && M.isVerbose());
+  assert('and the server-rendered pills are corrected before first open',
+    d.window.document.getElementById('multitail-wrap')
+      .getAttribute('aria-pressed') === 'true' &&
+    d.window.document.getElementById('multitail-ts')
+      .getAttribute('aria-pressed') === 'true' &&
+    d.window.document.getElementById('multitail-verbose')
+      .getAttribute('aria-pressed') === 'true');
+  assert('the overlay classes match the restored state, before it is opened',
+    d.window.document.getElementById('multitail').classList.contains('mt-wrap') &&
+    d.window.document.getElementById('multitail').classList.contains('mt-verbose'));
+
+  // A stored value this build cannot interpret must not be coerced.
+  d = bootFlags((w) => {
+    w.localStorage.setItem('qsite_mt_wrap', 'true');
+    w.localStorage.setItem('qsite_mt_ts', 'yes please');
+  });
+  assert('an unrecognised stored flag means the default, not truthiness',
+    d.window.__multitail.isWrap() === false &&
+    d.window.__multitail.isTimestamps() === false);
+
+  // Choosing writes through for the next load.
+  d = bootFlags();
+  d.window.__multitail.setWrap(true);
+  d.window.__multitail.setVerbose(true);
+  assert('choosing a toggle writes it through',
+    d.window.localStorage.getItem('qsite_mt_wrap') === '1' &&
+    d.window.localStorage.getItem('qsite_mt_verbose') === '1',
+    String(d.window.localStorage.getItem('qsite_mt_wrap')));
+  d.window.__multitail.setWrap(false);
+  assert('and turning it back off writes the OFF value, not a removal',
+    d.window.localStorage.getItem('qsite_mt_wrap') === '0',
+    String(d.window.localStorage.getItem('qsite_mt_wrap')));
+  assert('the storage keys are the documented, distinct ones',
+    d.window.__multitail.WRAP_STORAGE_KEY === 'qsite_mt_wrap' &&
+    d.window.__multitail.TS_STORAGE_KEY === 'qsite_mt_ts' &&
+    d.window.__multitail.VERBOSE_STORAGE_KEY === 'qsite_mt_verbose');
+
+  // Storage that throws on every access must not take the module down.
+  d = bootFlags((w) => {
+    Object.defineProperty(w, 'localStorage', {
+      configurable: true,
+      get() { throw new Error('site data blocked'); },
+    });
+  });
+  assert('the module still loads when localStorage throws',
+    !!d.window.__multitail && d.window.__multitail.isWrap() === false);
+  d.window.__multitail.setVerbose(true);
+  assert('and a toggle still applies to this page',
+    d.window.__multitail.isVerbose() === true);
 }
 
 console.log(

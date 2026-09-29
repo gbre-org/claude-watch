@@ -30,6 +30,10 @@ const liveLogSrc = fs.readFileSync(
   path.join(STATIC_DIR, 'live-log.js'),
   'utf8',
 );
+// Loaded FIRST, exactly as index.html loads it: live-log.js renders every log
+// string through window.AnsiText (static/ansi.js) so terminal colour
+// sequences come out as colour rather than as literal `[32m` text.
+const ansiSrc = fs.readFileSync(path.join(STATIC_DIR, 'ansi.js'), 'utf8');
 
 // Minimal DOM scaffolding — live-log.js looks up these IDs on load and
 // bails early if #log-modal is absent. We provide just enough chrome so
@@ -96,7 +100,9 @@ const initialHTML = `<!doctype html>
 const dom = new JSDOM(initialHTML, { runScripts: 'outside-only' });
 const { window } = dom;
 // Inject + execute live-log.js inside the jsdom window so its IIFE
-// runs and registers __liveLog on window.
+// runs and registers __liveLog on window. ansi.js goes first, matching the
+// deferred script order in index.html.
+window.eval(ansiSrc);
 window.eval(liveLogSrc);
 
 const { renderEvent, formatters, headlinePreview } = window.__liveLog;
@@ -1258,6 +1264,112 @@ console.log('\nheadline dedupe (botchat #3363) — data-headline-redundant marki
     assert('TOOL_RESULT headline preview still in DOM',
       details && details.querySelector('.log-headline-text').textContent.includes('total 0'));
   }
+}
+
+// ==========================================================================
+console.log('\n-- ANSI / SGR rendering (static/ansi.js) in the single-log view');
+// ==========================================================================
+// Most of what this modal tails is colourised CLI output. The conversion
+// itself is one shared module (static/ansi.js, pinned by ansi.test.js); what
+// belongs HERE is that the modal's own rendering path goes through it — the
+// plain-text workload tail, a Bash tool result, the headline preview — and
+// that the escaping guarantee survives the trip into the DOM.
+const ESC_ = '\u001b';
+
+{
+  // The real shape from a live `docker compose up -d --build` workload log,
+  // with the server-side timestamp prefix already split off into source_ts.
+  const colourful = ESC_ + '[32m✔' + ESC_ + '[0m Image docker.gbre.org/queue-minisite   ' +
+    ESC_ + '[32mBuilt' + ESC_ + '[0m    ' + ESC_ + '[34m0.9s' + ESC_ + '[0m';
+  const line = render({
+    type: 'event', kind: 'workload_line', text: colourful,
+    source_ts: '2026-09-29T04:06:53Z',
+  });
+  assert('a colourised workload line renders colour spans',
+    line.querySelectorAll('span.ansi-fg-green').length >= 2, line.innerHTML);
+  assert('and the blue duration too', !!line.querySelector('span.ansi-fg-blue'));
+  assert('NO escape text leaks into the row',
+    line.textContent.indexOf('[32m') === -1 && line.textContent.indexOf(ESC_) === -1,
+    JSON.stringify(line.textContent));
+  assert('the visible text is the line minus its sequences',
+    line.textContent.indexOf('✔ Image docker.gbre.org/queue-minisite') !== -1,
+    JSON.stringify(line.textContent));
+  // The source-timestamp prefix is split off server-side and rendered as its
+  // own cell; a colourised line must still get one.
+  assert('a colourised line still renders its source timestamp',
+    !!line.querySelector('.log-ts'), line.innerHTML);
+}
+
+{
+  // Cursor movement / cursor show-hide / erase-line have no terminal grid to
+  // address here, so they are dropped rather than printed.
+  const line = render({
+    type: 'event', kind: 'workload_line',
+    text: ESC_ + '[?25h' + ESC_ + '[1A' + ESC_ + '[0G' + ESC_ + '[?25l[+] Building 0.3s (2/3)',
+  });
+  assert('a compose redraw frame renders as just its text',
+    line.textContent.trim() === '[+] Building 0.3s (2/3)',
+    JSON.stringify(line.textContent));
+}
+
+{
+  // ESCAPING COMES FIRST. A log line is untrusted text, and a colour sequence
+  // wrapped around markup must not turn that markup into an element.
+  const line = render({
+    type: 'event', kind: 'workload_line',
+    text: ESC_ + '[31m<script>alert(1)</script>' + ESC_ + '[0m',
+  });
+  assert('markup inside a coloured log line never becomes an element',
+    line.querySelector('script') === null, line.innerHTML);
+  assert('and it is still VISIBLE as text',
+    line.textContent.indexOf('<script>alert(1)</script>') !== -1,
+    JSON.stringify(line.textContent));
+  assert('the span around it is ours', !!line.querySelector('span.ansi-fg-red'));
+
+  // An attribute-breakout attempt through the line text.
+  const line2 = render({
+    type: 'event', kind: 'workload_line',
+    text: ESC_ + '[32m" onmouseover="alert(1)' + ESC_ + '[0m',
+  });
+  // Asserted on the live DOM, not on a serialised string: the serialiser
+  // prints a text node's quote as a bare `"`, so an innerHTML grep here would
+  // fail on safe output. What matters is that no ELEMENT gained an attribute.
+  let smuggled = false;
+  line2.querySelectorAll('*').forEach((n) => {
+    if (n.hasAttribute('onmouseover')) smuggled = true;
+  });
+  assert('a quote in the line cannot open an attribute', !smuggled,
+    line2.innerHTML);
+  assert('and the attempt is visible as text',
+    line2.textContent.indexOf('" onmouseover="alert(1)') !== -1,
+    JSON.stringify(line2.textContent));
+}
+
+{
+  // A Bash tool result is a command's own stdout, so it carries the same
+  // sequences and goes through the same converter.
+  const line = render({
+    type: 'event', kind: 'tool_result',
+    rec: { message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_a',
+      content: ESC_ + '[1;32mPASS' + ESC_ + '[0m tests/test_x.py' }] } },
+  });
+  assert('a coloured tool result renders colour',
+    !!line.querySelector('span.ansi-fg-green.ansi-bold'), line.innerHTML);
+  assert('and no escape text survives in it',
+    line.textContent.indexOf('[1;32m') === -1, JSON.stringify(line.textContent));
+}
+
+{
+  // The headline preview truncates on VISIBLE characters, so a colourised
+  // line is not cut to a couple of words by its own markup — and the cut can
+  // never land inside a sequence.
+  const long = ESC_ + '[36m' + 'y'.repeat(300) + ESC_ + '[0m';
+  const probe = window.document.createElement('div');
+  probe.innerHTML = headlinePreview(long, 200);
+  assert('headlinePreview clips 200 VISIBLE chars, not 200 bytes',
+    probe.textContent === 'y'.repeat(200) + '…',
+    'len=' + probe.textContent.length);
+  assert('and keeps the colour', !!probe.querySelector('span.ansi-fg-cyan'));
 }
 
 console.log('\n--------------------------------------------------------------');

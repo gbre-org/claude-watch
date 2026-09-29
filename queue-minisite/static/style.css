@@ -2872,6 +2872,36 @@ body.multitail-open { overflow: hidden; }
   text-overflow: clip;
 }
 
+/* ---- VERBOSE (`v`) ----
+ *
+ * Verbose stops the renderer eliding, and what it stops eliding first is
+ * MULTI-LINE content: a whole assistant message, a whole tool result, an
+ * indented tool-argument dump. None of that reads as one clipped row, so a
+ * verbose pane wraps and honours the newlines whether or not `w` is on — the
+ * two toggles answer different questions ("this line is too wide" vs "show me
+ * everything"), and verbose implies the first one.
+ *
+ * `mt-body` is the only part that grows; the timestamp cell and the sigil stay
+ * on the first visual row so a wall of wrapped text is still scannable down
+ * its left edge. */
+.multitail.mt-verbose .mt-line {
+  white-space: pre-wrap;
+  overflow: visible;
+}
+.multitail.mt-verbose .mt-line .mt-body {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  text-overflow: clip;
+}
+/* A verbose row is a block of text rather than a line in a list, so it needs a
+   visible boundary — without one, two consecutive multi-line records read as
+   one. Cheap: a hairline in the pane's own divider colour. */
+.multitail.mt-verbose .mt-line + .mt-line {
+  border-top: 1px solid var(--line);
+  padding-top: 1px;
+}
+
 /* Phones: the header hint costs a line it cannot afford, and the floor drops
    so three tails still fit above the fold. */
 @media (max-width: 560px) {
@@ -2908,3 +2938,139 @@ body.multitail-open { overflow: hidden; }
   .mt-pane-foot .mt-foot-out,
   .mt-pane-foot .mt-foot-tool { display: none; }
 }
+
+/* =====================================================================
+ * ANSI / SGR rendering for tailed log lines  (static/ansi.js)
+ * =====================================================================
+ *
+ * Both log views render line text through static/ansi.js, which converts
+ * SGR escape sequences into the classes below. The module NEVER emits a raw
+ * terminal RGB value for the 16 base colours, because a palette chosen
+ * against a dark background is regularly unreadable on a light one — it
+ * emits a class, and the colour lives here, defined once per theme.
+ *
+ * These are NOT the canonical Solarized terminal mappings, on purpose.
+ * Solarized maps the bright variants onto its base greys, which turns
+ * `bright green` — a success marker in most CLI output — into body text, and
+ * maps `black` / `white` onto values that are invisible on one of the two
+ * backgrounds. So: the hues are Solarized's, adjusted per theme for legible
+ * contrast against that theme's background (every value clears ~3.2:1, the
+ * floor this site's own accent palette sits at), with `black` and `white`
+ * pulled to the greys that still read on the background in question.
+ *
+ * Indexed-cube and truecolor values have no table to map onto, so ansi.js
+ * computes a light and a dark variant per colour and ships both as custom
+ * properties on the span; `.ansi-fg-rgb` just picks the one for the theme.
+ * Backgrounds arrive as a single low-alpha tint, which keeps the foreground
+ * readable in both themes without a second computed value. */
+
+:root {
+  --ansi-black:          #073642;
+  --ansi-red:            #b32c26;
+  --ansi-green:          #5b6e00;
+  --ansi-yellow:         #7d5f00;
+  --ansi-blue:           #1a6491;
+  --ansi-magenta:        #a32566;
+  --ansi-cyan:           #17726b;
+  --ansi-white:          #61737a;
+  --ansi-bright-black:   #586e75;
+  --ansi-bright-red:     #d0342e;
+  --ansi-bright-green:   #6f8500;
+  --ansi-bright-yellow:  #96700a;
+  --ansi-bright-blue:    #2179ad;
+  --ansi-bright-magenta: #c22e79;
+  --ansi-bright-cyan:    #1c8a81;
+  --ansi-bright-white:   #7b8c8e;
+  /* Which of the two computed rgb-span variants this theme reads. */
+  --ansi-rgb-pick: var(--ansi-fg-l, inherit);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ansi-black:          #6b8288;
+    --ansi-red:            #e2453f;
+    --ansi-green:          #859900;
+    --ansi-yellow:         #b58900;
+    --ansi-blue:           #3f9fdc;
+    --ansi-magenta:        #dd4b91;
+    --ansi-cyan:           #2aa198;
+    --ansi-white:          #93a1a1;
+    --ansi-bright-black:   #728a90;
+    --ansi-bright-red:     #f4796f;
+    --ansi-bright-green:   #a5bd00;
+    --ansi-bright-yellow:  #d9a900;
+    --ansi-bright-blue:    #6bb6e8;
+    --ansi-bright-magenta: #ea6fa8;
+    --ansi-bright-cyan:    #4ecec3;
+    --ansi-bright-white:   #eee8d5;
+    --ansi-rgb-pick: var(--ansi-fg-d, inherit);
+  }
+}
+
+.ansi-fg-black          { color: var(--ansi-black); }
+.ansi-fg-red            { color: var(--ansi-red); }
+.ansi-fg-green          { color: var(--ansi-green); }
+.ansi-fg-yellow         { color: var(--ansi-yellow); }
+.ansi-fg-blue           { color: var(--ansi-blue); }
+.ansi-fg-magenta        { color: var(--ansi-magenta); }
+.ansi-fg-cyan           { color: var(--ansi-cyan); }
+.ansi-fg-white          { color: var(--ansi-white); }
+.ansi-fg-bright-black   { color: var(--ansi-bright-black); }
+.ansi-fg-bright-red     { color: var(--ansi-bright-red); }
+.ansi-fg-bright-green   { color: var(--ansi-bright-green); }
+.ansi-fg-bright-yellow  { color: var(--ansi-bright-yellow); }
+.ansi-fg-bright-blue    { color: var(--ansi-bright-blue); }
+.ansi-fg-bright-magenta { color: var(--ansi-bright-magenta); }
+.ansi-fg-bright-cyan    { color: var(--ansi-bright-cyan); }
+.ansi-fg-bright-white   { color: var(--ansi-bright-white); }
+
+/* Backgrounds are a TINT, not the terminal's solid block: a solid
+ * Solarized-saturation panel behind body-coloured text is unreadable in both
+ * themes, and log output uses background colour as emphasis (a failing test
+ * name, a highlighted match) rather than as a picture. */
+.ansi-bg-black,
+.ansi-bg-bright-black   { background-color: color-mix(in srgb, var(--ansi-black) 28%, transparent); }
+.ansi-bg-red,
+.ansi-bg-bright-red     { background-color: color-mix(in srgb, var(--ansi-red) 28%, transparent); }
+.ansi-bg-green,
+.ansi-bg-bright-green   { background-color: color-mix(in srgb, var(--ansi-green) 28%, transparent); }
+.ansi-bg-yellow,
+.ansi-bg-bright-yellow  { background-color: color-mix(in srgb, var(--ansi-yellow) 28%, transparent); }
+.ansi-bg-blue,
+.ansi-bg-bright-blue    { background-color: color-mix(in srgb, var(--ansi-blue) 28%, transparent); }
+.ansi-bg-magenta,
+.ansi-bg-bright-magenta { background-color: color-mix(in srgb, var(--ansi-magenta) 28%, transparent); }
+.ansi-bg-cyan,
+.ansi-bg-bright-cyan    { background-color: color-mix(in srgb, var(--ansi-cyan) 28%, transparent); }
+.ansi-bg-white,
+.ansi-bg-bright-white   { background-color: color-mix(in srgb, var(--ansi-white) 28%, transparent); }
+
+/* Fallback for browsers without color-mix(): the tint degrades to a flat
+ * low-contrast panel rather than to nothing, so background-only emphasis is
+ * still visible. */
+@supports not (background-color: color-mix(in srgb, red 28%, transparent)) {
+  .ansi-bg-black, .ansi-bg-bright-black,
+  .ansi-bg-red, .ansi-bg-bright-red,
+  .ansi-bg-green, .ansi-bg-bright-green,
+  .ansi-bg-yellow, .ansi-bg-bright-yellow,
+  .ansi-bg-blue, .ansi-bg-bright-blue,
+  .ansi-bg-magenta, .ansi-bg-bright-magenta,
+  .ansi-bg-cyan, .ansi-bg-bright-cyan,
+  .ansi-bg-white, .ansi-bg-bright-white { background-color: var(--bg-alt); }
+}
+
+/* Indexed-cube / truecolor: ansi.js ships both theme variants on the span. */
+.ansi-fg-rgb { color: var(--ansi-rgb-pick); }
+.ansi-bg-rgb { background-color: var(--ansi-bg-c, transparent); }
+
+/* Inverse video (`ESC[7m`) where the producer set only one of the two
+ * colours: the missing half is the theme's own default, swapped. */
+.ansi-fg-inv { color: var(--bg); }
+.ansi-bg-inv { background-color: var(--fg); }
+
+.ansi-bold      { font-weight: 700; }
+.ansi-dim       { opacity: 0.65; }
+.ansi-italic    { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-strike    { text-decoration: line-through; }
+.ansi-underline.ansi-strike { text-decoration: underline line-through; }

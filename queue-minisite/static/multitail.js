@@ -157,6 +157,72 @@
 // itself is strictly better than a plausible fabrication.
 //
 // ---------------------------------------------------------------------------
+// VERBOSE (`v`) — STOP ELIDING
+// ---------------------------------------------------------------------------
+// A pane's whole value is density, so the default renderer elides hard: ONE
+// LINE PER EVENT. Verbose mode turns each of those elisions off. They were
+// worth inventorying, because "show attachments and Read output" is a request
+// about the two the reader happened to notice, and shipping only those two
+// leaves the next one to be reported as a bug:
+//
+//   first line only      a multi-line assistant message, thinking block, user
+//                        message, system record or tool RESULT was cut to its
+//                        first line. Verbose keeps the whole body and the pane
+//                        renders it with `pre-wrap`, so the line breaks show.
+//   one tool argument    a tool call showed the first interesting key's first
+//                        line (`command`, `file_path`, …). Verbose shows the
+//                        whole input, indented — a Bash command or an agent
+//                        prompt is the thing being read, and a JSON-escaped
+//                        `\n` inside a one-liner is not reading.
+//   `[N block(s)]`       a tool result whose content array had no text block,
+//                        or had one AFTER an image block, said nothing at all.
+//                        Verbose describes every block.
+//   `[image]`            verbose gives the count, media types and payload
+//   `[attachment]`       sizes; an attachment gives its path plus the rest of
+//                        its record. NO image is inlined even in verbose: a
+//                        pane is ten rows tall and a data URI is megabytes, so
+//                        what verbose owes the reader here is what it is and
+//                        how big. The single-item modal renders the image.
+//   per-line clip        400 chars, or 2000 wrapped, becomes
+//                        MAX_LINE_CHARS_VERBOSE.
+//
+// IT IS NOT UNBOUNDED, because a firehose is not a feature. Four live streams
+// can each produce hundreds of lines a minute, and the browser has to lay every
+// one of them out:
+//
+//   * MAX_LINE_CHARS_VERBOSE (4000) caps a single line at roughly a screenful
+//     of wrapped text — past that, reading has become searching, and the
+//     single-item modal is the place for the complete payload.
+//   * MAX_PANE_CHARS caps the TEXT one pane retains, evicting from the head
+//     like the line-count bound does. The count bound alone stops bounding
+//     memory the moment a line can be ten times its normal size.
+//
+// RETROACTIVE ONLY AS FAR AS THE RECORDS GO. Lines are stored clipped at the
+// verbose width, so switching verbose on immediately widens every retained line
+// that a narrower setting had cut. What it cannot recover is what the formatter
+// never kept: outside verbose mode a multi-line record is reduced to its first
+// line when it ARRIVES. So verbose shows full detail for the lines that arrive
+// after it, and the pill's title says as much. The alternative — retaining
+// every raw payload in every pane against a toggle that may never be pressed —
+// is a memory multiplier across four live streams, paid by everyone.
+//
+// ---------------------------------------------------------------------------
+// THE SETTINGS ARE REMEMBERED (localStorage)
+// ---------------------------------------------------------------------------
+// All four header settings — wrap, timestamps, verbose, ended-pane retention —
+// persist per viewer under one key each, through one guarded accessor pair.
+// A fresh viewer gets the pre-existing defaults (wrap off, timestamps off,
+// verbose off, clear 1m); a returning one gets what they left set, reflected
+// on the pills at load rather than after the mode is first opened.
+//
+// Reads are GUARDED AND VALIDATED, not trusted. localStorage throws outright in
+// some privacy modes, comes back empty after cleared site data or during a
+// thumbnail capture, and can hold anything at all — an older or newer build's
+// spelling, a hand edit. A value this build does not recognise yields the
+// default, so no persisted string can wedge the view, and with storage
+// unavailable the mode works exactly as it did before it remembered anything.
+//
+// ---------------------------------------------------------------------------
 // PER-PANE FOOTER BAR — WHOSE AGENT IS THIS, AND WHAT IS IT COSTING
 // ---------------------------------------------------------------------------
 // Each pane carries a footer strip under its stream: the model that is running
@@ -253,6 +319,7 @@
   const wrapBtn = document.getElementById('multitail-wrap');
   const tsBtn = document.getElementById('multitail-ts');
   const retainBtn = document.getElementById('multitail-retain');
+  const verboseBtn = document.getElementById('multitail-verbose');
 
   // Rows the server marked as having a tailable log, in render order.
   const ROW_SELECTOR = '.item[data-live-log-mode]';
@@ -281,6 +348,19 @@
   // bound — see the header comment.
   const MAX_LINE_CHARS = 400;
   const MAX_LINE_CHARS_WRAPPED = 2000;
+  // VERBOSE mode's per-line ceiling. Verbose exists to stop eliding, but "no
+  // limit" is not a limit: one 2MB tool result would be the pane, the tab's
+  // memory and a layout pass. 4000 visible characters is roughly a full screen
+  // of wrapped text, which is where reading stops and searching starts.
+  const MAX_LINE_CHARS_VERBOSE = 4000;
+  // Hard ceiling on the TEXT one pane retains, across however many lines that
+  // is. MAX_LINES_PER_PANE alone bounds the line COUNT, and in verbose mode a
+  // line can be ten times its normal size, so the count bound stops bounding
+  // memory. Lines are dropped from the head until the pane is back under
+  // budget — the same eviction the count bound uses, for the same reason.
+  // 400 lines x 2000 chars is the pre-verbose worst case; this keeps verbose
+  // panes inside it instead of multiplying it by four.
+  const MAX_PANE_CHARS = 800000;
   // Stream-retry backoff: attempt N waits BASE * 2^(N-1), capped at MAX.
   // 3s / 6s / 12s / 24s / 30s / 30s… — fast enough that a log appearing a
   // moment after the pane does is picked up while the operator is still
@@ -322,13 +402,14 @@
   // this same key — test_multitail.py pins the two together.
   const DEFAULT_RETENTION_KEY = '1m';
   const RETENTION_STORAGE_KEY = 'qsite_mt_retain';
+  // The display toggles persist the same way the retention value does — one
+  // localStorage key each, read through the same guarded accessors below.
+  const WRAP_STORAGE_KEY = 'qsite_mt_wrap';
+  const TS_STORAGE_KEY = 'qsite_mt_ts';
+  const VERBOSE_STORAGE_KEY = 'qsite_mt_verbose';
 
   let open = false;
   let reconcileTimer = null;
-  // Display preferences. Module-level, so they survive closing and reopening
-  // the mode within a page load, and reset on reload like the mode itself.
-  let wrapOn = false;
-  let tsOn = false;
   // qid -> pane record. Insertion order is the order panes were added, which
   // is the order they get stream slots.
   const panes = new Map();
@@ -345,28 +426,66 @@
 
   // --- ended-pane retention ------------------------------------------------
 
-  // Persisted per viewer. Every access is guarded: storage throws in some
-  // privacy modes, and an unrecognised value (an older/newer build's key, hand
-  // editing) means the default rather than an unhandled state.
-  function readStoredRetention() {
+  // --- persisted display preferences ---------------------------------------
+  //
+  // Every setting in this mode's header is remembered per viewer: the
+  // retention value and the three toggles all go through these two accessors.
+  //
+  // EVERY ACCESS IS GUARDED, AND EVERY READ IS VALIDATED. localStorage throws
+  // outright in some privacy modes, comes back empty after cleared site data
+  // or during a thumbnail capture, and can hold anything at all — an older or
+  // newer build's spelling, a hand edit. So a read that does not produce a
+  // value this build recognises yields the DEFAULT rather than being trusted:
+  // a persisted string must never be able to wedge the view. The mode renders
+  // correctly with storage entirely unavailable; the choice then simply
+  // applies to the current page.
+  function readStored(key) {
     try {
-      const v = window.localStorage.getItem(RETENTION_STORAGE_KEY);
-      if (v && RETENTION_BY_KEY[v]) return v;
+      return window.localStorage.getItem(key);
     } catch (_) {
-      /* storage unavailable — the default applies for this page */
+      return null;  // storage unavailable — caller's default applies
     }
-    return DEFAULT_RETENTION_KEY;
   }
 
-  function storeRetention(key) {
+  function writeStored(key, value) {
     try {
-      window.localStorage.setItem(RETENTION_STORAGE_KEY, key);
+      window.localStorage.setItem(key, value);
     } catch (_) {
       /* storage unavailable — the choice still applies to this page */
     }
   }
 
+  // Flags are stored as '1' / '0'. Anything else — absent, '', 'true', an
+  // older build's spelling — is the default, never a coerced truthy string.
+  function readStoredFlag(key, dflt) {
+    const v = readStored(key);
+    if (v === '1') return true;
+    if (v === '0') return false;
+    return dflt;
+  }
+
+  function storeFlag(key, on) {
+    writeStored(key, on ? '1' : '0');
+  }
+
+  function readStoredRetention() {
+    const v = readStored(RETENTION_STORAGE_KEY);
+    return (v && RETENTION_BY_KEY[v]) ? v : DEFAULT_RETENTION_KEY;
+  }
+
+  function storeRetention(key) {
+    writeStored(RETENTION_STORAGE_KEY, key);
+  }
+
   let retentionKey = readStoredRetention();
+  // The three display toggles. A FRESH viewer gets the old defaults — wrap
+  // off, timestamps off, verbose off — because off is the behaviour that
+  // existed before each of them did; a returning viewer gets what they left
+  // set. They are read here, before any pane exists, so the first paint is
+  // already in the remembered state.
+  let wrapOn = readStoredFlag(WRAP_STORAGE_KEY, false);
+  let tsOn = readStoredFlag(TS_STORAGE_KEY, false);
+  let verboseOn = readStoredFlag(VERBOSE_STORAGE_KEY, false);
 
   function retentionOption() {
     return RETENTION_BY_KEY[retentionKey] || RETENTION_BY_KEY[DEFAULT_RETENTION_KEY];
@@ -437,6 +556,49 @@
     return node;
   }
 
+  // --- terminal escape sequences (static/ansi.js) --------------------------
+  //
+  // Pane text arrives with the producer's ANSI sequences intact, and most of
+  // what gets tailed here is colourised CLI output (docker compose, cargo,
+  // pytest, ffmpeg). Rendered as plain text those sequences read as literal
+  // `[32m` garbage. ansi.js converts them to themed spans — and it does it
+  // WITHOUT innerHTML: `toFragment` builds text nodes and spans whose classes
+  // come from the module's own tables, so this module's no-innerHTML
+  // invariant is intact and a line containing `<script>` stays inert text.
+  //
+  // `limit` is a budget in VISIBLE characters, so a colourised line is not
+  // clipped to a couple of words by its own markup.
+  function setLineText(node, text, limit) {
+    const A = window.AnsiText;
+    if (A && typeof A.toFragment === 'function') {
+      const frag = A.toFragment(text, limit ? { limit: limit } : undefined);
+      if (frag) {
+        node.appendChild(frag);
+        return node;
+      }
+    }
+    // ansi.js absent: the pre-existing behaviour, escapes and all. Ugly beats
+    // blank.
+    node.textContent = clip(text, limit);
+    return node;
+  }
+
+  // Bound a line for STORAGE. Same job as clip(), counting visible characters
+  // and keeping the escape sequences whole — a sequence cut in half by the
+  // storage bound would render as visible garbage at every later width.
+  function clipStore(text, limit) {
+    const A = window.AnsiText;
+    if (A && typeof A.clip === 'function') return A.clip(text, limit);
+    return clip(text, limit);
+  }
+
+  // The per-line ceiling under the CURRENT display settings. Verbose wins over
+  // wrap: it is the setting that says "stop eliding".
+  function lineCharLimit() {
+    if (verboseOn) return MAX_LINE_CHARS_VERBOSE;
+    return wrapOn ? MAX_LINE_CHARS_WRAPPED : MAX_LINE_CHARS;
+  }
+
   function clip(str, max) {
     const s = String(str === undefined || str === null ? '' : str);
     const lim = max || MAX_LINE_CHARS;
@@ -450,7 +612,10 @@
   }
 
   function nearBottomSlackPx() {
-    return wrapOn ? NEAR_BOTTOM_PX_WRAPPED : NEAR_BOTTOM_PX;
+    // Verbose takes the wider slack for the same reason wrap does: one record
+    // can now be many visual rows tall, and a reader sitting one row off the
+    // bottom of a tall record would never re-arm auto-scroll.
+    return (wrapOn || verboseOn) ? NEAR_BOTTOM_PX_WRAPPED : NEAR_BOTTOM_PX;
   }
 
   // Render an ISO8601 UTC source timestamp as a local wall-clock time, the
@@ -492,8 +657,30 @@
     'description', 'prompt', 'notebook_path', 'skill',
   ];
 
+  // The record's text, reduced to its first line — or kept whole in verbose
+  // mode, where the pane renders it with `pre-wrap` so the line breaks show.
+  // EVERY elision in this formatter goes through this function or through
+  // `toolArgPreview` / the two block formatters below, which is what makes
+  // "show everything" a single switch rather than a per-case audit.
+  function bodyText(str) {
+    const s = String(str === undefined || str === null ? '' : str);
+    return verboseOn ? s : firstLine(s);
+  }
+
   function toolArgPreview(input) {
     if (!input || typeof input !== 'object') return '';
+    if (verboseOn) {
+      // Verbose: the WHOLE input, indented, rather than one interesting key's
+      // first line. Indented (not compact) on purpose — a Bash command or an
+      // agent prompt is the thing being read, and JSON-escaped `\n` inside a
+      // one-liner is not reading.
+      try {
+        const j = JSON.stringify(input, null, 2);
+        if (j && j !== '{}') return j;
+      } catch (_) {
+        /* circular / unserialisable — fall through to the preview below */
+      }
+    }
     for (const k of TOOL_ARG_KEYS) {
       const v = input[k];
       if (typeof v === 'string' && v.trim()) return firstLine(v.trim());
@@ -523,6 +710,20 @@
     const c = block && block.content;
     if (typeof c === 'string') return c;
     if (Array.isArray(c)) {
+      if (verboseOn) {
+        // Verbose: every block, not the first text one — a result whose text
+        // block is preceded by an image block is exactly the case where
+        // `[2 block(s)]` hides the answer.
+        const parts = [];
+        for (const part of c) {
+          if (part && part.type === 'text' && typeof part.text === 'string') {
+            parts.push(part.text);
+          } else {
+            parts.push(describeBlock(part));
+          }
+        }
+        if (parts.length) return parts.join('\n');
+      }
       for (const part of c) {
         if (part && part.type === 'text' && typeof part.text === 'string') {
           return part.text;
@@ -531,6 +732,27 @@
       return '[' + c.length + ' block(s)]';
     }
     return '';
+  }
+
+  // A non-text content block, described rather than summarised away. Binary
+  // payloads (an image's base64) are reported by TYPE AND SIZE and never
+  // inlined: a pane is 10 rows tall and a data URI is megabytes, so the thing
+  // verbose mode owes the reader here is what it is and how big, not a
+  // thumbnail. The single-item log modal is where an image renders.
+  function describeBlock(part) {
+    if (!part || typeof part !== 'object') return String(part);
+    const src = part.source || {};
+    if (part.type === 'image' || src.media_type) {
+      const mt = src.media_type || 'image/?';
+      const size = typeof src.data === 'string'
+        ? ' ' + src.data.length + ' base64 chars' : '';
+      return '[' + mt + ' ' + (src.type || 'unknown') + size + ']';
+    }
+    try {
+      return JSON.stringify(part);
+    } catch (_) {
+      return '[' + (part.type || 'block') + ']';
+    }
   }
 
   function joinedText(rec) {
@@ -568,7 +790,7 @@
     if (!payload || typeof payload !== 'object') return null;
 
     if (payload.type === 'raw') {
-      return { sigil: '', text: firstLine(payload.line || ''), cls: 'mt-raw', ts: '' };
+      return { sigil: '', text: bodyText(payload.line || ''), cls: 'mt-raw', ts: '' };
     }
     if (payload.kind === 'workload_line') {
       // Plain-text tail (workload / hostjob / archived output): verbatim. A
@@ -597,7 +819,7 @@
       }
       case 'tool_result': {
         const tr = blockOfType(rec, 'tool_result') || {};
-        const body = firstLine(textOfToolResult(tr)).trim();
+        const body = bodyText(textOfToolResult(tr)).trim();
         return {
           sigil: '←',
           text: body || '(empty result)',
@@ -606,24 +828,53 @@
         };
       }
       case 'assistant_text':
-        return { sigil: '·', text: firstLine(joinedText(rec)).trim(), cls: 'mt-text', ts: ts };
+        return { sigil: '·', text: bodyText(joinedText(rec)).trim(), cls: 'mt-text', ts: ts };
       case 'thinking':
-        return { sigil: '~', text: firstLine(joinedText(rec)).trim(), cls: 'mt-think', ts: ts };
+        return { sigil: '~', text: bodyText(joinedText(rec)).trim(), cls: 'mt-think', ts: ts };
       case 'user':
-        return { sigil: '»', text: firstLine(joinedText(rec)).trim(), cls: 'mt-user', ts: ts };
+        return { sigil: '»', text: bodyText(joinedText(rec)).trim(), cls: 'mt-user', ts: ts };
       case 'user_image':
-        return { sigil: '»', text: '[image]', cls: 'mt-user', ts: ts };
+        return { sigil: '»', text: imageText(rec), cls: 'mt-user', ts: ts };
       case 'attachment':
-        return { sigil: '»', text: '[attachment]', cls: 'mt-user', ts: ts };
+        return { sigil: '»', text: attachmentText(rec), cls: 'mt-user', ts: ts };
       case 'system':
-        return { sigil: '·', text: firstLine(rec.content || rec.subtype || 'system'), cls: 'mt-sys', ts: ts };
+        return { sigil: '·', text: bodyText(rec.content || rec.subtype || 'system'), cls: 'mt-sys', ts: ts };
       case 'progress':
-        return { sigil: '·', text: firstLine(rec.message || 'progress'), cls: 'mt-sys', ts: ts };
+        return { sigil: '·', text: bodyText(rec.message || 'progress'), cls: 'mt-sys', ts: ts };
       default:
         // An unrecognised record is still evidence the agent is alive, so it
         // gets a line rather than being swallowed.
         return { sigil: '·', text: String(payload.kind || 'event'), cls: 'mt-sys', ts: ts };
     }
+  }
+
+  // `[image]` normally, and in verbose mode the count, media types and
+  // payload sizes — the two cases Andrew named when asking for verbose
+  // (attachments and Read output) are these two functions.
+  function imageText(rec) {
+    const blocks = contentBlocks(rec).filter((b) => b && b.type === 'image');
+    if (!verboseOn || !blocks.length) {
+      return blocks.length > 1 ? '[' + blocks.length + ' images]' : '[image]';
+    }
+    return '[' + blocks.length + (blocks.length === 1 ? ' image] ' : ' images] ') +
+      blocks.map(describeBlock).join(' ');
+  }
+
+  // An attachment's PATH is the useful field, so verbose leads with it and
+  // appends the rest of the record for the fields the path does not carry.
+  function attachmentText(rec) {
+    const a = (rec && rec.attachment) || {};
+    const path = a.path || a.file_path || a.filename || '';
+    if (!verboseOn) return path ? '[attachment] ' + path : '[attachment]';
+    let json = '';
+    try {
+      json = JSON.stringify(a, null, 2);
+    } catch (_) {
+      json = '';
+    }
+    const head = '[attachment ' + (a.type || 'attachment') + ']' +
+      (path ? ' ' + path : '');
+    return json && json !== '{}' ? head + '\n' + json : head;
   }
 
   // --- pane construction ---------------------------------------------------
@@ -765,6 +1016,10 @@
       // toggling wrap / timestamps can re-render lines that have already
       // scrolled past (or a pane whose job has ended and will emit no more).
       records: [],
+      // Total characters across `records`. Maintained incrementally so the
+      // pane's memory bound costs an addition per line rather than a walk of
+      // the whole buffer per line.
+      chars: 0,
       // Set while the server is replaying its historical backfill on a
       // RECONNECT. Plain-text tails carry no resume cursor, so without this a
       // quiet workload re-prints its last 200 lines every time the server's
@@ -823,8 +1078,7 @@
       }
     }
     if (rec.sigil) row.appendChild(el('span', 'mt-sigil', rec.sigil));
-    const limit = wrapOn ? MAX_LINE_CHARS_WRAPPED : MAX_LINE_CHARS;
-    row.appendChild(el('span', 'mt-body', clip(rec.text, limit)));
+    row.appendChild(setLineText(el('span', 'mt-body'), rec.text, lineCharLimit()));
     return row;
   }
 
@@ -837,9 +1091,19 @@
     if (!fmt.text && !fmt.sigil) return false;
     const rec = {
       sigil: fmt.sigil || '',
-      // Stored bounded, not clipped to the unwrapped width: the wrap toggle
-      // has to be able to show more of this line later.
-      text: clip(fmt.text, MAX_LINE_CHARS_WRAPPED),
+      // Stored bounded, not clipped to the current width: the wrap and verbose
+      // toggles have to be able to show MORE of this line later, so the
+      // storage bound is the widest any setting can ask for. The bound counts
+      // VISIBLE characters, so a heavily-coloured line is not thrown away as
+      // if its escape sequences were text.
+      //
+      // What a later toggle CANNOT recover is what the formatter never kept:
+      // outside verbose mode a multi-line record is reduced to its first line
+      // when it ARRIVES, so switching verbose on shows full detail for the
+      // lines that arrive after it, not retroactively. Retaining every raw
+      // payload against a toggle that may never be pressed is a memory
+      // multiplier on four live streams; the pill's title says so.
+      text: clipStore(fmt.text, MAX_LINE_CHARS_VERBOSE),
       cls: fmt.cls || '',
       ts: fmt.ts || '',
     };
@@ -851,8 +1115,17 @@
       syncPaneTsMarker(pane);
     }
     pane.streamEl.appendChild(renderRecord(rec));
-    while (pane.records.length > MAX_LINES_PER_PANE) {
-      pane.records.shift();
+    pane.chars = (pane.chars || 0) + rec.text.length;
+    // TWO bounds, both evicting from the head: the line COUNT (a tail is a
+    // window on the recent past) and the pane's total TEXT (a verbose line can
+    // be ten times a normal one, so the count bound alone stops bounding
+    // memory). Neither is allowed to empty the pane — the newest line always
+    // survives, or a single oversized record would leave a blank tail.
+    while (pane.records.length > 1 &&
+           (pane.records.length > MAX_LINES_PER_PANE ||
+            pane.chars > MAX_PANE_CHARS)) {
+      const dropped = pane.records.shift();
+      pane.chars -= (dropped && dropped.text ? dropped.text.length : 0);
       if (pane.streamEl.firstChild) {
         pane.streamEl.removeChild(pane.streamEl.firstChild);
       }
@@ -1241,8 +1514,12 @@
   function syncDisplayButtons() {
     if (wrapBtn) wrapBtn.setAttribute('aria-pressed', wrapOn ? 'true' : 'false');
     if (tsBtn) tsBtn.setAttribute('aria-pressed', tsOn ? 'true' : 'false');
+    if (verboseBtn) {
+      verboseBtn.setAttribute('aria-pressed', verboseOn ? 'true' : 'false');
+    }
     overlay.classList.toggle('mt-wrap', wrapOn);
     overlay.classList.toggle('mt-show-ts', tsOn);
+    overlay.classList.toggle('mt-verbose', verboseOn);
     syncRetainButton();
   }
 
@@ -1295,6 +1572,7 @@
     const next = !!on;
     if (next === wrapOn) return;
     wrapOn = next;
+    storeFlag(WRAP_STORAGE_KEY, wrapOn);
     syncDisplayButtons();
     rerenderAllPanes();
   }
@@ -1303,12 +1581,28 @@
     const next = !!on;
     if (next === tsOn) return;
     tsOn = next;
+    storeFlag(TS_STORAGE_KEY, tsOn);
+    syncDisplayButtons();
+    rerenderAllPanes();
+  }
+
+  // VERBOSE. Retroactive for what the records still hold — the stored text is
+  // bounded at the verbose width, so turning it on immediately widens every
+  // retained line that was clipped by the narrower one — and fully in effect
+  // for every line that arrives after, which is where the un-elided
+  // multi-line bodies, tool arguments and attachment records come from.
+  function setVerbose(on) {
+    const next = !!on;
+    if (next === verboseOn) return;
+    verboseOn = next;
+    storeFlag(VERBOSE_STORAGE_KEY, verboseOn);
     syncDisplayButtons();
     rerenderAllPanes();
   }
 
   function toggleWrap() { setWrap(!wrapOn); }
   function toggleTimestamps() { setTimestamps(!tsOn); }
+  function toggleVerbose() { setVerbose(!verboseOn); }
 
   function openMode() {
     if (open) return;
@@ -1366,10 +1660,14 @@
   if (retainBtn) {
     retainBtn.addEventListener('click', (ev) => { ev.preventDefault(); cycleRetention(); });
   }
-  // The pill is server-rendered with the DEFAULT label, so a stored choice has
-  // to be reflected before the mode is ever opened. The overlay is hidden until
-  // then, so there is nothing to flash.
-  syncRetainButton();
+  if (verboseBtn) {
+    verboseBtn.addEventListener('click', (ev) => { ev.preventDefault(); toggleVerbose(); });
+  }
+  // Every pill is server-rendered in its DEFAULT state, so a stored choice has
+  // to be reflected before the mode is ever opened — otherwise the header says
+  // `wrap` is off while the panes wrap. The overlay is hidden until then, so
+  // there is nothing to flash.
+  syncDisplayButtons();
 
   // Delegated toggle click: #topbar-meta is rebuilt by refresh.js every tick,
   // so a listener bound to the button itself would die on the first merge
@@ -1428,6 +1726,15 @@
       toggleTimestamps();
       return;
     }
+    // `v` is verbose. Mode-local like the others, and free on this site
+    // (nothing binds a bare v); Ctrl/Cmd+V is returned above untouched, so
+    // paste still works.
+    if (ev.key === 'v' || ev.key === 'V') {
+      if (!open || otherDialogOpen()) return;
+      ev.preventDefault();
+      toggleVerbose();
+      return;
+    }
     // `c` cycles the ended-pane retention. Also mode-local, also a free key
     // (nothing on the site binds it), and Ctrl/Cmd+C is returned above
     // untouched so copying selected log text still works.
@@ -1466,10 +1773,14 @@
     isOpen: () => open,
     setWrap,
     setTimestamps,
+    setVerbose,
     toggleWrap,
     toggleTimestamps,
+    toggleVerbose,
     isWrap: () => wrapOn,
     isTimestamps: () => tsOn,
+    isVerbose: () => verboseOn,
+    lineCharLimit,
     setRetention,
     cycleRetention,
     sweepEndedPanes,
@@ -1478,6 +1789,9 @@
     RETENTION_OPTIONS,
     DEFAULT_RETENTION_KEY,
     RETENTION_STORAGE_KEY,
+    WRAP_STORAGE_KEY,
+    TS_STORAGE_KEY,
+    VERBOSE_STORAGE_KEY,
     retryDelayMs,
     wantsSlot,
     paneHasSourceTimestamps,
@@ -1485,6 +1799,8 @@
     MAX_LINES_PER_PANE,
     MAX_LINE_CHARS,
     MAX_LINE_CHARS_WRAPPED,
+    MAX_LINE_CHARS_VERBOSE,
+    MAX_PANE_CHARS,
     NEAR_BOTTOM_PX,
     NEAR_BOTTOM_PX_WRAPPED,
     RECONCILE_MS,

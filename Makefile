@@ -198,6 +198,22 @@ test-queue-minisite: ## queue-minisite Flask end-to-end suites
 			uv run --python 3.12 --with flask==3.0.3 python "$$f"; \
 	done
 
+# Tests for queue-minisite/static/ansi.js — the converter BOTH log views render
+# line text through, turning a producer's terminal escape sequences into themed
+# markup. Pure string work with no DOM, so unlike the jsdom suites next to it
+# this one runs on plain node with no dependency to install, which is why it is
+# the half of the ANSI behaviour CI can actually execute: the escaping
+# guarantee (a log line containing markup stays inert AND visible), SGR
+# coverage, the non-SGR sequences that are dropped rather than printed,
+# carriage-return progress collapsing, visible-character clipping, and the real
+# `docker compose` output shape from a live workload log. The DOM half
+# (`toFragment` inside a pane) is asserted in static/multitail.test.js, and the
+# wiring — module served, loaded first, both views calling it, palette defined
+# in both themes — in queue-minisite/test_multitail.py, which `make
+# test-queue-minisite` above runs.
+test-minisite-ansi: ## queue-minisite ANSI escape-sequence renderer tests
+	node queue-minisite/static/ansi.test.js
+
 # Run the obligations / hooks Python tests. These are self-contained
 # scripts (not pytest), so we just exec them directly. Each runs against
 # an isolated $HOME tmpdir so the live obligations.json is never touched.

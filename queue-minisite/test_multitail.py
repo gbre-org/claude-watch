@@ -592,17 +592,26 @@ class MultitailTest(unittest.TestCase):
         """
         src = (HERE / "static" / "multitail.js").read_text()
         self.assertIn("RETENTION_STORAGE_KEY = 'qsite_mt_retain'", src)
+        # The try/catch lives in the SHARED accessors every persisted setting
+        # goes through (the display toggles were added to that same pair rather
+        # than growing a second mechanism), so that is where it is asserted.
+        for name in ("readStored", "writeStored"):
+            fn = re.search(
+                r"function " + name + r"\([^)]*\) \{(.*?)\n  \}", src, re.S
+            )
+            self.assertIsNotNone(fn, f"{name} not declared")
+            self.assertIn("try {", fn.group(1), name)
+            self.assertIn("catch", fn.group(1), name)
         reader = re.search(
             r"function readStoredRetention\(\) \{(.*?)\n  \}", src, re.S
         )
         self.assertIsNotNone(reader, "readStoredRetention not declared")
-        self.assertIn("try {", reader.group(1))
-        self.assertIn("catch", reader.group(1))
+        self.assertIn("readStored(", reader.group(1))
         # An unknown stored value must not become live state.
         self.assertIn("RETENTION_BY_KEY[v]", reader.group(1))
         writer = re.search(r"function storeRetention\(key\) \{(.*?)\n  \}", src, re.S)
         self.assertIsNotNone(writer, "storeRetention not declared")
-        self.assertIn("try {", writer.group(1))
+        self.assertIn("writeStored(", writer.group(1))
         # Same `qsite_` prefix as the density / header-collapse preferences, so
         # one origin's keys stay identifiable.
         self.assertIn("qsite_", src)
@@ -879,6 +888,136 @@ class MultitailTest(unittest.TestCase):
         self.assertIn("source_ts", ll)
         # Neither may fall back to arrival time for a source with no stamp.
         self.assertNotIn("Date.now()", mt.split("function sourceTs")[1][:400])
+
+    # -- ANSI / SGR rendering in log lines ---------------------------------
+    #
+    # Terminal colour sequences in tailed output used to render as literal
+    # `[32m` text. static/ansi.js converts them; the conversion itself is
+    # pinned by static/ansi.test.js (plain node, run by `make
+    # test-minisite-ansi`). What belongs HERE is the wiring CI would otherwise
+    # never check: the module is SERVED, it loads before the two views that
+    # call it, both views actually call it, and the palette it emits classes
+    # for exists in BOTH themes.
+
+    def test_ansi_module_is_served_and_loaded_first(self):
+        self._seed_mixed()
+        html = self._html()
+        self.assertIn("ansi.js", html)
+        resp = self.client.get("/static/ansi.js")
+        self.assertEqual(resp.status_code, 200)
+        # `defer` scripts run in document order, and both log views call
+        # window.AnsiText while rendering a line, so ansi.js has to be declared
+        # ahead of them or the first paint takes the fallback path.
+        pos_ansi = html.index("ansi.js")
+        self.assertLess(pos_ansi, html.index("live-log.js"))
+        self.assertLess(pos_ansi, html.index("multitail.js"))
+
+    def test_both_log_views_render_through_the_converter(self):
+        """One converter, both views — not two half-implementations."""
+        for name in ("live-log.js", "multitail.js"):
+            src = (HERE / "static" / name).read_text()
+            self.assertIn("window.AnsiText", src, name)
+        # The multitail pane path must use the DOM-node renderer, because that
+        # module's standing invariant is that it never assigns innerHTML.
+        mt = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("toFragment", mt)
+        self.assertNotRegex(mt, r"\.innerHTML\s*=")
+
+    def test_ansi_palette_is_defined_for_both_themes(self):
+        """A terminal palette picked for a dark background is unreadable light.
+
+        So ansi.js emits CLASSES, never raw ANSI RGB, and every base colour is
+        defined twice — once in `:root` and once under the dark
+        `prefers-color-scheme` block. A colour defined only once is a colour
+        that is wrong in one of the two themes.
+        """
+        css = (HERE / "static" / "style.css").read_text()
+        dark_blocks = re.findall(
+            r"@media \(prefers-color-scheme: dark\)\s*\{(.*?)\n\}", css, re.S
+        )
+        dark = "\n".join(dark_blocks)
+        for colour in (
+            "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+        ):
+            for var in (f"--ansi-{colour}", f"--ansi-bright-{colour}"):
+                self.assertIn(f"{var}:", css, var)
+                self.assertIn(f"{var}:", dark, f"{var} has no dark-theme value")
+                # And a class that consumes it, or the variable is decoration.
+                self.assertIn(f"var({var})", css, f"{var} is never used")
+        # Indexed-cube / truecolor values have no table: the module computes a
+        # light and a dark variant per colour and the stylesheet picks one.
+        self.assertIn("--ansi-rgb-pick", css)
+        self.assertIn(".ansi-fg-rgb", css)
+        # Attributes, not just colours.
+        for cls in (".ansi-bold", ".ansi-dim", ".ansi-italic",
+                    ".ansi-underline", ".ansi-strike"):
+            self.assertIn(cls, css, cls)
+
+    # -- verbose mode + persisted settings ---------------------------------
+
+    def test_verbose_control_rendered(self):
+        """The `all` pill and its key hint are served, defaulting to OFF.
+
+        Off is the behaviour that existed before the toggle, and the pill lives
+        inside the ``data-no-morph`` overlay like `wrap` / `time` / `clear`, so
+        it is rendered once and survives the 5s tick.
+        """
+        self._seed_mixed()
+        html = self._html()
+        overlay = re.search(r'<section\s+id="multitail".*?</section>', html, re.S)
+        self.assertIsNotNone(overlay)
+        self.assertIn('id="multitail-verbose"', overlay.group(0))
+        btn = re.search(r'<button[^>]*id="multitail-verbose".*?>', html, re.S)
+        self.assertIsNotNone(btn, "verbose pill not rendered")
+        self.assertIn('aria-pressed="false"', btn.group(0))
+        # Discoverable without reading the source.
+        self.assertIn("<kbd>v</kbd>", html)
+
+    def test_verbose_has_a_ceiling(self):
+        """Verbose stops eliding; it does not remove the bounds.
+
+        Four live streams at full tilt is the shape of this mode, so the module
+        must still cap a single line AND the text one pane retains — a line
+        budget alone stops bounding memory once one line can be ten times its
+        normal size.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        for name in ("MAX_LINE_CHARS_VERBOSE", "MAX_PANE_CHARS"):
+            m = re.search(rf"const {name} = (\d+);", src)
+            self.assertIsNotNone(m, f"{name} not declared")
+            self.assertGreater(int(m.group(1)), 0)
+        verbose_cap = int(re.search(r"const MAX_LINE_CHARS_VERBOSE = (\d+);", src).group(1))
+        wrapped_cap = int(re.search(r"const MAX_LINE_CHARS_WRAPPED = (\d+);", src).group(1))
+        self.assertGreater(verbose_cap, wrapped_cap)
+        # A ceiling low enough to still be a ceiling.
+        self.assertLessEqual(verbose_cap, 20000)
+        # The stylesheet half: verbose renders multi-line bodies, so it has to
+        # wrap and honour newlines whether or not `w` is on.
+        css = (HERE / "static" / "style.css").read_text()
+        self.assertIn(".multitail.mt-verbose .mt-line", css)
+
+    def test_every_header_setting_is_persisted_under_its_own_key(self):
+        """Wrap / time / verbose persist the way retention already did.
+
+        One key each, all four distinct, all read through the same guarded
+        accessor — a second storage mechanism for the same kind of setting is
+        how two of them end up disagreeing about what "unavailable" means.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        keys = {}
+        for name in ("RETENTION", "WRAP", "TS", "VERBOSE"):
+            m = re.search(rf"const {name}_STORAGE_KEY = '([^']+)';", src)
+            self.assertIsNotNone(m, f"{name}_STORAGE_KEY not declared")
+            keys[name] = m.group(1)
+        self.assertEqual(len(set(keys.values())), 4, keys)
+        # The retention key is LOAD-BEARING for viewers who already have a
+        # stored choice; renaming it silently resets everyone.
+        self.assertEqual(keys["RETENTION"], "qsite_mt_retain")
+        # Reads go through the guarded accessors, not a bare getItem.
+        self.assertIn("function readStored(", src)
+        self.assertIn("function readStoredFlag(", src)
+        self.assertEqual(src.count("window.localStorage.getItem"), 1)
+        self.assertEqual(src.count("window.localStorage.setItem"), 1)
 
     # -- "the log does not exist YET" -------------------------------------
 
