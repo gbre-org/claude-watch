@@ -2875,10 +2875,30 @@ body.multitail-open { overflow: hidden; }
 /* Phones: the header hint costs a line it cannot afford, and the floor drops
    so three tails still fit above the fold. */
 @media (max-width: 560px) {
-  :root { --mt-pane-min: 122px; }
+  :root { --mt-pane-min: 136px; }
   .multitail-hint { display: none; }
   .multitail-exit { margin-left: auto; }
-  .mt-pane-summary { display: none; }
+  /* THE PANE TITLE STAYS VISIBLE AT EVERY WIDTH (botchat #4974-era report:
+     "why aren't task titles visible in multitail anymore").
+     It used to be `display: none` here, which is the only rule in the
+     stylesheet that can hide a pane's title — so on a phone a stack of panes
+     was identified by queue id alone, and "which of these is the promote
+     job?" had no answer on the screen.
+     Rather than compete for the header's one line against the badge, the id,
+     the status and the close button — where the title would have been left
+     with a couple of ellipsised characters — the header WRAPS and the title
+     takes the second line to itself. --mt-pane-min grows by that line's
+     height so the cost comes out of the window budget (one fewer pane before
+     the stack scrolls), never out of the log rows the pane exists to show. */
+  .mt-pane-head { flex-wrap: wrap; }
+  /* `order` puts the title LAST in the flex line so the wrap happens after the
+     status and the close button. Giving it a 100% basis without reordering
+     would push those two onto a third line. */
+  .mt-pane-summary { order: 1; flex: 1 0 100%; font-size: 0.66rem; }
+  /* With the title on its own line the first line no longer has a flexible
+     item, so the close button needs the gap pushed to its left to stay at the
+     edge it is tapped from. */
+  .mt-pane-close { margin-left: auto; }
   /* Four pills plus the title is already tight at this width; the retention
      label can shrink to its text rather than hold a stable width. */
   .multitail-retain { min-width: 0; }

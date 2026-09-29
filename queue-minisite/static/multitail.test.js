@@ -480,6 +480,31 @@ console.log('\n-- compact formatter');
   mt.closeMode();
 }
 
+// THE PANE TITLE. A pane header is `badge · queue id · task title · status ·
+// close`, and the title is the only thing on screen that says WHICH tail this
+// is — in this whole-window mode the cards that carry it are not visible. It
+// went missing on phones through a stylesheet rule (the guard for that lives in
+// test_multitail.py, which CI runs); this is the renderer half: the element is
+// built, it carries the row's summary, and a changed summary is picked up on
+// the next reconcile without disturbing the stream.
+{
+  mt.openMode();
+  const head = paneFor('q-a').querySelector('.mt-pane-head');
+  const title = head.querySelector('.mt-pane-summary');
+  assert('the pane header carries a title element', !!title);
+  assert('and it holds the row\'s task summary',
+    title && title.textContent === 'agent one',
+    title && JSON.stringify(title.textContent));
+  // The queue record is editable, so the title has to track it.
+  document.querySelector('[data-queue-id="q-a"]').setAttribute('data-queue-summary', 'renamed task');
+  mt.reconcile();
+  assert('a renamed task updates the pane title in place',
+    paneFor('q-a').querySelector('.mt-pane-summary').textContent === 'renamed task');
+  document.querySelector('[data-queue-id="q-a"]').setAttribute('data-queue-summary', 'agent one');
+  mt.reconcile();
+  mt.closeMode();
+}
+
 // Transcript prose is untrusted: it must never reach the DOM as markup.
 {
   mt.openMode();

@@ -427,6 +427,70 @@ class MultitailTest(unittest.TestCase):
         self.assertIn(".multitail-retain", css)
         self.assertIn('.multitail-retain[data-retention="keep"]', css)
 
+    # -- pane title (the task summary) -------------------------------------
+    #
+    # A pane's header is `badge · queue id · TASK TITLE · status · close`. The
+    # title is the only thing on screen that answers "which of these tails is
+    # the promote job" — the queue id does not, and in this whole-window mode
+    # the cards that carry the title are not visible. It went missing on
+    # phones (botchat: "why aren't task titles visible in multitail anymore"),
+    # and nothing caught it, because it disappeared through a STYLESHEET rule
+    # rather than through the renderer. Hence two guards: the data has to be on
+    # the row, and no rule may hide the element the renderer puts it in.
+
+    def test_eligible_row_carries_the_task_title(self):
+        """The pane title's SOURCE: `data-queue-summary` on the tailable row.
+
+        multitail.js reads the title straight off the row (``rowInfo``), so an
+        eligible row without this attribute is a pane with no title no matter
+        what the stylesheet says.
+        """
+        self._seed_mixed()
+        html = self._html()
+        rows = [
+            m.group(0)
+            for m in re.finditer(r"<article\b[^>]*>", html)
+            if "data-live-log-mode" in m.group(0)
+        ]
+        self.assertTrue(rows, "no multitail-eligible row rendered")
+        for row in rows:
+            m = re.search(r'data-queue-summary="([^"]*)"', row)
+            self.assertIsNotNone(m, f"eligible row has no title attribute: {row}")
+            self.assertNotEqual(m.group(1).strip(), "", f"empty title on: {row}")
+
+    def test_refresh_js_keeps_the_title_on_the_rebuilt_row(self):
+        """The 5s tick rebuilds the row, so it has to re-emit the title too.
+
+        An attribute present only in the Jinja paint survives the first paint
+        and then vanishes — the standing failure mode in this file.
+        """
+        src = (HERE / "static" / "refresh.js").read_text()
+        self.assertIn("data-queue-summary", src)
+
+    def test_no_rule_hides_the_pane_title(self):
+        """THE REGRESSION GUARD: nothing may `display: none` the pane title.
+
+        The phone breakpoint used to carry ``.mt-pane-summary { display: none;
+        }``, which is why a stack of panes on a phone was identified by queue
+        id alone. The title now wraps onto its own line at that width instead
+        (``order`` + a 100% flex basis, so the status and close button are not
+        pushed onto a third line). This asserts the absence, because the
+        element is rendered either way and only CSS decides whether a human
+        can see it.
+        """
+        css = (HERE / "static" / "style.css").read_text()
+        # The declaration itself, in any spacing.
+        self.assertIsNone(
+            re.search(r"\.mt-pane-summary[^{}]*\{[^}]*display:\s*none", css),
+            ".mt-pane-summary is hidden by a rule — the pane title is invisible",
+        )
+        # And the wrap treatment that replaced it is actually shipped.
+        self.assertIn(".mt-pane-head { flex-wrap: wrap; }", css)
+        self.assertIsNotNone(
+            re.search(r"\.mt-pane-summary\s*\{[^}]*order:\s*1", css),
+            "the title must be ordered last so it wraps alone onto line 2",
+        )
+
     # -- ended-pane retention ---------------------------------------------
     #
     # Ended panes are cleared after a configurable delay, `keep` (forever)
