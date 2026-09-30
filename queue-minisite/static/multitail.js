@@ -293,22 +293,30 @@
 // are not on screen — without them, the reader can see what an agent is DOING
 // and nothing about what it is costing.
 //
-// THEY LIVE ON THE PANE'S TITLE LINE, NOT ON A ROW OF THEIR OWN. They started
-// as a footer strip under the stream, and a strip is a whole row of chrome per
-// pane — with five or six panes open that is five or six rows the logs do not
-// get (reported from botchat: "move the footer line in multitail up to the
-// title line (maybe right aligned for legibility). so left side is task title,
-// right side is calls/ctx/runtime/model"). The header already had a row and
-// spare width on it, so the title and the metrics share one: title flush left,
-// metrics flush right.
+// THEY LIVE IN THE PANE HEADER, ON A ROW OF THEIR OWN. They started as a
+// footer strip under the stream, and a strip below the log is a row of chrome
+// the reader's eye has to travel to; the request was to move it up onto the
+// header with the task title, right-aligned for legibility. That is where it
+// is — but the metrics get their OWN header row rather than sharing the
+// title's.
 //
-// The mechanism is the one the timestamp placement already uses a few hundred
-// lines down — in a flex row, make the thing that should fill the space the
-// ONLY flexible item and everything after it lands against the far edge. Here
-// the title is that item inside `.mt-pane-titlebar`, so the metrics need no
-// `margin-left: auto`, no absolute positioning and no second alignment idiom.
-// The title keeps a floor width and ellipsises; the metrics clip from their
-// own right, shedding the two cells that already know how to give way.
+// SHARING ONE ROW WAS THE FIRST ATTEMPT AND IT COST THE TITLES. Title left,
+// metrics right, both flexing in one row: the metrics hold their content
+// width (a clipped number is a WRONG number) so the title is the half that
+// gives, and six metric cells is most of a narrow pane. A real pane read
+// `debug V...` — a truncation that identifies nothing, which is the entire
+// job the title has. So the rule here is unconditional: THE METRICS ARE NEVER
+// ON THE TITLE'S ROW, at any width, however much room there looks to be. A
+// breakpoint or a "collapse only when the title is short" heuristic would put
+// the unreadable case straight back.
+//
+// The mechanism is structural rather than measured: the header is a wrapping
+// flex row and `.mt-pane-meta` — its LAST child — has a 100% flex basis, so it
+// cannot share a flex line with anything before it. No width query, no JS
+// measurement, nothing to tune. The title is then the header's only flexible
+// item and takes every pixel the badge, the id, the status and the close
+// button leave; it keeps a floor width and ellipsises only when a title really
+// is longer than a whole pane.
 //
 // EVERY FIELD IS READ, NEVER DERIVED. The values come off the pane's own queue
 // row (`.model-tag`, `.agent-stats`) as the strings the SERVER already
@@ -333,12 +341,14 @@
 // tracks whichever model is newest, so hardcoding one here would go stale
 // silently and lie about what actually ran.
 //
-// Space: --mt-pane-min came back DOWN by the strip's height when the strip
-// went away, so the reclaimed row goes to the window budget (one more pane
-// before the stack scrolls) rather than being quietly kept. Below 560px the
-// header wraps and the title line is the second row — the metrics ride along
-// on it, still right-aligned, and the output-token and last-tool cells drop
-// out so what is left (model, calls, ctx, age) fits beside a readable title.
+// Space: the metrics row costs a line, and --mt-pane-min carries that cost so
+// the pane's legibility floor is still "a header plus roughly ten log lines"
+// rather than eight and a half. A pane with nothing true to say hides the row
+// outright (`[hidden]`), so the cost is only paid where there are numbers.
+// Below 560px the title also takes a row of its own — the header there is
+// badge/id/status/close, then the title, then the metrics — and the
+// output-token and last-tool cells drop out so the remaining four (model,
+// calls, ctx, age) fit a phone's width without clipping.
 //
 // ---------------------------------------------------------------------------
 // SUBAGENTS — A PANE IS NOT ALWAYS A QUEUE ITEM
@@ -1420,23 +1430,11 @@
     const idEl = el('code', 'mt-pane-id', isSub ? info.target.slice(0, 12) : info.qid);
     if (isSub) idEl.title = info.target;
     head.appendChild(idEl);
-    // THE TITLE LINE: title left, metrics right, one row for both. The title
-    // is the only flexible item in this little flex row, so it takes every
-    // pixel the metrics do not and the metrics end up against the far edge
-    // without an alignment rule of their own — the same trick the timestamp
-    // cell uses inside a log row. Wrapping the pair in one element is what
-    // keeps them TOGETHER when the header wraps on a phone: the wrap moves one
-    // box, and the title does not end up on a line the metrics left behind.
-    const titlebar = el('div', 'mt-pane-titlebar');
+    // THE TITLE. It is the header's only flexible item, so it absorbs every
+    // pixel the badge, the id, the status and the close button do not take —
+    // and it NEVER shares its line with the metrics (see below).
     const summary = el('span', 'mt-pane-summary', info.summary);
-    titlebar.appendChild(summary);
-    // Metrics: whose agent this is and what it is costing. Filled from the row
-    // below, hidden while there is nothing true to put in it — and hidden here
-    // costs the pane nothing, because the row belongs to the title either way.
-    const meta = el('div', 'mt-pane-meta');
-    meta.hidden = true;
-    titlebar.appendChild(meta);
-    head.appendChild(titlebar);
+    head.appendChild(summary);
     // Nested-tail control. Built for every queue pane and shown only when the
     // card actually has a tree (paintPaneSubs); a subagent pane never gets one
     // — expansion is per CARD and its descendants are already in the stack.
@@ -1475,6 +1473,14 @@
     closeBtn.setAttribute('aria-label', 'Close the ' + info.target + ' tail');
     closeBtn.title = 'Close this tail (stays in multitail mode)';
     head.appendChild(closeBtn);
+    // Metrics: whose agent this is and what it is costing. THE LAST CHILD OF
+    // THE HEADER, and the stylesheet gives it a 100% flex basis, so it is
+    // always on a header row of its own — it can never be pulled up beside
+    // the title, at any width. Filled from the row below, hidden while there
+    // is nothing true to put in it (and a hidden row costs the pane nothing).
+    const meta = el('div', 'mt-pane-meta');
+    meta.hidden = true;
+    head.appendChild(meta);
     wrap.appendChild(head);
 
     const stream = el('pre', 'mt-pane-stream');

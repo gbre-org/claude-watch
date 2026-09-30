@@ -1348,7 +1348,7 @@ console.log('\n-- stamped plain-text lines (source_ts): a real time, or none');
 }
 
 // ==========================================================================
-console.log('\n-- per-pane metrics: on the title line, read off the row');
+console.log('\n-- per-pane metrics: own header row, read off the row');
 // ==========================================================================
 {
   // A card shaped like the real thing: the model chip and the agent-stats cell
@@ -1379,7 +1379,8 @@ console.log('\n-- per-pane metrics: on the title line, read off the row');
     Array.from(paneFor(qid).querySelectorAll('.mt-pane-meta > *'))
       .map((n) => n.textContent);
   const footBar = (qid) => paneFor(qid).querySelector('.mt-pane-meta');
-  const titleBar = (qid) => paneFor(qid).querySelector('.mt-pane-titlebar');
+  const headBar = (qid) => paneFor(qid).querySelector('.mt-pane-head');
+  const titleEl = (qid) => paneFor(qid).querySelector('.mt-pane-summary');
 
   resetQueue([
     richCard('q-f1', 'live', 'an agent'),
@@ -1438,15 +1439,17 @@ console.log('\n-- per-pane metrics: on the title line, read off the row');
     footCells('q-f3').join(' | ').indexOf('41 calls') !== -1,
     footCells('q-f3').join(' | '));
 
-  // WHERE THE METRICS LIVE (botchat #4997). They used to be a footer strip
-  // appended to the pane after the stream — a whole row of chrome per pane.
-  // They are now the right-hand half of the pane's TITLE line, which is a row
-  // the header was spending anyway, so the pane got a log row back.
+  // WHERE THE METRICS LIVE. They used to be a footer strip appended to the
+  // pane after the stream — a whole row of chrome below the log. They are now
+  // in the pane HEADER, on the row under the title.
   //
-  // Each half of that is asserted, because either one alone is the change
-  // half-made: a metrics element inside the header that the pane ALSO keeps a
-  // footer for reclaims nothing, and a pane with no footer whose metrics went
-  // somewhere other than the title line loses the numbers.
+  // NOT ON the title's row, which is the thing this asserts: sharing one flex
+  // row made the title the half that gives (the metrics must not shrink — a
+  // clipped number reads as a different number), and six metric cells cut a
+  // real pane's title down to `debug V...`. The stylesheet's 100% flex basis
+  // is what keeps them apart at every width; what is pinned HERE is the DOM
+  // shape that rule needs — the metrics being the header's LAST child, with
+  // the title a sibling ahead of it rather than a box they share.
   assert('the metrics are inside the pane HEADER, not a row of their own',
     paneFor('q-f1').querySelector('.mt-pane-head .mt-pane-meta') !== null);
   assert('the pane is exactly header + stream — no footer row left',
@@ -1455,22 +1458,27 @@ console.log('\n-- per-pane metrics: on the title line, read off the row');
     Array.from(paneFor('q-f1').children).map((n) => n.className).join(','));
   assert('the stream is still the pane\'s LAST child, so nothing clips it',
     paneFor('q-f1').lastElementChild.className === 'mt-pane-stream');
-  // Title left, metrics right: the title is the titlebar's FIRST child and the
-  // metrics its last, and both are in the same box so a wrapping header cannot
-  // separate them.
-  assert('title and metrics share one titlebar, title first',
-    titleBar('q-f1').children.length === 2 &&
-    titleBar('q-f1').children[0].className === 'mt-pane-summary' &&
-    titleBar('q-f1').children[1].className === 'mt-pane-meta',
-    titleBar('q-f1').innerHTML);
+  // The metrics are the header's LAST child: a 100% flex basis only lands on
+  // a row of its own if everything else comes first.
+  assert('the metrics are the LAST thing in the header',
+    headBar('q-f1').lastElementChild.className === 'mt-pane-meta',
+    Array.from(headBar('q-f1').children).map((n) => n.className).join(','));
+  // ...and the title is a SIBLING of theirs in that header, not a box the two
+  // share. A wrapper around the pair is exactly what put them on one row.
+  assert('the title is a direct child of the header, ahead of the metrics',
+    titleEl('q-f1').parentElement === headBar('q-f1') &&
+    Array.from(headBar('q-f1').children).indexOf(titleEl('q-f1')) <
+      Array.from(headBar('q-f1').children).indexOf(footBar('q-f1')),
+    Array.from(headBar('q-f1').children).map((n) => n.className).join(','));
+  assert('no element wraps the title and the metrics together again',
+    paneFor('q-f1').querySelector('.mt-pane-titlebar') === null);
   assert('and the title itself still says what the task is',
-    titleBar('q-f1').querySelector('.mt-pane-summary').textContent === 'an agent',
-    titleBar('q-f1').querySelector('.mt-pane-summary').textContent);
-  // A pane whose metrics are hidden still shows its title — the whole point of
-  // sharing the row is that an empty right half costs nothing.
+    titleEl('q-f1').textContent === 'an agent', titleEl('q-f1').textContent);
+  // A pane whose metrics are hidden still shows its title, and gets the row
+  // back rather than an empty bar.
   assert('a pane with no metrics keeps a visible title',
     footBar('q-f3').hidden === false ||
-    titleBar('q-f3').querySelector('.mt-pane-summary').textContent.length > 0);
+    titleEl('q-f3').textContent.length > 0);
   assert('textContent only — no markup from a queue record ever',
     paneFor('q-f3').querySelector('.mt-pane-meta').innerHTML.indexOf('<span') !== -1 &&
     paneFor('q-f3').querySelector('.mt-pane-meta').querySelectorAll('script').length === 0);

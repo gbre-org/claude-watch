@@ -2481,18 +2481,17 @@ html.density-compact .subagent-node .subagent-age { font-size: 0.68rem; }
  * instead of shrinking further. On a laptop viewport that is an even split up
  * to about five or six tails and a scrolling stack beyond.
  *
- * The per-pane metrics (botchat #4935) used to be a FOOTER strip under the
- * stream, and the floor was raised by 14px — that strip's height — so the bar
- * came out of the window budget rather than out of the ten log lines a pane
- * exists to show. The metrics now ride on the pane's title line instead
- * (botchat #4997, see PANE TITLE LINE below), so the strip's row is gone and
- * the floor is back to its pre-strip value: the reclaimed row is handed to the
- * window budget — one MORE pane before the stack scrolls — rather than quietly
- * kept.
+ * The per-pane metrics cost a row wherever they are put: first a FOOTER strip
+ * under the stream, then the pane's title line (which truncated the titles —
+ * see PANE TITLE, below), and now a second row of the pane HEADER. The floor
+ * carries that row's height (17px, measured) so the bar comes out of the
+ * window budget — one fewer pane before the stack scrolls — rather than out of
+ * the ten log lines a pane exists to show. A pane with no metrics to show
+ * hides the row outright and simply gets a taller stream.
  */
 
 :root {
-  --mt-pane-min: 132px;
+  --mt-pane-min: 149px;
   /* Indent step for ONE level of the nested subagent tree (multitail.js sets
      --mt-sub-depth per pane from the node's real depth, capped). A step, not a
      total: the depth does the multiplying. Narrower on a phone, below. */
@@ -2852,8 +2851,16 @@ body.multitail-open { overflow: hidden; }
 .mt-pane-head {
   flex: 0 0 auto;
   display: flex;
+  /* WRAPS AT EVERY WIDTH. The metrics row below relies on it (a 100% flex
+     basis needs somewhere to wrap TO), and it is also what keeps a very
+     narrow pane from spilling its close button out of the header instead of
+     dropping a box onto the next line. */
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 6px;
+  /* Row gap deliberately tighter than the column gap: the metrics row is a
+     continuation of the title, not a second band of chrome, and 6px of air
+     between them reads as two separate bars. */
+  gap: 1px 6px;
   padding: 3px 6px;
   background: var(--bg-alt);
   border-bottom: 1px solid var(--line);
@@ -2879,51 +2886,41 @@ body.multitail-open { overflow: hidden; }
   font-size: 0.68rem;
   color: var(--fg-emph);
 }
-/* ---- PANE TITLE LINE: title left, metrics right (botchat #4997) ----
+/* ---- PANE TITLE: its own row, never shared with the metrics ----
  *
- * "move the footer line in multitail up to the title line (maybe right aligned
- * for legibility). so left side is task title, right side is
- * calls/ctx/runtime/model."
+ * The per-pane metrics (model / calls / ctx / out / age / last tool) belong in
+ * this header — they used to be a footer strip under the stream and the ask
+ * was to lift them onto the title line, right-aligned. They ARE here. What
+ * they are not is on the title's ROW.
  *
- * The metrics were a footer strip under the stream, which is a whole row of
- * chrome per pane; with five or six panes open that is five or six rows the
- * logs do not get. The header already had a row with spare width on it, so the
- * two share it.
+ * WHY, because it is easy to "simplify" back: title and metrics in one flex
+ * row means one of the two has to give when the row is short, and it cannot
+ * be the metrics — a context size clipped to `12` is a wrong number, not a
+ * short one. So the title gave, and with six metric cells beside it a real
+ * pane rendered `debug V...`. A title truncated to two words identifies
+ * nothing, which is the only thing a title is for.
  *
- * The push-right mechanism is the one the TIMESTAMP PLACEMENT block below
- * already relies on: in a flex row, make the item that should absorb the slack
- * the ONLY flexible one and everything after it lands against the far edge by
- * itself. Here that item is the title. No `margin-left: auto`, no absolute
- * positioning — the stylesheet keeps one way of pushing something right in
- * this view rather than three.
+ * The fix is structural, NOT a breakpoint: `.mt-pane-meta` is the header's
+ * last child with `flex-basis: 100%`, so it can never share a flex line with
+ * anything ahead of it. There is deliberately no width at which the two
+ * collapse back together, and nothing here measures anything.
  *
- * The wrapper is what keeps the pair together when the header WRAPS at phone
- * width: it is one box, so the title cannot end up on a line its own metrics
- * left behind. See the 560px block.
- *
- * WHICH HALF GIVES WAY when the line is too narrow for both is decided here
- * and it is the TITLE: it already ellipsises, which is a degradation a reader
- * understands, whereas a shrinking metrics group clips a number in half and a
- * context size reading `12` instead of `12m` is a wrong number rather than a
- * short one. So the title carries the shrink (down to a floor, so it never
- * disappears entirely) and the metrics hold their content width. `overflow:
- * hidden` on the wrapper is the last-ditch guard for the pathological case
- * where even the floor plus the metrics do not fit: the overspill is clipped
- * inside the title line instead of escaping into the header and colliding
- * with the status and close button. */
-.mt-pane-titlebar {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  overflow: hidden;
-}
+ * That leaves the title as the header's ONLY flexible item, so it absorbs all
+ * the slack the badge, the id, the expander, the status and the close button
+ * do not use — no `margin-left: auto`, no absolute positioning. It keeps a
+ * floor width and ellipsises, which now only happens when a title is genuinely
+ * longer than a whole pane rather than whenever the numbers were wide. */
 .mt-pane-summary {
-  flex: 1 1 auto;
-  /* The floor: a title squeezed past this is no longer identifying anything.
-     Below it the wrapper's own overflow does the clipping, which keeps the
-     overspill inside the title line. */
+  /* Basis 0, NOT `auto`. In a wrapping flex row the line-breaking step uses
+     each item's hypothetical size, so an `auto` basis means a long title
+     measures its full text width and shoves itself — or the status and close
+     button after it — onto a line of its own, and the header's height then
+     jumps around per pane with the length of the task summary. A 0 basis
+     takes the line's leftover space instead, so row 1 is stable at every
+     width and the title simply fills it. */
+  flex: 1 1 0;
+  /* The floor: past this a title is no longer identifying anything. The
+     header wraps rather than overflowing if even that does not fit. */
   min-width: 5em;
   color: var(--fg-mute);
   white-space: nowrap;
@@ -3019,13 +3016,13 @@ body.multitail-open { overflow: hidden; }
 }
 .mt-pane-stream:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
 
-/* ---- PER-PANE METRICS (botchat #4935, moved onto the title line by #4997) ----
+/* ---- PER-PANE METRICS: the header's second row ----
  *
  * `opus · 41 calls · 118K ctx · 9.1K out · 12m · last Bash · promote-gundam`,
- * flush right on the pane's title line. Smaller than the title it shares the
- * row with, in the header's own muted colour, so the line reads as one thing
- * rather than as a title with a bar bolted to it — it carries no surface or
- * border of its own for the same reason.
+ * flush right on a row of the pane header directly under the title. Smaller
+ * than the title above it, in the header's own muted colour, so the two rows
+ * read as one header rather than as a title with a bar bolted under it — it
+ * carries no surface or border of its own for the same reason.
  *
  * Every cell is optional and multitail.js only appends the ones with a real
  * value, so this block must not reserve space for a cell that is not there: no
@@ -3033,13 +3030,25 @@ body.multitail-open { overflow: hidden; }
  * means the pane had nothing true to say, and the title simply takes the whole
  * line.
  *
- * `flex: 0 0 auto`: the metrics do NOT shrink. A half-printed number is a
- * wrong number, and the title beside them ellipsises instead — see the title
- * line block above. */
+ * `flex: 1 0 100%` IS THE WHOLE "never collapse onto the title row" RULE.
+ * A 100% basis cannot share a flex line with the boxes ahead of it, so as the
+ * header's last child this lands on a row of its own at every width — no media
+ * query, no container query, no measurement. Do not "optimise" it to
+ * `0 0 auto` when the row looks empty: that is exactly the layout that
+ * truncated pane titles to `debug V...`.
+ *
+ * `flex-shrink: 0` stays for the same reason it always did: the metrics do not
+ * shrink, because a half-printed number reads as a different number. On their
+ * own row there is nothing for them to shrink against anyway; the one
+ * unbounded cell (the tool name) still gives way on its own below. */
 .mt-pane-meta {
-  flex: 0 0 auto;
+  flex: 1 0 100%;
   display: flex;
   align-items: baseline;
+  /* Right-aligned, as the original request asked for: the numbers line up
+     against the pane's edge and the eye finds the same column in every pane
+     of the stack. */
+  justify-content: flex-end;
   gap: 7px;
   font-size: 0.62rem;
   color: var(--fg-mute);
@@ -3239,7 +3248,10 @@ body.multitail-open { overflow: hidden; }
 /* Phones: the header hint costs a line it cannot afford, and the floor drops
    so three tails still fit above the fold. */
 @media (max-width: 560px) {
-  :root { --mt-pane-min: 122px; }
+  /* +11px on the old 122px: the metrics left the title's row for one of
+     their own, and the phone header measures 60px against the desktop's 44px
+     because the title already had a row to itself here. */
+  :root { --mt-pane-min: 133px; }
   /* A phone cannot spend 56px of a 380px pane on four levels of indent, and
      the nesting is also carried by the badge, the border colour and the
      position in the stack. Half the step keeps the relationship legible and
@@ -3277,25 +3289,26 @@ body.multitail-open { overflow: hidden; }
      stylesheet that can hide a pane's title — so on a phone a stack of panes
      was identified by queue id alone, and "which of these is the promote
      job?" had no answer on the screen.
-     Rather than compete for the header's one line against the badge, the id,
-     the status and the close button — where the title would have been left
-     with a couple of ellipsised characters — the header WRAPS and the title
-     takes the second line (which it now shares with the per-pane metrics,
-     still right-aligned; see the PANE TITLE LINE block). --mt-pane-min grows
-     by that line's height so the cost comes out of the window budget (one
+     Rather than compete for a line against the badge, the id, the status and
+     the close button — where the title would have been left with a couple of
+     ellipsised characters — it takes a row of its own here. (The header
+     wraps at every width now; see the .mt-pane-head rule.) --mt-pane-min
+     covers that row's height so the cost comes out of the window budget (one
      fewer pane before the stack scrolls), never out of the log rows the pane
      exists to show. */
-  .mt-pane-head { flex-wrap: wrap; }
-  /* `order` puts the title line LAST in the flex line so the wrap happens
-     after the status and the close button. Giving it a 100% basis without
-     reordering would push those two onto a third line.
-     It is the TITLEBAR that wraps, not the title alone: the metrics come with
-     it and stay right-aligned against the pane edge, so the phone gets the
-     same "title left, metrics right" line the desktop does — and the row the
-     footer strip used to cost is reclaimed here too. */
-  .mt-pane-titlebar { order: 1; flex: 1 0 100%; }
-  .mt-pane-summary { font-size: 0.66rem; min-width: 4em; }
-  /* With the title on its own line the first line no longer has a flexible
+  /* `order` puts the title AFTER the status and the close button in the flex
+     ordering, so it wraps onto row 2 rather than pushing those two onto a
+     row 3 of their own. The metrics keep to the row below it — they are
+     already last in the DOM, but the title's `order: 1` would otherwise hop
+     over them. */
+  .mt-pane-summary {
+    order: 1;
+    flex: 1 0 100%;
+    font-size: 0.66rem;
+    min-width: 4em;
+  }
+  .mt-pane-meta { order: 2; }
+  /* With the title on its own row the first row no longer has a flexible
      item, so the close button needs the gap pushed to its left to stay at the
      edge it is tapped from. */
   .mt-pane-close { margin-left: auto; }
@@ -3303,9 +3316,10 @@ body.multitail-open { overflow: hidden; }
      label can shrink to its text rather than hold a stable width. */
   .multitail-retain { min-width: 0; }
   /* Metrics: keep model / calls / ctx / age, drop the two cells that answer
-     narrower questions. Six cells beside a title at phone width leave the
-     title a couple of ellipsised characters, which is the readability the
-     title line was given back in the first place. */
+     narrower questions. The metrics have their own row now, so they are no
+     longer crowding the title — but six cells is still wider than a 320px
+     pane, and the row clips from its left (it is right-aligned), which would
+     eat the model chip. Four cells fit. */
   .mt-pane-meta .mt-meta-out,
   .mt-pane-meta .mt-meta-tool { display: none; }
 }

@@ -225,9 +225,10 @@ modal N times in a row.
   panes are *not* clearing, check first whether the tab predates the deploy that
   added this — see **Is this page stale?** below.
 * **Per-pane metrics**: model · tool calls · context · output · age · last
-  tool, right-aligned on each pane's title line (task title left, numbers
-  right). They used to be a footer strip under the stream; moving them onto a
-  row the header was spending anyway gives every pane a log line back.
+  tool, right-aligned on their own row of each pane's header, directly under
+  the task title. They used to be a footer strip under the stream, and briefly
+  shared the title's row — which truncated long titles to a couple of words,
+  so they now get a row of their own at every width.
 * **All six settings are remembered** per viewer (localStorage, one key each),
   and the dialog shows the remembered state before the mode is first opened. A
   fresh viewer gets wrap off, timestamps off, verbose off, `cap 8K`, subagent
@@ -304,11 +305,12 @@ current queue id being copied back into the agent record, where it could drift
 out of date again.
 
 **How many panes stay legible.** Panes flex-share the viewport evenly, but only
-down to `--mt-pane-min` (132px — a header and roughly ten monospace lines;
-122px under 560px wide, where the header wraps onto two rows). Both numbers had
-grown by 14px when the metrics were a footer strip, and both came back down by
-it when the metrics moved onto the title line — the reclaimed row goes to the
-window budget (one more pane before the stack scrolls), not quietly kept. Below that a tail shows a line or two and stops being
+down to `--mt-pane-min` (149px — a header and roughly ten monospace lines;
+133px under 560px wide, where the title takes a row of its own as well). Both
+numbers carry the metrics row's height wherever that row has lived — a footer
+strip, and now the header's second row — so the bar comes out of the window
+budget (one fewer pane before the stack scrolls) rather than out of the ten log
+lines a pane exists to show. Below that a tail shows a line or two and stops being
 information, so past that point the stack **scrolls** instead of shrinking
 further. On a laptop viewport that is an even split up to about five or six
 tails and a scrolling stack beyond.
@@ -393,18 +395,25 @@ leaving empty cells. The model is whatever the row says — never a pinned id,
 since an alias like `opus` tracks whichever model is newest and a hardcoded id
 would go stale silently.
 
-**They sit on the title line, not on a row of their own.** A strip under the
-stream is a whole row of chrome per pane, and with five or six panes open that
-is five or six rows the logs do not get. The pane header already had a row with
-spare width, so the two share it: title flush left, metrics flush right. The
-push-right mechanism is the one the timestamp cell already uses — in a flex row,
-make the item that should absorb the slack the *only* flexible one and whatever
-follows lands against the far edge by itself, with no `margin-left: auto` and no
-absolute positioning. The title is that item and keeps a floor width, so long
-metrics ellipsise the numbers rather than the task name. Under 560px the header
-wraps, the title line becomes the second row (title and metrics together — they
-are one box, so a wrap cannot separate them) and the output-token and last-tool
-cells drop out, leaving model / calls / ctx / age beside a readable title.
+**They sit in the header, on a row of their own — never on the title's.** A
+strip under the stream is a row of chrome below the log, so the metrics moved up
+into the pane header. They first shared the title's row, flush right, and that
+is the arrangement this layout exists to replace: in one flex row something has
+to give when the row is short, and it cannot be the numbers (a context size
+clipped to `12` is a wrong number, not a short one), so the title gave — six
+metric cells cut a real pane's title down to `debug V...`, which identifies
+nothing.
+
+So `.mt-pane-meta` is the header's last child with `flex-basis: 100%`. A 100%
+basis cannot share a flex line with the boxes ahead of it, which makes the split
+structural: there is no width, and no setting, at which the two collapse back
+together. The title is then the header's *only* flexible item and takes all the
+slack the badge, the id, the status and the close button leave — from a **zero**
+basis, so a long title fills the row it is given instead of measuring its full
+text width at line-breaking time and shoving the status and close button onto a
+row of their own. Under 560px the title takes a row of its own too (header row,
+title row, metrics row) and the output-token and last-tool cells drop out,
+leaving model / calls / ctx / age on a row that fits a phone.
 
 **A pane whose log does not exist yet keeps trying.** Eligibility and
 log-existence are different instants, routinely: a `workload:` / `hostjob:` row
@@ -498,7 +507,8 @@ coming down for that pane only) and the per-pane metrics (the cells they print,
 the unknown values they omit rather than placeholders, the workload label as the
 one thing a workload pane can truthfully add, metrics hidden when nothing is
 known, the counters following the row on the next tick, and where the group
-lives in the pane — inside the title line, with no footer row left behind).
+lives in the pane — the header's last child, a sibling after the title rather
+than a box the two share, with no footer row left behind).
 
 `static/multitail-refresh.test.js` loads **both** modules in one page, which is
 the only place the handover between them can be tested: a running item moved to
