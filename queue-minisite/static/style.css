@@ -2890,8 +2890,8 @@ body.multitail-open { overflow: hidden; }
  *
  * The per-pane metrics (model / calls / ctx / out / age / last tool) belong in
  * this header — they used to be a footer strip under the stream and the ask
- * was to lift them onto the title line, right-aligned. They ARE here. What
- * they are not is on the title's ROW.
+ * was to lift them onto the title line. They ARE here. What they are not is
+ * on the title's ROW.
  *
  * WHY, because it is easy to "simplify" back: title and metrics in one flex
  * row means one of the two has to give when the row is short, and it cannot
@@ -3019,7 +3019,7 @@ body.multitail-open { overflow: hidden; }
 /* ---- PER-PANE METRICS: the header's second row ----
  *
  * `opus · 41 calls · 118K ctx · 9.1K out · 12m · last Bash · promote-gundam`,
- * flush right on a row of the pane header directly under the title. Smaller
+ * flush left on a row of the pane header directly under the title. Smaller
  * than the title above it, in the header's own muted colour, so the two rows
  * read as one header rather than as a title with a bar bolted under it — it
  * carries no surface or border of its own for the same reason.
@@ -3045,10 +3045,13 @@ body.multitail-open { overflow: hidden; }
   flex: 1 0 100%;
   display: flex;
   align-items: baseline;
-  /* Right-aligned, as the original request asked for: the numbers line up
-     against the pane's edge and the eye finds the same column in every pane
-     of the stack. */
-  justify-content: flex-end;
+  /* Left-aligned: the metrics start at the same left edge as the title above
+     them, so the model name reads as a continuation of the title block rather
+     than as a detached right-hand strip. The cells are a fixed sequence
+     (model, calls, ctx, out, age, tool), so they still line up column-wise
+     across panes from the left. This is alignment WITHIN the row only —
+     independent of the 100% basis above, which is what keeps the row a row. */
+  justify-content: flex-start;
   gap: 7px;
   font-size: 0.62rem;
   color: var(--fg-mute);

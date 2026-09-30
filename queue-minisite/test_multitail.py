@@ -954,8 +954,12 @@ class MultitailTest(unittest.TestCase):
             "flex-shrink stays 0: a half-printed number reads as a different "
             "number")
         self.assertRegex(
-            meta, r"justify-content\s*:\s*flex-end",
-            "the metrics stay right-aligned on their row")
+            meta, r"justify-content\s*:\s*flex-start",
+            "the metrics are left-aligned on their row, flush with the title "
+            "above them")
+        self.assertNotRegex(
+            meta, r"justify-content\s*:\s*(flex-end|right|end)",
+            "a rule pushes the metrics back to the right-hand edge")
 
         # And there is NO width at which the two are put back together.
         # `_decls` gathers every rule written for this exact selector ANYWHERE
