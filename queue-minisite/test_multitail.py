@@ -1209,41 +1209,59 @@ class MultitailTest(unittest.TestCase):
         self.assertEqual(m.group(1), "8k")
         self.assertEqual(as_chars[m.group(1)], 2 * as_chars["4k"])
 
-    def test_the_fifth_pill_does_not_push_exit_off_a_phone_header(self):
-        """The cap pill adds a FIFTH pill to the overlay header.
+    def test_the_phone_header_no_longer_has_to_wrap(self):
+        """REPLACES ``test_the_fifth_pill_does_not_push_exit_off_a_phone_header``.
 
-        Measured in a real browser at 380px: four pills fit the header row
-        exactly and five overflow it by about 33px, and the item that lands
-        past the right edge is `exit` — which on a phone is the only way out
-        of the mode, because `m` and Esc want a keyboard. So the header wraps
-        once verbose is on.
+        That test pinned a WORKAROUND, and this change removes its cause. The
+        overlay header used to carry every setting as a pill and it ran out of
+        width. Measured in a real browser on the code this replaces:
 
-        The rule is deliberately scoped to the overlay's `mt-verbose` class
-        rather than applied at this width outright: wrapping unconditionally
-        would cost the DEFAULT phone layout a second header row to prevent a
-        break that only happens in verbose.
+            320px, verbose off   header scrollWidth 348 vs clientWidth 320
+                                 — 28px of overflow, and the item whose right
+                                 edge lands at 348 is `exit`, which on a phone
+                                 is the only way out of a whole-window
+                                 takeover because `m` and Esc want a keyboard.
+            320px, verbose on    no overflow, but only because the header
+                                 WRAPPED to three rows: 91px tall instead of
+                                 33, out of a 700px viewport.
+            380px, verbose on    wrapped to two rows, 62px instead of 33.
+
+        The fix for the overflow was that wrap rule, scoped to `.mt-verbose`.
+        With the settings in a dialog the header carries `options` + `exit`
+        and fits 320px with room to spare (measured after: scrollWidth 320,
+        overflow 0, one 33px row at every width, verbose on or off), so the
+        wrap rule is not merely unnecessary — re-adding one would cost every
+        phone reader a header row to prevent a break that cannot happen.
+
+        What still has to hold is the thing the wrap rule existed to protect:
+        `exit` pinned to the edge it is tapped from.
         """
         css = (HERE / "static" / "style.css").read_text()
         phone_block = _multitail_phone_block(css)
-        m = re.search(
-            r"([^{}\n]*\.multitail-head[^{}]*)\{([^}]*flex-wrap\s*:\s*wrap[^}]*)\}",
-            phone_block,
+        self.assertIsNone(
+            re.search(
+                r"[^{}\n]*\.multitail-head[^{}]*\{[^}]*flex-wrap\s*:\s*wrap[^}]*\}",
+                phone_block,
+            ),
+            "the overlay header wraps at phone width again — it holds two "
+            "buttons now, so a wrap rule means something was put back on the "
+            "row. Re-measure the 320px header before keeping it.",
         )
-        self.assertIsNotNone(
-            m,
-            "nothing wraps the overlay header at phone width — the fifth pill "
-            "pushes the exit button off the right edge",
-        )
-        self.assertIn(
-            "mt-verbose", m.group(1),
-            "the header wrap must be scoped to verbose, or the default phone "
-            "layout pays a second header row it does not need",
-        )
-        # And the button it protects has to stay pinned to the edge it is
-        # tapped from, on whichever line it wraps onto.
         self.assertIsNotNone(
             re.search(r"\.multitail-exit\s*\{[^}]*margin-left:\s*auto", phone_block),
             "the exit button must stay at the right edge of its line",
+        )
+        # The sheet is the phone's whole settings surface, so it gets the
+        # width and a bounded height — a panel that runs off the bottom of a
+        # 700px viewport is a panel with a setting you cannot reach.
+        panel = re.search(
+            r"\.mt-options-panel\s*\{([^}]*)\}", phone_block)
+        self.assertIsNotNone(
+            panel, "no phone-width rule for the options panel")
+        self.assertIn("max-height", panel.group(1))
+        self.assertIsNotNone(
+            re.search(r"\.mt-options-panel\s*\{[^}]*overflow-y:\s*auto", css),
+            "the options panel must scroll rather than overflow the viewport",
         )
 
     def test_rendered_verbose_cap_default_matches_the_module(self):
@@ -1289,20 +1307,21 @@ class MultitailTest(unittest.TestCase):
             other_src = (HERE / "static" / other).read_text()
             self.assertNotIn("key === 'x'", other_src, f"x is bound in {other}")
 
-    def test_every_header_setting_is_persisted_under_its_own_key(self):
-        """Wrap / time / verbose persist the way retention already did.
+    def test_every_setting_is_persisted_under_its_own_key(self):
+        """Every control in the options dialog persists the same way.
 
-        One key each, all four distinct, all read through the same guarded
+        One key each, all six distinct, all read through the same guarded
         accessor — a second storage mechanism for the same kind of setting is
         how two of them end up disagreeing about what "unavailable" means.
         """
         src = (HERE / "static" / "multitail.js").read_text()
         keys = {}
-        for name in ("RETENTION", "WRAP", "TS", "VERBOSE", "VERBOSE_CAP"):
+        for name in ("RETENTION", "WRAP", "TS", "VERBOSE", "VERBOSE_CAP",
+                     "SUBS"):
             m = re.search(rf"const {name}_STORAGE_KEY = '([^']+)';", src)
             self.assertIsNotNone(m, f"{name}_STORAGE_KEY not declared")
             keys[name] = m.group(1)
-        self.assertEqual(len(set(keys.values())), 5, keys)
+        self.assertEqual(len(set(keys.values())), 6, keys)
         # The retention key is LOAD-BEARING for viewers who already have a
         # stored choice; renaming it silently resets everyone.
         self.assertEqual(keys["RETENTION"], "qsite_mt_retain")
@@ -1577,28 +1596,287 @@ class MultitailTest(unittest.TestCase):
         self.assertIn("--mt-sub-indent", phone,
                       "the indent step is not reduced at phone width")
 
-    def test_the_expander_is_a_pane_control_not_a_sixth_header_pill(self):
-        """The overlay header does not grow a control for this.
+    def test_the_expander_is_a_pane_control_not_a_header_one(self):
+        """Per-CARD expansion belongs on the card's pane, not in the dialog.
 
-        Four pills already fill the header row at 380px and the fifth (verbose)
-        is what makes it wrap; a sixth would push `exit` — the only way out of
-        the mode on a phone — off the right edge. So expansion lives on the
-        PANE that has subagents, which costs the header nothing and is also
-        where the thing being expanded is.
+        REPLACES ``test_the_expander_is_a_pane_control_not_a_sixth_header_pill``,
+        whose reason ("a sixth pill would push `exit` off a 380px header") is
+        gone — the header carries no pills now. The conclusion survives on a
+        different and better reason: the options dialog is GLOBAL, and "show
+        the subagents of THIS card" is not a global statement. There is a
+        global control for the default (``multitail-subs``, in the dialog); the
+        per-card override stays where the thing being overridden is.
         """
         tpl = (HERE / "templates" / "index.html").read_text()
         mt_src = (HERE / "static" / "multitail.js").read_text()
         self.assertIn("mt-pane-subs", mt_src)
         self.assertNotIn("mt-pane-subs", tpl)
-        # The header's pill set is unchanged: wrap / time / all / cap / clear.
+        # ...and the GLOBAL default does have a control, in the dialog.
+        self.assertIn('id="multitail-subs"', tpl)
+
+    # -- the options dialog -----------------------------------------------
+    #
+    # Every setting used to be a pill on the overlay's header row, and the row
+    # ran out of width: MEASURED in a real browser at 320px, the header
+    # overflowed by 28px and the item pushed past the right edge was `exit`,
+    # the only pointer way out of a whole-window takeover. The fix for that
+    # was to WRAP the header, which cost a phone reader a second (in verbose, a
+    # third) row of chrome in the one view whose design constraint is how many
+    # panes stay legible.
+    #
+    # What is pinned here is the contract that keeps it fixed: the header row
+    # holds no settings, the dialog holds all of them, and it is the site's own
+    # modal rather than a bespoke popover.
+
+    def _options_modal_markup(self, html: str) -> str:
+        m = re.search(
+            r'<div\s+[^>]*id="multitail-options-modal".*?\n    </div>',
+            html,
+            re.S,
+        )
+        self.assertIsNotNone(m, "the options dialog is not rendered")
+        return m.group(0)
+
+    def _overlay_header_markup(self, html: str) -> str:
+        m = re.search(
+            r'<header class="multitail-head">(.*?)</header>', html, re.S)
+        self.assertIsNotNone(m, "the overlay header is not rendered")
+        return m.group(1)
+
+    def test_the_header_row_carries_no_settings(self):
+        """THE INVARIANT THAT KEEPS THE 320px HEADER FITTING.
+
+        Two buttons, and neither is a setting: one opens the dialog, one
+        leaves the mode. Everything that was a pill is now inside the dialog.
+        A setting added back to this row is how the 28px overflow comes back,
+        and it comes back silently — the overflow is invisible on a laptop.
+        """
+        self._seed_mixed()
+        html = self._html()
+        head = self._overlay_header_markup(html)
+        ids = re.findall(r'<button[^>]*id="([^"]+)"', head)
         self.assertEqual(
-            tpl.count('class="multitail-display'), 5,
-            "the multitail header's pill set changed — re-measure the 380px "
-            "header before adding one")
-        for pill in ("multitail-wrap", "multitail-ts", "multitail-verbose",
-                     "multitail-vcap", "multitail-retain"):
-            self.assertIn('id="%s"' % pill, tpl)
-        self.assertNotIn("multitail-subs", tpl)
+            ids, ["multitail-options", "multitail-exit"],
+            "the overlay header row's buttons changed. It holds an entry "
+            "point and a way out; a SETTING here is what pushed `exit` off a "
+            "320px viewport. Re-measure the header before keeping this.",
+        )
+        # And every setting really is somewhere else.
+        for ctl in ("multitail-wrap", "multitail-ts", "multitail-verbose",
+                    "multitail-vcap", "multitail-subs", "multitail-retain"):
+            self.assertNotIn('id="%s"' % ctl, head, f"{ctl} is on the header row")
+            self.assertIn('id="%s"' % ctl, self._options_modal_markup(html),
+                          f"{ctl} is not in the options dialog either")
+
+    def test_the_options_dialog_is_the_sites_own_modal(self):
+        """Not a bespoke popover: the shape action.js's confirm dialog uses.
+
+        `.modal` + `.modal-backdrop[data-modal-dismiss]` + `.modal-panel`,
+        role=dialog, aria-modal, hidden by default, an explicit close control
+        that is also a dismiss target. Matching the idiom is what gets it the
+        positioning, the z-index band and the dismissal semantics for free.
+        """
+        self._seed_mixed()
+        modal = self._options_modal_markup(self._html())
+        self.assertIn('class="modal mt-options"', modal)
+        self.assertIn('role="dialog"', modal)
+        self.assertIn('aria-modal="true"', modal)
+        self.assertRegex(modal, r'<div\s+[^>]*id="multitail-options-modal"[^>]*\bhidden\b')
+        self.assertIn('class="modal-backdrop" data-modal-dismiss', modal)
+        self.assertIn('class="modal-panel mt-options-panel"', modal)
+        self.assertIn('id="multitail-options-close"', modal)
+        self.assertEqual(
+            modal.count("data-modal-dismiss"), 2,
+            "backdrop and close button are the dismiss targets")
+        # It has to sit INSIDE the overlay, which is what gives it the
+        # data-no-morph exemption the pills relied on (a settings control
+        # rebuilt by the 5s merge loses its listener) and keeps it below the
+        # single-item log modal's z-index band.
+        overlay = re.search(
+            r'<section\s+id="multitail".*?</section>', self._html(), re.S)
+        self.assertIsNotNone(overlay)
+        self.assertIn('id="multitail-options-modal"', overlay.group(0))
+
+    def test_the_dialog_does_not_take_a_second_owner_of_modal_open(self):
+        """``body.modal-open`` has exactly one job: stop the page scrolling.
+
+        ``body.multitail-open`` — on for as long as this dialog can exist at
+        all — already sets ``overflow: hidden``. A second owner of one rule
+        means whichever dialog closes LAST decides whether the page scrolls
+        again, which is the class of bug that shows up as "the queue list
+        won't scroll any more" long after the dialog is gone.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        # The comment block explaining this says "modal-open"; what must not
+        # exist is a CALL that sets it.
+        self.assertIsNone(
+            re.search(r"classList\.(add|toggle|remove)\(\s*'modal-open'", src),
+            "multitail.js takes a second owner of body.modal-open",
+        )
+        css = (HERE / "static" / "style.css").read_text()
+        self.assertIn("body.multitail-open { overflow: hidden; }", css)
+
+    def test_the_entry_point_is_a_dialog_trigger_not_a_toggle(self):
+        """It opens a dialog; it is not a setting with an on state.
+
+        ``aria-pressed`` on it would tell a screen reader there is a pressed
+        state to reason about, and the five controls it reveals are the things
+        that actually have one.
+        """
+        self._seed_mixed()
+        html = self._html()
+        btn = re.search(
+            r'<button[^>]*id="multitail-options".*?</button>', html, re.S)
+        self.assertIsNotNone(btn, "no options entry point")
+        self.assertIn('aria-haspopup="dialog"', btn.group(0))
+        self.assertIn('aria-expanded=', btn.group(0))
+        self.assertIn('aria-controls="multitail-options-modal"', btn.group(0))
+        self.assertNotIn("aria-pressed", btn.group(0))
+        # Keyboard-reachable and discoverable without reading the source.
+        self.assertIn("<kbd>o</kbd>", html)
+        for other in ("keyboard.js", "live-log.js", "refresh.js", "action.js"):
+            other_src = (HERE / "static" / other).read_text()
+            self.assertNotIn("key === 'o'", other_src, f"o is bound in {other}")
+
+    def test_the_dialog_closes_the_way_the_sites_dialogs_close(self):
+        """Esc, backdrop, close button — and Esc dismisses ONE thing.
+
+        The overlay behind it also binds Esc (it is how you leave the mode),
+        so without an explicit precedence one keypress would close both: the
+        sheet AND the window it configures.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("function closeOptions(", src)
+        self.assertIn("data-modal-dismiss", src)
+        # Escape is handled under the options-open branch BEFORE the branch
+        # that closes the mode, which is what makes it dismiss one thing.
+        opt_esc = src.index("if (optionsOpen) {")
+        mode_esc = src.index("if (open && ev.key === 'Escape')")
+        self.assertLess(
+            opt_esc, mode_esc,
+            "Escape reaches closeMode() before the options sheet gets a look "
+            "at it — one keypress would close both",
+        )
+        # And Tab is trapped in the panel, as action.js traps its own.
+        self.assertIn("function optionsFocusables(", src)
+        self.assertIn("ev.key === 'Tab'", src)
+
+    # -- subagent tails are shown by default -------------------------------
+
+    def test_subagent_tails_default_to_shown(self):
+        """THE CROSS-FILE PIN: the served control and the module agree.
+
+        Same failure mode the retention and cap pills have — the rendered
+        state is Jinja text while the default that governs behaviour is in
+        multitail.js, and the module only rewrites the control when a STORED
+        choice exists. Drift ships a dialog that states a default the window
+        is not using.
+
+        The default itself flipped (Andrew: "make subagent views autoshow by
+        default"). It shipped collapsed because a pane costs viewport and one
+        of the browser's scarce connections; both costs are real and both are
+        bounded by machinery that does not care where a pane came from (the
+        stack scrolls past --mt-pane-min, MAX_LIVE_STREAMS rations sockets).
+        What collapsing bought instead was that a running item's children were
+        in practice never on screen in the window that exists to answer "what
+        is everything doing".
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        m = re.search(r"const DEFAULT_SUBS_SHOWN = (true|false);", src)
+        self.assertIsNotNone(m, "DEFAULT_SUBS_SHOWN not declared")
+        self.assertEqual(m.group(1), "true")
+
+        self._seed_mixed()
+        html = self._html()
+        btn = re.search(
+            r'<button[^>]*id="multitail-subs".*?</button>', html, re.S)
+        self.assertIsNotNone(btn, "the subagent control is not rendered")
+        # A TOGGLE, so it carries aria-pressed — and it is rendered in the
+        # module's default state, not the pre-change one.
+        self.assertIn('aria-pressed="true"', btn.group(0))
+        # Keyboard-reachable and discoverable without reading the source.
+        self.assertIn("<kbd>s</kbd>", html)
+        for other in ("keyboard.js", "live-log.js", "refresh.js", "action.js"):
+            other_src = (HERE / "static" / other).read_text()
+            self.assertNotIn("key === 's'", other_src, f"s is bound in {other}")
+
+    def test_the_default_persists_but_a_per_card_collapse_does_not(self):
+        """Two lifetimes, and the split is deliberate.
+
+        "Show subagent tails" is a preference about the VIEW and survives a
+        reload like every other setting in the dialog. "Collapse THIS card" is
+        a statement about one queue item's tree: persisting a per-qid map
+        would accumulate keys for items that stopped existing weeks ago and
+        re-apply a judgment about a different agent's children. So the map is
+        cleared when the mode opens, exactly as dismissals are, and only the
+        default it falls back to is written to storage.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("const SUBS_STORAGE_KEY = 'qsite_mt_subs';", src)
+        self.assertIn("storeFlag(SUBS_STORAGE_KEY, subsShown)", src)
+        # The per-card map is session state: never stored, cleared on open.
+        self.assertIn("const subsChoice = new Map();", src)
+        self.assertNotIn("SUBS_CHOICE_STORAGE", src)
+        open_mode = src[src.index("function openMode()"):]
+        open_mode = open_mode[: open_mode.index("function closeMode()")]
+        self.assertIn("subsChoice.clear();", open_mode)
+        self.assertIn("dismissed.clear();", open_mode)
+
+    def test_top_level_tails_get_a_connection_before_nested_ones(self):
+        """WHAT AUTOSHOW DOES TO THE CAP.
+
+        It cannot exceed it: ``pumpSlots`` stops at MAX_LIVE_STREAMS and does
+        not care where a pane came from. What it CAN do, if slots are handed
+        out in plain display order, is let one busy item take the whole budget
+        — nested panes are inserted beside their parent, so an item with three
+        children would hold all four connections and the SECOND running task
+        would be dark, in the window whose entire question is "what is
+        everything doing".
+
+        So the order is tiered: every queue pane, then every subagent pane,
+        each tier still in the order it is on screen. It only changes the case
+        where the top-level panes do not already fill the cap — with four or
+        more items running, a tree waited for a slot before and waits now.
+        """
+        src = (HERE / "static" / "multitail.js").read_text()
+        self.assertIn("function slotOrder(", src)
+        pump = src[src.index("function pumpSlots()"):]
+        pump = pump[: pump.index("function destroyPane(")]
+        self.assertIn("slotOrder()", pump)
+        self.assertNotIn(
+            "panesInDisplayOrder()", pump,
+            "pumpSlots is back on plain display order — one item's subagents "
+            "can take every connection and starve the other running tasks",
+        )
+        # The cap itself is untouched: autoshow must not buy itself sockets.
+        self.assertIn("const MAX_LIVE_STREAMS = 4;", src)
+
+    def test_options_dialog_styles_shipped(self):
+        """The dialog is class-driven; without the CSS it is a plain list.
+
+        Three deviations from the site's modal are deliberate and all scoped
+        to `.mt-options`: it is top-anchored (it drops from under the button
+        that opened it rather than landing over the stack), its backdrop is
+        lighter (these are DISPLAY settings and the panes behind are the
+        feedback), and it scrolls (six rows of prose do not fit a 700px phone).
+        """
+        css = (HERE / "static" / "style.css").read_text()
+        rules = _css_rules(css)
+        self.assertIsNotNone(_decls(rules, ".mt-options-panel"))
+        self.assertIsNotNone(_decls(rules, ".mt-option"))
+        self.assertIsNotNone(_decls(rules, ".mt-options-list"))
+        # Top-anchored rather than centred.
+        self.assertRegex(
+            _decls(rules, ".mt-options") or "", r"align-items:\s*flex-start")
+        # Its own backdrop, not the site's 0.55 dim.
+        self.assertIsNotNone(
+            _decls(rules, ".mt-options .modal-backdrop"),
+            "the options dialog does not scope its own backdrop")
+        # The cap row is hidden with verbose off, and `hidden` has to WIN over
+        # the row's own display — the same trap the cap pill itself had.
+        self.assertIn(".mt-option-sub[hidden] { display: none; }", css)
+        # The entry point reads as engaged while the dialog it opens is up.
+        self.assertIn('.multitail-options-btn[aria-expanded="true"]', css)
 
 
 if __name__ == "__main__":

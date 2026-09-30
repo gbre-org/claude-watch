@@ -186,15 +186,41 @@ modal N times in a row.
   owns the keyboard.
 * **Dismiss one pane**: the `×` in that pane's header. It does not leave the
   mode, and the pane does not come back while the mode stays open.
-* **Line wrap**: the `wrap` pill, or the **`w`** key. Off by default.
-* **Timestamps**: the `time` pill, or the **`t`** key. Off by default.
-* **Verbose**: the `all` pill, or the **`v`** key. Off by default. See
+* **Settings**: the `options` button in the overlay header, or the **`o`** key.
+  Every setting below lives in that dialog. `Esc`, a backdrop click or its `×`
+  close it — and `Esc` closes the *dialog*, not the mode behind it. Settings
+  apply as you make them; there is no OK/Cancel.
+
+  They were pills on the header row and the row ran out of width. Measured in a
+  real browser: at **320px the header overflowed by 28px**, and the item pushed
+  past the right edge was **`exit`** — on a phone the only way out of a
+  whole-window takeover, because `m` and `Esc` want a keyboard. The fix for that
+  was to *wrap* the header, which cost a phone reader a second (in verbose, a
+  third: **91px of a 700px viewport**) row of chrome in the one view whose whole
+  design constraint is how many panes stay legible. With one entry point the row
+  is **0px of overflow and a single 33px row at every width**, verbose on or off.
+* **Line wrap**: in options, or the **`w`** key. Off by default.
+* **Timestamps**: in options, or the **`t`** key. Off by default.
+* **Verbose**: in options, or the **`v`** key. Off by default. See
   **Verbose mode** below.
-* **Verbose cap**: the `cap` pill, or the **`x`** key. Cycles `cap 4K` →
+* **Verbose cap**: in options, or the **`x`** key. Cycles `cap 4K` →
   `cap 8K` → `cap 16K` → `cap 32K`, default **8K** — how much of a single line
-  verbose mode shows before clipping it. The pill is only on screen while
+  verbose mode shows before clipping it. Its row is only on screen while
   verbose is on, since that is the only mode the cap bounds.
-* **Ended-pane retention**: the `clear` pill, or the **`c`** key. Cycles
+* **Subagent tails**: in options, or the **`s`** key. **On by default** — each
+  running item's subagents get a nested pane under it, indented by their real
+  depth in the spawn tree. One card can be collapsed on its own from the
+  `N subagents` button on its pane, which overrides the default for that card
+  for the rest of the sitting.
+
+  This defaults ON because the children of a running item are part of "what is
+  everything doing", and having to ask for them per card meant they were in
+  practice never on screen. It does **not** buy itself more connections:
+  `MAX_LIVE_STREAMS` is unchanged and stream slots are handed out **tiered** —
+  every top-level tail first, then every nested one, each group in the order it
+  is on screen. Without that, one item with three children would hold all four
+  connections and the second running task would be dark.
+* **Ended-pane retention**: in options, or the **`c`** key. Cycles
   `clear 1m` → `clear 5m` → `clear 15m` → `keep`, default **1m**. If finished
   panes are *not* clearing, check first whether the tab predates the deploy that
   added this — see **Is this page stale?** below.
@@ -202,25 +228,26 @@ modal N times in a row.
   tool, right-aligned on each pane's title line (task title left, numbers
   right). They used to be a footer strip under the stream; moving them onto a
   row the header was spending anyway gives every pane a log line back.
-* **All five settings are remembered** per viewer (localStorage), and the pills
-  show the remembered state before the mode is first opened. A fresh viewer gets
-  the original defaults: wrap off, timestamps off, verbose off, `cap 8K`,
-  `clear 1m`.
+* **All six settings are remembered** per viewer (localStorage, one key each),
+  and the dialog shows the remembered state before the mode is first opened. A
+  fresh viewer gets wrap off, timestamps off, verbose off, `cap 8K`, subagent
+  tails **on**, `clear 1m`.
   Reads are guarded *and* validated — storage throws outright in some privacy
   modes and can hold an older build's value, so anything unrecognised means the
   default rather than a wedged view, and with storage unavailable the mode
   behaves exactly as it did before it remembered anything.
-* `w`, `t`, `v` and `c` are mode-local — inert while the overlay is closed, while
-  you are typing in a field, and while another dialog owns the keyboard. Modified
-  chords pass straight through, so `Ctrl`/`Cmd`+`W` still closes the tab,
-  `Ctrl`/`Cmd`+`V` still pastes, and `Ctrl`/`Cmd`+`C` still copies the log text
-  you just selected.
+* `w`, `t`, `v`, `x`, `s`, `c` and `o` are mode-local — inert while the overlay
+  is closed, while you are typing in a field, and while another dialog owns the
+  keyboard. Modified chords pass straight through, so `Ctrl`/`Cmd`+`W` still
+  closes the tab, `Ctrl`/`Cmd`+`V` still pastes, and `Ctrl`/`Cmd`+`C` still
+  copies the log text you just selected.
 * The MODE is not persisted: a full-window takeover that survived a reload
-  would be a surprise rather than a convenience. The `w` / `t` preferences live
-  as long as the page does. The retention choice *is* persisted per viewer
-  (`localStorage`, `qsite_mt_retain`) — it is a policy about how much finished
-  output survives rather than a projection of the current page, so picking
-  `keep` should not have to be repeated after every reload.
+  would be a surprise rather than a convenience. Neither is anything scoped to a
+  particular queue item — a dismissed pane and a hand-collapsed subagent tree
+  both die with the mode, because they are statements about this sitting's stack
+  rather than preferences about the view. The six settings in the dialog *are*
+  persisted per viewer (e.g. `qsite_mt_retain`): picking `keep` because you read
+  finished output carefully should not have to be repeated after every reload.
 
 **Is this page stale?** This dashboard is built to be left open: it refreshes
 itself by polling `/api/queue` and morphing the result in, and it never reloads.

@@ -92,22 +92,50 @@ const initialHTML = `<!doctype html>
     <header class="multitail-head">
       <h2 id="multitail-title">multitail</h2>
       <span id="multitail-count"></span>
-      <button type="button" id="multitail-wrap" class="multitail-display"
-              aria-pressed="false">wrap</button>
-      <button type="button" id="multitail-ts" class="multitail-display"
-              aria-pressed="false">time</button>
-      <button type="button" id="multitail-verbose" class="multitail-display"
-              aria-pressed="false">all</button>
-      <button type="button" id="multitail-vcap"
-              class="multitail-display multitail-vcap"
-              data-verbose-cap="8k" hidden>cap 8K</button>
-      <button type="button" id="multitail-retain"
-              class="multitail-display multitail-retain"
-              data-retention="1m">clear 1m</button>
+      <button type="button" id="multitail-options" class="multitail-display"
+              aria-haspopup="dialog" aria-expanded="false"
+              aria-controls="multitail-options-modal">options</button>
       <button type="button" id="multitail-exit">exit</button>
     </header>
     <div id="multitail-panes"></div>
     <p id="multitail-empty" hidden>Nothing to tail</p>
+    <div id="multitail-options-modal" class="modal mt-options" role="dialog"
+         aria-modal="true" hidden>
+      <div class="modal-backdrop" data-modal-dismiss></div>
+      <div id="multitail-options-panel" class="modal-panel mt-options-panel"
+           role="document">
+        <button type="button" id="multitail-options-close"
+                data-modal-dismiss>&times;</button>
+        <ul class="mt-options-list">
+          <li class="mt-option">
+            <button type="button" id="multitail-wrap" class="multitail-display"
+                    aria-pressed="false">wrap</button>
+          </li>
+          <li class="mt-option">
+            <button type="button" id="multitail-ts" class="multitail-display"
+                    aria-pressed="false">time</button>
+          </li>
+          <li class="mt-option">
+            <button type="button" id="multitail-verbose" class="multitail-display"
+                    aria-pressed="false">all</button>
+          </li>
+          <li class="mt-option mt-option-sub" id="multitail-vcap-row" hidden>
+            <button type="button" id="multitail-vcap"
+                    class="multitail-display multitail-vcap"
+                    data-verbose-cap="8k" hidden>cap 8K</button>
+          </li>
+          <li class="mt-option">
+            <button type="button" id="multitail-subs" class="multitail-display"
+                    aria-pressed="true">subagents</button>
+          </li>
+          <li class="mt-option">
+            <button type="button" id="multitail-retain"
+                    class="multitail-display multitail-retain"
+                    data-retention="1m">clear 1m</button>
+          </li>
+        </ul>
+      </div>
+    </div>
   </section>
 </body></html>`;
 
@@ -1890,28 +1918,30 @@ function clickEl(node) {
   ]);
   mt.openMode();
 
-  // --- collapsed by default -----------------------------------------------
-  assert('a card with subagents still gets exactly ONE pane by default',
-    paneEls().length === 2, paneEls().length + ' panes');
-  assert('and no nested pane is opened without being asked for',
-    subPaneFor(SID_A) === null && subPaneFor(SID_B) === null &&
-    subPaneFor(SID_C) === null);
+  // --- SHOWN by default ----------------------------------------------------
+  // This flipped (Andrew: "make subagent views autoshow by default"). The
+  // children of a running item are part of "what is everything doing", and
+  // having to ask for them per card meant they were usually not on screen.
+  assert('a card with subagents opens one pane per node WITHOUT being asked',
+    paneEls().length === 5, paneEls().length + ' panes');
+  assert('every node in the tree is there, at whatever depth',
+    subPaneFor(SID_A) !== null && subPaneFor(SID_B) !== null &&
+    subPaneFor(SID_C) !== null);
 
   const btn = subsBtnOf('q-tree');
   assert('the pane carries a subagent expander', btn !== null && !btn.hidden);
-  assert('it is collapsed', btn.getAttribute('aria-expanded') === 'false');
-  assert('it counts every tail it would open, not just the top level',
+  assert('and it reads as already expanded',
+    btn.getAttribute('aria-expanded') === 'true');
+  assert('it counts every tail it opened, not just the top level',
     btn.textContent.indexOf('3') !== -1 && /subagents/.test(btn.textContent),
     btn.textContent);
   assert('a pane whose item has no subagents carries no expander at all',
     subsBtnOf('q-plain').hidden === true);
+  assert('the default the cards start from is the persisted view preference',
+    mt.isSubagentsShown() === true && mt.DEFAULT_SUBS_SHOWN === true);
+  assert('and no per-card deviation was recorded to get there',
+    mt.subsChoice.size === 0, String(mt.subsChoice.size));
 
-  // --- expand --------------------------------------------------------------
-  clickEl(btn);
-
-  assert('expanding opens one pane per node in the tree',
-    paneEls().length === 5, paneEls().length + ' panes');
-  assert('the expander says so', btn.getAttribute('aria-expanded') === 'true');
   assert('nested panes sit directly under their parent, in tree order',
     paneEls().map((p) => p.getAttribute('data-pane-key')).join(',') ===
       ['q:q-tree', 's:' + SID_A, 's:' + SID_B, 's:' + SID_C, 'q:q-plain'].join(','),
@@ -1963,18 +1993,24 @@ function clickEl(node) {
   assert('the cap still holds across both kinds of pane',
     openStreams().length === mt.MAX_LIVE_STREAMS,
     'open=' + openStreams().length);
-  // Slot order is the order panes are ON SCREEN, not the order they were
+  // DISPLAY order is the order panes are ON SCREEN, not the order they were
   // created: a nested pane is inserted beside its parent, so map order and
-  // display order diverge the moment a tree is expanded.
-  assert('slot order is display order, with the tree ahead of a later card',
+  // display order diverge the moment a tree is shown.
+  assert('display order puts the tree between its parent and the next card',
     mt.panesInDisplayOrder().map((p) => p.key).join(',') ===
       ['q:q-tree', 's:' + SID_A, 's:' + SID_B, 's:' + SID_C, 'q:q-plain'].join(','),
     mt.panesInDisplayOrder().map((p) => p.key).join(','));
-  // What the cap does NOT do is yank a pane off a live connection to make
-  // room for one the reader just asked for — mid-read is mid-read.
-  assert('a pane already streaming keeps its connection',
+  // SLOT order is NOT display order any more. Nested tails now open without
+  // being asked for, so plain display order would let one busy item take the
+  // whole connection budget and leave the second running task dark — in the
+  // window whose entire question is "what is everything doing".
+  assert('slot order puts every top-level tail ahead of every nested one',
+    mt.slotOrder().map((p) => p.key).join(',') ===
+      ['q:q-tree', 'q:q-plain', 's:' + SID_A, 's:' + SID_B, 's:' + SID_C].join(','),
+    mt.slotOrder().map((p) => p.key).join(','));
+  assert('so the SECOND running item is streaming, not starved by the tree',
     paneRecord('q-plain').streaming === true, statusOf('q-plain'));
-  assert('so the nested pane past the cap waits, and says so',
+  assert('and it is the nested pane past the cap that waits, and says so',
     /waiting for a stream slot/.test(subStatusOf(SID_C)), subStatusOf(SID_C));
   assert('the overlay count names how much of the stack is the tree',
     /3 subagents/.test(document.getElementById('multitail-count').textContent),
@@ -2040,7 +2076,7 @@ function clickEl(node) {
       subPaneFor(SID_B) === null && subPaneRecord(SID_B) === undefined);
   }
 
-  // --- collapse ------------------------------------------------------------
+  // --- collapse ONE card, against the default ------------------------------
   {
     const before = openStreams().length;
     clickEl(subsBtnOf('q-tree'));
@@ -2052,10 +2088,49 @@ function clickEl(node) {
       before + ' -> ' + openStreams().length);
     assert('and records NO dismissal - it is not the same statement as x',
       mt.dismissed.size === 0, Array.from(mt.dismissed).join(','));
+    assert('what it records is a per-card deviation from the default',
+      mt.subsChoice.get('q-tree') === false &&
+      mt.isSubagentsShown() === true,
+      JSON.stringify(Array.from(mt.subsChoice.entries())));
     mt.reconcile();
     assert('a later reconcile does not resurrect them', subPaneFor(SID_A) === null);
+    // The per-card choice OUTRANKS the default, in both directions: a card the
+    // reader collapsed by hand must not spring open because the default was
+    // toggled under it.
+    mt.setSubagents(false);
+    mt.setSubagents(true);
+    assert('a card collapsed by hand survives the default being cycled',
+      subPaneFor(SID_A) === null, 'nested panes came back');
     clickEl(subsBtnOf('q-tree'));
     assert('re-expanding brings them straight back',
+      subPaneFor(SID_A) !== null && subPaneFor(SID_C) !== null);
+  }
+
+  // --- turning the DEFAULT off ---------------------------------------------
+  // On a fresh open, so every card is following the default rather than a
+  // per-card choice — which is what the default is for.
+  {
+    mt.closeMode();
+    resetQueue([
+      treeCard('q-tree', 'parent item', fullTree()),
+      card('q-plain', 'live', 'no subagents'),
+    ]);
+    mt.openMode();
+    assert('the fresh stack is showing its tree', subPaneFor(SID_A) !== null);
+    mt.setSubagents(false);
+    assert('every card that was following the default closes its tree',
+      subPaneFor(SID_A) === null && subPaneFor(SID_C) === null,
+      'nested panes survived');
+    assert('the top-level panes are untouched',
+      paneFor('q-tree') !== null && paneFor('q-plain') !== null);
+    assert('and the nested panes are GONE, not marked ended - nobody ended',
+      mt.panes.has('s:' + SID_A) === false,
+      Array.from(mt.panes.keys()).join(','));
+    assert('the control in the options sheet says so',
+      document.getElementById('multitail-subs')
+        .getAttribute('aria-pressed') === 'false');
+    mt.setSubagents(true);
+    assert('turning it back on brings every tree back',
       subPaneFor(SID_A) !== null && subPaneFor(SID_C) !== null);
   }
 
@@ -2080,7 +2155,6 @@ console.log('\n-- subagents: the whole group ends when the item stops running');
 {
   resetQueue([treeCard('q-tree2', 'parent item', fullTree())]);
   mt.openMode();
-  clickEl(subsBtnOf('q-tree2'));
   assert('three nested panes are up', paneEls().length === 4,
     paneEls().length + ' panes');
 
@@ -2107,8 +2181,12 @@ console.log('\n-- subagents: the whole group ends when the item stops running');
 }
 
 // ==========================================================================
-console.log('\n-- subagents: expanding never exceeds the connection cap');
+console.log('\n-- subagents: auto-showing never exceeds the connection cap');
 // ==========================================================================
+// The cap is what stops "autoshow by default" meaning "open more live
+// connections than the browser will give us". It is enforced by pumpSlots and
+// does not care where a pane came from, so a stack that opens itself is
+// rationed exactly as one the reader opened by hand was.
 {
   resetQueue([
     card('q-1', 'live', 'one'), card('q-2', 'live', 'two'),
@@ -2116,19 +2194,119 @@ console.log('\n-- subagents: expanding never exceeds the connection cap');
     treeCard('q-tree3', 'parent item', fullTree()),
   ]);
   mt.openMode();
-  assert('the cap is already full before expanding',
-    openStreams().length === mt.MAX_LIVE_STREAMS);
-  clickEl(subsBtnOf('q-tree3'));
-  assert('the nested panes are still built and visible',
+  assert('the nested panes are built and visible without being asked for',
     subPaneFor(SID_A) !== null && subPaneFor(SID_B) !== null &&
     subPaneFor(SID_C) !== null);
-  assert('but no fifth connection is opened for them',
+  assert('but the cap is unchanged — no fifth connection for them',
     openStreams().length === mt.MAX_LIVE_STREAMS,
     'open=' + openStreams().length);
   assert('and each one SAYS it is waiting rather than looking broken',
     [SID_A, SID_B, SID_C].every((s2) =>
       /waiting for a stream slot/.test(subStatusOf(s2))),
     [SID_A, SID_B, SID_C].map(subStatusOf).join(' | '));
+  // THE POINT OF THE TIER. Five top-level items and a tree: the four
+  // connections go to top-level tails, and it is the tree — and the fifth
+  // card — that wait. Under plain display order the tree would have taken
+  // three of the four and left q-2, q-3 and q-4 dark.
+  assert('every connection went to a top-level tail',
+    openStreams().every((st) => st.url.indexOf('/api/queue/') === 0),
+    openStreams().map((st) => st.url).join(' '));
+  assert('the count line names how much of the stack is nested',
+    /3 subagents/.test(document.getElementById('multitail-count').textContent),
+    document.getElementById('multitail-count').textContent);
+}
+
+// ==========================================================================
+console.log('\n-- the options dialog: one entry point for every setting');
+// ==========================================================================
+{
+  resetQueue([card('q-opt', 'live', 'one')]);
+  mt.openMode();
+  const optBtn = document.getElementById('multitail-options');
+  const modal = document.getElementById('multitail-options-modal');
+
+  assert('it starts closed', modal.hidden === true &&
+    mt.isOptionsOpen() === false &&
+    optBtn.getAttribute('aria-expanded') === 'false');
+
+  clickEl(optBtn);
+  assert('the header button opens it', modal.hidden === false &&
+    mt.isOptionsOpen() === true);
+  assert('and the trigger says the dialog it controls is open',
+    optBtn.getAttribute('aria-expanded') === 'true');
+  assert('every setting is reachable inside the panel',
+    ['multitail-wrap', 'multitail-ts', 'multitail-verbose',
+     'multitail-subs', 'multitail-retain'].every((id) =>
+      document.getElementById('multitail-options-panel')
+        .querySelector('#' + id) !== null));
+
+  // A setting changed from inside the sheet applies at once — no OK/Cancel.
+  clickEl(document.getElementById('multitail-wrap'));
+  assert('a control in the sheet applies live', mt.isWrap() === true);
+  clickEl(document.getElementById('multitail-wrap'));
+
+  // The verbose cap is verbose mode's own bound: its whole ROW comes and goes
+  // with verbose, not just its control, or the sheet keeps a labelled row
+  // describing something that is not there.
+  const capRow = document.getElementById('multitail-vcap-row');
+  assert('the cap row is hidden while verbose is off', capRow.hidden === true);
+  mt.setVerbose(true);
+  assert('and appears with it', capRow.hidden === false &&
+    document.getElementById('multitail-vcap').hidden === false);
+  assert('and its control is then tabbable',
+    mt.optionsFocusables().indexOf(
+      document.getElementById('multitail-vcap')) !== -1);
+  // The trap walks ANCESTORS, not just the control: a row hidden with its
+  // control still visible would otherwise leave Tab stopping on something
+  // nobody can see.
+  capRow.hidden = true;
+  assert('a visible control inside a hidden ROW is not tabbable',
+    mt.optionsFocusables().indexOf(
+      document.getElementById('multitail-vcap')) === -1);
+  capRow.hidden = false;
+  mt.setVerbose(false);
+  assert('turning verbose back off hides the cap row again',
+    capRow.hidden === true &&
+    document.getElementById('multitail-vcap').hidden === true);
+
+  // Esc dismisses the DIALOG, not the mode behind it: dismissing should undo
+  // the last thing that opened, not two things.
+  key('Escape');
+  assert('Esc closes the sheet', mt.isOptionsOpen() === false);
+  assert('and leaves the window open', mt.isOpen() === true);
+  key('Escape');
+  assert('a second Esc then leaves the mode', mt.isOpen() === false);
+
+  // `o` is the keyboard entry point, and the backdrop is a way out.
+  mt.openMode();
+  key('o');
+  assert('`o` opens it', mt.isOptionsOpen() === true);
+  key('m');
+  assert('`m` does NOT yank the window out from under the dialog',
+    mt.isOpen() === true && mt.isOptionsOpen() === true);
+  clickEl(modal.querySelector('.modal-backdrop'));
+  assert('a backdrop click closes it', mt.isOptionsOpen() === false);
+  clickEl(optBtn);
+  clickEl(document.getElementById('multitail-options-close'));
+  assert('so does the close button', mt.isOptionsOpen() === false);
+
+  // `s` is the subagent default's key, and it is the same setting the sheet
+  // shows — the control repaints rather than going stale.
+  key('s');
+  assert('`s` flips the subagent default', mt.isSubagentsShown() === false);
+  assert('and the control in the sheet followed it',
+    document.getElementById('multitail-subs')
+      .getAttribute('aria-pressed') === 'false');
+  key('s');
+  assert('back on', mt.isSubagentsShown() === true);
+
+  // Leaving the mode cannot leave the sheet behind, or it would be the first
+  // thing the next `m` showed.
+  clickEl(optBtn);
+  assert('the sheet is up', mt.isOptionsOpen() === true);
+  mt.closeMode();
+  assert('closing the mode closes the sheet with it',
+    mt.isOptionsOpen() === false && modal.hidden === true);
 }
 
 console.log(

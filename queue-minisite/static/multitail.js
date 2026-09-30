@@ -7,10 +7,43 @@
 //   toggle on/off  the `multitail` pill in the header, or the `m` key
 //   leave          `m`, Esc, or the exit button
 //   dismiss one    the × in that pane's header (stays in the mode)
-//   line wrap      the `wrap` pill, or the `w` key
-//   timestamps     the `time` pill, or the `t` key
-//   ended-retention the `clear` pill, or the `c` key
-//   subagent tails  the `N subagents` button on a pane whose item has them
+//   settings       the `options` button in the header, or the `o` key
+//   line wrap      in options, or the `w` key
+//   timestamps     in options, or the `t` key
+//   verbose        in options, or the `v` key (`x` picks its cap)
+//   subagent tails in options, or the `s` key — and per card, the
+//                  `N subagents` button on that card's pane
+//   ended-retention in options, or the `c` key
+//
+// ---------------------------------------------------------------------------
+// WHY THE SETTINGS ARE IN A DIALOG AND NOT ON THE HEADER ROW
+// ---------------------------------------------------------------------------
+// They were pills on the header row, one per setting, and the row ran out of
+// width. MEASURED in a real browser rather than reasoned about: at 320px the
+// header overflowed by 28px and the item pushed past the right edge was
+// `exit` — which on a phone is the only way out of a whole-window takeover,
+// because `m` and Esc want a keyboard. Turning verbose on made it worse
+// rather than better, because the fix for that overflow was to WRAP the
+// header: three rows, 91px of a 700px viewport, spent on chrome by the window
+// whose entire design constraint is how many panes stay legible.
+//
+// One `options` button replaces the five settings. What stayed on the row is
+// what is not a setting — the title, the live count readout, the key hint and
+// `exit` — and the header now fits 320px with room to spare, so the wrap rule
+// is gone and the rows it cost go back to the panes.
+//
+// THE DIALOG IS THE SITE'S OWN MODAL. `.modal` + `.modal-backdrop` +
+// `.modal-panel`, Esc / backdrop / close-button dismissal, a Tab focus trap,
+// focus to the close button on open and back to the trigger on close — the
+// same shape action.js's confirm dialog uses. It lives INSIDE the overlay, so
+// it inherits the `data-no-morph` exemption the pills relied on and stays
+// below the single-item log modal's z-index band, which is the precedence
+// that was already true.
+//
+// SETTINGS APPLY LIVE. There is no OK/Cancel, because every control is a
+// projection of the panes behind the dialog and already persists on the spot;
+// a confirm step would mean holding a pending copy of six settings and a way
+// to revert them, to buy nothing.
 //
 // ---------------------------------------------------------------------------
 // WHICH ITEMS GET A PANE
@@ -237,11 +270,12 @@
 // ---------------------------------------------------------------------------
 // THE SETTINGS ARE REMEMBERED (localStorage)
 // ---------------------------------------------------------------------------
-// All four header settings — wrap, timestamps, verbose, ended-pane retention —
-// persist per viewer under one key each, through one guarded accessor pair.
-// A fresh viewer gets the pre-existing defaults (wrap off, timestamps off,
-// verbose off, clear 1m); a returning one gets what they left set, reflected
-// on the pills at load rather than after the mode is first opened.
+// All six settings in the options dialog — wrap, timestamps, verbose, the
+// verbose cap, subagent tails and ended-pane retention — persist per viewer
+// under one key each, through one guarded accessor pair. A fresh viewer gets
+// the defaults (wrap off, timestamps off, verbose off, cap 8K, subagent tails
+// ON, clear 1m); a returning one gets what they left set, reflected on the
+// controls at load rather than after the mode is first opened.
 //
 // Reads are GUARDED AND VALIDATED, not trusted. localStorage throws outright in
 // some privacy modes, comes back empty after cleared site data or during a
@@ -342,40 +376,61 @@
 // the same server shaping, and a per-pane fetch would spend the connection
 // budget this module rations everywhere else to learn what it has.
 //
-// COLLAPSED BY DEFAULT, PER CARD. The card renders its tree `<details open>`,
-// because a tree node there costs one row. A PANE costs a slice of the
-// viewport and one of the browser's scarce connections, and one item can own
-// half a dozen descendants, so opening them all by default would flood the
-// stack the mode exists to make readable. Instead the pane's header carries a
-// `N subagents` button, and expanding is per CARD: the whole subtree appears
-// at once, each pane indented by its real depth in the tree, so the stack
-// mirrors the hierarchy the card shows rather than inventing a second one.
-// Collapsing removes those panes outright (the reader said "go away", which is
-// what the per-pane x means too) and does NOT record a dismissal, so expanding
-// again brings them straight back.
+// SHOWN BY DEFAULT — TWO LEVELS OF CONTROL. Nested tails shipped COLLAPSED,
+// on the reasoning that a pane costs a slice of the viewport and one of the
+// browser's scarce connections, and one item can own half a dozen
+// descendants. Both costs are real; neither is unbounded, and neither is
+// bounded by collapsing. The stack SCROLLS past --mt-pane-min rather than
+// shrinking panes below legibility, and MAX_LIVE_STREAMS rations the sockets —
+// machinery that does not care where a pane came from. What collapsing bought
+// instead was that the children of a running item were, in practice, never on
+// screen in the window whose whole question is "what is everything doing": you
+// had to already know a card had a tree worth opening.
 //
-// The expansion is view state, not a viewer preference: it is per ITEM, it
-// dies with the mode (openMode clears it, exactly as it clears dismissals), and
-// it is not persisted. Persisting a per-qid set would accumulate keys for
-// queue items that stopped existing weeks ago, and re-opening the mode would
-// silently re-open N streams nobody asked for in this sitting.
+//   the DEFAULT       `subsShown` — a viewer preference, in the options
+//                     dialog and on the `s` key, PERSISTED like every other
+//                     setting there (DEFAULT_SUBS_SHOWN = on).
+//   per CARD          `subsChoice` — the `N subagents` button on a card's own
+//                     pane writes a deviation from that default for this
+//                     sitting. Hiding removes those panes outright (the reader
+//                     said "go away", which is what the per-pane × means too)
+//                     and does NOT record a dismissal, so showing again brings
+//                     them straight back.
 //
-// SLOT ORDER IS DISPLAY ORDER. Nested panes are INSERTED next to their parent
-// rather than appended, so the pane list is no longer in map-insertion order
-// and "the earliest panes get the connections" had to be restated as what it
-// always meant on screen: the order you SEE is the order slots are handed out
-// (panesInDisplayOrder). A subagent the reader just expanded therefore
-// outranks a later card's pane, which is the honest reading of having asked
-// for it — and the cap itself is unchanged, so expanding a tree cannot open a
-// fifth connection.
+// The split is the point. "Show subagent tails" is a statement about the VIEW
+// and should survive a reload; "collapse THIS card" is a statement about one
+// queue item's tree, and persisting a per-qid map would accumulate keys for
+// items that stopped existing weeks ago and re-apply a judgment about a
+// different agent's children. So openMode clears the per-card map exactly as
+// it clears dismissals, and the default it falls back to persists.
+// Consequently flipping the default moves every card the reader has not
+// touched by hand, and leaves the ones they have.
 //
-// What expansion does NOT do is take a connection away from a pane that
-// already has one: mid-read is mid-read, and a stack that reshuffled its live
-// streams on every click would be worse than a wait. So expanding a tree while
-// the cap is already full builds the panes, shows them, and leaves the ones
-// past the cap saying `waiting for a stream slot` until an earlier pane ends
-// or is closed — the same state, and the same wording, a sixth card's pane has
-// always had. Closing what you are not reading is how you get a slot back.
+// Whichever way a card is showing its tree, the whole subtree appears at once,
+// each pane indented by its real depth, so the stack mirrors the hierarchy the
+// card shows rather than inventing a second one.
+//
+// SLOT ORDER IS TIERED: EVERY QUEUE PANE, THEN EVERY SUBAGENT PANE. Nested
+// panes are INSERTED next to their parent rather than appended, so the pane
+// list is not in map-insertion order and the rule has to be stated against the
+// screen (panesInDisplayOrder). It used to be plain display order, and a
+// subagent the reader had just expanded therefore outranked a later card's
+// pane — the honest reading of having ASKED for it. Nobody asks any more, and
+// under plain display order one busy item would silently take the whole
+// connection budget: an item with three children would hold all four slots and
+// the SECOND running task would get nothing. So slotOrder() hands slots to
+// every top-level pane first, each tier still in the order you see it. That
+// only changes the case where the top-level panes do not already fill the cap;
+// with four or more items running, a tree waited for a slot before and waits
+// for one now.
+//
+// What none of this does is take a connection away from a pane that already
+// has one: mid-read is mid-read, and a stack that reshuffled its live streams
+// on every click would be worse than a wait. So a tree opened while the cap is
+// already full builds the panes, shows them, and leaves the ones past the cap
+// saying `waiting for a stream slot` until an earlier pane ends or is closed —
+// the same state, and the same wording, a sixth card's pane has always had.
+// Closing what you are not reading is how you get a slot back.
 //
 // AN ENDED SUBAGENT ENDS LIKE AN ENDED AGENT. There is no end frame on a
 // transcript tail (an agent pane's `ended` comes from its ROW leaving the
@@ -420,18 +475,19 @@
 //   * An ended pane holds no stream slot (markEnded released it), so clearing
 //     one cannot disturb the 4-slot pump.
 //
-// The retention CHOICE is the one thing in this module that is persisted
-// (localStorage, `qsite_mt_retain`, per viewer — the same mechanism as the
-// density and header-collapse pills). It is a policy about how much finished
-// output survives, not a projection of the current page, and someone who picked
-// `keep` because they read finished output carefully should not have to pick it
-// again after every reload. Storage can throw or come back empty, so every
-// access is guarded and an unreadable or unrecognised value simply means the
-// default.
+// The retention CHOICE persists (localStorage, `qsite_mt_retain`, per viewer —
+// the same mechanism as the density and header-collapse pills), as every
+// setting in the options dialog now does. It is a policy about how much
+// finished output survives, and someone who picked `keep` because they read
+// finished output carefully should not have to pick it again after every
+// reload. Storage can throw or come back empty, so every access is guarded and
+// an unreadable or unrecognised value simply means the default.
 //
 // The MODE itself is still not persisted: a full-window takeover that survived
-// a reload would be a surprise, not a convenience. The wrap / timestamp
-// preferences are display projections, and live as long as the page does.
+// a reload would be a surprise, not a convenience. Nor is anything scoped to a
+// particular queue item — dismissals and per-card subagent collapses die with
+// the mode, because they are statements about this sitting's stack rather than
+// preferences about the view.
 
 (function () {
   'use strict';
@@ -448,6 +504,16 @@
   const retainBtn = document.getElementById('multitail-retain');
   const verboseBtn = document.getElementById('multitail-verbose');
   const vcapBtn = document.getElementById('multitail-vcap');
+  // The verbose cap's whole ROW in the options dialog, not just its control:
+  // the setting's name and note have to disappear with it, or the sheet keeps
+  // a labelled row explaining a control that is not there.
+  const vcapRow = document.getElementById('multitail-vcap-row');
+  const subsModeBtn = document.getElementById('multitail-subs');
+  // The options dialog and its one entry point on the header row.
+  const optionsBtn = document.getElementById('multitail-options');
+  const optionsModal = document.getElementById('multitail-options-modal');
+  const optionsPanel = document.getElementById('multitail-options-panel');
+  const optionsCloseBtn = document.getElementById('multitail-options-close');
 
   // Rows the server marked as having a tailable log, in render order.
   const ROW_SELECTOR = '.item[data-live-log-mode]';
@@ -576,6 +642,20 @@
   const TS_STORAGE_KEY = 'qsite_mt_ts';
   const VERBOSE_STORAGE_KEY = 'qsite_mt_verbose';
   const VERBOSE_CAP_STORAGE_KEY = 'qsite_mt_vcap';
+  const SUBS_STORAGE_KEY = 'qsite_mt_subs';
+  // Nested subagent tails are SHOWN by default. This flipped: they shipped
+  // collapsed, on the reasoning that a pane costs a slice of the viewport and
+  // one of the browser's scarce connections. Both costs are real, and both are
+  // already bounded by machinery that does not care where a pane came from —
+  // the stack SCROLLS past --mt-pane-min rather than shrinking, and
+  // MAX_LIVE_STREAMS rations the sockets. What collapsing bought instead was
+  // that the children of a running item were, in practice, never on screen in
+  // the window whose whole question is "what is everything doing" — you had to
+  // already know a card had a tree worth opening. Stated here rather than
+  // implied, and templates/index.html renders the control with this same
+  // value; test_multitail.py pins the two together, as it does for the
+  // retention and cap defaults.
+  const DEFAULT_SUBS_SHOWN = true;
 
   let open = false;
   let reconcileTimer = null;
@@ -597,12 +677,20 @@
   // it, a pane whose stream said `workload-end` while the queue row was still
   // running would be cleared and rebuilt on every tick.
   const cleared = new Set();
-  // Queue items whose nested subagent tails are EXPANDED, by qid. Collapsed is
-  // the default — see the SUBAGENTS block in the header comment for why a
-  // nested pane is not treated like the card's `<details open>` tree node.
-  // Not persisted, and cleared when the mode opens, because it is view state
-  // about particular items rather than a preference about the view.
-  const expanded = new Set();
+  // Queue items whose nested subagent tails were explicitly shown or hidden
+  // FROM THEIR OWN PANE, by qid. An entry is a per-card DEVIATION from the
+  // `subsShown` default below; a qid that is absent simply follows that
+  // default, which is what makes flipping the default move every card that has
+  // not been touched by hand and leave the ones that have.
+  //
+  // Session-scoped on purpose, while the default it deviates from persists.
+  // "Show subagent tails" is a preference about the VIEW and survives reloads
+  // like every other setting in the sheet; "collapse THIS card" is a statement
+  // about one queue item, and persisting a per-qid map would accumulate keys
+  // for items that stopped existing weeks ago and re-apply a judgment about a
+  // different agent's tree. Same lifetime as `dismissed`, for the same reason:
+  // openMode clears it.
+  const subsChoice = new Map();
 
   // --- ended-pane retention ------------------------------------------------
 
@@ -679,6 +767,17 @@
   let tsOn = readStoredFlag(TS_STORAGE_KEY, false);
   let verboseOn = readStoredFlag(VERBOSE_STORAGE_KEY, false);
   let verboseCapKey = readStoredVerboseCap();
+  // Whether a card's nested subagent tails are shown WITHOUT being asked for.
+  // Read through the same guarded accessor as the other flags, so a viewer who
+  // turned it off keeps it off and unreadable storage just means the default.
+  let subsShown = readStoredFlag(SUBS_STORAGE_KEY, DEFAULT_SUBS_SHOWN);
+
+  // Does THIS card show its nested tails right now? The per-card choice wins
+  // over the default; absent means follow the default.
+  function subsShownFor(qid) {
+    const v = subsChoice.get(qid);
+    return v === undefined ? subsShown : v;
+  }
 
   function verboseCapOption() {
     return VERBOSE_CAP_BY_KEY[verboseCapKey] ||
@@ -1254,7 +1353,7 @@
       btn.hidden = true;
       return;
     }
-    const on = expanded.has(pane.qid);
+    const on = subsShownFor(pane.qid);
     const noun = n === 1 ? 'subagent' : 'subagents';
     btn.hidden = false;
     btn.setAttribute('aria-expanded', on ? 'true' : 'false');
@@ -1268,16 +1367,18 @@
     pane.subsWordEl.textContent = noun;
   }
 
-  // Expand / collapse one card's nested subagent tails. Expanding lets the
-  // next reconcile build them (which is also what keeps a tree that GROWS
-  // while expanded up to date); collapsing removes them at once rather than
-  // waiting a tick, and records NO dismissal — see the header comment.
+  // Show / hide ONE card's nested subagent tails, from that card's own pane.
+  // Showing lets the next reconcile build them (which is also what keeps a
+  // tree that GROWS while shown up to date); hiding removes them at once
+  // rather than waiting a tick, and records NO dismissal — see the header
+  // comment. Either way it writes a per-card deviation from the default, so a
+  // card the reader collapsed by hand stays collapsed even if the default is
+  // toggled under it.
   function toggleSubagents(qid) {
-    if (expanded.has(qid)) {
-      expanded.delete(qid);
+    const next = !subsShownFor(qid);
+    subsChoice.set(qid, next);
+    if (!next) {
       for (const pane of subPanesOf(qid)) destroyPane(pane);
-    } else {
-      expanded.add(qid);
     }
     reconcile();
   }
@@ -1447,7 +1548,7 @@
       // Closing a card's pane takes its nested tails with it (destroyPane
       // cascades): they are presented AS a detail of this pane, and leaving
       // them behind would orphan a tail under a card that is no longer shown.
-      if (pane.kind === 'queue') expanded.delete(pane.qid);
+      if (pane.kind === 'queue') subsChoice.delete(pane.qid);
       destroyPane(pane);
       pumpSlots();
       paintCount();
@@ -1837,9 +1938,34 @@
     return out;
   }
 
+  // THE ORDER STREAM SLOTS ARE HANDED OUT: every QUEUE pane first, then every
+  // SUBAGENT pane, each group in the order it appears on screen.
+  //
+  // This used to be plain display order, on the reasoning that a subagent the
+  // reader had just EXPANDED outranks a later card's pane — which is the
+  // honest reading of having asked for it. Subagent tails are now shown
+  // without being asked for, so nobody asked, and plain display order would
+  // have meant one busy item silently taking the whole connection budget: an
+  // item with three children would hold all four slots and the SECOND running
+  // task in the list would get nothing, in the window whose entire question is
+  // "what is everything doing".
+  //
+  // Tiering is the smallest fix that keeps both properties. Within a tier the
+  // order you see is still the order slots are given; across tiers, top-level
+  // coverage comes first. It only changes the case where the top-level panes
+  // do not already fill the cap — with four or more items running, an expanded
+  // tree waited for a slot before this change and waits for one now.
+  function slotOrder() {
+    const ordered = panesInDisplayOrder();
+    const out = [];
+    for (const pane of ordered) if (pane.kind !== 'subagent') out.push(pane);
+    for (const pane of ordered) if (pane.kind === 'subagent') out.push(pane);
+    return out;
+  }
+
   // Give connections to the earliest panes that want one, up to the cap.
   function pumpSlots() {
-    const ordered = panesInDisplayOrder();
+    const ordered = slotOrder();
     let live = 0;
     for (const pane of ordered) {
       if (pane.streaming) live += 1;
@@ -1912,16 +2038,17 @@
   }
 
   // Everything that should have a pane right now, in DISPLAY order: each
-  // eligible row, followed by the nested subagent tails of the cards whose
-  // trees are expanded. One pass, so the order panes are built in is the order
-  // they are placed in and the order they are given stream slots.
+  // eligible row, followed by the nested subagent tails of the cards that are
+  // showing them. One pass, so the order panes are built in is the order they
+  // are placed in. It is NOT the order they are given stream slots any more —
+  // see slotOrder().
   function eligibleInfos() {
     const out = [];
     for (const row of eligibleRows()) {
       const info = rowInfo(row);
       if (!info.qid || !info.mode) continue;
       out.push(info);
-      if (!expanded.has(info.qid)) continue;
+      if (!subsShownFor(info.qid)) continue;
       // A card's nested tails are eligible only while the card's OWN pane is:
       // a nested tail under a pane the reader dismissed (or retention cleared)
       // would be attributed to nothing on screen.
@@ -2027,6 +2154,9 @@
     if (verboseBtn) {
       verboseBtn.setAttribute('aria-pressed', verboseOn ? 'true' : 'false');
     }
+    if (subsModeBtn) {
+      subsModeBtn.setAttribute('aria-pressed', subsShown ? 'true' : 'false');
+    }
     overlay.classList.toggle('mt-wrap', wrapOn);
     overlay.classList.toggle('mt-show-ts', tsOn);
     overlay.classList.toggle('mt-verbose', verboseOn);
@@ -2044,6 +2174,10 @@
   // accessible name spells out what that state means rather than leaving
   // `cap 16K` to be guessed at.
   function syncVerboseCapButton() {
+    // The whole ROW goes with the control. In the options sheet the control
+    // has a name and a note beside it, and hiding only the button would leave
+    // a labelled row describing something that is not there.
+    if (vcapRow) vcapRow.hidden = !verboseOn;
     if (!vcapBtn) return;
     const opt = verboseCapOption();
     vcapBtn.hidden = !verboseOn;
@@ -2162,19 +2296,114 @@
     rerenderAllPanes();
   }
 
+  // THE DEFAULT every card starts from, not a command that overrides the ones
+  // the reader has already collapsed by hand: `subsChoice` entries survive it,
+  // so turning it off closes the trees nobody touched and leaves a card that
+  // was explicitly shown stay shown.
+  //
+  // Turning it OFF destroys the newly-unwanted nested panes here rather than
+  // leaving them to reconcile, because reconcile's job for a pane that left
+  // the eligible set is to mark it ENDED (a job that finished keeps its
+  // output) — which is the wrong answer for a pane the reader just switched
+  // off. Same reason toggleSubagents() destroys rather than waits.
+  function setSubagents(on) {
+    const next = !!on;
+    if (next === subsShown) return;
+    subsShown = next;
+    storeFlag(SUBS_STORAGE_KEY, subsShown);
+    syncDisplayButtons();
+    if (open) {
+      for (const pane of Array.from(panes.values())) {
+        if (pane.kind !== 'subagent') continue;
+        if (!subsShownFor(pane.qid)) destroyPane(pane);
+      }
+      reconcile();
+    }
+  }
+
   function toggleWrap() { setWrap(!wrapOn); }
   function toggleTimestamps() { setTimestamps(!tsOn); }
   function toggleVerbose() { setVerbose(!verboseOn); }
+  function toggleSubagentsDefault() { setSubagents(!subsShown); }
+
+  // --- the options dialog --------------------------------------------------
+  //
+  // The site's own modal, wired the way action.js wires its confirm dialog:
+  // Esc, backdrop click and an explicit close button all dismiss; Tab is
+  // trapped inside the panel; focus goes to the close button on open and back
+  // to the button that opened it on close.
+  //
+  // It deliberately does NOT add `body.modal-open`. That class exists to stop
+  // the page behind a dialog scrolling, and `body.multitail-open` — which is
+  // on for as long as this dialog can exist at all — already does exactly
+  // that. Adding a second owner of one `overflow: hidden` means whichever
+  // dialog closes last decides whether the page scrolls again.
+  //
+  // Settings apply LIVE. There is no OK/Cancel because every control here is
+  // a projection of the panes behind the dialog and already persists on the
+  // spot; a confirm step would mean holding a pending copy of six settings
+  // and a way to revert them, to buy nothing.
+  let optionsOpen = false;
+  let optionsTrigger = null;
+
+  function syncOptionsButton() {
+    if (optionsBtn) {
+      optionsBtn.setAttribute('aria-expanded', optionsOpen ? 'true' : 'false');
+    }
+  }
+
+  // Focusable controls inside the panel, for the Tab trap. Read live rather
+  // than cached: the verbose-cap row comes and goes with verbose.
+  function optionsFocusables() {
+    if (!optionsPanel) return [];
+    const nodes = optionsPanel.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    return Array.prototype.filter.call(nodes, (n) => {
+      if (n.disabled) return false;
+      if (n.hidden) return false;
+      // A control inside the hidden verbose-cap row is not reachable either.
+      return !(n.closest && n.closest('[hidden]'));
+    });
+  }
+
+  function openOptions() {
+    if (!optionsModal || optionsOpen) return;
+    optionsOpen = true;
+    optionsTrigger = optionsBtn;
+    optionsModal.hidden = false;
+    syncOptionsButton();
+    if (optionsCloseBtn) {
+      setTimeout(() => { try { optionsCloseBtn.focus(); } catch (_) {} }, 0);
+    }
+  }
+
+  function closeOptions() {
+    if (!optionsModal || !optionsOpen) return;
+    optionsOpen = false;
+    optionsModal.hidden = true;
+    syncOptionsButton();
+    const back = optionsTrigger;
+    optionsTrigger = null;
+    if (back && typeof back.focus === 'function') {
+      try { back.focus(); } catch (_) {}
+    }
+  }
+
+  function toggleOptions() {
+    if (optionsOpen) closeOptions();
+    else openOptions();
+  }
 
   function openMode() {
     if (open) return;
     open = true;
     dismissed.clear();
     cleared.clear();
-    // A fresh open starts collapsed, like it starts with nothing dismissed:
-    // re-opening the mode should not silently re-open N nested streams that
-    // were expanded in some earlier sitting.
-    expanded.clear();
+    // A fresh open starts from the DEFAULT for every card, like it starts with
+    // nothing dismissed: a card collapsed by hand in an earlier sitting was a
+    // statement about that sitting's tree, not a standing preference. The
+    // standing preference is `subsShown`, which persists.
+    subsChoice.clear();
     overlay.hidden = false;
     document.body.classList.add('multitail-open');
     syncToggleButton();
@@ -2191,6 +2420,9 @@
   function closeMode() {
     if (!open) return;
     open = false;
+    // The settings sheet cannot outlive the window it configures — left open,
+    // it would be the first thing the next `m` showed.
+    closeOptions();
     if (reconcileTimer !== null) {
       clearInterval(reconcileTimer);
       reconcileTimer = null;
@@ -2199,7 +2431,7 @@
     panes.clear();
     dismissed.clear();
     cleared.clear();
-    expanded.clear();
+    subsChoice.clear();
     if (panesEl) panesEl.textContent = '';
     overlay.hidden = true;
     document.body.classList.remove('multitail-open');
@@ -2233,6 +2465,27 @@
   if (vcapBtn) {
     vcapBtn.addEventListener('click', (ev) => { ev.preventDefault(); cycleVerboseCap(); });
   }
+  if (subsModeBtn) {
+    subsModeBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      toggleSubagentsDefault();
+    });
+  }
+  if (optionsBtn) {
+    optionsBtn.addEventListener('click', (ev) => { ev.preventDefault(); toggleOptions(); });
+  }
+  // Backdrop, the × and anything else tagged [data-modal-dismiss] — the same
+  // delegated dismissal action.js and live-log.js use, so a control added to
+  // the panel later needs no new listener to be able to close it.
+  if (optionsModal) {
+    optionsModal.addEventListener('click', (ev) => {
+      if (ev.target.closest && ev.target.closest('[data-modal-dismiss]')) {
+        ev.preventDefault();
+        closeOptions();
+      }
+    });
+  }
+  syncOptionsButton();
   // Every pill is server-rendered in its DEFAULT state, so a stored choice has
   // to be reflected before the mode is ever opened — otherwise the header says
   // `wrap` is off while the panes wrap. The overlay is hidden until then, so
@@ -2272,6 +2525,41 @@
   document.addEventListener('keydown', (ev) => {
     if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
     if (isTypingTarget(document.activeElement)) return;
+    // THE OPTIONS SHEET OWNS TAB AND ESC WHILE IT IS UP. Esc closes the sheet
+    // and NOT the mode behind it — dismissing a dialog should undo the last
+    // thing that opened, not two things — and Tab cycles inside the panel, the
+    // same trap action.js puts on its confirm dialog. The setting keys below
+    // are deliberately NOT gated on the sheet being closed: they are the same
+    // settings the sheet shows, the sheet repaints as they change, and the
+    // panes behind it are the feedback.
+    if (optionsOpen) {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeOptions();
+        return;
+      }
+      if (ev.key === 'Tab') {
+        const nodes = optionsFocusables();
+        if (!nodes.length) return;
+        const first = nodes[0];
+        const last = nodes[nodes.length - 1];
+        if (ev.shiftKey && document.activeElement === first) {
+          ev.preventDefault();
+          last.focus();
+        } else if (!ev.shiftKey && document.activeElement === last) {
+          ev.preventDefault();
+          first.focus();
+        }
+        return;
+      }
+      // `m` would take the whole window out from under the dialog configuring
+      // it. The dialog is what Esc dismisses; the mode is what Esc dismisses
+      // once the dialog is gone.
+      if (ev.key === 'm' || ev.key === 'M') {
+        ev.preventDefault();
+        return;
+      }
+    }
     if (open && ev.key === 'Escape') {
       ev.preventDefault();
       closeMode();
@@ -2325,6 +2613,23 @@
       cycleRetention();
       return;
     }
+    // `s` flips whether cards show their nested subagent tails by default.
+    // Mode-local like the rest, and free on this site; Ctrl/Cmd+S is returned
+    // above untouched so the browser's save still works.
+    if (ev.key === 's' || ev.key === 'S') {
+      if (!open || otherDialogOpen()) return;
+      ev.preventDefault();
+      toggleSubagentsDefault();
+      return;
+    }
+    // `o` opens the options sheet — the single entry point that replaced the
+    // header's row of pills. Mode-local, and free on this site.
+    if (ev.key === 'o' || ev.key === 'O') {
+      if (!open || otherDialogOpen()) return;
+      ev.preventDefault();
+      toggleOptions();
+      return;
+    }
     // `m` is the mode toggle. Chosen because it is a free single key, and
     // unlike `/` — which is Firefox's quick-find — a bare `m` has no default
     // browser action to swallow.
@@ -2352,12 +2657,13 @@
     panes,
     dismissed,
     cleared,
-    expanded,
+    subsChoice,
     paneKey,
     streamUrl,
     toggleSubagents,
     subPanesOf,
     panesInDisplayOrder,
+    slotOrder,
     SUB_NODE_SELECTOR,
     MAX_SUB_INDENT_DEPTH,
     isOpen: () => open,
@@ -2370,6 +2676,17 @@
     isWrap: () => wrapOn,
     isTimestamps: () => tsOn,
     isVerbose: () => verboseOn,
+    setSubagents,
+    toggleSubagentsDefault,
+    subsShownFor,
+    isSubagentsShown: () => subsShown,
+    SUBS_STORAGE_KEY,
+    DEFAULT_SUBS_SHOWN,
+    openOptions,
+    closeOptions,
+    toggleOptions,
+    isOptionsOpen: () => optionsOpen,
+    optionsFocusables,
     lineCharLimit,
     setVerboseCap,
     cycleVerboseCap,

@@ -87,13 +87,22 @@ const initialHTML = `<!doctype html>
     <header class="multitail-head">
       <h2 id="multitail-title">multitail</h2>
       <span id="multitail-count"></span>
-      <button type="button" id="multitail-wrap" class="multitail-display" aria-pressed="false">wrap</button>
-      <button type="button" id="multitail-ts" class="multitail-display" aria-pressed="false">time</button>
-      <button type="button" id="multitail-retain" class="multitail-display multitail-retain" data-retention="1m">clear 1m</button>
+      <button type="button" id="multitail-options" class="multitail-display"
+              aria-haspopup="dialog" aria-expanded="false">options</button>
       <button type="button" id="multitail-exit">exit</button>
     </header>
     <div id="multitail-panes"></div>
     <p id="multitail-empty" hidden>Nothing to tail</p>
+    <div id="multitail-options-modal" class="modal mt-options" role="dialog" aria-modal="true" hidden>
+      <div class="modal-backdrop" data-modal-dismiss></div>
+      <div id="multitail-options-panel" class="modal-panel mt-options-panel" role="document">
+        <button type="button" id="multitail-options-close" data-modal-dismiss>&times;</button>
+        <button type="button" id="multitail-wrap" class="multitail-display" aria-pressed="false">wrap</button>
+        <button type="button" id="multitail-ts" class="multitail-display" aria-pressed="false">time</button>
+        <button type="button" id="multitail-subs" class="multitail-display" aria-pressed="true">subagents</button>
+        <button type="button" id="multitail-retain" class="multitail-display multitail-retain" data-retention="1m">clear 1m</button>
+      </div>
+    </div>
   </section>
 </body></html>`;
 
@@ -192,7 +201,7 @@ console.log('\n-- a finished item\'s pane ends, then clears (refresh.js + multit
 
   mt.openMode();
   assert('the pane exists', paneFor('q-wl') !== null);
-  assert('and it is not ended', mt.panes.get('q-wl').ended === false);
+  assert('and it is not ended', mt.panes.get(mt.paneKey('queue', 'q-wl')).ended === false);
 
   // THE TRANSITION. This is what the two suites could not see between them:
   // refresh.js moves the item into the done section on a real morph, and
@@ -205,7 +214,7 @@ console.log('\n-- a finished item\'s pane ends, then clears (refresh.js + multit
     document.querySelector('.item') ? document.querySelector('.item').outerHTML.slice(0, 220) : '(no card)');
 
   mt.reconcile();
-  const pane = mt.panes.get('q-wl');
+  const pane = mt.panes.get(mt.paneKey('queue', 'q-wl'));
   assert('the pane is marked ended by the reconcile that followed the merge',
     !!pane && pane.ended === true);
   assert('it says so, with a countdown to its clear',

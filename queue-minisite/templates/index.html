@@ -1295,6 +1295,19 @@
        also covers the `wrap` / `time` / `clear` pills below: they sit inside
        the data-no-morph subtree, so unlike the topbar multitail pill (which
        refresh.js must re-emit every tick) they are rendered once and survive.
+
+       THE SETTINGS LIVE IN A DIALOG, NOT ON THE HEADER ROW. They were six
+       pills in a row and the row ran out of width: measured in a real browser
+       at 320px the header overflowed by 28px and the item pushed past the
+       right edge was `exit` — on a phone the only way out of a whole-window
+       takeover, since `m` and Esc want a keyboard. Turning verbose on made it
+       worse rather than better: the header wrapped to THREE rows (91px of a
+       700px viewport) to keep the exit button reachable.
+
+       So the header now carries one entry point (`options`) beside `exit`,
+       and every setting lives in the dialog below. What stayed on the row is
+       what is not a setting: the title, the live count readout, the key hint,
+       and `exit` itself.
    #}
   <section
     id="multitail"
@@ -1307,61 +1320,23 @@
     <header class="multitail-head">
       <h2 id="multitail-title" class="multitail-title">multitail</h2>
       <span id="multitail-count" class="multitail-count"></span>
+      {#- The header row's hint names only the two keys the ROW still offers.
+          Every per-setting key is printed beside its own control in the
+          options dialog, which is where the reader who wants it now goes. -#}
       <span class="multitail-hint">
-        <kbd>w</kbd> wrap · <kbd>t</kbd> time · <kbd>v</kbd> all ·
-        <kbd>x</kbd> cap · <kbd>c</kbd> clear · <kbd>m</kbd>/<kbd>Esc</kbd> exit
+        <kbd>o</kbd> options · <kbd>m</kbd>/<kbd>Esc</kbd> exit
       </span>
-      {#- Display toggles. All default OFF (off == the behaviour before each
-          existed) and all are keyboard-reachable: `w` wrap, `t` timestamps,
-          `v` verbose. Each is rendered in its DEFAULT state and multitail.js
-          overwrites it at load from the viewer's stored choice — the overlay is
-          hidden until then, so nothing flashes. -#}
+      {#- THE ONE ENTRY POINT. `aria-haspopup="dialog"` + `aria-expanded`
+          rather than `aria-pressed`: it opens a dialog, it is not a setting
+          with an on state. multitail.js keeps aria-expanded honest. -#}
       <button
         type="button"
-        id="multitail-wrap"
-        class="multitail-display"
-        aria-pressed="false"
-        title="Wrap long lines instead of clipping them (w)">wrap</button>
-      <button
-        type="button"
-        id="multitail-ts"
-        class="multitail-display"
-        aria-pressed="false"
-        title="Show each line's own source timestamp where the log has one (t). Plain-text workload and hostjob logs carry none — those panes show no time rather than your browser's arrival time.">time</button>
-      <button
-        type="button"
-        id="multitail-verbose"
-        class="multitail-display"
-        aria-pressed="false"
-        title="Show everything the panes normally elide (v): whole multi-line messages and tool results instead of their first line, full tool arguments, and attachment / image detail instead of a placeholder. Applies to lines received from now on; lines already on screen widen but cannot regain detail that was not kept. Long lines are still capped — the single-item log view has the complete payload.">all</button>
-      {#- Verbose's per-line ceiling. A VALUE like the retention pill, and
-          HIDDEN until verbose is on — the cap is verbose mode's own bound and
-          does nothing with verbose off, so it appears beside the pill that
-          turned verbose on rather than sitting inert in the header. Rendered
-          with multitail.js's DEFAULT_VERBOSE_CAP_KEY; the module overwrites
-          the label at load from the viewer's stored choice, and
-          test_multitail.py pins this default against the module's. -#}
-      <button
-        type="button"
-        id="multitail-vcap"
-        class="multitail-display multitail-vcap"
-        data-verbose-cap="8k"
-        aria-label="Verbose mode shows at most 8,000 characters of a single line. Activate to change (x)."
-        title="How much of one line verbose mode shows before clipping it (x). Cycles cap 4K → cap 8K → cap 16K → cap 32K. Raising it applies to lines received from now on; lowering it applies at once. Your choice is remembered in this browser."
-        hidden>cap 8K</button>
-      {#- Ended-pane retention. A VALUE, not a toggle, so no aria-pressed: the
-          label IS the state and `c` cycles it (clear 1m → 5m → 15m → keep).
-          Rendered with multitail.js's DEFAULT_RETENTION_KEY; the module
-          overwrites the label at load from the viewer's stored choice (the
-          overlay is hidden until then, so nothing flashes), and
-          test_multitail.py pins this default against the module's. -#}
-      <button
-        type="button"
-        id="multitail-retain"
-        class="multitail-display multitail-retain"
-        data-retention="1m"
-        aria-label="Ended tails are cleared 1 minute after they end. Activate to change (c)."
-        title="How long a finished tail stays in the window (c). Cycles clear 1m → clear 5m → clear 15m → keep. Your choice is remembered in this browser.">clear 1m</button>
+        id="multitail-options"
+        class="multitail-display multitail-options-btn"
+        aria-haspopup="dialog"
+        aria-expanded="false"
+        aria-controls="multitail-options-modal"
+        title="Display and retention settings for this window (o).">options</button>
       <button
         type="button"
         id="multitail-exit"
@@ -1372,6 +1347,160 @@
     <p id="multitail-empty" class="multitail-empty" hidden>
       Nothing to tail — no running task or workload has a log yet.
     </p>
+
+    {#- ---------- THE OPTIONS DIALOG ----------
+
+        Every setting this mode has, in the site's OWN modal idiom: a
+        `.modal` wrapper with `role=dialog aria-modal=true`, a
+        `.modal-backdrop[data-modal-dismiss]`, a `.modal-panel[role=document]`,
+        Esc / backdrop / close-button dismissal and a Tab focus trap — the
+        same shape action.js's confirm dialog and live-log.js's log modal use.
+        Nothing new is imported for it.
+
+        IT LIVES INSIDE THE OVERLAY, which buys two things. The overlay is
+        `data-no-morph`, so these controls are rendered once and survive the
+        5s merge exactly as the pills they replace did; and `.multitail` has
+        a z-index, so the dialog paints above the panes but stays BELOW the
+        single-item log modal's own band — which is the precedence that was
+        already true and should stay true.
+
+        The controls keep their ids, their classes and their defaults. Only
+        their PLACE changed, so the persistence (one localStorage key each),
+        the module's sync functions and the keyboard shortcuts are untouched.
+
+        SETTINGS APPLY LIVE — there is no OK/Cancel. Every one of them is a
+        projection of the panes behind the dialog (multitail.js re-renders and
+        persists on the spot), so a confirm step would mean holding a pending
+        copy of five settings and a way to revert them, to buy nothing. -#}
+    <div
+      id="multitail-options-modal"
+      class="modal mt-options"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="multitail-options-title"
+      hidden>
+      <div class="modal-backdrop" data-modal-dismiss></div>
+      <div
+        id="multitail-options-panel"
+        class="modal-panel mt-options-panel"
+        role="document">
+        <div class="mt-options-head">
+          <h3 id="multitail-options-title" class="modal-title">options</h3>
+          <button
+            type="button"
+            id="multitail-options-close"
+            class="mt-options-close"
+            data-modal-dismiss
+            title="Close (Esc)"
+            aria-label="Close options">&times;</button>
+        </div>
+        <ul class="mt-options-list">
+          {#- Display toggles. All default OFF (off == the behaviour before
+              each existed) and all are keyboard-reachable: `w` wrap, `t`
+              timestamps, `v` verbose. Each is rendered in its DEFAULT state
+              and multitail.js overwrites it at load from the viewer's stored
+              choice — the overlay is hidden until then, so nothing flashes. -#}
+          <li class="mt-option">
+            <span class="mt-option-text">
+              <span class="mt-option-name">Wrap long lines <kbd>w</kbd></span>
+              <span class="mt-option-note">Show a whole line over as many rows as it needs instead of clipping it at the pane edge.</span>
+            </span>
+            <button
+              type="button"
+              id="multitail-wrap"
+              class="multitail-display"
+              aria-pressed="false"
+              title="Wrap long lines instead of clipping them (w)">wrap</button>
+          </li>
+          <li class="mt-option">
+            <span class="mt-option-text">
+              <span class="mt-option-name">Source timestamps <kbd>t</kbd></span>
+              <span class="mt-option-note">Each line's own time where the log has one. Plain-text workload and hostjob logs carry none and show nothing rather than your browser's arrival time.</span>
+            </span>
+            <button
+              type="button"
+              id="multitail-ts"
+              class="multitail-display"
+              aria-pressed="false"
+              title="Show each line's own source timestamp where the log has one (t). Plain-text workload and hostjob logs carry none — those panes show no time rather than your browser's arrival time.">time</button>
+          </li>
+          <li class="mt-option">
+            <span class="mt-option-text">
+              <span class="mt-option-name">Stop eliding <kbd>v</kbd></span>
+              <span class="mt-option-note">Whole multi-line messages and tool results instead of their first line, full tool arguments, and attachment detail instead of a placeholder. Applies to lines received from now on.</span>
+            </span>
+            <button
+              type="button"
+              id="multitail-verbose"
+              class="multitail-display"
+              aria-pressed="false"
+              title="Show everything the panes normally elide (v): whole multi-line messages and tool results instead of their first line, full tool arguments, and attachment / image detail instead of a placeholder. Applies to lines received from now on; lines already on screen widen but cannot regain detail that was not kept. Long lines are still capped — the single-item log view has the complete payload.">all</button>
+          </li>
+          {#- Verbose's per-line ceiling. A VALUE like the retention pill, and
+              HIDDEN until verbose is on — the cap is verbose mode's own bound
+              and does nothing with verbose off, so it appears under the
+              control that turned verbose on rather than sitting inert.
+              Rendered with multitail.js's DEFAULT_VERBOSE_CAP_KEY; the module
+              overwrites the label at load from the viewer's stored choice, and
+              test_multitail.py pins this default against the module's. -#}
+          <li class="mt-option mt-option-sub" id="multitail-vcap-row" hidden>
+            <span class="mt-option-text">
+              <span class="mt-option-name">…up to <kbd>x</kbd></span>
+              <span class="mt-option-note">Raising it applies to lines received from now on; lowering it applies at once.</span>
+            </span>
+            <button
+              type="button"
+              id="multitail-vcap"
+              class="multitail-display multitail-vcap"
+              data-verbose-cap="8k"
+              aria-label="Verbose mode shows at most 8,000 characters of a single line. Activate to change (x)."
+              title="How much of one line verbose mode shows before clipping it (x). Cycles cap 4K → cap 8K → cap 16K → cap 32K. Raising it applies to lines received from now on; lowering it applies at once. Your choice is remembered in this browser."
+              hidden>cap 8K</button>
+          </li>
+          {#- Nested subagent tails. Rendered ON, which is the default
+              multitail.js carries (DEFAULT_SUBS_SHOWN) — a card's children are
+              part of "what is everything doing" and having to ask for them per
+              card meant they were usually not on screen. Per-CARD collapse
+              stays on each pane's own expander; this is the default those
+              start from. test_multitail.py pins the rendered state against the
+              module's default. -#}
+          <li class="mt-option">
+            <span class="mt-option-text">
+              <span class="mt-option-name">Subagent tails <kbd>s</kbd></span>
+              <span class="mt-option-note">Tail each running item's subagents as nested panes. Individual cards can still be collapsed from their own pane. The connection cap is unchanged — top-level tails get a stream before any nested one does.</span>
+            </span>
+            <button
+              type="button"
+              id="multitail-subs"
+              class="multitail-display"
+              aria-pressed="true"
+              title="Tail each item's subagents as nested panes under it (s). Collapse one card from its own pane header. Your choice is remembered in this browser.">subagents</button>
+          </li>
+          {#- Ended-pane retention. A VALUE, not a toggle, so no aria-pressed:
+              the label IS the state and `c` cycles it (clear 1m → 5m → 15m →
+              keep). Rendered with multitail.js's DEFAULT_RETENTION_KEY; the
+              module overwrites the label at load from the viewer's stored
+              choice (the overlay is hidden until then, so nothing flashes),
+              and test_multitail.py pins this default against the module's. -#}
+          <li class="mt-option">
+            <span class="mt-option-text">
+              <span class="mt-option-name">Keep finished tails <kbd>c</kbd></span>
+              <span class="mt-option-note">How long a pane stays after its job ends, before the window clears it. The pane counts its own remaining time down.</span>
+            </span>
+            <button
+              type="button"
+              id="multitail-retain"
+              class="multitail-display multitail-retain"
+              data-retention="1m"
+              aria-label="Ended tails are cleared 1 minute after they end. Activate to change (c)."
+              title="How long a finished tail stays in the window (c). Cycles clear 1m → clear 5m → clear 15m → keep. Your choice is remembered in this browser.">clear 1m</button>
+          </li>
+        </ul>
+        <p class="mt-options-foot">
+          Every choice here is remembered in this browser and applies as you make it.
+        </p>
+      </div>
+    </div>
   </section>
 
   {% if site_brand %}
