@@ -459,6 +459,56 @@ class CompletionPollNeverSucceedsWithPickerOpenTest(unittest.TestCase):
         self.assertTrue(self.mod.is_idle("sess:0.0"))
         self.assertTrue(self.mod._rewind_picker_visible(pane_text))
 
+    def test_poll_loop_never_issues_a_second_independent_capture_for_idle(self):
+        """Regression test for the 2026-09-30 wedge: the poll loop's idle
+        check must reuse the SAME pane_text the picker check just examined,
+        never a second, separately-timed `tmux capture-pane` call.
+
+        The wedge happened even though `_rewind_picker_confirm_once()` was
+        already being called every poll iteration (the prior fix, #816): the
+        picker-check capture and a LATER, independent `is_idle(pane)`
+        capture could land on different render frames. One iteration's
+        picker-check capture missed the not-yet-fully-rendered picker
+        footer (picker_seen=False), while `is_idle(pane)`'s own separate
+        capture -- issued moments later, after the `get_token_count()`
+        subprocess call added latency -- caught the picker's `❯ (current)`
+        cursor row and misread it as the ordinary idle prompt. tokens read
+        0 (the picker screen has no token line to parse), so the poll
+        declared /clear complete and injected the resume prompt straight
+        into the still-open picker.
+
+        This test proves the fix structurally rather than by timing: it
+        inspects the completion-poll loop's source (between the "polling
+        for /clear completion" log line and the loop's closing `if
+        clear_confirmed: break`) and asserts it calls `_is_idle_text(
+        pane_text)` -- the pure, no-subprocess variant that reuses the
+        iteration's own capture -- and never `is_idle(pane)`, which issues
+        its own independent `tmux capture-pane`. A future edit that
+        reintroduces a second capture inside this loop will fail this test
+        even if every other picker/idle unit test above still passes in
+        isolation (as they did before this fix -- they exercise the pure
+        predicates against a single shared pane_text by construction, which
+        is exactly what let the two-capture race in the real loop go
+        undetected).
+        """
+        src = SCRIPT.read_text()
+        start = src.index('"  polling for /clear completion')
+        end = src.index("if clear_confirmed:\n            break", start)
+        loop_body = src[start:end]
+        self.assertIn(
+            "_is_idle_text(pane_text)",
+            loop_body,
+            "completion poll must check idle against the SAME snapshot "
+            "already captured for the picker check this iteration",
+        )
+        self.assertNotIn(
+            "is_idle(pane)",
+            loop_body,
+            "completion poll must NOT call is_idle(pane) -- that issues "
+            "its own independent capture-pane, reopening the two-capture "
+            "race between the picker check and the idle check",
+        )
+
 
 class InjectCommandTest(unittest.TestCase):
     """The argv `inject()` hands to `claude-watch inject`.

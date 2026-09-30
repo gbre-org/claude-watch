@@ -427,25 +427,55 @@ def dismiss_feedback_prompt(pane, max_attempts=3):
     return not still_present
 
 
+def _is_idle_text(pane_text):
+    """Pure: does this ALREADY-CAPTURED pane text show the idle prompt (❯)?
+
+    Split out of `is_idle` so callers that already have a fresh capture
+    (e.g. the `/clear` completion poll in `child_main`) can reuse it
+    instead of issuing a SEPARATE `tmux capture-pane` call. Two independent
+    captures taken moments apart during that poll is exactly the race that
+    caused the 2026-09-30 hang: the picker-detection capture caught a frame
+    before the Rewind picker had rendered (picker_seen=False), while a
+    LATER, separate `is_idle(pane)` capture caught the picker's OWN
+    `❯ (current)` cursor row and misread it as the ordinary prompt --
+    tokens read 0 (the picker screen has no token status line to parse,
+    indistinguishable from a genuinely completed /clear), so the poll
+    declared completion and injected the resume prompt straight into the
+    still-open picker.
+
+    Deliberately does NOT special-case the picker's own `❯` row here --
+    that exclusion lives in the caller (the poll loop already `continue`s
+    whenever `_rewind_picker_visible` matches THIS SAME pane_text), so the
+    single source of truth for "picker or not" stays in one place.
+    """
+    if not pane_text:
+        return False
+    lines = pane_text.strip().split("\n")
+    last_lines = lines[-15:]
+    for line in last_lines:
+        if "❯" in line:
+            return True
+    return False
+
+
 def is_idle(pane):
     """Check if Claude Code is ready to accept input.
 
     Only checks for prompt visibility (❯). Does NOT check thinking
     indicators — Escape interrupts thinking, so we don't need to wait
     for thinking to stop. We just need the prompt to be visible.
+
+    Captures its own pane snapshot -- fine for callers outside the /clear
+    completion poll (wait_for_idle, dismiss_feedback_prompt, etc.), which
+    don't have a same-instant capture to reuse. The poll loop in
+    `child_main` calls `_is_idle_text` directly against ITS OWN capture
+    instead, precisely to avoid the two-capture race this function's
+    self-capture would otherwise reintroduce there.
     """
     out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
     if rc != 0 or not out:
         return False
-
-    lines = out.strip().split("\n")
-    last_lines = lines[-15:]
-
-    for line in last_lines:
-        if "❯" in line:
-            return True
-
-    return False
+    return _is_idle_text(out)
 
 
 def wait_for_idle(pane, timeout=60, poll_interval=0.5):
@@ -967,6 +997,12 @@ def child_main(pane, args):
             time.sleep(0.5)
             out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
             pane_text = out if (rc == 0 and out) else None
+            if pane_text is None:
+                # Capture failed outright -- nothing to check against this
+                # iteration (not even idle). Re-poll rather than falling
+                # through to a stale/undefined idle reading.
+                log("  poll: capture-pane failed this iteration -- not done")
+                continue
             picker_seen, picker_confirmed = _rewind_picker_confirm_once(
                 pane, pane_text=pane_text)
             if picker_seen:
@@ -977,8 +1013,25 @@ def child_main(pane, args):
                 log(f"  poll: Rewind picker visible "
                     f"(confirmed_this_pass={picker_confirmed}) -- not done")
                 continue
+            # Reuse THIS SAME pane_text for the idle check rather than
+            # issuing a fresh, separately-timed capture-pane of our own
+            # (the self-capturing helper below issues exactly that kind of
+            # independent capture, which is what we must avoid here). Two
+            # independent captures moments apart is exactly the race that
+            # caused the 2026-09-30 hang: a picker could render in the gap
+            # between this iteration's picker-check capture (picker_seen=
+            # False, above) and a later separate self-capture, whose OWN
+            # `❯ (current)` cursor row would then be misread as the
+            # ordinary idle prompt -- while
+            # get_token_count() (a fully separate `claude-watch status`
+            # subprocess call, with its own timing) read 0 because the
+            # picker screen has no token line to parse. Both readings would
+            # look like a completed /clear when the picker was still open.
+            # Checking idle against the SAME snapshot the picker-check just
+            # examined closes that gap: if a picker is visible in pane_text,
+            # picker_seen already caught it above and we never reach here.
             tokens_now = get_token_count()
-            idle_now = is_idle(pane)
+            idle_now = _is_idle_text(pane_text)
             log(f"  poll: tokens={tokens_now} idle={idle_now}")
             if tokens_now < FRESH_SESSION_MAX_TOKENS and idle_now:
                 log(f"  /clear confirmed (tokens {tokens_before} -> {tokens_now})")
