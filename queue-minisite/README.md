@@ -718,26 +718,52 @@ and a vendored `session-task` (auto-located under `../tools/session-task/`;
 override with `SESSION_TASK_BIN`). Each file gets its own process because
 they rewrite `os.environ` and reload the `app` module at class setup.
 
-These suites run in CI (`Queue-minisite Python tests` job) and gate
-merges to `main`.
+These suites run in CI, in the `Queue-minisite Python tests` job.
 
 The browser-side modules have their own suites in `static/*.test.js`. One of
-them needs no DOM and therefore no dependency, so it runs in that same CI job:
+them needs no DOM and therefore no dependency, so it runs in that same job:
 
 ```bash
 make test-minisite-ansi      # static/ansi.test.js, plain node
 ```
 
-The rest drive the modules under jsdom and are local-only — point
-`QM_NODE_MODULES` at a directory with `jsdom` installed and run the file:
+The rest drive the modules under jsdom, and they run in CI too, in their own
+`Queue-minisite jsdom tests` job:
+
+```bash
+make test-minisite-jsdom     # every static/*.test.js that needs a DOM
+```
+
+That target installs a pinned jsdom into `/tmp/queue-minisite-test` (override
+with `MINISITE_JSDOM_DIR`) and runs every suite that reads `QM_NODE_MODULES`, so
+a new jsdom suite joins the gate just by existing. It refuses to run rather than
+skipping when node/npm are missing, and asserts a minimum suite count, because a
+check that cannot fail is worse than no check. Measured cost: ~6s for all ten
+files, plus a couple of seconds to fetch jsdom.
+
+A single file, against a jsdom you already have:
 
 ```bash
 QM_NODE_MODULES=/tmp/queue-minisite-test/node_modules \
   node static/multitail.test.js
 ```
 
-Because CI does not execute those, anything a jsdom suite proves that must not
-regress silently gets a second, grep-or-render assertion in a `test_*.py` file —
-which is why `test_multitail.py` checks things like "no stylesheet rule hides the
-pane title" and "the ANSI palette is defined in both themes" rather than leaving
-them to the client suites alone.
+**Running in CI and gating a merge are different things.** A job that is not
+named in the branch's required-status-check list goes red without blocking
+anything, which is the same silent rot wearing more logs:
+`static/multitail-refresh.test.js` sat broken on `main` for hours because these
+suites were local-only, and a non-required check would have let that happen
+again. Which checks actually gate is a repository setting, not a property of
+this file — read it live rather than trusting this paragraph:
+
+```bash
+gh api repos/gbre-org/claude-watch/branches/main/protection \
+  --jq '.required_status_checks.checks[].context'
+```
+
+The doubled coverage the old local-only situation forced is still worth keeping:
+anything a jsdom suite proves that must not regress silently also has a
+grep-or-render assertion in a `test_*.py` file — which is why `test_multitail.py`
+checks things like "no stylesheet rule hides the pane title" and "the ANSI
+palette is defined in both themes" rather than leaving them to the client suites
+alone.

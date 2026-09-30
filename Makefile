@@ -64,6 +64,7 @@
 # Tests — host tooling (Python / shell)
 .PHONY: test-session-task test-obligations-init test-cw-agent-stats
 .PHONY: test-queue-minisite test-hooks test-agent-msg test-agent-tail
+.PHONY: test-minisite-ansi test-minisite-jsdom
 .PHONY: test-claude-event test-pr-branches test-event-must-act
 .PHONY: test-self-clear test-self-login test-self-login-tmux test-self-mcp-reconnect
 .PHONY: test-watchers
@@ -213,6 +214,65 @@ test-queue-minisite: ## queue-minisite Flask end-to-end suites
 # test-queue-minisite` above runs.
 test-minisite-ansi: ## queue-minisite ANSI escape-sequence renderer tests
 	node queue-minisite/static/ansi.test.js
+
+# Run the queue-minisite jsdom suites: every static/*.test.js that drives the
+# browser modules against a real DOM.
+#
+# These were LOCAL-ONLY, and that is precisely how
+# static/multitail-refresh.test.js came to sit broken on main for hours: a
+# change re-keyed multitail's panes from a bare queue id to `q:<qid>`, the
+# suite kept looking them up the old way, and nothing reported it, because the
+# only thing that ever ran the file was a human choosing to. It was repaired
+# only because someone happened to run it by hand -- which is not a gate.
+#
+# The suites need one dependency the runner image does not carry, so this
+# target provisions it: jsdom, into $(MINISITE_JSDOM_DIR), which defaults to
+# the SAME path the suites already fall back to when QM_NODE_MODULES is unset.
+# That keeps the documented single-file local invocation working untouched, and
+# means CI needs no env of its own.
+#
+# jsdom is PINNED. A floating `npm install jsdom` would let this gate's
+# meaning drift under the suites with no commit to blame -- the same reason
+# promtool is pinned for test-prometheus-rules below.
+#
+# Two non-vacuity guards, because a check that cannot fail is worse than no
+# check: a missing npm is a hard error rather than a skip, and the run asserts
+# it actually executed at least $(MINISITE_JSDOM_MIN_SUITES) files, so a glob
+# or grep that matched nothing fails instead of reporting a green zero.
+#
+# The file list is DERIVED, not hardcoded: every static/*.test.js that reads
+# QM_NODE_MODULES is by definition a jsdom suite, so a new one joins this gate
+# just by existing. static/ansi.test.js is DOM-free and deliberately does not
+# match -- it has its own target above and runs on plain node.
+MINISITE_JSDOM_DIR ?= /tmp/queue-minisite-test
+MINISITE_JSDOM_VERSION ?= 29.1.1
+MINISITE_JSDOM_MIN_SUITES ?= 10
+
+test-minisite-jsdom: ## queue-minisite browser-module suites (jsdom)
+	@set -e; \
+	if [ ! -d "$(MINISITE_JSDOM_DIR)/node_modules/jsdom" ]; then \
+		command -v npm >/dev/null 2>&1 || { \
+			echo "FAIL: jsdom is absent from $(MINISITE_JSDOM_DIR) and npm is not on PATH."; \
+			echo "      Install node + npm, or point MINISITE_JSDOM_DIR at a tree that has jsdom."; \
+			exit 1; \
+		}; \
+		mkdir -p "$(MINISITE_JSDOM_DIR)"; \
+		npm --prefix "$(MINISITE_JSDOM_DIR)" install --no-save --no-audit --no-fund \
+			--loglevel=error "jsdom@$(MINISITE_JSDOM_VERSION)"; \
+	fi; \
+	suites=$$(grep -l QM_NODE_MODULES queue-minisite/static/*.test.js || true); \
+	ran=0; \
+	for f in $$suites; do \
+		echo "==> $$f"; \
+		QM_NODE_MODULES="$(MINISITE_JSDOM_DIR)/node_modules" node "$$f"; \
+		ran=$$((ran + 1)); \
+	done; \
+	if [ "$$ran" -lt $(MINISITE_JSDOM_MIN_SUITES) ]; then \
+		echo "FAIL: ran $$ran jsdom suite(s), expected at least $(MINISITE_JSDOM_MIN_SUITES)."; \
+		echo "      A suite was deleted or renamed, or the QM_NODE_MODULES grep stopped matching."; \
+		exit 1; \
+	fi; \
+	echo "OK: $$ran jsdom suites passed"
 
 # Run the obligations / hooks Python tests. These are self-contained
 # scripts (not pytest), so we just exec them directly. Each runs against

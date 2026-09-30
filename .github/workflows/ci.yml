@@ -171,6 +171,46 @@ jobs:
         run: make test-cw-agent-stats
         timeout-minutes: 5
 
+  # SEPARATE JOB, not extra steps on the job above, for two reasons. It runs
+  # in parallel, so the ~25s it costs does not land on the pull request's
+  # critical path at all. And it reports under its own check name, which is
+  # what a branch-protection required-status-check list can name: folding it
+  # into a neighbouring job would hide a jsdom failure behind that job's name
+  # and make the two impossible to require independently.
+  queue-minisite-jsdom-tests:
+    name: Queue-minisite jsdom tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node is PINNED rather than taken from whatever the runner image
+      # happens to bundle. The suites run against a pinned jsdom (see the
+      # Makefile target), and an image-side node bump out from under that pin
+      # is exactly the kind of silent breakage this job exists to catch rather
+      # than to suffer.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # `make test-minisite-jsdom` installs the pinned jsdom itself, into the
+      # same default path the suites fall back to, so there is no separate
+      # install step to drift from the target and no env to set here. It
+      # refuses to run rather than skipping if node/npm are missing: a suite
+      # that quietly self-skips and reports green is the failure mode this job
+      # exists to remove.
+      #
+      # The hole being closed: static/multitail-refresh.test.js sat BROKEN on
+      # main for hours because these suites were local-only. The pane re-key
+      # to `q:<qid>` landed, the suite kept using the old key, and nothing
+      # said a word -- the only thing that ever ran the file was a human
+      # choosing to.
+      #
+      # Cheap: measured at ~6s for all 10 suites plus a couple of seconds to
+      # fetch jsdom, so no cargo-style cache is worth the complexity here.
+      - name: Run queue-minisite jsdom suites
+        run: make test-minisite-jsdom
+        timeout-minutes: 5
+
   container-shell-tests:
     name: Container shell + shim tests
     runs-on: ubuntu-latest
