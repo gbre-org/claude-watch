@@ -1732,16 +1732,15 @@ fn default_api_retry_max_stuck_secs() -> u64 {
 /// the alert is SUPPRESSED — there's an out-of-band workload providing
 /// liveness that the main loop's idleness can't explain on its own.
 ///
-/// Distinct from the existing 15-min
-/// `/var/run/claude/workload-state/<label>.heartbeat` which
-/// `cron-workload-stale-check` consumes to detect wedged workloads
-/// (1h stale threshold). The two heartbeats serve different purposes
-/// and live in different subdirs of `/var/run/claude/`:
-///   * `/run/claude/workloads/` (this): fast cadence (30s), daemon-side
-///     suppression of false-positive stuck alerts.
-///   * `/var/run/claude/workload-state/`: slow cadence (15min), cron-side
-///     detection of stalled workloads. The legacy `/tmp/claude-workloads`
-///     path is symlinked to it for back-compat with out-of-tree consumers.
+/// This is the only heartbeat FILE the wrapper still writes. A second
+/// one under `/var/run/claude/workload-state/` used to be pet on a
+/// 15-minute timer for an out-of-tree cron stale-check; both were
+/// retired 2026-09-30 in favour of the wrapper's queue heartbeat, which
+/// detects the same "wrapper machinery dead, work still nominally
+/// running" failure against the bound queue item and on a far shorter
+/// window. `/var/run/claude/workload-state/` still holds the workload's
+/// other artifacts (`.output`, `.exit`, `.pgid`) and is symlinked from
+/// the legacy `/tmp/claude-workloads` for out-of-tree consumers.
 #[derive(Debug, Deserialize, Clone)]
 pub struct StuckDetectionConfig {
     /// Master switch. Default: true. Set to false to disable workload-

@@ -15,16 +15,17 @@
 //!
 //! Note the subdir name — `workload-state/`, NOT `workloads/`. The
 //! runtime heartbeat sidecar already owns `/run/claude/workloads/`
-//! (`<label>.heartbeat`), and since `/var/run -> /run` is a symlink we
-//! can't reuse `workloads/` for the slow 15-min heartbeat file without
-//! both sidecars clobbering each other's `<label>.heartbeat` write.
-//! Distinct subdirs keep the two heartbeat layers independent.
+//! (`<label>.heartbeat`), and since `/var/run -> /run` is a symlink the
+//! two would have clobbered each other's `<label>.heartbeat` write back
+//! when this dir also held a slow 15-min heartbeat file (retired
+//! 2026-09-30). Keeping the subdirs distinct keeps that collision
+//! impossible to re-introduce by accident.
 //!
 //! A backward-compat symlink `/tmp/claude-workloads -> /var/run/claude/workload-state`
-//! is created lazily by `cmd_run` so legacy consumers (docker bind-mount
-//! into queue-minisite, `cron-workload-stale-check`) keep working
-//! transparently. The symlink is best-effort: failure to create it does
-//! not block workload startup.
+//! is created lazily by `cmd_run` so legacy consumers (the docker
+//! bind-mount into queue-minisite) keep working transparently. The
+//! symlink is best-effort: failure to create it does not block workload
+//! startup.
 //!
 //! On workload completion (natural or via `workload kill`), an event of
 //! `tag=workload-done`, `source=workload` is emitted into
@@ -82,17 +83,16 @@ const SESSION: &str = "tasks";
 /// runtime workload heartbeat under `/run/claude/workloads/`). `/var/run`
 /// is a symlink to `/run` on Debian-style systems.
 ///
-/// Subdir is `workload-state/` rather than `workloads/` to keep the
-/// slow-cadence (15-min) heartbeat file `<label>.heartbeat` from
-/// colliding with the runtime (30s, progress-driven) heartbeat at
-/// `/run/claude/workloads/<label>.heartbeat`. Same filename, distinct
-/// dirs.
+/// Subdir is `workload-state/` rather than `workloads/`: it once also
+/// held a slow-cadence `<label>.heartbeat` file (retired 2026-09-30)
+/// whose name collided with the runtime, progress-driven heartbeat at
+/// `/run/claude/workloads/<label>.heartbeat`. The dirs stay distinct —
+/// renaming either is a coordinated multi-repo deploy.
 const WORKLOAD_DIR: &str = "/var/run/claude/workload-state";
 
-/// Legacy artifact path. Kept as a symlink target for one cycle so
-/// out-of-tree consumers (docker bind-mount into queue-minisite,
-/// an out-of-tree `cron-workload-stale-check`) keep working without a
-/// coordinated multi-repo deploy.
+/// Legacy artifact path. Kept as a symlink target so out-of-tree
+/// consumers (the docker bind-mount into queue-minisite) keep working
+/// without a coordinated multi-repo deploy.
 const LEGACY_WORKLOAD_DIR: &str = "/tmp/claude-workloads";
 
 /// Per-workload runtime heartbeat directory. Used by the daemon's
@@ -115,20 +115,18 @@ const LEGACY_WORKLOAD_DIR: &str = "/tmp/claude-workloads";
 /// command is making progress" (proxied by stdout growth), not "the
 /// wrapper's timer is running".
 ///
-/// Distinct from the slow-cadence (`heartbeat_file` above, 15-min interval,
-/// `/var/run/claude/workloads/`) which `cron-workload-stale-check`
-/// consumes to fire `workload-stale` claude-events at 1h+ stalls. The
-/// two heartbeats coexist:
-///   * runtime heartbeat (this, `/run/claude/workloads/`): progress-driven,
-///     used by claude-watch daemon to suppress prolonged-thinking +
-///     heartbeat-stale alerts while a workload is actively making progress.
-///   * legacy heartbeat (15-min, `/var/run/claude/workloads/`): cron-side
-///     stale-detection. Same parent dir as the slow-cadence sidecar
-///     post-migration; they share the workloads dir but write to
-///     different per-label files (`<label>.heartbeat` for the 15-min
-///     pet vs. `/run/claude/workloads/<label>.heartbeat` for the 30s
-///     progress pet — note `/run` vs `/var/run/claude`, two different
-///     dirs that happen to live on the same tmpfs).
+/// Distinct from the QUEUE heartbeat (`QUEUE_HEARTBEAT_INTERVAL_SECS`
+/// below), which pats the bound queue item rather than a file and
+/// answers a different question: this one says "the wrapped command is
+/// making progress", that one says "the wrapper is still alive".
+///
+/// A third, slow-cadence file heartbeat (`<label>.heartbeat` under
+/// `WORKLOAD_DIR`, 15-min timer, consumed by an out-of-tree cron
+/// stale-check) was RETIRED 2026-09-30. Its only job was detecting "the
+/// wrapper machinery died while the work was still nominally running",
+/// which the queue heartbeat now detects six times faster (a 600s
+/// staleness window versus a 1h one) and reports on the queue item
+/// itself. Do not reintroduce it.
 ///
 /// `/run/claude/` is a tmpfs (cleared on reboot, same mount as the
 /// main-loop heartbeat at `/run/claude/heartbeat`) so leftover files
@@ -206,18 +204,6 @@ fn exit_file(label: &str) -> PathBuf {
 
 fn script_file(label: &str) -> PathBuf {
     PathBuf::from(WORKLOAD_DIR).join(format!("{label}.sh"))
-}
-
-/// Per-workload watchdog heartbeat file. The wrapper script touches this
-/// every `WORKLOAD_HEARTBEAT_INTERVAL_SECS` seconds (default 900 = 15 min)
-/// while the user command is running. A separate cron-driven detector
-/// (`cron-workload-stale-check`) scans these files for stale mtimes and
-/// emits a `workload-stale` claude-event when one ages past 1h with no
-/// matching `<label>.exit` (i.e. the workload hasn't legitimately
-/// finished). Pet-or-fire watchdog pattern — no per-iter health spam,
-/// but real stalls page Andrew.
-fn heartbeat_file(label: &str) -> PathBuf {
-    PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat"))
 }
 
 /// Per-workload runtime heartbeat file under `RUNTIME_HEARTBEAT_DIR`.
@@ -601,9 +587,9 @@ pub fn save_state(state: &WorkloadState) -> std::io::Result<()> {
 }
 
 /// Best-effort: ensure `/tmp/claude-workloads -> /var/run/claude/workload-state`
-/// exists so out-of-tree consumers (docker bind-mount into queue-minisite,
-/// an out-of-tree `cron-workload-stale-check`) keep finding workload
-/// artifacts at the legacy path. The symlink is intentionally lazy —
+/// exists so out-of-tree consumers (the docker bind-mount into
+/// queue-minisite) keep finding workload artifacts at the legacy path.
+/// The symlink is intentionally lazy —
 /// created on first `workload run` after a reboot — so a fresh tmpfs
 /// always lands us in a known state without depending on a separate
 /// boot-time hook.
@@ -1435,7 +1421,6 @@ fn build_wrapper_script(
     command: &str,
     out_path: &Path,
     exit_path: &Path,
-    heartbeat_path: &Path,
     runtime_heartbeat_path: &Path,
     pgid_path: &Path,
     exe_path: &str,
@@ -1443,7 +1428,6 @@ fn build_wrapper_script(
 ) -> String {
     let out_q = shell_quote(&out_path.to_string_lossy());
     let exit_q = shell_quote(&exit_path.to_string_lossy());
-    let hb_q = shell_quote(&heartbeat_path.to_string_lossy());
     let pgid_q = shell_quote(&pgid_path.to_string_lossy());
     let rt_hb_q = shell_quote(&runtime_heartbeat_path.to_string_lossy());
     let rt_hb_dir_q = shell_quote(
@@ -1477,8 +1461,9 @@ fn build_wrapper_script(
     // `cmd_run` OR explicitly supplied via --queue-id), append the qid
     // to the emit-done call so the wrapper-side emit carries the qid
     // into the workload-done event AND triggers the queue done/abandon
-    // transition. Bare (--no-queue / auto-create disabled) workloads
-    // emit the legacy event with no qid and no queue side effect.
+    // transition. `cmd_run` refuses to start an unbound workload, so in
+    // practice `queue_id` is always Some here; the None arm survives only
+    // for direct unit-test renders of the template.
     let queue_id_emit_arg = match queue_id {
         Some(qid) => format!(" --queue-id {}", shell_quote(qid)),
         None => String::new(),
@@ -1525,9 +1510,9 @@ fn build_wrapper_script(
                 interval = QUEUE_HEARTBEAT_INTERVAL_SECS,
             )
         }
-        // No bound queue item (--no-queue, or auto-create disabled):
-        // nothing to pat. The variable is still initialised so the
-        // teardown lines below stay unconditional.
+        // No bound queue item — unreachable from `cmd_run`, which
+        // refuses to start unbound. The variable is still initialised so
+        // the teardown lines below stay unconditional.
         None => "QUEUE_HEARTBEAT_PID=".to_string(),
     };
     // Per-line ISO8601 timestamp prefix. Two paths:
@@ -1583,37 +1568,6 @@ fn build_wrapper_script(
          echo 'Started: '$(date -Iseconds)\n\
          echo 'Command: {command_escaped}'\n\
          echo '---'\n\
-         # Pet-or-fire watchdog: touch the heartbeat file every\n\
-         # ${{WORKLOAD_HEARTBEAT_INTERVAL_SECS:-900}} seconds (default 15 min)\n\
-         # while the user command runs. NO claude-event emitted on heartbeat —\n\
-         # absence-of-heartbeat is the signal. cron-workload-stale-check\n\
-         # detects mtime > 1h + no .exit file and fires workload-stale.\n\
-         # Set WORKLOAD_HEARTBEAT=0 to disable (e.g. for tests).\n\
-         #\n\
-         # Spawn the sidecar via `setsid` so it runs in its OWN process\n\
-         # group. We then kill the whole group on teardown (`kill -TERM\n\
-         # -<pgid>`), which reliably reaps both the loop subshell AND\n\
-         # any in-flight `sleep` child. Without setsid, killing just\n\
-         # $! often leaves a dangling `sleep` that wakes up and writes\n\
-         # one more heartbeat, giving false-positive freshness to the\n\
-         # stale-watchdog detector.\n\
-         HEARTBEAT_PID=\n\
-         if [ \"${{WORKLOAD_HEARTBEAT:-1}}\" != \"0\" ]; then\n\
-             # Touch immediately so a fresh-arrival check has a non-empty file.\n\
-             # Use write-tmp + atomic mv so a concurrent reader never sees a\n\
-             # post-truncate / pre-write empty file (real prod race; readers\n\
-             # like cron-workload-stale-check parse this body as ISO8601).\n\
-             date -Iseconds > {hb_q}.tmp 2>/dev/null && mv -f {hb_q}.tmp {hb_q} 2>/dev/null || true\n\
-             # Pass the heartbeat path via env var so we don't have to\n\
-             # nest single-quoted shell-escape inside the outer\n\
-             # `bash -c '...'` (which would close the outer quote and\n\
-             # break the loop body — see q-2026-05-05-8aae bring-up).\n\
-             WORKLOAD_HB_FILE={hb_q} setsid bash -c 'while true; do\n\
-                 sleep \"${{WORKLOAD_HEARTBEAT_INTERVAL_SECS:-900}}\"\n\
-                 date -Iseconds > \"$WORKLOAD_HB_FILE.tmp\" 2>/dev/null && mv -f \"$WORKLOAD_HB_FILE.tmp\" \"$WORKLOAD_HB_FILE\" 2>/dev/null || true\n\
-               done' </dev/null >/dev/null 2>&1 &\n\
-             HEARTBEAT_PID=$!\n\
-         fi\n\
          # Runtime heartbeat (progress-driven). Consumed by the\n\
          # claude-watch daemon's stuck-detection suppression path — see\n\
          # `policy::workload_heartbeat_fresh`. While ANY workload's file\n\
@@ -1644,8 +1598,6 @@ fn build_wrapper_script(
          # emitted anything yet.\n\
          #\n\
          # Set WORKLOAD_RUNTIME_HEARTBEAT=0 to disable (e.g. for tests).\n\
-         # Separate sidecar PID + separate trap so the legacy 15-min\n\
-         # heartbeat above is unaffected by changes here.\n\
          #\n\
          # Edge case (intentionally NOT papered over): a workload that\n\
          # legitimately runs silent for long stretches (e.g. a `sleep\n\
@@ -1713,7 +1665,6 @@ fn build_wrapper_script(
          # but explicit cleanup keeps the dir tidy + makes the test\n\
          # assertion deterministic).\n\
          trap '\n\
-           if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            if [ -n \"$RUNTIME_HEARTBEAT_PID\" ]; then kill -TERM -\"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || kill \"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            if [ -n \"$QUEUE_HEARTBEAT_PID\" ]; then kill -TERM -\"$QUEUE_HEARTBEAT_PID\" 2>/dev/null || kill \"$QUEUE_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            rm -f {rt_hb_q} {rt_hb_q}.tmp 2>/dev/null || true\n\
@@ -1844,13 +1795,12 @@ fn build_wrapper_script(
          echo ''\n\
          echo \"=== DONE (exit $EC) at $(date -Iseconds) ===\"\n\
          echo $EC > {exit_q}\n\
-         # Stop both heartbeats BEFORE emit-done so the .exit + stop happen tightly.\n\
+         # Stop the heartbeat sidecars BEFORE emit-done so the .exit + stop happen tightly.\n\
          # The runtime heartbeat goes first so the daemon's next stuck-check\n\
          # immediately sees no fresh proof-of-life (no risk of a one-tick\n\
          # window where the workload is done but suppression still active).\n\
          if [ -n \"$RUNTIME_HEARTBEAT_PID\" ]; then kill -TERM -\"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || kill \"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
          rm -f {rt_hb_q} {rt_hb_q}.tmp 2>/dev/null || true\n\
-         if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
          # Stop the queue pat before emit-done: that call transitions the\n\
          # item to done/abandoned, and a pat arriving afterwards is simply\n\
          # refused (heartbeat requires status=running), but leaving the\n\
@@ -1872,32 +1822,37 @@ fn build_wrapper_script(
     )
 }
 
-/// CLI: `workload run <label> [--queue-id q-X | --no-queue] -- <command...>`
+/// CLI: `workload run <label> [--queue-id q-X] -- <command...>`
 ///
-/// **Workloads are first-class queue items by default** (Andrew DM
-/// 2026-05-04 21:02 ET). When neither `--queue-id` nor `--no-queue` is
-/// passed, `cmd_run` auto-creates a queue row via `session-task queue
-/// add --force-enqueue` (scope `workload:<label>`, summary derived from
-/// the command), atomically `register`s it, and binds the resulting qid
-/// to the workload — so the workload appears in `session-task queue
-/// list` alongside agent queue items, and on workload exit the queue
-/// item transitions to `done` (rc==0) or `abandoned` (rc!=0 / killed).
+/// **Every workload is a queue item. There is no opt-out.** When
+/// `--queue-id` is omitted, `cmd_run` auto-creates a queue row via
+/// `session-task queue add --force-enqueue` (scope `workload:<label>`,
+/// summary derived from the command), atomically `register`s it, and
+/// binds the resulting qid to the workload — so the workload appears in
+/// `session-task queue list` alongside agent queue items, and on
+/// workload exit the queue item transitions to `done` (rc==0) or
+/// `abandoned` (rc!=0 / killed).
 ///
-/// Explicit modes:
+/// Two modes, and only two:
 ///   * `--queue-id q-X` — bind to an existing queue item (caller has
 ///     already added/registered it). Auto-create is skipped; the qid is
 ///     used as-is.
-///   * `--no-queue` — opt out entirely. The workload runs without a
-///     queue row (legacy behaviour). Use this when the caller knows the
-///     queue layer is unavailable, or for short throwaway workloads
-///     that shouldn't pollute the queue history.
-///   * Neither — auto-create a queue row tied to the workload.
+///   * omitted — auto-create a queue row tied to the workload.
 ///
-/// Auto-create is fail-soft: if `session-task` is missing or returns
-/// non-zero, the workload still runs — only the queue side effect is
-/// skipped. Suppression knob: `WORKLOAD_QUEUE_AUTO_CREATE=0` (env)
-/// disables auto-create globally without touching CLI args. Used by
-/// tests + by environments without `session-task` installed.
+/// **Binding is fail-HARD.** If `session-task` cannot be located, or
+/// `queue add` / the JSON parse fails, `cmd_run` refuses to start the
+/// workload and returns [`QUEUE_BINDING_REQUIRED_EXIT`]. A workload with
+/// no queue row is invisible to every orphan / stall check that watches
+/// the queue, which is precisely the state this rule exists to prevent —
+/// so an unrunnable queue layer is a startup error, never a degraded
+/// mode. The `session-task` lookup is pre-flighted BEFORE the
+/// replace-teardown below, so the common "queue layer unavailable" case
+/// fails without having disturbed a running workload.
+///
+/// The retired escape hatches — `--no-queue` and the
+/// `WORKLOAD_QUEUE_AUTO_CREATE=0` environment knob — are both gone as of
+/// 2026-09-30. `--no-queue` is still parsed purely so it can be rejected
+/// with an explanation. Do not reintroduce either.
 ///
 /// # Replacing a live run of the same label
 ///
@@ -1936,15 +1891,25 @@ fn build_wrapper_script(
 /// The teardown uses the standard kill grace ([`KILL_GRACE_SECS_DEFAULT`],
 /// env [`KILL_GRACE_ENV`]); `workload run` has no `--grace` flag of its
 /// own.
-pub fn cmd_run(
-    label: &str,
-    cmd_args: &[String],
-    queue_id: Option<&str>,
-    no_queue: bool,
-) -> i32 {
+pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 {
     if cmd_args.is_empty() {
         eprintln!("No command specified");
         return 1;
+    }
+
+    // PRE-FLIGHT the queue layer. Queue binding is mandatory, so a
+    // missing `session-task` means this run cannot legally happen — and
+    // finding that out HERE, before the replace-teardown below, means we
+    // refuse without having killed a healthy previous run of the label.
+    if queue_id.is_none() && find_session_task_cli().is_none() {
+        eprintln!(
+            "Refusing to start workload '{label}': every workload must be bound to a \
+             queue item, and the `session-task` CLI could not be found on PATH, at \
+             $SESSION_TASK_CLI, or at ~/bin/session-task.\n\
+             Install/repair session-task, or pass --queue-id q-XXXX to bind an item \
+             that already exists."
+        );
+        return QUEUE_BINDING_REQUIRED_EXIT;
     }
     let command: String = cmd_args
         .iter()
@@ -1962,14 +1927,13 @@ pub fn cmd_run(
         return 1;
     }
     // Best-effort: maintain the legacy `/tmp/claude-workloads` path as
-    // a symlink so out-of-tree consumers (docker bind-mount,
-    // cron-workload-stale-check) keep working without a coordinated
-    // multi-repo deploy. Lazy + idempotent — see helper docs.
+    // a symlink so out-of-tree consumers (the docker bind-mount) keep
+    // working without a coordinated multi-repo deploy. Lazy +
+    // idempotent — see helper docs.
     ensure_legacy_compat_symlink();
 
     let out_path = output_file(label);
     let exit_path = exit_file(label);
-    let heartbeat_path = heartbeat_file(label);
     let runtime_heartbeat_path = runtime_heartbeat_file(label);
     let pgid_path = pgid_file(label);
     let script_path = script_file(label);
@@ -2035,17 +1999,15 @@ pub fn cmd_run(
         }
     }
 
-    // Clean up previous run's exit marker + output + heartbeats. The
-    // heartbeats MUST be removed up-front so neither the cron-stale
-    // detector nor the daemon's stuck-suppression check can get a
-    // false-positive on a stale leftover from a prior run that pet the
-    // watchdog and then crashed.
+    // Clean up previous run's exit marker + output + runtime heartbeat.
+    // The heartbeat MUST be removed up-front so the daemon's
+    // stuck-suppression check can't get a false-positive on a stale
+    // leftover from a prior run that pet it and then crashed.
     // Also remove any prior script-capture sidecar so a re-run that no
     // longer matches the interpreter pattern doesn't surface a stale
     // capture from the previous invocation.
     let _ = fs::remove_file(&exit_path);
     let _ = fs::remove_file(&out_path);
-    let _ = fs::remove_file(&heartbeat_path);
     let _ = fs::remove_file(&runtime_heartbeat_path);
     // Stale process-group sidecar from a previous run would point a
     // later `workload kill` at a recycled pid.
@@ -2062,38 +2024,41 @@ pub fn cmd_run(
     if let Some(cap) = try_capture_script(cmd_args) {
         write_script_capture(label, &cap);
     }
-    // Also clear the cron-workload-stale-check single-emit sentinel so
-    // a freshly-started workload that legitimately stalls again will
-    // re-fire workload-stale instead of being silently swallowed.
-    let alerted_path = PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat.alerted"));
-    let _ = fs::remove_file(&alerted_path);
+    // Sweep the retired slow-heartbeat artifacts (the 15-min watchdog
+    // file and its single-emit sentinel) left behind by a pre-retirement
+    // build of this binary, so nothing keeps scanning a directory full of
+    // files that no longer have a writer.
+    let _ = fs::remove_file(PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat")));
+    let _ = fs::remove_file(PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat.alerted")));
 
-    // Resolve effective queue id. Precedence:
-    //   1. Caller-supplied --queue-id wins (existing behaviour).
-    //   2. --no-queue opts out entirely (no auto-create).
-    //   3. WORKLOAD_QUEUE_AUTO_CREATE=0 env opts out (test escape hatch).
-    //   4. Otherwise: auto-create + register a queue row, bind qid.
+    // Resolve effective queue id. Two cases, no opt-out:
+    //   1. Caller-supplied --queue-id wins.
+    //   2. Otherwise: auto-create + register a queue row, bind qid.
+    //
+    // FAIL-HARD on auto-create failure. This used to fall through to a
+    // warning and run the workload anyway, on the theory that the queue
+    // is a visibility layer rather than a prerequisite. It is not: an
+    // unbound workload is invisible to every queue-side orphan and stall
+    // check, so "degraded queue" silently means "unwatched job". Refuse
+    // instead, loudly, with the underlying error attached.
     let caller_supplied_qid = queue_id.is_some();
     let mut effective_queue_id: Option<String> = queue_id.map(str::to_string);
-    let auto_create_disabled = std::env::var("WORKLOAD_QUEUE_AUTO_CREATE")
-        .ok()
-        .as_deref()
-        == Some("0");
-    if effective_queue_id.is_none() && !no_queue && !auto_create_disabled {
+    if effective_queue_id.is_none() {
         match auto_create_and_register_queue_item(label, &command) {
             Ok(qid) => {
                 println!("Bound workload '{label}' to queue item {qid}");
                 effective_queue_id = Some(qid);
             }
             Err(e) => {
-                // Fail-soft: log and continue without a queue row. The
-                // workload still runs; only the queue side effect is
-                // skipped. This matches the contract that workloads are
-                // resilient to queue-layer outages (the queue is a
-                // visibility layer, not a hard prerequisite).
                 eprintln!(
-                    "warning: workload queue auto-register failed (running without queue row): {e}"
+                    "Refusing to start workload '{label}': queue auto-registration \
+                     failed and every workload must be bound to a queue item.\n  \
+                     {e}\n\
+                     Fix the queue layer, or pass --queue-id q-XXXX to bind an item \
+                     that already exists."
                 );
+                rebalance();
+                return QUEUE_BINDING_REQUIRED_EXIT;
             }
         }
     }
@@ -2110,16 +2075,7 @@ pub fn cmd_run(
     //
     // Skipped on the auto-create path because that path's scope
     // already includes the token by construction.
-    //
-    // Skipped on the test escape hatch (`WORKLOAD_QUEUE_AUTO_CREATE=0`)
-    // when the caller also supplied a qid — both opt-outs should
-    // collapse into "don't touch session-task" behaviour for the unit-
-    // test harness.
-    let inject_disabled = std::env::var("WORKLOAD_QUEUE_AUTO_CREATE")
-        .ok()
-        .as_deref()
-        == Some("0");
-    if caller_supplied_qid && !inject_disabled {
+    if caller_supplied_qid {
         if let Some(ref qid) = effective_queue_id {
             inject_workload_scope_token(label, qid);
         }
@@ -2143,7 +2099,6 @@ pub fn cmd_run(
         &command,
         &out_path,
         &exit_path,
-        &heartbeat_path,
         &runtime_heartbeat_path,
         &pgid_path,
         &exe_path,
@@ -2762,6 +2717,15 @@ pub fn cmd_stamp() -> i32 {
 /// alive". Distinct from 1 (`no such workload`) so a caller can tell
 /// "nothing to kill" from "the kill did not fully take".
 pub const KILL_SURVIVORS_EXIT: i32 = 3;
+
+/// Exit code for "this workload could not be bound to a queue item".
+///
+/// Queue binding is mandatory: every `workload run` ends up owning a
+/// `q-XXXX` or it does not start. Distinct from 1 (generic startup
+/// failure) so a caller — or a wrapper script — can tell a missing
+/// `session-task`, a refused `queue add`, or a passed `--no-queue` from
+/// "no command specified" / "no tmux session".
+pub const QUEUE_BINDING_REQUIRED_EXIT: i32 = 4;
 
 /// CLI: `workload kill <label> [--grace SECS]`
 ///
@@ -3557,6 +3521,57 @@ mod tests {
             15,
         );
         assert_eq!(rc, 1, "unknown label must exit 1, got {rc}");
+    }
+
+    /// Queue binding is MANDATORY — a workload that cannot be bound does
+    /// not start. The escape hatches that used to let one run unbound
+    /// (`--no-queue`, `WORKLOAD_QUEUE_AUTO_CREATE=0`) are gone, so the
+    /// only remaining way to end up without a qid is an unreachable
+    /// queue layer, and that is a startup ERROR rather than a degraded
+    /// mode: an unbound workload is invisible to every queue-side orphan
+    /// and stall check.
+    ///
+    /// The refusal is also pre-flighted ahead of everything with a side
+    /// effect — no tmux session is required to reach it, which is what
+    /// lets this be a unit test, and more importantly it means a host
+    /// with no queue layer refuses BEFORE the same-label replace
+    /// teardown could kill a running workload.
+    #[test]
+    fn cmd_run_refuses_to_start_when_queue_layer_is_unreachable() {
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_path = std::env::var("PATH").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        // Hide every place `find_session_task_cli` looks: the explicit
+        // override, PATH, and ~/bin.
+        unsafe {
+            std::env::remove_var("SESSION_TASK_CLI");
+            std::env::set_var("PATH", "");
+            std::env::set_var("HOME", tmp.path());
+        }
+        let rc = cmd_run("no-queue-layer", &["true".to_string()], None);
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(
+            rc, QUEUE_BINDING_REQUIRED_EXIT,
+            "an unbindable workload must refuse to start with \
+             QUEUE_BINDING_REQUIRED_EXIT, not run unbound (got {rc})"
+        );
     }
 
     #[test]
@@ -4554,7 +4569,6 @@ mod tests {
             "echo hi",
             Path::new("/tmp/claude-workloads/demo.output"),
             Path::new("/tmp/claude-workloads/demo.exit"),
-            Path::new("/tmp/claude-workloads/demo.heartbeat"),
             Path::new("/tmp/claude-wl-rt/demo.heartbeat"),
             Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
@@ -4584,7 +4598,6 @@ mod tests {
             "echo hi",
             Path::new("/tmp/claude-workloads/hee.output"),
             Path::new("/tmp/claude-workloads/hee.exit"),
-            Path::new("/tmp/claude-workloads/hee.heartbeat"),
             Path::new("/tmp/claude-wl-rt/hee.heartbeat"),
             Path::new("/tmp/claude-workloads/hee.pgid"),
             "/usr/local/bin/claude-watch",
@@ -4741,7 +4754,6 @@ mod tests {
             "echo one; echo two; exit 7",
             &out_path,
             &exit_path,
-            &tmp.path().join("st.heartbeat"),
             &tmp.path().join("st.runtime.heartbeat"),
             &tmp.path().join("st.pgid"),
             &fake_exe.to_string_lossy(),
@@ -4754,7 +4766,6 @@ mod tests {
 
         let status = Command::new("bash")
             .arg(&script_path)
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .status()
             .expect("run wrapper");
@@ -4803,7 +4814,6 @@ mod tests {
             "echo kept",
             &out_path,
             &exit_path,
-            &tmp.path().join("fb.heartbeat"),
             &tmp.path().join("fb.runtime.heartbeat"),
             &tmp.path().join("fb.pgid"),
             "/bin/true",
@@ -4816,7 +4826,6 @@ mod tests {
 
         Command::new("bash")
             .arg(&script_path)
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .status()
             .expect("run wrapper");
@@ -4852,7 +4861,6 @@ mod tests {
             "echo plain",
             &out_path,
             &exit_path,
-            &tmp.path().join("oo.heartbeat"),
             &tmp.path().join("oo.runtime.heartbeat"),
             &tmp.path().join("oo.pgid"),
             &fake_exe.to_string_lossy(),
@@ -4865,7 +4873,6 @@ mod tests {
 
         Command::new("bash")
             .arg(&script_path)
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .env("WORKLOAD_STAMP", "0")
             .status()
@@ -4893,7 +4900,6 @@ mod tests {
             "rsync --progress src dst",
             Path::new("/tmp/pty.output"),
             Path::new("/tmp/pty.exit"),
-            Path::new("/tmp/pty.heartbeat"),
             Path::new("/tmp/claude-wl-rt/pty.heartbeat"),
             Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
@@ -4941,7 +4947,6 @@ mod tests {
             "true",
             Path::new("/tmp/g.output"),
             Path::new("/tmp/g.exit"),
-            Path::new("/tmp/g.heartbeat"),
             Path::new("/tmp/claude-wl-rt/guard.heartbeat"),
             Path::new("/tmp/claude-workloads/demo.pgid"),
             "/bin/claude-watch",
@@ -4971,7 +4976,6 @@ mod tests {
             "true",
             Path::new("/tmp/wp.output"),
             Path::new("/tmp/wp.exit"),
-            Path::new("/tmp/wp.heartbeat"),
             Path::new("/tmp/claude-wl-rt/wp.heartbeat"),
             Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
@@ -5000,7 +5004,6 @@ mod tests {
             "echo hi",
             Path::new("/tmp/lb.output"),
             Path::new("/tmp/lb.exit"),
-            Path::new("/tmp/lb.heartbeat"),
             Path::new("/tmp/claude-wl-rt/lb.heartbeat"),
             Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
@@ -5035,7 +5038,6 @@ mod tests {
             "true",
             Path::new("/tmp/wnq.output"),
             Path::new("/tmp/wnq.exit"),
-            Path::new("/tmp/wnq.heartbeat"),
             Path::new("/tmp/claude-wl-rt/wnq.heartbeat"),
             Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
@@ -5070,14 +5072,12 @@ mod tests {
         // emit-done call becomes `/bin/true workload emit-done ...`
         // which exits 0 (true ignores its args) and the wrapper's
         // `|| true` swallows any anomaly.
-        let hb_path = tmp.path().join("rt.heartbeat");
         let rt_hb_path = tmp.path().join("rt.runtime.heartbeat");
         let script_full = build_wrapper_script(
             "rt",
             "echo first; echo second",
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &out_path.with_extension("pgid"),
             "/bin/true",
@@ -5191,7 +5191,6 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir");
             let out_path = tmp.path().join(format!("{label}.output"));
             let exit_path = tmp.path().join(format!("{label}.exit"));
-            let hb_path = tmp.path().join(format!("{label}.heartbeat"));
             let rt_hb_path = tmp.path().join(format!("{label}.runtime.heartbeat"));
             let script_path = tmp.path().join(format!("{label}.sh"));
 
@@ -5200,7 +5199,6 @@ mod tests {
                 inner,
                 &out_path,
                 &exit_path,
-                &hb_path,
                 &rt_hb_path,
                 &out_path.with_extension("pgid"),
                 "/bin/true",
@@ -5214,7 +5212,6 @@ mod tests {
 
             let status = Command::new("bash")
                 .arg(&script_path)
-                .env("WORKLOAD_HEARTBEAT", "0")
                 .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
                 .status()
                 .expect("run wrapper");
@@ -5309,7 +5306,6 @@ mod tests {
         for (label, inner, expected_rc, qid, _expected_sub) in cases {
             let out_path = tmp.path().join(format!("{label}.output"));
             let exit_path = tmp.path().join(format!("{label}.exit"));
-            let hb_path = tmp.path().join(format!("{label}.heartbeat"));
             let rt_hb_path = tmp.path().join(format!("{label}.runtime.heartbeat"));
             let script_path = tmp.path().join(format!("{label}.sh"));
 
@@ -5318,7 +5314,6 @@ mod tests {
                 inner,
                 &out_path,
                 &exit_path,
-                &hb_path,
                 &rt_hb_path,
                 &out_path.with_extension("pgid"),
                 "/bin/true",
@@ -5331,7 +5326,6 @@ mod tests {
 
             let status = Command::new("bash")
                 .arg(&script_path)
-                .env("WORKLOAD_HEARTBEAT", "0")
                 .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
                 .status()
                 .expect("run wrapper");
@@ -5419,7 +5413,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("cr.output");
         let exit_path = tmp.path().join("cr.exit");
-        let hb_path = tmp.path().join("cr.heartbeat");
         let rt_hb_path = tmp.path().join("cr.runtime.heartbeat");
         let script_path = tmp.path().join("cr.sh");
 
@@ -5432,7 +5425,6 @@ mod tests {
             inner,
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &out_path.with_extension("pgid"),
             "/bin/true",
@@ -5446,7 +5438,6 @@ mod tests {
 
         let mut child = Command::new("bash")
             .arg(&script_path)
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .spawn()
             .expect("spawn wrapper");
@@ -5523,7 +5514,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("lb.output");
         let exit_path = tmp.path().join("lb.exit");
-        let hb_path = tmp.path().join("lb.heartbeat");
         let rt_hb_path = tmp.path().join("lb.runtime.heartbeat");
         let script_path = tmp.path().join("lb.sh");
 
@@ -5540,7 +5530,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             inner,
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &out_path.with_extension("pgid"),
             "/bin/true",
@@ -5556,7 +5545,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             .arg(&script_path)
             // Defeat the heartbeat sidecars — we don't want their writes
             // showing up in the .output sampling window.
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .spawn()
             .expect("spawn wrapper");
@@ -5598,103 +5586,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         );
     }
 
-    // ----- build_wrapper_script: heartbeat sidecar tests --------------------
-
-    #[test]
-    fn wrapper_script_contains_heartbeat_sidecar() {
-        // The wrapper must spawn a backgrounded `while true; touch HB; sleep N`
-        // sidecar so the watchdog file gets pet every interval, AND must
-        // install an EXIT trap that reaps the sidecar PID. Both halves are
-        // load-bearing — without the trap the sidecar leaks past wrapper
-        // death (the exact case the watchdog should detect).
-        let script = build_wrapper_script(
-            "hb",
-            "true",
-            Path::new("/tmp/claude-workloads/hb.output"),
-            Path::new("/tmp/claude-workloads/hb.exit"),
-            Path::new("/tmp/claude-workloads/hb.heartbeat"),
-            Path::new("/run/claude/workloads/hb.heartbeat"),
-            Path::new("/tmp/claude-workloads/demo.pgid"),
-            "/usr/local/bin/claude-watch",
-            None,
-        );
-        assert!(
-            script.contains("WORKLOAD_HEARTBEAT:-1"),
-            "wrapper must default WORKLOAD_HEARTBEAT to 1 when unset:\n{script}"
-        );
-        assert!(
-            script.contains("WORKLOAD_HEARTBEAT_INTERVAL_SECS:-900"),
-            "wrapper must default heartbeat interval to 900s (15 min):\n{script}"
-        );
-        assert!(
-            script.contains("'/tmp/claude-workloads/hb.heartbeat'"),
-            "wrapper must write to the per-label heartbeat path:\n{script}"
-        );
-        assert!(
-            script.contains("HEARTBEAT_PID=$!"),
-            "wrapper must capture sidecar pid:\n{script}"
-        );
-        // EXIT trap must reap the heartbeat sidecar (new multi-line trap
-        // also reaps the runtime heartbeat sidecar — assert on the
-        // load-bearing kill substring rather than the literal trap line
-        // so the assertion stays robust to formatting tweaks).
-        assert!(
-            script.contains("if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\""),
-            "wrapper must reap HEARTBEAT_PID in EXIT trap:\n{script}"
-        );
-        assert!(
-            script.contains("kill -TERM -\"$HEARTBEAT_PID\""),
-            "wrapper must kill the sidecar's whole process group (kill -- -pgid):\n{script}"
-        );
-        assert!(
-            script.contains("setsid bash -c 'while true"),
-            "sidecar must run via setsid so it owns its own pgid:\n{script}"
-        );
-        assert!(
-            script.contains("WORKLOAD_HB_FILE="),
-            "heartbeat path must be passed via env var (not inline quoted) to avoid breaking the outer single-quote of bash -c:\n{script}"
-        );
-        // After setsid returns, before emit-done, the wrapper kills the
-        // sidecar so the heartbeat does NOT keep getting pet during the
-        // 30s tmux keepalive sleep at the end (otherwise a workload that
-        // exited an hour ago could still appear "alive" to the watchdog).
-        let post_exit_idx = script.find("=== DONE (exit $EC)")
-            .expect("DONE line present");
-        let post_exit = &script[post_exit_idx..];
-        assert!(
-            post_exit.contains("kill") && post_exit.contains("HEARTBEAT_PID"),
-            "wrapper must kill sidecar after the user command exits, not just on EXIT trap:\n{post_exit}"
-        );
-    }
-
-    #[test]
-    fn wrapper_script_heartbeat_disabled_via_env() {
-        // The opt-out path: WORKLOAD_HEARTBEAT=0 in the environment skips
-        // the sidecar entirely. The script still must compile (the
-        // shell-script-side guard does the work).
-        let script = build_wrapper_script(
-            "hbo",
-            "true",
-            Path::new("/tmp/hbo.output"),
-            Path::new("/tmp/hbo.exit"),
-            Path::new("/tmp/hbo.heartbeat"),
-            Path::new("/run/claude/workloads/hbo.heartbeat"),
-            Path::new("/tmp/claude-workloads/demo.pgid"),
-            "/bin/claude-watch",
-            None,
-        );
-        // Must reference the env var (gating logic exists).
-        assert!(
-            script.contains("WORKLOAD_HEARTBEAT:-1"),
-            "wrapper must reference WORKLOAD_HEARTBEAT env var:\n{script}"
-        );
-        // The condition checks for "!= 0" (default-on, opt-out):
-        assert!(
-            script.contains("\"${WORKLOAD_HEARTBEAT:-1}\" != \"0\""),
-            "wrapper heartbeat must be default-on (opt-out via =0):\n{script}"
-        );
-    }
-
     // ----- build_wrapper_script: QUEUE heartbeat sidecar tests -------------
 
     /// A workload bound to a queue item must pat that item for the life of
@@ -5710,7 +5601,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "true",
             Path::new("/tmp/claude-workloads/qhb.output"),
             Path::new("/tmp/claude-workloads/qhb.exit"),
-            Path::new("/tmp/claude-workloads/qhb.heartbeat"),
             Path::new("/run/claude/workloads/qhb.heartbeat"),
             Path::new("/tmp/claude-workloads/qhb.pgid"),
             "/usr/local/bin/claude-watch",
@@ -5781,7 +5671,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "true",
             Path::new("/tmp/qhbpid.output"),
             Path::new("/tmp/qhbpid.exit"),
-            Path::new("/tmp/qhbpid.heartbeat"),
             Path::new("/run/claude/workloads/qhbpid.heartbeat"),
             Path::new("/tmp/qhbpid.pgid"),
             "/bin/claude-watch",
@@ -5802,7 +5691,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "true",
             Path::new("/tmp/noq.output"),
             Path::new("/tmp/noq.exit"),
-            Path::new("/tmp/noq.heartbeat"),
             Path::new("/run/claude/workloads/noq.heartbeat"),
             Path::new("/tmp/noq.pgid"),
             "/bin/claude-watch",
@@ -5846,7 +5734,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
 
         let out_path = tmp.path().join("qe2e.output");
         let exit_path = tmp.path().join("qe2e.exit");
-        let hb_path = tmp.path().join("qe2e.heartbeat");
         let rt_hb_path = tmp.path().join("runtime").join("qe2e.heartbeat");
         let script_path = tmp.path().join("qe2e.sh");
 
@@ -5860,7 +5747,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "sleep 3",
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &out_path.with_extension("pgid"),
             "/bin/true",
@@ -5879,7 +5765,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
 
         let status = Command::new("bash")
             // Other two heartbeats off: separate concerns, separate tests.
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .env("WORKLOAD_QUEUE_HEARTBEAT_INTERVAL_SECS", "1")
             .arg(&script_path)
@@ -5947,7 +5832,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "true",
             Path::new("/tmp/rt.output"),
             Path::new("/tmp/rt.exit"),
-            Path::new("/tmp/rt.heartbeat"),
             Path::new("/run/claude/workloads/rt.heartbeat"),
             Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
@@ -6063,7 +5947,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "true",
             Path::new("/tmp/rt2.output"),
             Path::new("/tmp/rt2.exit"),
-            Path::new("/tmp/rt2.heartbeat"),
             Path::new("/run/claude/workloads/rt2.heartbeat"),
             Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
@@ -6107,7 +5990,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("rh2.output");
         let exit_path = tmp.path().join("rh2.exit");
-        let hb_path = tmp.path().join("rh2.heartbeat");
         // Runtime heartbeat under a SUBDIR so the wrapper's
         // `mkdir -p` path is exercised end-to-end (the real prod
         // path is `/run/claude/workloads/`, but the wrapper must
@@ -6120,7 +6002,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "echo running; sleep 1",
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &out_path.with_extension("pgid"),
             "/bin/true",
@@ -6139,7 +6020,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // sidecar should pet at least once during the 1-second user
         // command.
         let status = Command::new("bash")
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS", "1")
             .arg(&script_path)
             .status()
@@ -6189,7 +6069,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("prog.output");
         let exit_path = tmp.path().join("prog.exit");
-        let hb_path = tmp.path().join("prog.heartbeat");
         let rt_hb_path = tmp.path().join("runtime").join("prog.heartbeat");
         let script_path = tmp.path().join("prog.sh");
         let start_mtime_path = tmp.path().join("start.mtime");
@@ -6218,7 +6097,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &user_cmd,
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &out_path.with_extension("pgid"),
             "/bin/true",
@@ -6233,7 +6111,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // for hermetic behavior on CI (no PTY echo / EOL conversion
         // noise from `script`).
         let status = Command::new("bash")
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS", "1")
             .env("WORKLOAD_PTY", "0")
             .arg(&script_path)
@@ -6285,7 +6162,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("hung.output");
         let exit_path = tmp.path().join("hung.exit");
-        let hb_path = tmp.path().join("hung.heartbeat");
         let rt_hb_path = tmp.path().join("runtime").join("hung.heartbeat");
         let script_path = tmp.path().join("hung.sh");
         let start_mtime_path = tmp.path().join("start.mtime");
@@ -6309,7 +6185,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &user_cmd,
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &out_path.with_extension("pgid"),
             "/bin/true",
@@ -6323,7 +6198,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // Slow heartbeat OFF; runtime heartbeat poll = 1s. PTY OFF
         // for hermetic behavior.
         let status = Command::new("bash")
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS", "1")
             .env("WORKLOAD_PTY", "0")
             .arg(&script_path)
@@ -6355,41 +6229,61 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         );
     }
 
+    /// REGRESSION GUARD for the retired slow heartbeat.
+    ///
+    /// A 15-minute timer sidecar used to write `<label>.heartbeat` next
+    /// to the `.output` file, purely so an out-of-tree cron could notice
+    /// a wrapper that had died with work still nominally running. The
+    /// queue heartbeat detects that same failure against the bound queue
+    /// item, six times faster, so the file sidecar was deleted
+    /// 2026-09-30 along with its cron consumer. If it comes back, this
+    /// fails: a resurrected writer with no reader is pure dead weight,
+    /// and its mere existence reads as evidence the mechanism is live.
     #[test]
-    fn wrapper_script_runtime_pets_and_reaps_heartbeat() {
+    fn wrapper_script_has_no_timer_driven_file_heartbeat() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let out_path = tmp.path().join("rh.output");
-        let exit_path = tmp.path().join("rh.exit");
-        let hb_path = tmp.path().join("rh.heartbeat");
-        let rt_hb_path = tmp.path().join("rh.runtime.heartbeat");
-        let script_path = tmp.path().join("rh.sh");
+        let out_path = tmp.path().join("nohb.output");
+        let exit_path = tmp.path().join("nohb.exit");
+        let rt_hb_path = tmp.path().join("nohb.runtime.heartbeat");
+        let script_path = tmp.path().join("nohb.sh");
+        let legacy_hb_path = tmp.path().join("nohb.heartbeat");
 
         let script_full = build_wrapper_script(
-            "rh",
-            "echo running; sleep 1",
+            "nohb",
+            "echo running",
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &out_path.with_extension("pgid"),
             "/bin/true",
-            None,
+            Some("q-2026-09-30-nohb"),
         );
-        // Patch out the trailing tmux-keepalive sleep so the test runs in
-        // ~1s (the user command sleeps 1s by design — covers an interval
-        // boundary).
+        // Static: neither the env knobs nor the sidecar variable survive.
+        for gone in [
+            "WORKLOAD_HEARTBEAT:-1",
+            "WORKLOAD_HEARTBEAT_INTERVAL_SECS",
+            "WORKLOAD_HB_FILE",
+        ] {
+            assert!(
+                !script_full.contains(gone),
+                "retired slow-heartbeat token {gone:?} is back in the wrapper:\n{script_full}"
+            );
+        }
+        // `$HEARTBEAT_PID` must be gone, but the two surviving sidecars
+        // ($RUNTIME_HEARTBEAT_PID / $QUEUE_HEARTBEAT_PID) end in the same
+        // characters, so match the whole variable reference.
+        assert!(
+            !script_full.contains("\"$HEARTBEAT_PID\""),
+            "retired slow-heartbeat sidecar PID is back in the wrapper:\n{script_full}"
+        );
+
+        // Dynamic: RUNNING the wrapper must not create the file either.
         let script = script_full.replace("sleep 30\n", "sleep 0\n");
         std::fs::write(&script_path, &script).expect("write script");
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
-
-        // Run with a 1-second heartbeat interval; that way during the
-        // 1-second user command the sidecar should pet at least once.
-        // Disable the runtime heartbeat (separate sidecar) — this test
-        // only exercises the legacy 15-min heartbeat sidecar.
         let status = Command::new("bash")
-            .env("WORKLOAD_HEARTBEAT_INTERVAL_SECS", "1")
-            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .env("WORKLOAD_QUEUE_HEARTBEAT", "0")
             .arg(&script_path)
             .status()
             .expect("run wrapper");
@@ -6397,41 +6291,10 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             status.success(),
             "wrapper exited non-zero: {status:?}\nscript:\n{script}"
         );
-
-        // (a) Heartbeat file must exist (touched on startup).
         assert!(
-            hb_path.exists(),
-            "heartbeat file was never created at {hb_path:?}\nscript:\n{script}"
+            !legacy_hb_path.exists(),
+            "wrapper recreated the retired slow-heartbeat file at {legacy_hb_path:?}"
         );
-        let body = std::fs::read_to_string(&hb_path).expect("read heartbeat");
-        // Body should be an ISO8601 timestamp from `date -Iseconds`.
-        let ts_re = regex_lite::Regex::new(
-            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:?\d{2}",
-        )
-        .expect("compile regex");
-        assert!(
-            ts_re.is_match(body.trim()),
-            "heartbeat body is not ISO8601: {body:?}"
-        );
-
-        // (b) Capture mtime, sleep > 2× interval, verify it didn't move
-        // (sidecar reaped). If the EXIT trap is broken the sidecar
-        // would still be petting the file after wrapper exit.
-        let mtime_a = std::fs::metadata(&hb_path)
-            .expect("stat hb")
-            .modified()
-            .expect("mtime");
-        std::thread::sleep(Duration::from_millis(2500));
-        let mtime_b = std::fs::metadata(&hb_path)
-            .expect("stat hb")
-            .modified()
-            .expect("mtime");
-        assert_eq!(
-            mtime_a, mtime_b,
-            "heartbeat file kept getting touched after wrapper exit — sidecar leaked past EXIT trap"
-        );
-
-        // (c) Exit file must also exist with the user-command rc.
         let ec = std::fs::read_to_string(&exit_path).expect("read exit");
         assert_eq!(ec.trim(), "0", "expected exit 0; got {ec:?}");
     }
@@ -6964,7 +6827,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "echo hi",
             Path::new("/tmp/claude-workloads/pg.output"),
             Path::new("/tmp/claude-workloads/pg.exit"),
-            Path::new("/tmp/claude-workloads/pg.heartbeat"),
             Path::new("/tmp/claude-wl-rt/pg.heartbeat"),
             Path::new("/tmp/claude-workloads/pg.pgid"),
             "/usr/bin/claude-watch",
@@ -7037,7 +6899,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("kt.output");
         let exit_path = tmp.path().join("kt.exit");
-        let hb_path = tmp.path().join("kt.heartbeat");
         let rt_hb_path = tmp.path().join("kt.runtime.heartbeat");
         let pgid_path = tmp.path().join("kt.pgid");
         let script_path = tmp.path().join("kt.sh");
@@ -7063,7 +6924,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &command,
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &pgid_path,
             "/bin/true",
@@ -7075,7 +6935,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             .arg(&script_path)
             // Heartbeat sidecars are orthogonal here and would only add
             // noise to the survivor report.
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .spawn()
             .expect("spawn wrapper");
@@ -7632,7 +7491,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let events = tmp.path().join("events");
         let out_path = tmp.path().join("rt.output");
         let exit_path = tmp.path().join("rt.exit");
-        let hb_path = tmp.path().join("rt.heartbeat");
         let rt_hb_path = tmp.path().join("rt.runtime.heartbeat");
         let pgid_path = tmp.path().join("rt.pgid");
         let sentinel_path = tmp.path().join("rt.kill-emitted");
@@ -7655,7 +7513,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &command,
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &pgid_path,
             "/bin/true",
@@ -7665,7 +7522,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
 
         let mut wrapper = Command::new("bash")
             .arg(&script_path)
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .spawn()
             .expect("spawn wrapper");
@@ -7946,7 +7802,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let events = tmp.path().join("events");
         let out_path = tmp.path().join("rp.output");
         let exit_path = tmp.path().join("rp.exit");
-        let hb_path = tmp.path().join("rp.heartbeat");
         let rt_hb_path = tmp.path().join("rp.runtime.heartbeat");
         let pgid_path = tmp.path().join("rp.pgid");
         let sentinel_path = tmp.path().join("rp.kill-emitted");
@@ -7969,7 +7824,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &command,
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &pgid_path,
             "/bin/true",
@@ -7979,7 +7833,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
 
         let mut wrapper = Command::new("bash")
             .arg(&script_path)
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .spawn()
             .expect("spawn wrapper");
@@ -8094,7 +7947,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "echo replaced-run-ok",
             &out_path,
             &exit_path,
-            &hb_path,
             &rt_hb_path,
             &pgid_path,
             "/bin/true",
@@ -8103,7 +7955,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         std::fs::write(&new_script_path, &new_script).expect("write new script");
         let mut new_wrapper = Command::new("bash")
             .arg(&new_script_path)
-            .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
             .spawn()
             .expect("spawn the replacing wrapper");

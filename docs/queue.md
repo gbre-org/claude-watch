@@ -226,10 +226,30 @@ it to.
   the same "owner is gone" reading.
 - Harmless alongside `workload babysit`, which keeps its own pat: both just
   move one timestamp forward.
-- `WORKLOAD_QUEUE_HEARTBEAT=0` disables the sidecar; a workload with no bound
-  queue id (`--no-queue`) never spawns one. If `session-task` is not
-  resolvable when the wrapper is generated, the sidecar is skipped rather
-  than spawned to fail in a loop.
+- `WORKLOAD_QUEUE_HEARTBEAT=0` disables the sidecar. Every workload is bound
+  to a queue item (see below), so there is no unbound case to skip. If
+  `session-task` is not resolvable when the wrapper is generated, the sidecar
+  is skipped rather than spawned to fail in a loop.
+
+### Queue binding is mandatory
+
+`workload run` **always** ends up owning a `q-XXXX`:
+
+- `--queue-id q-XXXX` binds an item the caller already created.
+- Omitting it auto-creates and registers one, scope `workload:<label>`.
+
+There is no third option. `--no-queue` and the `WORKLOAD_QUEUE_AUTO_CREATE=0`
+environment knob were both removed on 2026-09-30; `--no-queue` is still
+parsed only so that passing it exits non-zero with an explanation instead of
+clap's generic "unexpected argument". If the queue layer cannot be reached —
+`session-task` missing, `queue add` refusing — `workload run` **fails** with
+exit 4 rather than starting an unbound workload. That is deliberate: an
+unbound workload is invisible to every queue-side orphan and stall check, so
+"degraded queue" would silently mean "unwatched job".
+
+The `session-task` lookup is pre-flighted before the same-label replace
+teardown, so a host with no queue layer refuses without first killing a
+running workload.
 
 ### Waiting on a long workload — use `workload babysit`, not tight-poll
 
