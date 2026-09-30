@@ -6,6 +6,8 @@ Restart the whole CONTAINER (not just the inner Claude Code process) via `docker
 
 **SESSION-KILLING.** The restart kills PID 1 (process-compose) and with it the inner `claude` process; the current Claude Code session ends. The next session resumes automatically via `CLAUDE_AUTO_CONTINUE` (the entrypoint re-appends `--continue <value>` to the in-container claude invocation, so the prior conversation is picked back up).
 
+**Like force-recreate (and unlike self-clear), this KILLS every in-container subagent, and none of them auto-restart.** Killing PID 1 tears down the whole process tree — any `run_in_background` Bash task, spawned `Agent` subagent, watcher, or in-flight `hostjob` monitor loop dies with it. `CLAUDE_AUTO_CONTINUE` only resumes the main conversation, not whatever subagents were running. Contrast with `/claude-container:self-clear`, which resets ONLY the main loop's conversation context and leaves every background agent/subagent/watcher running untouched. If urgent agents are in flight, prefer self-clear (or wait) over either restart-container or deploy-container.
+
 ## When to use this vs. the two siblings
 
 There are three distinct "restart" operations. Pick by what you need re-run:
