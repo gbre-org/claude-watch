@@ -194,6 +194,43 @@ an empty line stays empty, and `\r\n` gets one stamp rather than two.
 - Old `.output` files have no prefix, and nothing needs converting: readers
   treat an unstamped line as "no time known" and render it verbatim.
 
+### A workload keeps its own queue item alive
+
+`workload run` bakes a **queue heartbeat sidecar** into the wrapper it
+generates. For as long as the wrapped command runs, that sidecar calls
+`session-task queue heartbeat <qid>` every
+`WORKLOAD_QUEUE_HEARTBEAT_INTERVAL_SECS` seconds (default 150) on the queue
+item the workload is bound to, and is reaped when the command exits.
+
+Why it has to live in the wrapper: the work-queue exporter judges a `running`
+item that has no agent record by its `last_heartbeat_at`, and **every**
+`workload:`-scoped item is in that class — a workload is owned by a process,
+not by an agent. Nothing else pats it. The two heartbeat *files* a workload
+writes are read by other things entirely (a cron stale-check and the daemon's
+stuck-alert suppression), and the only queue-side pat used to live in
+`workload babysit`, which something has to be sitting inside. Fire-and-forget
+`workload run` has nobody sitting in it, so its item aged past the staleness
+window and got published as orphaned while the workload was running perfectly
+well — every time, for the workload's whole life. The old advice, "have the
+workload's own loop pat its qid each iteration", only ever worked for a shell
+loop; a workload whose command is one long-running binary has no loop to add
+it to.
+
+- **Liveness only, never progress.** The pat says the wrapper is still
+  running, which is exactly what the orphan check asks. It does **not** feed
+  the progress heartbeat, which stays driven by the output file growing —
+  patting that on a timer would make a wedged silent workload look healthy
+  forever.
+- **Never stamps a pid.** `queue heartbeat` leaves `pid` alone unless asked,
+  and pointing the item at the sidecar's ephemeral shell pid would re-create
+  the same "owner is gone" reading.
+- Harmless alongside `workload babysit`, which keeps its own pat: both just
+  move one timestamp forward.
+- `WORKLOAD_QUEUE_HEARTBEAT=0` disables the sidecar; a workload with no bound
+  queue id (`--no-queue`) never spawns one. If `session-task` is not
+  resolvable when the wrapper is generated, the sidecar is skipped rather
+  than spawned to fail in a loop.
+
 ### Waiting on a long workload — use `workload babysit`, not tight-poll
 
 When an agent or the main loop has kicked off a long `workload run <label>`

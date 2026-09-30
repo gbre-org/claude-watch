@@ -135,6 +135,33 @@ const LEGACY_WORKLOAD_DIR: &str = "/tmp/claude-workloads";
 /// from a crashed wrapper don't outlive the host.
 const RUNTIME_HEARTBEAT_DIR: &str = "/run/claude/workloads";
 
+/// Default cadence (seconds) for the wrapper's QUEUE heartbeat sidecar —
+/// the loop that pats the bound queue item's `last_heartbeat_at` via
+/// `session-task queue heartbeat <qid>` for as long as the wrapped
+/// command is running.
+///
+/// Why it exists: the work-queue exporter decides whether a `running`
+/// item with NO agent record still has a live owner from that item's
+/// `last_heartbeat_at`. Every `workload:`-scoped item is in that class (a
+/// workload is owned by a process, never by an agent), so once the
+/// timestamp ages past the exporter's staleness window the item is
+/// published as orphaned and the orphan alert fires — on a workload that
+/// is running perfectly well. Nothing in the wrapper used to pat it: the
+/// two heartbeat files above are a cron watchdog and a daemon
+/// progress-suppression signal, neither of which the queue item reads,
+/// and the only queue-side pat lived in `workload babysit`, which an
+/// AGENT has to be sitting in. A fire-and-forget `workload run` has no
+/// babysitter, so its item went stale every time — and a workload whose
+/// command is a single long-running binary cannot pat the qid from
+/// inside its own loop either, because it has no loop.
+///
+/// Chosen well under the exporter's 600 s default staleness window so a
+/// missed tick (a slow `session-task`, a machine under load) still leaves
+/// three more chances before the item looks abandoned. Override per-run
+/// with `WORKLOAD_QUEUE_HEARTBEAT_INTERVAL_SECS`; disable the sidecar
+/// entirely with `WORKLOAD_QUEUE_HEARTBEAT=0`.
+const QUEUE_HEARTBEAT_INTERVAL_SECS: u64 = 150;
+
 /// Env override for the registry path, shared with `task_watch`'s
 /// read-only mirror of the same file (`workload_state_path`). Both sides
 /// MUST resolve it the same way: `task init --recreate --force` reads
@@ -1456,6 +1483,53 @@ fn build_wrapper_script(
         Some(qid) => format!(" --queue-id {}", shell_quote(qid)),
         None => String::new(),
     };
+    // QUEUE heartbeat sidecar (third heartbeat, and the only one the
+    // WORK QUEUE itself reads). Pats `session-task queue heartbeat <qid>`
+    // on a timer for as long as the wrapped command runs, so a
+    // fire-and-forget `workload run` keeps its bound queue item's
+    // `last_heartbeat_at` fresh without anybody sitting in `workload
+    // babysit`. See QUEUE_HEARTBEAT_INTERVAL_SECS for the failure this
+    // closes.
+    //
+    // Deliberately NOT `--pid`: `session-task queue heartbeat` leaves
+    // `pid` alone by default, and stamping this sidecar's ephemeral shell
+    // pid would re-create the same false "owner is gone" reading the
+    // moment the shell was replaced. Liveness for a workload item is "the
+    // wrapper is still running", which is exactly what the presence of
+    // these pats means.
+    //
+    // Resolved at RENDER time (this process has the operator's PATH and
+    // HOME; a tmux pane may not) and baked in shell-quoted, with a
+    // runtime existence probe so a host without the CLI silently skips
+    // the sidecar instead of spawning a loop that can never succeed.
+    let queue_heartbeat_block = match queue_id {
+        Some(qid) => {
+            let cli = find_session_task_cli()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "session-task".to_string());
+            let cli_q = shell_quote(&cli);
+            let qid_q = shell_quote(qid);
+            format!(
+                "QUEUE_HEARTBEAT_PID=\n\
+                 if [ \"${{WORKLOAD_QUEUE_HEARTBEAT:-1}}\" != \"0\" ]; then\n\
+                 if [ -x {cli_q} ] || command -v {cli_q} >/dev/null 2>&1; then\n\
+                 WORKLOAD_QHB_CLI={cli_q} WORKLOAD_QHB_QID={qid_q} setsid bash -c 'while true; do\n\
+                 sleep \"${{WORKLOAD_QUEUE_HEARTBEAT_INTERVAL_SECS:-{interval}}}\"\n\
+                 \"$WORKLOAD_QHB_CLI\" queue heartbeat \"$WORKLOAD_QHB_QID\" >/dev/null 2>&1 || true\n\
+                 done' </dev/null >/dev/null 2>&1 &\n\
+                 QUEUE_HEARTBEAT_PID=$!\n\
+                 fi\n\
+                 fi",
+                cli_q = cli_q,
+                qid_q = qid_q,
+                interval = QUEUE_HEARTBEAT_INTERVAL_SECS,
+            )
+        }
+        // No bound queue item (--no-queue, or auto-create disabled):
+        // nothing to pat. The variable is still initialised so the
+        // teardown lines below stay unconditional.
+        None => "QUEUE_HEARTBEAT_PID=".to_string(),
+    };
     // Per-line ISO8601 timestamp prefix. Two paths:
     //   1. `ts` from moreutils if installed — fast, native.
     //   2. Pure-bash fallback — a `while IFS= read -r line` loop calling
@@ -1615,7 +1689,20 @@ fn build_wrapper_script(
                  RUNTIME_HEARTBEAT_PID=$!\n\
              fi\n\
          fi\n\
-         # Reap BOTH heartbeat sidecars on any wrapper exit (normal, signal, or\n\
+         # QUEUE heartbeat sidecar. Pats the BOUND QUEUE ITEM (not a file)\n\
+         # every ${{WORKLOAD_QUEUE_HEARTBEAT_INTERVAL_SECS:-{queue_heartbeat_interval}}} seconds, so a\n\
+         # fire-and-forget workload keeps its own `last_heartbeat_at` fresh\n\
+         # with no agent babysitting it. Empty when the workload has no\n\
+         # bound queue id. Sleeps FIRST: registration already stamped a\n\
+         # fresh timestamp, and an immediate pat would race it.\n\
+         #\n\
+         # This is a LIVENESS signal, never a progress one -- it says the\n\
+         # wrapper is still alive, which is exactly the question the\n\
+         # orphan check asks. The progress heartbeat above stays\n\
+         # output-growth-driven on purpose; pat it on a timer and a wedged\n\
+         # silent workload would look healthy forever.\n\
+         {queue_heartbeat_block}\n\
+         # Reap EVERY heartbeat sidecar on any wrapper exit (normal, signal, or\n\
          # tmux kill-pane). Without this the sidecars leak and keep petting\n\
          # the watchdog after the workload has died — exactly the case we\n\
          # want to detect. EXIT pseudo-signal fires unconditionally. Kill the\n\
@@ -1628,6 +1715,7 @@ fn build_wrapper_script(
          trap '\n\
            if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            if [ -n \"$RUNTIME_HEARTBEAT_PID\" ]; then kill -TERM -\"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || kill \"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
+           if [ -n \"$QUEUE_HEARTBEAT_PID\" ]; then kill -TERM -\"$QUEUE_HEARTBEAT_PID\" 2>/dev/null || kill \"$QUEUE_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            rm -f {rt_hb_q} {rt_hb_q}.tmp 2>/dev/null || true\n\
            rm -f {pgid_q} {pgid_q}.tmp 2>/dev/null || true\n\
          ' EXIT\n\
@@ -1763,6 +1851,12 @@ fn build_wrapper_script(
          if [ -n \"$RUNTIME_HEARTBEAT_PID\" ]; then kill -TERM -\"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || kill \"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
          rm -f {rt_hb_q} {rt_hb_q}.tmp 2>/dev/null || true\n\
          if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
+         # Stop the queue pat before emit-done: that call transitions the\n\
+         # item to done/abandoned, and a pat arriving afterwards is simply\n\
+         # refused (heartbeat requires status=running), but leaving the\n\
+         # loop alive through the 30s keepalive sleep below would keep a\n\
+         # finished workload looking live to the orphan check.\n\
+         if [ -n \"$QUEUE_HEARTBEAT_PID\" ]; then kill -TERM -\"$QUEUE_HEARTBEAT_PID\" 2>/dev/null || kill \"$QUEUE_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
          # Emit claude-event for the main loop. Default-open: any failure\n\
          # here is silently swallowed — the exit-file write above is the\n\
          # source of truth for `workload wait`.\n\
@@ -1773,6 +1867,8 @@ fn build_wrapper_script(
         command_escaped = command.replace('\'', "'\\''"),
         inner_cmd_lb_q = inner_cmd_lb_q,
         inner_cmd_raw_q = inner_cmd_raw_q,
+        queue_heartbeat_block = queue_heartbeat_block,
+        queue_heartbeat_interval = QUEUE_HEARTBEAT_INTERVAL_SECS,
     )
 }
 
@@ -2431,23 +2527,30 @@ fn babysit_heartbeat(qid: &str, label: &str) {
 ///     wrapped command's output grows — babysit does not touch it and
 ///     does not need to. StuckSoft needs progress >15m stale `for:15m`;
 ///     a live, output-producing workload never trips it.
-///   * `WorkQueueOrphaned` keys on `worktask_queue_item_has_live_owner`
-///     (the exporter joining queue.json against claude-watch
-///     active-agents) and on `cron-queue-check`'s orphan pass. BOTH treat
-///     a live workload pane as proof-of-life: the exporter stays silent
-///     on workload-bound items that have no agent record, and
-///     cron-queue-check clears all orphan suspicion whenever ANY workload
-///     is alive. So a running workload already silences Orphaned —
-///     babysit's heartbeat is not load-bearing for that alert.
+///   * `WorkQueueOrphaned` keys on `worktask_queue_item_has_live_owner`.
+///     For an item with no agent record — which every workload-bound item
+///     is — the exporter falls back to the item's `last_heartbeat_at` and
+///     publishes `has_live_owner=0` once it ages past its staleness
+///     window (600s by default). So `last_heartbeat_at` IS load-bearing
+///     for this alert, and a running workload does NOT silence it by
+///     itself.
 ///
-///   The `session-task queue heartbeat` refresh updates
-///   `last_heartbeat_at`. That field is NOT currently consumed by the
-///   deployed exporter or cron-queue-check — but refreshing it is cheap,
-///   correct hygiene (it IS the documented liveness field for pid=None
-///   items), keeps the field meaningful for the queue CLI / dashboard,
-///   and future-proofs babysit if a heartbeat-staleness alert is added.
-///   60s sits an order of magnitude under every `for:` window above, so
-///   no tightening is warranted.
+///     The 2026-06-03 note here used to say the opposite ("the exporter
+///     stays silent on workload-bound items"). That is true of the
+///     owner-UNKNOWN gauge, which exempts `workload:` scopes, but not of
+///     the never-spawned-orphan branch of has_live_owner, which carries
+///     no such exemption. Believing it is why fire-and-forget workloads
+///     went on tripping the alert.
+///
+///     The wrapper now pats the bound item itself for the life of the
+///     command (see `QUEUE_HEARTBEAT_INTERVAL_SECS`), so this no longer
+///     depends on anyone sitting in babysit. babysit's own pat stays: it
+///     costs one subprocess per minute, the two simply move the same
+///     timestamp forward, and babysit is also usable against a workload
+///     started before that wrapper change shipped.
+///
+///   babysit's `--heartbeat` default of 60s sits an order of magnitude
+///   under every `for:` window above, so no tightening is warranted.
 pub fn cmd_babysit(
     label: &str,
     qid: &str,
@@ -5589,6 +5692,233 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         assert!(
             script.contains("\"${WORKLOAD_HEARTBEAT:-1}\" != \"0\""),
             "wrapper heartbeat must be default-on (opt-out via =0):\n{script}"
+        );
+    }
+
+    // ----- build_wrapper_script: QUEUE heartbeat sidecar tests -------------
+
+    /// A workload bound to a queue item must pat that item for the life of
+    /// the wrapped command. Without this the item's `last_heartbeat_at`
+    /// only ever moved when an agent sat in `workload babysit`, so every
+    /// fire-and-forget `workload run` aged into the exporter's
+    /// never-spawned-orphan branch and the orphan alert fired on a healthy
+    /// workload, repeatedly, for its whole life.
+    #[test]
+    fn wrapper_script_contains_queue_heartbeat_sidecar() {
+        let script = build_wrapper_script(
+            "qhb",
+            "true",
+            Path::new("/tmp/claude-workloads/qhb.output"),
+            Path::new("/tmp/claude-workloads/qhb.exit"),
+            Path::new("/tmp/claude-workloads/qhb.heartbeat"),
+            Path::new("/run/claude/workloads/qhb.heartbeat"),
+            Path::new("/tmp/claude-workloads/qhb.pgid"),
+            "/usr/local/bin/claude-watch",
+            Some("q-2026-01-01-abcd"),
+        );
+        assert!(
+            script.contains("queue heartbeat \"$WORKLOAD_QHB_QID\""),
+            "wrapper must pat the bound queue item:\n{script}"
+        );
+        assert!(
+            script.contains("WORKLOAD_QHB_QID='q-2026-01-01-abcd'"),
+            "wrapper must bake the bound qid into the sidecar env:\n{script}"
+        );
+        assert!(
+            script.contains("WORKLOAD_QUEUE_HEARTBEAT:-1"),
+            "queue heartbeat must be default-on (opt-out via =0):\n{script}"
+        );
+        assert!(
+            script.contains(&format!(
+                "WORKLOAD_QUEUE_HEARTBEAT_INTERVAL_SECS:-{QUEUE_HEARTBEAT_INTERVAL_SECS}"
+            )),
+            "sidecar interval must default to QUEUE_HEARTBEAT_INTERVAL_SECS:\n{script}"
+        );
+        assert!(
+            script.contains("QUEUE_HEARTBEAT_PID=$!"),
+            "wrapper must capture the queue sidecar pid:\n{script}"
+        );
+        assert!(
+            script.contains("setsid bash -c 'while true"),
+            "queue sidecar must run via setsid so it owns its own pgid:\n{script}"
+        );
+        // Reaped in the EXIT trap AND on the normal path before emit-done.
+        assert!(
+            script.contains(
+                "if [ -n \"$QUEUE_HEARTBEAT_PID\" ]; then kill -TERM -\"$QUEUE_HEARTBEAT_PID\""
+            ),
+            "wrapper must reap QUEUE_HEARTBEAT_PID:\n{script}"
+        );
+        let post_exit_idx = script
+            .find("=== DONE (exit $EC)")
+            .expect("DONE line present");
+        let post_exit = &script[post_exit_idx..];
+        assert!(
+            post_exit.contains("QUEUE_HEARTBEAT_PID") && post_exit.contains("kill"),
+            "wrapper must stop the queue pat after the command exits, not only \
+             on the EXIT trap:\n{post_exit}"
+        );
+        let emit_idx = post_exit
+            .find("workload emit-done")
+            .expect("emit-done present");
+        let kill_idx = post_exit
+            .find("kill -TERM -\"$QUEUE_HEARTBEAT_PID\"")
+            .expect("queue kill present");
+        assert!(
+            kill_idx < emit_idx,
+            "queue pat must stop BEFORE emit-done flips the item:\n{post_exit}"
+        );
+    }
+
+    /// The pat must never stamp a pid. `session-task queue heartbeat`
+    /// leaves `pid` alone unless asked, and pointing the item at this
+    /// sidecar's ephemeral shell pid would re-create the very
+    /// "owner is gone" reading the sidecar exists to prevent.
+    #[test]
+    fn wrapper_script_queue_heartbeat_never_stamps_pid() {
+        let script = build_wrapper_script(
+            "qhbpid",
+            "true",
+            Path::new("/tmp/qhbpid.output"),
+            Path::new("/tmp/qhbpid.exit"),
+            Path::new("/tmp/qhbpid.heartbeat"),
+            Path::new("/run/claude/workloads/qhbpid.heartbeat"),
+            Path::new("/tmp/qhbpid.pgid"),
+            "/bin/claude-watch",
+            Some("q-2026-01-01-abcd"),
+        );
+        assert!(
+            !script.contains("queue heartbeat \"$WORKLOAD_QHB_QID\" --pid"),
+            "queue pat must not stamp a pid:\n{script}"
+        );
+    }
+
+    /// No bound queue item -> no sidecar at all, but the teardown lines
+    /// still reference an initialised variable (they are unconditional).
+    #[test]
+    fn wrapper_script_omits_queue_heartbeat_without_qid() {
+        let script = build_wrapper_script(
+            "noq",
+            "true",
+            Path::new("/tmp/noq.output"),
+            Path::new("/tmp/noq.exit"),
+            Path::new("/tmp/noq.heartbeat"),
+            Path::new("/run/claude/workloads/noq.heartbeat"),
+            Path::new("/tmp/noq.pgid"),
+            "/bin/claude-watch",
+            None,
+        );
+        assert!(
+            !script.contains("queue heartbeat"),
+            "unbound workload must not spawn a queue pat:\n{script}"
+        );
+        assert!(
+            script.contains("QUEUE_HEARTBEAT_PID="),
+            "teardown reads the var unconditionally, so it must be \
+             initialised even with no qid:\n{script}"
+        );
+    }
+
+    /// End-to-end proof on the exact shape that was false-alerting: a
+    /// SILENT long-running command (no output at all, so the
+    /// progress-driven runtime heartbeat never fires) bound to a queue
+    /// item. Runs the generated wrapper for real against a stub
+    /// `session-task` that logs every invocation, and asserts:
+    ///   * the queue item gets patted repeatedly WHILE the command runs
+    ///   * every pat is the bare `queue heartbeat <qid>` form (no --pid)
+    ///   * the pats STOP once the wrapper exits (no leaked sidecar)
+    #[test]
+    fn wrapper_script_pats_queue_item_while_quiet_command_runs() {
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let calls_path = tmp.path().join("session-task.calls");
+        let stub_path = tmp.path().join("session-task");
+        std::fs::write(
+            &stub_path,
+            format!(
+                "#!/bin/bash\necho \"$*\" >> {}\n",
+                calls_path.to_string_lossy()
+            ),
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod stub");
+
+        let out_path = tmp.path().join("qe2e.output");
+        let exit_path = tmp.path().join("qe2e.exit");
+        let hb_path = tmp.path().join("qe2e.heartbeat");
+        let rt_hb_path = tmp.path().join("runtime").join("qe2e.heartbeat");
+        let script_path = tmp.path().join("qe2e.sh");
+
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        let script_full = build_wrapper_script(
+            "qe2e",
+            // Deliberately silent: no stdout, no stderr, nothing for the
+            // output-growth heartbeat to notice. This is the single
+            // long-running binary case.
+            "sleep 3",
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            &out_path.with_extension("pgid"),
+            "/bin/true",
+            Some("q-2026-01-01-abcd"),
+        );
+        match prev_cli {
+            Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+            None => std::env::remove_var("SESSION_TASK_CLI"),
+        }
+
+        // Drop the trailing tmux keepalive so the test doesn't wait 30s.
+        let script = script_full.replace("sleep 30\n", "sleep 0\n");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod script");
+
+        let status = Command::new("bash")
+            // Other two heartbeats off: separate concerns, separate tests.
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .env("WORKLOAD_QUEUE_HEARTBEAT_INTERVAL_SECS", "1")
+            .arg(&script_path)
+            .status()
+            .expect("run wrapper");
+        assert!(
+            status.success(),
+            "wrapper exited non-zero: {status:?}\nscript:\n{script}"
+        );
+
+        let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+        let lines: Vec<&str> = calls.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(
+            lines.len() >= 2,
+            "expected repeated queue pats during a 3s silent command, got \
+             {} ({calls:?})",
+            lines.len()
+        );
+        for line in &lines {
+            assert_eq!(
+                *line, "queue heartbeat q-2026-01-01-abcd",
+                "pat must be the bare heartbeat form with no pid stamp"
+            );
+        }
+
+        // No leaked sidecar: the pat count must not grow after the
+        // wrapper is gone. At a 1s interval, 2s of quiet is 2 missed
+        // ticks -- a survivor would show up.
+        let before = lines.len();
+        std::thread::sleep(Duration::from_millis(2200));
+        let after_calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+        let after = after_calls
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(
+            after, before,
+            "queue heartbeat sidecar outlived the wrapper (pats kept \
+             arriving): {after_calls:?}"
         );
     }
 
