@@ -304,6 +304,25 @@ invariant; the queue row stays the authority on ownership rather than the
 current queue id being copied back into the agent record, where it could drift
 out of date again.
 
+**Why the first rung is not just "the freshest record".** That same
+spawn-marker attribution means a queue id can name *several* agents: a
+subagent inherits the `Queue item: q-XXXX` line from the prompt of the agent
+that spawned it, so an agent and everything it spawns are all recorded under
+one queue id. Collapsing that set by liveness and transcript freshness alone
+hands the item to whichever of them wrote last — and an agent waiting on its
+own children, or parked inside a long tool call, loses that race. The item's
+owner then flips *mid-run* to one of its own subagents, and the subagent tree
+(which correctly refuses to render an item's owner as a child of itself) puts
+the real owner back on screen as a co-bound peer: one agent, two rows, two log
+streams tailing the same transcript, and a subagent count that includes the
+agent doing the counting. So rung 0 of the ladder is the spawn graph: for a
+contested queue id only, `_load_agent_state` reconstructs `child → parent`
+edges from the transcripts' own `Agent`/`Task` launch records — the same
+evidence the nested tree nests on — and an agent that descends from another
+candidate is dropped before liveness is consulted at all. Freshness still
+breaks ties between candidates with no spawn edge between them (a genuine
+re-dispatch), and a queue id with a single record never pays for the scan.
+
 **How many panes stay legible.** Panes flex-share the viewport evenly, but only
 down to `--mt-pane-min` (149px — a header and roughly ten monospace lines;
 133px under 560px wide, where the title takes a row of its own as well). Both

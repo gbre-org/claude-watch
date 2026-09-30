@@ -26,10 +26,17 @@ Functions:
       Returns the parsed dict (always has `subagents`/`workloads`/`agents`
       keys, even on failure — empty arrays).
 
-  agents_by_queue_id(state)
-      Build a queue_id -> agent record map. Dedup rule when multiple
-      agents reference the same queue_id (rare — happens after a retry):
-      live > stale; among same liveness, smaller jsonl_age_seconds wins.
+  agents_by_queue_id(state, parent_of=None)
+      Build a queue_id -> OWNING agent record map. Several agents share a
+      queue id whenever an agent spawns subagents (they inherit its
+      ``Queue item:`` marker), and after a retry. Selection: a spawn
+      DESCENDANT of another candidate is never the owner (needs
+      ``parent_of``, the child -> parent spawn graph); then live > stale;
+      then smaller jsonl_age_seconds wins.
+
+  agent_records_by_queue_id(state)
+      The un-collapsed queue_id -> [records] view, for callers that need
+      to know a queue id is contested before paying to build ``parent_of``.
 
   agent_for_queue(state, queue_id)
       Convenience: load+lookup. Returns None if not found.
@@ -72,41 +79,138 @@ def load_agent_state(path: str = DEFAULT_AGENT_STATE_PATH) -> dict[str, Any]:
     }
 
 
-def agents_by_queue_id(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Map queue_id -> agent record from a loaded state dict.
+def agents_by_queue_id(
+    state: dict[str, Any],
+    parent_of: Optional[dict[str, str]] = None,
+) -> dict[str, dict[str, Any]]:
+    """Map queue_id -> the OWNING agent record from a loaded state dict.
 
-    Dedup rule when the same queue_id appears on multiple records:
+    Several records can carry the same queue id, because the agent ->
+    queue mapping is derived from the ``Queue item: q-XXXX`` marker in
+    each transcript's first user message and a subagent INHERITS that
+    line from the prompt of the agent that spawned it. So an agent and
+    every agent it spawns are all recorded under ONE queue id.
+
+    Selection rule:
+      0. an agent that is a SPAWN DESCENDANT of another candidate for the
+         same queue id is never the owner (requires ``parent_of``)
       1. live > stale
       2. among same liveness, smaller jsonl_age_seconds wins
       3. if both have age=None and same liveness, first-seen wins
 
+    Rules 1-3 alone pick whichever co-bound agent happens to have written
+    most recently at snapshot time. For a parent and its own children that
+    is a race the parent LOSES whenever it is parked inside a long tool
+    call (or simply waiting on those children) — so an item's owner flips,
+    mid-run, to one of its own subagents. Rule 0 is what stops that: pass
+    ``parent_of`` (``child_agent_id -> parent_agent_id``, reconstructed
+    from the transcripts' Agent/Task launch records) and any candidate
+    reachable UP that graph to another candidate is dropped before the
+    liveness/freshness tiebreak runs. Callers with no spawn-graph signal
+    omit it and keep the historical behaviour.
+
     Records without a queue_id are skipped.
     """
     by_qid: dict[str, dict[str, Any]] = {}
+    for qid, records in agent_records_by_queue_id(state).items():
+        owner = pick_owner_record(records, parent_of)
+        if owner is not None:
+            by_qid[qid] = owner
+    return by_qid
+
+
+def agent_records_by_queue_id(
+    state: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Map queue_id -> EVERY agent record carrying it, in file order.
+
+    The un-collapsed view behind ``agents_by_queue_id``. A queue id with
+    more than one record is a queue item whose agents are contested: the
+    owner plus, usually, the subagents it spawned (which inherit its
+    ``Queue item:`` marker). Callers use this to detect that case cheaply
+    before paying for a spawn-graph reconstruction.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
     for rec in state.get("agents", []):
         if not isinstance(rec, dict):
             continue
         qid = rec.get("queue_id")
         if not qid:
             continue
-        prev = by_qid.get(qid)
-        if prev is None:
-            by_qid[qid] = rec
-            continue
-        prev_alive = bool(prev.get("alive"))
-        rec_alive = bool(rec.get("alive"))
-        if rec_alive and not prev_alive:
-            by_qid[qid] = rec
-            continue
-        if rec_alive == prev_alive:
-            prev_age = prev.get("jsonl_age_seconds")
-            rec_age = rec.get("jsonl_age_seconds")
-            if (
-                rec_age is not None
-                and (prev_age is None or rec_age < prev_age)
-            ):
-                by_qid[qid] = rec
-    return by_qid
+        out.setdefault(qid, []).append(rec)
+    return out
+
+
+def _is_spawn_descendant_of_any(
+    agent_id: str,
+    candidate_ids: set[str],
+    parent_of: dict[str, str],
+) -> bool:
+    """True when walking ``agent_id``'s spawn parents reaches a candidate.
+
+    Cycle-guarded (a child has exactly one parent on disk, so a cycle can
+    only come from a corrupt map). An empty / missing parent link ends the
+    walk with False.
+    """
+    seen = {agent_id}
+    cur = agent_id
+    while True:
+        parent = parent_of.get(cur)
+        if not parent or parent in seen:
+            return False
+        if parent in candidate_ids:
+            return True
+        seen.add(parent)
+        cur = parent
+
+
+def _outranks(rec: dict[str, Any], best: dict[str, Any]) -> bool:
+    """Liveness/freshness comparison: live > stale, then youngest jsonl."""
+    best_alive = bool(best.get("alive"))
+    rec_alive = bool(rec.get("alive"))
+    if rec_alive and not best_alive:
+        return True
+    if rec_alive != best_alive:
+        return False
+    best_age = best.get("jsonl_age_seconds")
+    rec_age = rec.get("jsonl_age_seconds")
+    return rec_age is not None and (best_age is None or rec_age < best_age)
+
+
+def pick_owner_record(
+    records: list[dict[str, Any]],
+    parent_of: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, Any]]:
+    """Choose the owning agent record among records sharing one queue id.
+
+    See ``agents_by_queue_id`` for the rule set. ``parent_of`` is the
+    spawn graph (``child -> parent``); when it is supplied and some (but
+    not all) candidates are descendants of other candidates, only the
+    spawn ROOTS are eligible. Falls back to the whole set if every
+    candidate is a descendant (a corrupt/cyclic map), so this can never
+    return None for a non-empty input.
+    """
+    recs = [r for r in records if isinstance(r, dict)]
+    if not recs:
+        return None
+    if parent_of and len(recs) > 1:
+        candidate_ids = {
+            str(r.get("agent_id")) for r in recs if r.get("agent_id")
+        }
+        roots = [
+            r
+            for r in recs
+            if not _is_spawn_descendant_of_any(
+                str(r.get("agent_id") or ""), candidate_ids, parent_of
+            )
+        ]
+        if roots:
+            recs = roots
+    best = recs[0]
+    for rec in recs[1:]:
+        if _outranks(rec, best):
+            best = rec
+    return best
 
 
 def agent_for_queue(

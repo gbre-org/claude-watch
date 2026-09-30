@@ -63,6 +63,7 @@ from typing import Any, Iterator
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 # Shared loader / dedup logic — see claude_agents.py alongside this file.
+from claude_agents import agent_records_by_queue_id as _agent_records_by_qid
 from claude_agents import agents_by_queue_id as _agents_by_qid
 from claude_agents import load_agent_state as _load_state
 from claude_agents import load_agent_queue_bindings as _agents_bindings_by_qid
@@ -736,14 +737,63 @@ def _humanize_age(seconds: float | None) -> str:
     return f"{d}d {rem // 3600}h {suffix}"
 
 
-def _load_agent_state() -> dict[str, dict[str, Any]]:
-    """Map queue_id -> agent record from claude-watch's active-agents JSON.
+def _spawn_parent_map_for(agent_ids: list[str]) -> dict[str, str]:
+    """Merged ``child -> parent`` spawn graph covering ``agent_ids``.
 
-    Thin wrapper over the shared `claude_agents` helpers — kept as a
-    one-liner so the call site reads naturally. See `claude_agents.py`
-    alongside this module for the implementation.
+    Resolves each agent's parent main-loop session (``_session_id_for_subagent``)
+    and unions that session's spawn graph (``_session_subagent_parent_map``,
+    reconstructed from the transcripts' Agent/Task launch records). Sessions
+    are visited once, so the usual case — several co-bound agents of ONE
+    main-loop session — costs a single directory scan. Fail-soft: agents whose
+    session cannot be resolved simply contribute no edges.
     """
-    return _agents_by_qid(_load_state(AGENT_STATE_PATH))
+    out: dict[str, str] = {}
+    seen_sessions: set[str] = set()
+    for aid in agent_ids:
+        if not aid:
+            continue
+        session_id = _session_id_for_subagent(aid)
+        if not session_id or session_id in seen_sessions:
+            continue
+        seen_sessions.add(session_id)
+        out.update(_session_subagent_parent_map(session_id))
+    return out
+
+
+def _load_agent_state() -> dict[str, dict[str, Any]]:
+    """Map queue_id -> OWNING agent record from claude-watch's active-agents
+    JSON.
+
+    THE ONE PLACE owner attribution is decided, so the dashboard cards, the
+    nested subagent tree and the live-log / multitail streams can never
+    disagree about which agent IS a queue item.
+
+    Why this is more than a call to the shared dedup helper: claude-watch maps
+    agents to queue items by the ``Queue item: q-XXXX`` marker in each
+    transcript's first user message, and a subagent INHERITS that line from
+    the prompt of the agent that spawned it. So a running agent and every
+    agent it spawns are all recorded under the SAME queue id, and the helper's
+    liveness/freshness tiebreak would hand ownership to whichever of them
+    wrote last — which, once the parent is parked in a tool call waiting on
+    its children, is a child. The item's owner then flips mid-run to its own
+    subagent, and the subagent tree (which correctly refuses to render the
+    OWNER as a child of itself) re-emits the real owner as a co-bound peer:
+    one agent, two rows, two log streams.
+
+    So for any queue id with more than one record we reconstruct the spawn
+    graph from the transcripts (evidence: the Agent/Task launch records) and
+    let the shared helper drop descendants before it ranks anything. Contested
+    queue ids are rare, so the scan is skipped entirely in the common case.
+    """
+    state = _load_state(AGENT_STATE_PATH)
+    contested: list[str] = [
+        str(rec.get("agent_id") or "")
+        for records in _agent_records_by_qid(state).values()
+        if len(records) > 1
+        for rec in records
+    ]
+    parent_of = _spawn_parent_map_for(contested) if contested else {}
+    return _agents_by_qid(state, parent_of)
 
 
 def _fmt_count(n: Any) -> str:
@@ -4123,6 +4173,12 @@ def _build_subagent_tree(
         NO such inference. They render as FLAT ``kind="peer"`` siblings,
         labeled neutrally (short id / first-prompt-line / timestamp) — never
         "attempt N", never nested under one another.
+      * **Ancestors of the owner** — the agent that spawned the owner (and
+        its own ancestors) is co-bound to this item for the same reason the
+        owner is: the spawn prompt carried the ``Queue item:`` line down. It
+        is NOT a subagent of the item, so it is excluded outright rather than
+        rendered as a peer. (That was the duplicate: one agent showing as both
+        the item's own row and one of its children, with two log streams.)
       * **Unrelated agents** — agents that are neither descendants of this
         owner nor same-item peers (e.g. another item'''s subtree) render under
         their own item'''s card; excluded here.
@@ -4275,12 +4331,31 @@ def _build_subagent_tree(
     #
     # Most-recently-active first (matches the ``roots`` sort and
     # ``_list_session_subagents``).
+    #
+    # An ANCESTOR of the owner is not a peer of it — it is the agent that
+    # spawned it (transitively). It is co-bound to this item for the same
+    # reason the owner is (the child inherited the ``Queue item:`` line), so
+    # the peer filter below would otherwise render THE SPAWNING AGENT as one
+    # of this item's subagents. Owner resolution re-roots to the spawn root
+    # precisely so this set is normally empty; the guard covers the case where
+    # it could not (e.g. the ancestor has no active-agents record at all), and
+    # it is the same evidence either way: a recorded spawn edge.
+    ancestor_ids: set[str] = set()
+    cur = owner_agent_id
+    while True:
+        parent = pmap.get(cur)
+        if not parent or parent == owner_agent_id or parent in ancestor_ids:
+            break
+        ancestor_ids.add(parent)
+        cur = parent
+
     peers = [
         sa
         for sa in session_subagents
         if _auth_qid(sa) == item_id
         and sa.get("subagent_id") != owner_agent_id
         and sa.get("subagent_id", "") not in descendant_ids
+        and sa.get("subagent_id", "") not in ancestor_ids
     ]
     peers.sort(key=lambda sa: sa.get("age_seconds", 0.0))
     peer_nodes: list[dict[str, Any]] = []
@@ -5382,7 +5457,12 @@ def api_queue_stream(qid: str) -> Any:
     # spawn-time marker and never follows a `queue register --agent-id`
     # rebind, so the pane showed "no active agent record" while the agent
     # was alive and writing its transcript.
-    agent_by_qid = _agents_by_qid(_load_state(AGENT_STATE_PATH))
+    #
+    # `_load_agent_state()` — not the bare dedup helper — because owner
+    # attribution must come out of ONE resolver: a pane that tailed a
+    # different agent than the card calls its owner is exactly how the same
+    # transcript ended up streaming into two panes at once.
+    agent_by_qid = _load_agent_state()
     agent_id, agent_id_source = _resolve_stream_agent_id(qid, item, agent_by_qid)
 
     if not agent_id:
