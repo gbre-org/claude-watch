@@ -234,34 +234,31 @@ this section enforces that the spawn should happen at all.
 
 ### Long blocking jobs → `workload run`, wait with `workload babysit`
 
-For long-running SYSTEM jobs (media-promote, rsync, ffmpeg, a remux, a big
-scan) the right tier is a **workload**, not an inline command and not a
-blocking Agent: `workload run <label> -- <cmd>` launches the job in a detached
-tmux pane that survives `/clear` and emits a `workload-done` event when it
-finishes. The runner auto-creates its own queue item (`--scope
-workload:<label>`).
+For long-running SYSTEM jobs (rsync, ffmpeg, a big scan) the right tier is a **workload**, not an inline command and not a blocking Agent: `workload run <label> -- <cmd>` launches it in a detached
+tmux pane that survives `/clear` and emits a `workload-done` event. The runner
+auto-creates its own queue item (`--scope workload:<label>`).
 
-To WAIT for it, **block in-process with `workload babysit` — never tight-poll
-with repeated `workload list` / `workload log` across separate LLM turns**
-(that burns thousands of tokens per turn for zero progress; the exact failure
-mode babysit fixes):
+To WAIT, **block in-process with `workload babysit` — never tight-poll
+`workload list` / `workload log` across LLM turns**
+(thousands of tokens per turn for zero progress):
 
 ```
 workload babysit <label> --qid q-XXXX [--heartbeat 60] [--max-block 540] [--poll 15]
 ```
 
-- Blocks **in-process** waiting for `<label>` — zero LLM turns while it
-  waits.
-- Pats the bound queue item's heartbeat every `--heartbeat` seconds
-  (default 60) so `last_heartbeat_at` stays fresh (never mistaken orphaned).
-- **Returns 0** on `done (exit N)` (the workload's rc is propagated).
-- **Returns 75** (EX_TEMPFAIL) at `--max-block` seconds (default 540, under
-  the Bash 600 s cap) if still running.
+- Blocks **in-process** on `<label>` — zero LLM turns while waiting.
+- Pats the queue item's heartbeat every `--heartbeat` s (default 60).
+- **Returns 0** on `done (exit N)` (workload's rc propagated).
+- **Returns 75** (EX_TEMPFAIL) at `--max-block` s (default 540) if still running.
 
-**Pattern**: call `workload babysit`; on **exit 75 re-invoke it** to keep
-waiting. Each re-invocation is the only LLM-turn cost of the whole wait
-(≈ once per `--max-block`) vs a fresh turn per poll. Exit 1 = no such label;
+**Pattern**: call `workload babysit`; on **exit 75 re-invoke it**. Each
+re-invocation is the only LLM-turn cost. Exit 1 = no such label;
 2 = bad `--qid`.
+
+**CARDINAL, subagents too: never background work with `nohup`, trailing `&`,
+`disown`, or `setsid`** (host-bash or container): invisible to queue, no done event.
+Host: `hostjob run --label L --cwd D -- cmd`, then `hostjob wait L` (re-invoke
+on exit 75). Container: `workload run` + `babysit`. Poll in short bounded calls (host-bash caps at 30s).
 
 ## Queue protocol — every Agent tool call
 
