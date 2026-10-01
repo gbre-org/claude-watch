@@ -269,8 +269,8 @@ Before firing **any** `Agent` tool call, you MUST first add a queue item
 via `session-task queue`. The queue serializes work touching overlapping
 scopes, and the scope namespace is **shared with the host** —
 `repo:claude-watch` covers BOTH host- and container-side work on that repo.
-An agent skipping the queue can race host work, lose edits to a parallel
-agent, or stomp builds.
+Skipping the queue can race host work, lose edits to a parallel agent, or
+stomp builds.
 
 **Scope: this governs every `Agent` call the MAIN LOOP dispatches —
 one queue item per main-loop-spawned agent, the queue being the main
@@ -313,27 +313,31 @@ The five-step protocol (mirrors the host `## Resume Actions` workflow):
 5. Fire the Agent. On completion: `session-task queue done <id>`
    (success) or `abandon <id> --reason "..."` (failure / cancelled).
 
-Quick reference: `session-task queue --help` for the full subcommand
-surface (`add | list | spawn-check | register | block | unblock |
-wedge | unwedge | done | abandon | show`).
-The `session-task` CLI is bind-mounted via `~/repos/claude-watch`; if
-it's not on PATH, the operator hasn't wired the bind-mount — flag that
+Quick reference: `session-task queue --help` lists the full subcommand
+surface (`add/list/spawn-check/register/block/unblock/wedge/unwedge/
+done/abandon/show/depend/...`). Bind-mounted via `~/repos/claude-watch`;
+if not on PATH, the operator hasn't wired the bind-mount — flag that
 before spawning agents at all.
 
 ### Parking on an external blocker — use `block`, not a fake `running`
 
 When an agent finishes all autonomous work and is parked on something
-OUTSIDE the system (awaiting CI, human greenlight, branch-protection toggle,
-third-party API window), flip the item to `blocked` — do NOT leave it a fake
+OUTSIDE the system (CI, human greenlight, branch-protection toggle,
+third-party window), flip the item to `blocked` — do NOT leave it a fake
 `running`. Flow: `register` (→running) → `block <id> --reason "awaiting <X>"`
 (→blocked) → `unblock <id>` when the blocker clears (or `done`/`abandon`).
 `unblock` preserves `blocked_at` + `block_reason` as audit.
 
 `blocked` (waiting on someone else) is distinct from `wedge` (the system
-itself is STUCK). Blocked items are EXEMPT from the WorkQueueOrphaned /
-running-without-owner alert. So `block` is the HONEST way to park work: a
-fake `running` lies about state, holds the scope lock, and trips the
-orphaned-running alert; abandon-and-re-add loses the item's audit trail.
+itself is STUCK), and is EXEMPT from the WorkQueueOrphaned /
+running-without-owner alert — the HONEST way to park work: a fake
+`running` lies about state, holds the scope lock, and still trips that
+alert; abandon-and-re-add loses the item's audit trail.
+
+**CARDINAL: a wait on another queue item is a DEPENDENCY, not a
+`block` (block is EXTERNAL waits only)** — same scope -> enqueue
+(preferred); diff scope -> `queue depend` (auto-readies on upstream
+`done`).
 
 ### Verify agent success before marking done
 
@@ -345,7 +349,7 @@ spawned signals its completion. Verify `<status>completed</status>` (not
 `failed`/`cancelled`), THEN `done`; on failure or unconfirmed success,
 `abandon <id> --reason "agent failed: <reason>"`.
 
-Marking a queue item `done` prematurely (before agent completion or on a
+Marking an item `done` prematurely (before completion or on a
 misidentified notification) releases the scope lock and lets conflicting
 work start — racing the still-running agent or dropping failed work.
 
@@ -371,8 +375,8 @@ highest-priority main-loop work — nothing else proceeds until processed.
 **Why N=0 (no grace window)?** Claude Code fires no PostToolUse hook on
 agent completion (completions arrive as system messages), so nothing
 auto-populates `agent-ack-pending.json`. `agent-ack register` MUST be the
-loop's first action on a task-notification; with N=0, forgetting fires the
-gate on the very next call — immediately visible.
+loop's first action on a task-notification; with N=0, forgetting fires
+the gate on the very next call, visibly.
 
 **Concrete sequence when you receive a task-notification:**
 
@@ -408,16 +412,16 @@ session-task queue add "..." --scope <same-scope> --force-enqueue
 ```
 
 **Restart-tasks are queueable too.** Redeploy / `cwsr` / restart are
-ordinary work — enqueue them, encoding the restart dependency with a
-blocking scope. The queue survives restarts.
+ordinary work — enqueue them with a shared scope so they serialize. The
+queue survives restarts.
 
 ### Continuous subagent queue-discipline enforcement
 
 The `pre-agent-queue-gate-hook` above only fires at SPAWN time. A
 second gate, the `subagent_queue_item_running` obligations predicate,
-enforces queue discipline THROUGHOUT a subagent's lifetime. It is
-seeded as a default-bundled obligation row by `obligations-init` (run
-from the entrypoint when `CLAUDE_CONTAINER_OBLIGATIONS=1`).
+enforces queue discipline THROUGHOUT a subagent's lifetime — seeded as a
+default-bundled row by `obligations-init` (run from the
+entrypoint when `CLAUDE_CONTAINER_OBLIGATIONS=1`).
 
 > **Operator obligation manifests (bind-mounted, NOT baked).**
 > `obligations-init` also applies each `*.json` obligation-row manifest
