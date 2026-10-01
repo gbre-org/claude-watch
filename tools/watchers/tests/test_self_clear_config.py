@@ -510,6 +510,20 @@ class CompletionPollNeverSucceedsWithPickerOpenTest(unittest.TestCase):
         )
 
 
+class PartialPickerRenderTest(unittest.TestCase):
+    """2026-10-01: picker rows visible but footer not yet rendered."""
+
+    def setUp(self):
+        self.mod = _import_self_clear()
+
+    def test_partial_picker_detected_without_footer(self):
+        pane = " \n   ❯ (current)\n"
+        self.assertTrue(self.mod._rewind_picker_visible(pane))
+
+    def test_normal_prompt_not_picker(self):
+        self.assertFalse(self.mod._rewind_picker_visible("── \n❯ \n── \n  0 tokens"))
+
+
 class InjectCommandTest(unittest.TestCase):
     """The argv `inject()` hands to `claude-watch inject`.
 

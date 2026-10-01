@@ -635,7 +635,30 @@ def _rewind_picker_visible(pane_text):
     by the pre-2.1.283 direct-clear behavior, so this is a strict no-op on
     older versions rather than a version-string check).
     """
-    return all(marker in pane_text for marker in _REWIND_PICKER_FOOTER)
+    if all(marker in pane_text for marker in _REWIND_PICKER_FOOTER):
+        return True
+    return _rewind_picker_partial_visible(pane_text)
+
+
+def _rewind_picker_partial_visible(pane_text):
+    """Pure: a PARTIALLY-rendered Rewind picker (footer not drawn yet).
+
+    The 2026-10-01 wedge: the picker's `❯ (current)` row was on screen but the
+    `Enter to continue . Esc to cancel` footer had not rendered when the poll
+    captured it, so the footer-only check said "no picker", the row's `❯`
+    read as idle, tokens read 0, and the resume prompt was typed into the open
+    picker. The picker's entry rows are unique enough to detect on their own:
+    a cursor/entry row ending in `(current)`, or a `/resume <id> (previous)`
+    row. Normal conversation prompts never contain those.
+    """
+    for raw in pane_text.splitlines():
+        t = raw.strip()
+        if t.startswith(_FLEETVIEW_CURSOR):
+            t = t[len(_FLEETVIEW_CURSOR):].strip()
+        if t.endswith("(current)") or (t.startswith("/resume") and
+                                       t.endswith("(previous)")):
+            return True
+    return False
 
 
 def _rewind_picker_default_is_current(pane_text):
@@ -1074,6 +1097,17 @@ def child_main(pane, args):
     ensure_main_loop_focus(pane)
 
     dismiss_feedback_prompt(pane)
+
+    # Last line of defence: NEVER type the resume prompt into an open Rewind
+    # picker, whatever the completion poll concluded. Confirm it (Enter on
+    # `(current)`) and wait for it to close before injecting.
+    for _ in range(10):
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        if rc != 0 or not out or not _rewind_picker_visible(out):
+            break
+        log("  pre-resume: Rewind picker still open -- confirming before resume")
+        _rewind_picker_confirm_once(pane, pane_text=out)
+        time.sleep(0.5)
 
     if not wait_for_idle(pane, timeout=30):
         log("  WARNING: idle wait timed out before resume inject")
