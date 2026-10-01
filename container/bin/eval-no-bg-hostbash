@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""eval-no-bg-hostbash -- obligations evaluator that DENIES backgrounding
+idioms inside host-bash MCP tool calls (run_command / run_script).
+
+A host-bash call is a bounded, foreground window onto the host. Launching
+work with ``nohup ... &`` / ``disown`` / ``setsid`` detaches it from any
+supervisor: nothing tracks it, nothing reports completion, and the output
+goes to an ad-hoc file. The supported tools are ``hostjob run`` + ``hostjob
+wait`` (or ``workload run``), which background internally and are observable.
+
+Protocol (obligations ``evaluator`` predicate, decision_mode=exit_code):
+  - stdin : the rendered tool call. For host-bash this is the JSON
+            ``tool_input`` (``{"script": ..., "interpreter": ...}`` or
+            ``{"command": ...}``); a raw command string is also accepted.
+  - exit 0: ALLOW        exit 1: DENY        stderr: shown in the deny banner
+
+DENIED (via the shell_ast parser, so quoting/heredocs do not false-positive):
+  - a command-position ``nohup`` / ``disown`` / ``setsid`` (wrappers count)
+  - any segment backgrounded by a real top-level ``&``
+  - the same two checks inside ``bash -c '...'`` bodies
+
+ALLOWED:
+  - ``&&``, ``2>&1``, ``&>``, ``>&2``; ``nohup`` / ``&`` inside quotes,
+    heredoc bodies, or whole-line ``#`` comments
+  - a segment whose head is ``hostjob`` or ``workload``
+  - a non-shell ``run_script`` interpreter (python, node, ...): the body is
+    not shell, so shell parsing would be meaningless
+  - an escape hatch comment anywhere in the body:  # BACKGROUND_OK: <reason>
+  - ANY internal error (parser missing, unparseable body): default-open
+"""
+import json
+import os
+import re
+import sys
+
+ESCAPE_RE = re.compile(r"#\s*BACKGROUND_OK:\s*\S")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+BG_WORDS = ["nohup", "disown", "setsid"]
+EXEMPT_HEADS = {"hostjob", "workload"}
+MAX_DEPTH = 4
+
+MSG = (
+    "DENIED: do not background work in host-bash with nohup/disown/setsid or "
+    "a trailing '&' (untracked, unobservable, output lost). Use "
+    "`hostjob run --label L --cwd D -- cmd` then `hostjob wait L` (re-invoke "
+    "on exit 75), or `workload run`. Genuine exception: add a "
+    "'# BACKGROUND_OK: <reason>' comment line."
+)
+
+
+def _load_shell_ast():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for d in (here, "/usr/local/bin",
+              os.path.join(here, "..", "..", "tools", "obligations")):
+        if os.path.exists(os.path.join(d, "shell_ast.py")):
+            sys.path.insert(0, d)
+            import shell_ast  # noqa: WPS433
+            return shell_ast
+    return None
+
+
+def extract_body(raw):
+    """Return (body, is_shell). JSON tool_input or raw string."""
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw, True
+    if not isinstance(obj, dict):
+        return raw, True
+    body = obj.get("script")
+    if not isinstance(body, str):
+        body = obj.get("command")
+    if not isinstance(body, str):
+        return "", True
+    interp = obj.get("interpreter")
+    is_shell = True
+    if isinstance(interp, str) and interp.strip():
+        is_shell = os.path.basename(interp.split()[0]) in SHELLS
+    return body, is_shell
+
+
+def strip_comment_lines(body):
+    return "\n".join(l for l in body.split("\n") if not l.lstrip().startswith("#"))
+
+
+def violates(sa, body, depth=0):
+    if depth > MAX_DEPTH:
+        return False
+    body = strip_comment_lines(body)
+    if sa.command_invokes(body, BG_WORDS):
+        return True
+    parsed = sa.parse(body)
+    for seg in parsed.segments:
+        words = sa._strip_command_prefix(seg.words)
+        if seg.op_after == "&" and words:
+            if os.path.basename(words[0]) not in EXEMPT_HEADS:
+                return True
+        if words and os.path.basename(words[0]) in SHELLS and "-c" in words:
+            i = words.index("-c")
+            if i + 1 < len(words) and violates(sa, words[i + 1], depth + 1):
+                return True
+    return False
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+        body, is_shell = extract_body(raw)
+        if not body or not is_shell or ESCAPE_RE.search(body):
+            return 0
+        sa = _load_shell_ast()
+        if sa is None:
+            return 0
+        if violates(sa, body):
+            sys.stderr.write(MSG + "\n")
+            return 1
+    except Exception:  # default-open: never blackhole the loop
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

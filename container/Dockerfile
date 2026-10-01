@@ -1171,6 +1171,9 @@ COPY container/bin/eval-orphaned-running-hard-gate /usr/local/bin/eval-orphaned-
 # ready_now=true. Forces the main loop to spawn agents for ready work
 # before doing anything else. Default-open on errors.
 COPY container/bin/eval-queue-ready-unspawned /usr/local/bin/eval-queue-ready-unspawned
+# eval-no-bg-hostbash -- obligations evaluator denying nohup/disown/setsid/
+# trailing-& backgrounding in host-bash MCP calls (hostjob/workload instead).
+COPY container/bin/eval-no-bg-hostbash /usr/local/bin/eval-no-bg-hostbash
 
 # agent-ack — CLI to manage the agent completion acknowledgment state.
 # Subcommands: register, done, list, clear, status. Manages the state
@@ -1425,6 +1428,7 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
              /usr/local/bin/eval-event-must-act \
              /usr/local/bin/eval-agent-ack-pending \
              /usr/local/bin/eval-queue-ready-unspawned \
+             /usr/local/bin/eval-no-bg-hostbash \
              /usr/local/bin/agent-ack \
              /usr/local/bin/event-ack \
              /usr/local/bin/event-classify \

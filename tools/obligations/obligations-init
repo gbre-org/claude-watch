@@ -125,6 +125,8 @@ ORPHANED_RUNNING_HARD_GATE_TAG = "[default-seed] orphaned_running_hard_gate"
 QUEUE_READY_UNSPAWNED_TAG = "[default-seed] queue_ready_unspawned"
 NO_BACKGROUNDED_WATCHER_TAG = "[default-seed] no_backgrounded_watcher"
 SUBAGENT_QUEUE_MUTATING_BANNED_TAG = "[default-seed] subagent_queue_mutating_banned"
+NO_BG_HOSTBASH_RUN_COMMAND_TAG = "[default-seed] no_bg_hostbash:run_command"
+NO_BG_HOSTBASH_RUN_SCRIPT_TAG = "[default-seed] no_bg_hostbash:run_script"
 
 # Default in-container path where the operator's bind-mounted, USER-MANAGED
 # obligation manifest dir lands (the entrypoint mounts
@@ -839,6 +841,64 @@ def seed_no_backgrounded_watcher(cli: str, *, dry_run: bool = False,
     return 0
 
 
+def seed_no_bg_hostbash(cli: str, *, dry_run: bool = False,
+                        force: bool = False, verbose: bool = False) -> int:
+    """Add the no_bg_hostbash rows (one per host-bash tool). Each uses the
+    generic ``evaluator`` predicate with ``eval-no-bg-hostbash`` to DENY
+    backgrounding idioms (nohup / disown / setsid / a trailing ``&``) in a
+    host-bash ``run_command`` / ``run_script`` body. Deliberately NOT
+    main-loop-only: subagents are the usual offenders. The evaluator is
+    default-open and honours ``# BACKGROUND_OK: <reason>``. Returns 0 on
+    success."""
+    rc_all = 0
+    for tool, tag in (
+        ("mcp__host-bash__run_command", NO_BG_HOSTBASH_RUN_COMMAND_TAG),
+        ("mcp__host-bash__run_script", NO_BG_HOSTBASH_RUN_SCRIPT_TAG),
+    ):
+        if not force and _row_already_present(cli, tag):
+            if verbose:
+                print(f"no_bg_hostbash: {tool} already seeded -- skipping",
+                      file=sys.stderr)
+            continue
+        params = {
+            "cmd": _eval_bin("eval-no-bg-hostbash"),
+            "timeout_ms": 5000,
+            "stdin_field": "tool_input.command",
+            "decision_mode": "exit_code",
+        }
+        cmd = [
+            cli, "add",
+            "--tool-pattern", tool,
+            "--predicate", "evaluator",
+            "--params", json.dumps(params),
+            "--ttl", "0",
+            "--enforcement", "gate",
+            "--deny-msg", tag,
+            "--created-by", "obligations-init",
+            "--json",
+        ]
+        if dry_run:
+            print("DRY-RUN: " + " ".join(cmd))
+            continue
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+            rc_all = 1
+            continue
+        if proc.returncode != 0:
+            print("obligations-init: obligations add failed "
+                  f"rc={proc.returncode}", file=sys.stderr)
+            if proc.stderr:
+                print(proc.stderr, file=sys.stderr)
+            rc_all = 1
+        elif verbose:
+            print(f"no_bg_hostbash: seeded {tool}", file=sys.stderr)
+    return rc_all
+
+
 def seed_subagent_queue_mutating_banned(cli: str, *, dry_run: bool = False,
                                           force: bool = False,
                                           verbose: bool = False) -> int:
@@ -1291,6 +1351,7 @@ SEEDERS = {
     "orphaned_running_hard_gate": seed_orphaned_running_hard_gate,
     "no_backgrounded_watcher": seed_no_backgrounded_watcher,
     "subagent_queue_mutating_banned": seed_subagent_queue_mutating_banned,
+    "no_bg_hostbash": seed_no_bg_hostbash,
 }
 
 
@@ -1387,6 +1448,10 @@ def main() -> int:
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
 
+    rc_bg = seed_no_bg_hostbash(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+
     # User-managed obligation manifests from the bind-mounted, operator-owned
     # config dir. Applied AFTER all baked default-seed rows so an operator
     # manifest can layer on top of (never displace) the container-policy
@@ -1402,7 +1467,7 @@ def main() -> int:
     )
 
     # Return first non-zero exit code (if any)
-    return rc or rc2 or rc3 or rc4 or rc5 or rc_orphan or rc6 or rc7 or rc8
+    return rc or rc2 or rc3 or rc4 or rc5 or rc_orphan or rc6 or rc7 or rc_bg or rc8
 
 
 if __name__ == "__main__":

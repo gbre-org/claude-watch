@@ -386,6 +386,18 @@ clear-path. NEVER set it on a dispatch-RECOVERY gate
 whose only clear-path IS dispatch — that would deadlock (incident
 2026-06-03).
 
+## `no_bg_hostbash` — no backgrounding in host-bash calls
+
+Seeded by `obligations-init` (rows `[default-seed] no_bg_hostbash:run_command`
+and `:run_script`) using the generic `evaluator` predicate with
+`container/bin/eval-no-bg-hostbash`. It DENIES a host-bash body that runs
+`nohup` / `disown` / `setsid` or backgrounds a segment with a real top-level
+`&` (AST-based: `&&`, `2>&1`, `&>`, quoted text, heredoc bodies and comment
+lines never match). Allowed: segments headed by `hostjob` / `workload`, a
+non-shell `run_script` interpreter, and a `# BACKGROUND_OK: <reason>` comment.
+Default-open on any evaluator error. Use `hostjob run --label L --cwd D -- cmd`
+then `hostjob wait L` instead.
+
 ## State files
 
   - `~/.config/claude/obligations.json` (0600) — persistent state.
