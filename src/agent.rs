@@ -401,7 +401,9 @@ pub struct ScannedSession {
 /// the current liveness (newer transcript).
 pub fn resolve_agent_dirs(now: std::time::SystemTime) -> Vec<ScannedSession> {
     let dirs = find_active_subagents_dirs(now, DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS);
-    dirs.into_iter().map(|p| describe_session(&p, now)).collect()
+    dirs.into_iter()
+        .map(|p| describe_session(&p, now))
+        .collect()
 }
 
 /// Pure-ish: build a `ScannedSession` for one `subagents/` directory.
@@ -840,7 +842,10 @@ pub fn format_list(view: &ListView) -> String {
 
         let mut hidden = 0usize;
         for (agent_id, info) in sorted_agents {
-            let pids = view.matches.get(agent_id.as_str()).filter(|p| !p.is_empty());
+            let pids = view
+                .matches
+                .get(agent_id.as_str())
+                .filter(|p| !p.is_empty());
             let age = age_of(info);
             let live = age.is_some_and(|a| a <= view.live_window_secs as f64);
             let recent = age.is_some_and(|a| a <= view.recent_window_secs as f64);
@@ -1704,7 +1709,10 @@ mod tests {
             assert_eq!(m.agent_type, "general-purpose");
             assert_eq!(m.jsonl_mtime, 2000.0);
             assert_eq!(m.last_bash_cmd.as_deref(), Some("new cmd"));
-            assert_eq!(m.jsonl_path, PathBuf::from("/p/new/subagents/agent-x.jsonl"));
+            assert_eq!(
+                m.jsonl_path,
+                PathBuf::from("/p/new/subagents/agent-x.jsonl")
+            );
         }
     }
 

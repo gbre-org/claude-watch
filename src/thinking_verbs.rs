@@ -54,7 +54,8 @@ fn looks_like_spinner_verb(s: &str) -> bool {
     let starts_uppercase = matches!(s.chars().next(), Some(c) if c.is_ascii_uppercase());
     starts_uppercase
         && (2..=30).contains(&s.len())
-        && s.chars().all(|c| c.is_ascii_alphabetic() || c == '\'' || c == '-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphabetic() || c == '\'' || c == '-')
 }
 
 /// Pure: given the ordered strings extracted from the binary, find the
@@ -205,7 +206,11 @@ mod tests {
             return;
         };
         if let Some(verbs) = discover_thinking_verbs(&path) {
-            assert!(verbs.len() > 20, "expected a large verb list, got {:?}", verbs);
+            assert!(
+                verbs.len() > 20,
+                "expected a large verb list, got {:?}",
+                verbs
+            );
             assert!(verbs.iter().any(|v| v == "Coalescing"));
         }
     }

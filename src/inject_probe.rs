@@ -68,7 +68,11 @@ pub enum ProbeOutcome {
     // On non-Linux the variant is read-only (pattern-matched), which trips
     // dead_code under CI/pre-commit -D warnings. Allow it off-Linux only.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Ok { bytes: usize, parent_pid: u32, parent_fd: u32 },
+    Ok {
+        bytes: usize,
+        parent_pid: u32,
+        parent_fd: u32,
+    },
     /// Agent's stdin is a pty — wrong deployment mode for pidfd inject.
     /// Caller should fall back to `tmux send-keys`.
     WrongMode { stdin_target: String },
@@ -77,7 +81,11 @@ pub enum ProbeOutcome {
     /// Couldn't find the parent-side socketpair fd.
     ParentFdNotFound { agent_pid: u32, expected_inode: u64 },
     /// pidfd_open / pidfd_getfd / write failed.
-    SyscallFailed { stage: &'static str, errno: i32, msg: String },
+    SyscallFailed {
+        stage: &'static str,
+        errno: i32,
+        msg: String,
+    },
 }
 
 /// Find the agent's stdin socket inode from /proc/PID/fd/0.
@@ -178,9 +186,8 @@ mod linux_inject {
 
     fn pidfd_getfd(pidfd: &OwnedFd, target_fd: libc::c_int) -> std::io::Result<OwnedFd> {
         // SAFETY: pidfd_getfd is a syscall with no userspace pointer args.
-        let raw = unsafe {
-            libc::syscall(SYS_PIDFD_GETFD, pidfd.as_raw_fd(), target_fd, 0i32) as i32
-        };
+        let raw =
+            unsafe { libc::syscall(SYS_PIDFD_GETFD, pidfd.as_raw_fd(), target_fd, 0i32) as i32 };
         if raw < 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -215,21 +222,27 @@ mod linux_inject {
         payload: &[u8],
     ) -> Result<usize, (String, i32, String)> {
         let pid = parent_pid_u as libc::pid_t;
-        let pidfd = pidfd_open(pid).map_err(|e| (
-            "pidfd_open".to_string(),
-            e.raw_os_error().unwrap_or(-1),
-            e.to_string(),
-        ))?;
-        let dup_fd = pidfd_getfd(&pidfd, parent_fd_u as libc::c_int).map_err(|e| (
-            "pidfd_getfd".to_string(),
-            e.raw_os_error().unwrap_or(-1),
-            e.to_string(),
-        ))?;
-        let written = write_all_libc(&dup_fd, payload).map_err(|e| (
-            "write".to_string(),
-            e.raw_os_error().unwrap_or(-1),
-            e.to_string(),
-        ))?;
+        let pidfd = pidfd_open(pid).map_err(|e| {
+            (
+                "pidfd_open".to_string(),
+                e.raw_os_error().unwrap_or(-1),
+                e.to_string(),
+            )
+        })?;
+        let dup_fd = pidfd_getfd(&pidfd, parent_fd_u as libc::c_int).map_err(|e| {
+            (
+                "pidfd_getfd".to_string(),
+                e.raw_os_error().unwrap_or(-1),
+                e.to_string(),
+            )
+        })?;
+        let written = write_all_libc(&dup_fd, payload).map_err(|e| {
+            (
+                "write".to_string(),
+                e.raw_os_error().unwrap_or(-1),
+                e.to_string(),
+            )
+        })?;
         // OwnedFd Drop closes dup_fd and pidfd here.
         Ok(written)
     }
@@ -257,11 +270,19 @@ pub fn probe(agent_pid: u32, payload_text: &str) -> ProbeOutcome {
     let fd0_link_path = format!("/proc/{}/fd/0", agent_pid);
     let fd0_target = match fs::read_link(&fd0_link_path) {
         Ok(t) => t.to_string_lossy().into_owned(),
-        Err(e) => return ProbeOutcome::AgentUnreadable { reason: e.to_string() },
+        Err(e) => {
+            return ProbeOutcome::AgentUnreadable {
+                reason: e.to_string(),
+            }
+        }
     };
     let agent_inode = match parse_socket_inode(&fd0_target) {
         Some(i) => i,
-        None => return ProbeOutcome::WrongMode { stdin_target: fd0_target },
+        None => {
+            return ProbeOutcome::WrongMode {
+                stdin_target: fd0_target,
+            }
+        }
     };
 
     // 2. Find parent and its matching socketpair fd.
@@ -339,7 +360,11 @@ pub fn cmd_inject_probe(pid: u32, text: &str, json: bool) -> i32 {
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else {
         match &outcome {
-            ProbeOutcome::Ok { bytes, parent_pid, parent_fd } => {
+            ProbeOutcome::Ok {
+                bytes,
+                parent_pid,
+                parent_fd,
+            } => {
                 println!(
                     "ok: wrote {} bytes via pidfd_getfd(parent_pid={}, parent_fd={})",
                     bytes, parent_pid, parent_fd
@@ -355,7 +380,10 @@ pub fn cmd_inject_probe(pid: u32, text: &str, json: bool) -> i32 {
             ProbeOutcome::AgentUnreadable { reason } => {
                 eprintln!("agent-unreadable: {}", reason);
             }
-            ProbeOutcome::ParentFdNotFound { agent_pid, expected_inode } => {
+            ProbeOutcome::ParentFdNotFound {
+                agent_pid,
+                expected_inode,
+            } => {
                 eprintln!(
                     "parent-fd-not-found: agent pid {} expected parent socket inode {}",
                     agent_pid, expected_inode
@@ -433,7 +461,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(trimmed).expect("must round-trip");
         // The whole point: serde escapes for us so payloads with quotes
         // don't break the NDJSON line.
-        assert_eq!(v["message"]["content"][0]["text"], "hi \"there\" \\backslash");
+        assert_eq!(
+            v["message"]["content"][0]["text"],
+            "hi \"there\" \\backslash"
+        );
     }
 
     #[test]

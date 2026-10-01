@@ -724,12 +724,9 @@ fn find_session_task_cli() -> Option<PathBuf> {
 /// Both invocations are bounded with a 10s timeout (registration is
 /// normally <500ms; a wedged session-task must not stall the workload
 /// startup path).
-fn auto_create_and_register_queue_item(
-    label: &str,
-    command: &str,
-) -> Result<String, String> {
-    let cli = find_session_task_cli()
-        .ok_or_else(|| "session-task CLI not found on PATH".to_string())?;
+fn auto_create_and_register_queue_item(label: &str, command: &str) -> Result<String, String> {
+    let cli =
+        find_session_task_cli().ok_or_else(|| "session-task CLI not found on PATH".to_string())?;
 
     let scope = format!("workload:{label}");
     // Summary: first ~60 chars of the command for at-a-glance
@@ -1108,7 +1105,11 @@ pub struct KillTreeReport {
 /// State character (field 3) of a `/proc/<pid>/stat` line. Pure.
 pub fn parse_proc_state(content: &str) -> Option<char> {
     let close = content.rfind(')')?;
-    content[close + 1..].split_whitespace().next()?.chars().next()
+    content[close + 1..]
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
 }
 
 /// Is this pid still RUNNING?
@@ -1174,7 +1175,9 @@ pub fn kill_tree(
     targets.retain(|p| *p > 1 && !protected.contains(p));
 
     let target_vec: Vec<i32> = targets.iter().copied().collect();
-    let mut pgids: BTreeSet<i32> = pgids_of(&procs, &target_vec, protected).into_iter().collect();
+    let mut pgids: BTreeSet<i32> = pgids_of(&procs, &target_vec, protected)
+        .into_iter()
+        .collect();
     if let Some(pg) = recorded_pgid {
         if pg > 1 && !protected.contains(&pg) {
             pgids.insert(pg);
@@ -2599,7 +2602,6 @@ pub fn cmd_log(label: &str, lines: usize, follow: bool) -> i32 {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // PER-LINE TIMESTAMPS (`workload stamp`)
 // ---------------------------------------------------------------------------
@@ -2898,7 +2900,15 @@ fn ensure_kill_done_event(
     }
     let _ = fs::write(exit_path, "-15\n");
     mark_kill_emitted_at(sentinel_path);
-    emit_done_with_sentinel(label, -15, log_path, true, queue_id, sentinel_path, teardown);
+    emit_done_with_sentinel(
+        label,
+        -15,
+        log_path,
+        true,
+        queue_id,
+        sentinel_path,
+        teardown,
+    );
     true
 }
 
@@ -3174,11 +3184,7 @@ fn transition_queue_item_for_workload(
     log_path: &str,
     teardown: &Teardown,
 ) {
-    if std::env::var("WORKLOAD_QUEUE_TRANSITION")
-        .ok()
-        .as_deref()
-        == Some("0")
-    {
+    if std::env::var("WORKLOAD_QUEUE_TRANSITION").ok().as_deref() == Some("0") {
         return;
     }
     let cli = match find_session_task_cli() {
@@ -3211,9 +3217,7 @@ fn transition_queue_item_for_workload(
         } else if killed {
             format!("workload {label} killed (rc={exit_code}, log={log_path})")
         } else {
-            format!(
-                "workload {label} exited non-zero rc={exit_code} (log={log_path})"
-            )
+            format!("workload {label} exited non-zero rc={exit_code} (log={log_path})")
         };
         vec![
             "queue".to_string(),
@@ -3490,7 +3494,11 @@ mod tests {
         // still fire so a long-registered queue item gets refreshed.
         let (outcome, hb) = run_babysit_sim(60, 540, 15, Some(0), 0);
         assert_eq!(outcome, BabysitOutcome::Done(0));
-        assert_eq!(hb, vec![0], "up-front heartbeat must fire before completion check");
+        assert_eq!(
+            hb,
+            vec![0],
+            "up-front heartbeat must fire before completion check"
+        );
     }
 
     #[test]
@@ -3589,10 +3597,7 @@ mod tests {
             rec = shell_quote(&recording.to_string_lossy()),
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
@@ -3607,7 +3612,10 @@ mod tests {
             }
         }
 
-        assert!(recording.exists(), "stub session-task should have been invoked");
+        assert!(
+            recording.exists(),
+            "stub session-task should have been invoked"
+        );
         let recorded = std::fs::read_to_string(&recording).expect("read recording");
         assert!(
             recorded.contains("queue\nheartbeat\nq-2026-06-03-hb"),
@@ -3741,10 +3749,7 @@ mod tests {
             rec = shell_quote(&recording.to_string_lossy()),
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
@@ -3771,7 +3776,10 @@ mod tests {
         }
 
         assert_eq!(rc, 0);
-        assert!(recording.exists(), "stub session-task should have been invoked");
+        assert!(
+            recording.exists(),
+            "stub session-task should have been invoked"
+        );
         let recorded = std::fs::read_to_string(&recording).expect("read recording");
         assert!(
             recorded.contains("queue\ndone\nq-2026-05-03-stub"),
@@ -3801,10 +3809,7 @@ mod tests {
             rec = shell_quote(&recording.to_string_lossy()),
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
@@ -3870,10 +3875,7 @@ mod tests {
             rec = shell_quote(&recording.to_string_lossy()),
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
@@ -3928,10 +3930,7 @@ mod tests {
             rec = shell_quote(&recording.to_string_lossy()),
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
@@ -4005,10 +4004,7 @@ mod tests {
             qid = synth_qid,
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
         stub_path
     }
 
@@ -4021,17 +4017,13 @@ mod tests {
         let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
 
         let recording = tmp.path().join("session-task.recording");
-        let stub_path =
-            write_session_task_stub(tmp.path(), &recording, "q-test-auto-1");
+        let stub_path = write_session_task_stub(tmp.path(), &recording, "q-test-auto-1");
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
         }
 
-        let result = auto_create_and_register_queue_item(
-            "auto-test-1",
-            "echo hello world",
-        );
+        let result = auto_create_and_register_queue_item("auto-test-1", "echo hello world");
 
         unsafe {
             match prev_cli {
@@ -4086,8 +4078,7 @@ mod tests {
         let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
 
         let recording = tmp.path().join("session-task.recording");
-        let stub_path =
-            write_session_task_stub(tmp.path(), &recording, "q-test-reg-1");
+        let stub_path = write_session_task_stub(tmp.path(), &recording, "q-test-reg-1");
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
@@ -4142,8 +4133,7 @@ mod tests {
             std::env::set_var("HOME", tmp.path()); // no $HOME/bin/session-task
         }
 
-        let result =
-            auto_create_and_register_queue_item("missing-cli-test", "true");
+        let result = auto_create_and_register_queue_item("missing-cli-test", "true");
 
         unsafe {
             match prev_cli {
@@ -4195,17 +4185,13 @@ mod tests {
             rec = shell_quote(&recording.to_string_lossy()),
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
         }
 
-        let result =
-            auto_create_and_register_queue_item("fail-add-test", "true");
+        let result = auto_create_and_register_queue_item("fail-add-test", "true");
 
         unsafe {
             match prev_cli {
@@ -4247,19 +4233,13 @@ mod tests {
                     fi\n\
                     exit 0\n";
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
         }
 
-        let result = auto_create_and_register_queue_item(
-            "malformed-json-test",
-            "true",
-        );
+        let result = auto_create_and_register_queue_item("malformed-json-test", "true");
 
         unsafe {
             match prev_cli {
@@ -4300,17 +4280,13 @@ mod tests {
                     fi\n\
                     exit 0\n";
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
         }
 
-        let result =
-            auto_create_and_register_queue_item("register-fail-test", "true");
+        let result = auto_create_and_register_queue_item("register-fail-test", "true");
 
         unsafe {
             match prev_cli {
@@ -4340,10 +4316,7 @@ mod tests {
     /// Build a recording session-task stub that:
     ///   * appends argv to `recording` (one block per call, separator `=== invocation ===`)
     ///   * exits 0 on every invocation
-    fn write_inject_recording_stub(
-        tmp: &std::path::Path,
-        recording: &std::path::Path,
-    ) -> PathBuf {
+    fn write_inject_recording_stub(tmp: &std::path::Path, recording: &std::path::Path) -> PathBuf {
         let stub_path = tmp.join("session-task-inject-stub");
         let stub = format!(
             "#!/bin/bash\n\
@@ -4355,10 +4328,7 @@ mod tests {
             rec = shell_quote(&recording.to_string_lossy()),
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
         stub_path
     }
 
@@ -4446,10 +4416,7 @@ mod tests {
         let stub_path = tmp.path().join("inject-fail-stub");
         let stub = "#!/bin/bash\nprintf 'simulated failure\\n' >&2\nexit 1\n";
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
@@ -4527,10 +4494,7 @@ mod tests {
         let stub_path = tmp.path().join("hang-stub");
         let stub = "#!/bin/bash\nsleep 30\n";
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         let start = std::time::Instant::now();
         let res = run_session_task_with_timeout(
@@ -4619,7 +4583,6 @@ mod tests {
             "wrapper must stay tool-agnostic (no atuin/tool specifics):\n{script}"
         );
     }
-
 
     // --- `workload stamp` -------------------------------------------------
 
@@ -4716,7 +4679,11 @@ mod tests {
         assert!(p.ends_with(' '), "prefix must end in one space: {p:?}");
         let body = p.trim_end();
         assert!(!body.contains(' '), "prefix must be one token: {p:?}");
-        assert_eq!(body.len(), "2026-09-28T22:53:35-04:00".len(), "unexpected shape: {p:?}");
+        assert_eq!(
+            body.len(),
+            "2026-09-28T22:53:35-04:00".len(),
+            "unexpected shape: {p:?}"
+        );
         assert!(
             body.as_bytes()[4] == b'-' && body.as_bytes()[10] == b'T',
             "not ISO8601: {p:?}"
@@ -5109,21 +5076,17 @@ mod tests {
         // practice, but a small slack covers PTY teardown.
         std::thread::sleep(Duration::from_millis(200));
 
-        let body = std::fs::read_to_string(&out_path)
-            .unwrap_or_else(|e| panic!("read {out_path:?}: {e}"));
-        assert!(
-            !body.is_empty(),
-            "output file is empty; script:\n{script}"
-        );
+        let body =
+            std::fs::read_to_string(&out_path).unwrap_or_else(|e| panic!("read {out_path:?}: {e}"));
+        assert!(!body.is_empty(), "output file is empty; script:\n{script}");
 
         // No more ISO8601 prefix — verify the OPPOSITE: lines must NOT
         // be prefixed with a `YYYY-MM-DDTHH:MM:SS±HHMM ` timestamp.
         // (One header line `Started: <iso>` contains an ISO8601 but
         // not as a leading prefix — it's preceded by `Started: `.)
-        let leading_ts_re = regex_lite::Regex::new(
-            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:?\d{2} ",
-        )
-        .expect("compile regex");
+        let leading_ts_re =
+            regex_lite::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:?\d{2} ")
+                .expect("compile regex");
         for (i, line) in body.lines().enumerate() {
             if line.is_empty() {
                 continue;
@@ -5286,10 +5249,7 @@ mod tests {
             rec = shell_quote(&recording.to_string_lossy()),
         );
         std::fs::write(&stub_path, stub).expect("write stub");
-        let _ = std::fs::set_permissions(
-            &stub_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
 
         unsafe {
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
@@ -5299,7 +5259,13 @@ mod tests {
         let cases: &[(&str, &str, i32, &str, &str)] = &[
             // (label, inner, expected_rc, qid, expected_subcommand)
             ("rqfalse", "false", 1, "q-rqfalse-test", "abandon"),
-            ("rqexit7", "bash -c \"exit 7\"", 7, "q-rqexit7-test", "abandon"),
+            (
+                "rqexit7",
+                "bash -c \"exit 7\"",
+                7,
+                "q-rqexit7-test",
+                "abandon",
+            ),
             ("rqok", "true", 0, "q-rqok-test", "done"),
         ];
 
@@ -5329,7 +5295,10 @@ mod tests {
                 .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
                 .status()
                 .expect("run wrapper");
-            assert!(status.success(), "wrapper rc != 0 for case {label}: {status:?}");
+            assert!(
+                status.success(),
+                "wrapper rc != 0 for case {label}: {status:?}"
+            );
 
             std::thread::sleep(Duration::from_millis(150));
 
@@ -5565,10 +5534,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             body.contains("py-line-9"),
             "expected python output in .output file:\n{body}"
         );
-        assert!(
-            final_size > 0,
-            "final size should be > 0; body:\n{body}"
-        );
+        assert!(final_size > 0, "final size should be > 0; body:\n{body}");
 
         // Core assertion: at the mid-point, the file should already
         // contain a substantial fraction of the final output. We allow
@@ -5796,10 +5762,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let before = lines.len();
         std::thread::sleep(Duration::from_millis(2200));
         let after_calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
-        let after = after_calls
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count();
+        let after = after_calls.lines().filter(|l| !l.trim().is_empty()).count();
         assert_eq!(
             after, before,
             "queue heartbeat sidecar outlived the wrapper (pats kept \
@@ -5884,9 +5847,10 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // Slice from sidecar start to the trailing `&` so we test only
         // the loop body, not the EXIT-trap touch logic later in the
         // script.
-        let rt_sidecar_end = rt_sidecar_idx + script[rt_sidecar_idx..]
-            .find("RUNTIME_HEARTBEAT_PID=$!")
-            .expect("sidecar end marker present");
+        let rt_sidecar_end = rt_sidecar_idx
+            + script[rt_sidecar_idx..]
+                .find("RUNTIME_HEARTBEAT_PID=$!")
+                .expect("sidecar end marker present");
         let rt_sidecar_block = &script[rt_sidecar_idx..rt_sidecar_end];
 
         assert!(
@@ -5958,12 +5922,14 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // The loop body starts after the `setsid bash -c '` opening and
         // ends at the closing `'`. Find the end of the loop body so we
         // don't false-positive on the initial touch above.
-        let loop_start = rt_idx + script[rt_idx..]
-            .find("while true; do")
-            .expect("while true present");
-        let loop_end = loop_start + script[loop_start..]
-            .find("done\n")
-            .expect("done marker present");
+        let loop_start = rt_idx
+            + script[rt_idx..]
+                .find("while true; do")
+                .expect("while true present");
+        let loop_end = loop_start
+            + script[loop_start..]
+                .find("done\n")
+                .expect("done marker present");
         let loop_body = &script[loop_start..loop_end];
         // The dumb-timer pattern was:
         //     sleep N
@@ -6220,7 +6186,8 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             .expect("final mtime int");
         let out_body = std::fs::read_to_string(&out_path).unwrap_or_default();
         assert_eq!(
-            start, final_mt,
+            start,
+            final_mt,
             "runtime heartbeat mtime must NOT advance during a 5s silent stretch: \
              start={start} final={final_mt} delta={delta}s\n\
              .output body:\n{out_body}\n\
@@ -6383,11 +6350,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
     #[test]
     fn capture_refuses_dash_c_inline_script() {
         // `bash -c 'echo hi'` is NOT a script invocation — refuse.
-        let args = vec![
-            "bash".to_string(),
-            "-c".to_string(),
-            "echo hi".to_string(),
-        ];
+        let args = vec!["bash".to_string(), "-c".to_string(), "echo hi".to_string()];
         assert!(try_capture_script(&args).is_none());
     }
 
@@ -6475,7 +6438,9 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
     fn capture_resolves_path_lookup() {
         // Place a script in a tmpdir, prepend to PATH, invoke with bare
         // basename. We want resolve_script_path to find it via PATH.
-        let _guard = WORKLOAD_TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = WORKLOAD_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join("only-on-path.sh");
         std::fs::write(&script, "echo hi\n").expect("write");
@@ -6497,10 +6462,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             std::env::set_var("PATH", &new_path);
         }
 
-        let args = vec![
-            "bash".to_string(),
-            "only-on-path.sh".to_string(),
-        ];
+        let args = vec!["bash".to_string(), "only-on-path.sh".to_string()];
         let cap = try_capture_script(&args);
 
         // Restore PATH before any assert (so a failing assert doesn't
@@ -6550,8 +6512,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         );
         create_compat_symlink(&legacy, &target);
         // Post-condition: legacy IS a symlink to target.
-        let meta = std::fs::symlink_metadata(&legacy)
-            .expect("symlink metadata after create");
+        let meta = std::fs::symlink_metadata(&legacy).expect("symlink metadata after create");
         assert!(meta.file_type().is_symlink(), "legacy must be a symlink");
         let resolved = std::fs::read_link(&legacy).expect("read_link");
         assert_eq!(resolved, target, "symlink target mismatch");
@@ -6568,8 +6529,8 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         create_compat_symlink(&legacy, &target);
         // Second invocation should be a no-op.
         create_compat_symlink(&legacy, &target);
-        let meta = std::fs::symlink_metadata(&legacy)
-            .expect("symlink metadata after second create");
+        let meta =
+            std::fs::symlink_metadata(&legacy).expect("symlink metadata after second create");
         assert!(
             meta.file_type().is_symlink(),
             "legacy must still be a symlink"
@@ -6592,8 +6553,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         create_compat_symlink(&legacy, &target);
         // Post-condition: legacy is still a dir (NOT a symlink), canary
         // still exists.
-        let meta = std::fs::symlink_metadata(&legacy)
-            .expect("symlink metadata after create");
+        let meta = std::fs::symlink_metadata(&legacy).expect("symlink metadata after create");
         assert!(
             !meta.file_type().is_symlink(),
             "real legacy dir must NOT be replaced with a symlink"
@@ -6607,10 +6567,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
     #[test]
     fn pgid_file_lives_beside_the_other_workload_artifacts() {
         let p = pgid_file("furiosity-render");
-        assert_eq!(
-            p,
-            PathBuf::from(WORKLOAD_DIR).join("furiosity-render.pgid")
-        );
+        assert_eq!(p, PathBuf::from(WORKLOAD_DIR).join("furiosity-render.pgid"));
     }
 
     #[test]
@@ -6636,8 +6593,8 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
 
     #[test]
     fn parse_proc_stat_reads_ppid_pgid_and_sid() {
-        let row = parse_proc_stat("4242 (bash) S 4000 4242 4242 34816 4242 4194304 ...")
-            .expect("parse");
+        let row =
+            parse_proc_stat("4242 (bash) S 4000 4242 4242 34816 4242 4194304 ...").expect("parse");
         assert_eq!(
             row,
             ProcRow {
@@ -6654,8 +6611,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // `comm` is process-controlled. Splitting on the FIRST `)` (or
         // on whitespace) mis-indexes every field after it, which would
         // hand the killer someone else's pgid.
-        let row = parse_proc_stat("77 (my (weird) proc) S 5 66 9 0 -1 0")
-            .expect("parse");
+        let row = parse_proc_stat("77 (my (weird) proc) S 5 66 9 0 -1 0").expect("parse");
         assert_eq!(
             row,
             ProcRow {
@@ -6703,14 +6659,54 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
     /// ```
     fn fixture_procs() -> Vec<ProcRow> {
         vec![
-            ProcRow { pid: 1, ppid: 0, pgid: 1, sid: 1 },
-            ProcRow { pid: 100, ppid: 50, pgid: 100, sid: 50 },
-            ProcRow { pid: 200, ppid: 100, pgid: 100, sid: 50 },
-            ProcRow { pid: 300, ppid: 200, pgid: 300, sid: 300 },
-            ProcRow { pid: 400, ppid: 300, pgid: 300, sid: 300 },
-            ProcRow { pid: 500, ppid: 400, pgid: 300, sid: 300 },
-            ProcRow { pid: 600, ppid: 1, pgid: 300, sid: 300 },
-            ProcRow { pid: 900, ppid: 1, pgid: 900, sid: 900 },
+            ProcRow {
+                pid: 1,
+                ppid: 0,
+                pgid: 1,
+                sid: 1,
+            },
+            ProcRow {
+                pid: 100,
+                ppid: 50,
+                pgid: 100,
+                sid: 50,
+            },
+            ProcRow {
+                pid: 200,
+                ppid: 100,
+                pgid: 100,
+                sid: 50,
+            },
+            ProcRow {
+                pid: 300,
+                ppid: 200,
+                pgid: 300,
+                sid: 300,
+            },
+            ProcRow {
+                pid: 400,
+                ppid: 300,
+                pgid: 300,
+                sid: 300,
+            },
+            ProcRow {
+                pid: 500,
+                ppid: 400,
+                pgid: 300,
+                sid: 300,
+            },
+            ProcRow {
+                pid: 600,
+                ppid: 1,
+                pgid: 300,
+                sid: 300,
+            },
+            ProcRow {
+                pid: 900,
+                ppid: 1,
+                pgid: 900,
+                sid: 900,
+            },
         ]
     }
 
@@ -6731,8 +6727,18 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // A ppid loop cannot happen on a sane kernel, but a snapshot is
         // racy and this must terminate regardless.
         let procs = vec![
-            ProcRow { pid: 10, ppid: 11, pgid: 10, sid: 10 },
-            ProcRow { pid: 11, ppid: 10, pgid: 10, sid: 10 },
+            ProcRow {
+                pid: 10,
+                ppid: 11,
+                pgid: 10,
+                sid: 10,
+            },
+            ProcRow {
+                pid: 11,
+                ppid: 10,
+                pgid: 10,
+                sid: 10,
+            },
         ];
         let d = descendants_of(&procs, &[10]);
         assert_eq!(d, vec![11]);
@@ -6843,7 +6849,9 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
              `workload kill` never reads a half-written file:\n{script}"
         );
         assert!(
-            script.contains("rm -f '/tmp/claude-workloads/pg.pgid' '/tmp/claude-workloads/pg.pgid'.tmp"),
+            script.contains(
+                "rm -f '/tmp/claude-workloads/pg.pgid' '/tmp/claude-workloads/pg.pgid'.tmp"
+            ),
             "the EXIT trap must remove the sidecar — a stale one names a \
              pid the kernel may have recycled:\n{script}"
         );
@@ -7124,7 +7132,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         );
     }
 
-
     fn entry(pane: &str) -> WorkloadEntry {
         WorkloadEntry {
             pane_id: pane.to_string(),
@@ -7233,7 +7240,10 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             std::fs::read_to_string(&exit_path).expect("exit marker written"),
             "-15\n"
         );
-        assert!(sentinel.exists(), "sentinel must be dropped for the wrapper");
+        assert!(
+            sentinel.exists(),
+            "sentinel must be dropped for the wrapper"
+        );
 
         let ev = one_done_event(&events);
         assert_eq!(ev["data"]["killed"], true);
@@ -7353,7 +7363,15 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let _guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
 
         // No sentinel: a natural completion emits as always.
-        emit_done_with_sentinel("kt", 0, "/tmp/kt.output", false, None, &sentinel, &Teardown::plain());
+        emit_done_with_sentinel(
+            "kt",
+            0,
+            "/tmp/kt.output",
+            false,
+            None,
+            &sentinel,
+            &Teardown::plain(),
+        );
         assert_eq!(done_events(&events).len(), 1);
 
         // Sentinel present but this IS a kill emit: not suppressed.
@@ -7389,10 +7407,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
 
         let bare = kill_protected_set(&procs, None);
         for guarded in [0, 1, self_pid, self_row.pgid, self_row.sid, self_row.ppid] {
-            assert!(
-                bare.contains(&guarded),
-                "{guarded} must never be signalled"
-            );
+            assert!(bare.contains(&guarded), "{guarded} must never be signalled");
         }
 
         // A pane shell (stand-in: our own parent) adds itself and its
@@ -7623,7 +7638,6 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         assert_eq!(ev["data"]["label"], "rt");
         drop(guard);
     }
-
 
     // ----- `workload run` replacing a live same-label run --------------------
 
@@ -7898,7 +7912,10 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         );
         let _ = wrapper.wait();
 
-        assert!(emitted, "the replace must synthesise the old run's completion");
+        assert!(
+            emitted,
+            "the replace must synthesise the old run's completion"
+        );
         for (name, pid) in [
             ("payload leader", recorded),
             ("driver", drv),

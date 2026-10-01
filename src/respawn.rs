@@ -449,10 +449,8 @@ pub async fn execute_respawn_with_versions_dir(
         claude_pid,
         "auto-respawn: SIGTERM Claude Code process tree (multi-signal hang detected)"
     );
-    let term_killed = crate::agent::kill_process_tree(
-        claude_pid,
-        nix::sys::signal::Signal::SIGTERM,
-    );
+    let term_killed =
+        crate::agent::kill_process_tree(claude_pid, nix::sys::signal::Signal::SIGTERM);
 
     // Wait the grace period for graceful exit.
     tokio::time::sleep(std::time::Duration::from_secs(config.kill_grace_secs)).await;
@@ -485,7 +483,10 @@ pub async fn execute_respawn_with_versions_dir(
     } else {
         dashboard_session
     };
-    info!(session, "auto-respawn: tearing down old dashboard tmux session");
+    info!(
+        session,
+        "auto-respawn: tearing down old dashboard tmux session"
+    );
     let _ = crate::cmd::run_cmd_any(&["tmux", "kill-session", "-t", session], 5).await;
 
     // Best-effort cleanup of stale claude-watch state files that can
@@ -533,11 +534,7 @@ pub async fn execute_respawn_with_versions_dir(
     // host-side `dashboard` script (which does not exist inside the
     // container). setsid via spawn_detached so the process survives a
     // daemon SIGTERM mid-respawn.
-    let respawn_argv: Vec<&str> = config
-        .respawn_command
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let respawn_argv: Vec<&str> = config.respawn_command.iter().map(|s| s.as_str()).collect();
     info!(
         respawn_command = ?config.respawn_command,
         "auto-respawn: launching fresh Claude Code via configured respawn_command"
@@ -552,8 +549,8 @@ pub async fn execute_respawn_with_versions_dir(
     }
 
     // Verify the new claude PID appears within the verify window.
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(config.respawn_verify_secs);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(config.respawn_verify_secs);
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         if let Some(new_pid) = crate::agent::find_claude_pid() {
@@ -907,9 +904,21 @@ mod tests {
             3,
             "jsonl-only alive (mid-thought subagent) must win over 0 proc — the leak fix"
         );
-        assert_eq!(combine_alive_counts(2, 0), 2, "proc-only alive wins over 0 jsonl");
-        assert_eq!(combine_alive_counts(1, 1), 1, "MAX: no double-count when both see it");
-        assert_eq!(combine_alive_counts(0, 0), 0, "genuinely idle → 0 (interrupt allowed)");
+        assert_eq!(
+            combine_alive_counts(2, 0),
+            2,
+            "proc-only alive wins over 0 jsonl"
+        );
+        assert_eq!(
+            combine_alive_counts(1, 1),
+            1,
+            "MAX: no double-count when both see it"
+        );
+        assert_eq!(
+            combine_alive_counts(0, 0),
+            0,
+            "genuinely idle → 0 (interrupt allowed)"
+        );
     }
 
     #[test]
@@ -938,27 +947,27 @@ mod tests {
     #[test]
     fn pane_unchanged_first_observation_does_not_fire() {
         let now = iso_at(0);
-        let (h, fs, fire) =
-            evaluate_pane_unchanged(0xdeadbeef, None, None, &now, 600);
+        let (h, fs, fire) = evaluate_pane_unchanged(0xdeadbeef, None, None, &now, 600);
         assert_eq!(h, Some(0xdeadbeef));
         assert!(fs.is_some());
-        assert!(!fire, "first observation should never fire — no elapsed time");
+        assert!(
+            !fire,
+            "first observation should never fire — no elapsed time"
+        );
     }
 
     #[test]
     fn pane_unchanged_fires_after_threshold() {
         let now = iso_at(0);
         let earlier = iso_at(-700);
-        let (h, fs, fire) = evaluate_pane_unchanged(
-            0xdeadbeef,
-            Some(0xdeadbeef),
-            Some(&earlier),
-            &now,
-            600,
-        );
+        let (h, fs, fire) =
+            evaluate_pane_unchanged(0xdeadbeef, Some(0xdeadbeef), Some(&earlier), &now, 600);
         assert_eq!(h, Some(0xdeadbeef));
         assert_eq!(fs, Some(earlier));
-        assert!(fire, "after 700s with same hash and 600s threshold, must fire");
+        assert!(
+            fire,
+            "after 700s with same hash and 600s threshold, must fire"
+        );
     }
 
     #[test]
@@ -982,13 +991,8 @@ mod tests {
     fn pane_unchanged_below_threshold_does_not_fire() {
         let now = iso_at(0);
         let earlier = iso_at(-100);
-        let (_h, _fs, fire) = evaluate_pane_unchanged(
-            0xdeadbeef,
-            Some(0xdeadbeef),
-            Some(&earlier),
-            &now,
-            600,
-        );
+        let (_h, _fs, fire) =
+            evaluate_pane_unchanged(0xdeadbeef, Some(0xdeadbeef), Some(&earlier), &now, 600);
         assert!(!fire, "100s elapsed < 600s threshold => no fire");
     }
 

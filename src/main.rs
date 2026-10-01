@@ -978,10 +978,7 @@ fn status_json_value(r: &StatusReport) -> serde_json::Value {
         serde_json::Value::String(r.claude_watch_version.to_string()),
     );
     if let Some(active) = r.daemon_active {
-        map.insert(
-            "daemon_active".to_string(),
-            serde_json::Value::Bool(active),
-        );
+        map.insert("daemon_active".to_string(), serde_json::Value::Bool(active));
     }
     map.insert(
         "active_agents".to_string(),
@@ -1015,11 +1012,7 @@ fn status_json_value(r: &StatusReport) -> serde_json::Value {
 /// We deliberately don't surface the granular state: the status output is
 /// for human eyeballs + the JSON consumer only cares about active/not-active.
 async fn check_daemon_active() -> Option<bool> {
-    let (out, _) = cmd::run_cmd_any(
-        &["systemctl", "is-active", "claude-watch.service"],
-        5,
-    )
-    .await;
+    let (out, _) = cmd::run_cmd_any(&["systemctl", "is-active", "claude-watch.service"], 5).await;
     let trimmed = out.trim();
     if trimmed.is_empty() {
         None
@@ -1535,8 +1528,7 @@ async fn run_daemon() {
                         // the default-disabled majority). `None` (unreadable
                         // queue) is treated as NOT empty — fail-safe: never
                         // clear on an unknown queue state.
-                        let queue_empty =
-                            idle_autocompact::queue_is_empty(10).unwrap_or(false);
+                        let queue_empty = idle_autocompact::queue_is_empty(10).unwrap_or(false);
                         let in_cooldown = state
                             .last_idle_autocompact
                             .as_deref()
@@ -1777,9 +1769,7 @@ async fn run_watcher(action: WatcherAction) {
         }
         WatcherAction::Stop { name } => watcher::cmd_stop(&cfg, extra_ref, &name).await,
         WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, extra_ref, &name, true).await,
-        WatcherAction::Disable { name } => {
-            watcher::cmd_toggle(&cfg, extra_ref, &name, false).await
-        }
+        WatcherAction::Disable { name } => watcher::cmd_toggle(&cfg, extra_ref, &name, false).await,
         WatcherAction::Restart => {
             watcher::cmd_restart(&cfg, extra_ref).await;
             0
@@ -1839,13 +1829,7 @@ fn run_workload(action: WorkloadAction) -> i32 {
             log_path,
             killed,
             queue_id,
-        } => workload::cmd_emit_done(
-            &label,
-            exit_code,
-            &log_path,
-            killed,
-            queue_id.as_deref(),
-        ),
+        } => workload::cmd_emit_done(&label, exit_code, &log_path, killed, queue_id.as_deref()),
     }
 }
 
@@ -2094,7 +2078,11 @@ async fn run_inject(
                 "[claude-watch inject] menu {} answered with option {}{}",
                 menu.summary(),
                 answer,
-                if *auto { " (allowlisted auto-answer)" } else { "" }
+                if *auto {
+                    " (allowlisted auto-answer)"
+                } else {
+                    ""
+                }
             ),
             inject_menu::MenuOutcome::Unanswered { menu } => eprintln!(
                 "[claude-watch inject] NOTE: the submit opened a menu that was NOT answered \
@@ -2141,12 +2129,7 @@ async fn run_inject(
 /// Deliberately LOUD on failure: "no URL" can mean the session is already
 /// authenticated, the dialog never rendered, or the pane is wedged, and every
 /// one of those is something the caller must surface rather than swallow.
-async fn run_login_url(
-    pane_flag: Option<&str>,
-    wait: u64,
-    not: &[String],
-    json: bool,
-) -> i32 {
+async fn run_login_url(pane_flag: Option<&str>, wait: u64, not: &[String], json: bool) -> i32 {
     let pane = resolve_inject_pane(pane_flag).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
     let mut saw_stale = false;
@@ -2314,11 +2297,8 @@ async fn main() {
             max_age_seconds,
             write_state,
         }) => {
-            let code = active_agents::cmd_active_agents(
-                json,
-                max_age_seconds,
-                write_state.as_deref(),
-            );
+            let code =
+                active_agents::cmd_active_agents(json, max_age_seconds, write_state.as_deref());
             if code != 0 {
                 std::process::exit(code);
             }
@@ -2349,11 +2329,8 @@ async fn main() {
             state_dir,
             dry_run,
         }) => {
-            let code = stale_ready::cmd_stale_ready_check(
-                threshold_min,
-                state_dir.as_deref(),
-                dry_run,
-            );
+            let code =
+                stale_ready::cmd_stale_ready_check(threshold_min, state_dir.as_deref(), dry_run);
             if code != 0 {
                 std::process::exit(code);
             }
@@ -2419,8 +2396,7 @@ async fn main() {
             credentials_file,
             json,
         }) => {
-            let code =
-                run_login_expiry(pane.as_deref(), credentials_file.as_deref(), json).await;
+            let code = run_login_expiry(pane.as_deref(), credentials_file.as_deref(), json).await;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -2599,7 +2575,11 @@ mod tests {
         let mut r = base_report();
         r.pane = String::new();
         let out = format_status_human(&r);
-        assert!(!out.contains("Pane:"), "pane line should be omitted; out:\n{}", out);
+        assert!(
+            !out.contains("Pane:"),
+            "pane line should be omitted; out:\n{}",
+            out
+        );
     }
 
     #[test]
@@ -2615,7 +2595,11 @@ mod tests {
         let r = base_report();
         // 467176 / 1000000 = 46.7176%, rounds to 47%.
         let out = format_status_human(&r);
-        assert!(out.contains("Tokens:         467,176 / 1,000,000 (47%)"), "out:\n{}", out);
+        assert!(
+            out.contains("Tokens:         467,176 / 1,000,000 (47%)"),
+            "out:\n{}",
+            out
+        );
     }
 
     #[test]

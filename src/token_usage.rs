@@ -433,11 +433,15 @@ fn find_main_transcript(projects_dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
     let slugs = std::fs::read_dir(projects_dir).ok()?;
     for slug in slugs.flatten() {
-        let Ok(file_type) = slug.file_type() else { continue };
+        let Ok(file_type) = slug.file_type() else {
+            continue;
+        };
         if !file_type.is_dir() {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(slug.path()) else { continue };
+        let Ok(entries) = std::fs::read_dir(slug.path()) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -448,7 +452,9 @@ fn find_main_transcript(projects_dir: &Path) -> Option<PathBuf> {
                 continue;
             }
             let Ok(mtime) = meta.modified() else { continue };
-            let is_newer = best.as_ref().is_none_or(|(_, best_mtime)| mtime > *best_mtime);
+            let is_newer = best
+                .as_ref()
+                .is_none_or(|(_, best_mtime)| mtime > *best_mtime);
             if is_newer {
                 best = Some((path, mtime));
             }
@@ -763,9 +769,33 @@ mod tests {
     #[test]
     fn summarize_splits_month_to_date() {
         let mut days = HashMap::new();
-        days.insert("2026-06-01".to_string(), TokenCounts { input: 10, output: 1, cache_creation: 0, cache_read: 0 });
-        days.insert("2026-06-27".to_string(), TokenCounts { input: 20, output: 2, cache_creation: 0, cache_read: 0 });
-        days.insert("2026-05-31".to_string(), TokenCounts { input: 5, output: 5, cache_creation: 0, cache_read: 0 });
+        days.insert(
+            "2026-06-01".to_string(),
+            TokenCounts {
+                input: 10,
+                output: 1,
+                cache_creation: 0,
+                cache_read: 0,
+            },
+        );
+        days.insert(
+            "2026-06-27".to_string(),
+            TokenCounts {
+                input: 20,
+                output: 2,
+                cache_creation: 0,
+                cache_read: 0,
+            },
+        );
+        days.insert(
+            "2026-05-31".to_string(),
+            TokenCounts {
+                input: 5,
+                output: 5,
+                cache_creation: 0,
+                cache_read: 0,
+            },
+        );
         let u = summarize(&days, "2026-06");
         assert_eq!(u.cumulative.input, 35);
         assert_eq!(u.cumulative.output, 8);
@@ -777,7 +807,15 @@ mod tests {
     fn summarize_empty_month_resets() {
         // No transcripts in the current month → month-to-date is all zeros.
         let mut days = HashMap::new();
-        days.insert("2026-05-15".to_string(), TokenCounts { input: 99, output: 9, cache_creation: 0, cache_read: 0 });
+        days.insert(
+            "2026-05-15".to_string(),
+            TokenCounts {
+                input: 99,
+                output: 9,
+                cache_creation: 0,
+                cache_read: 0,
+            },
+        );
         let u = summarize(&days, "2026-06");
         assert_eq!(u.cumulative.input, 99);
         assert_eq!(u.month_to_date, TokenCounts::default());
@@ -786,8 +824,18 @@ mod tests {
     #[test]
     fn token_metric_lines_render_both_series() {
         let usage = TokenUsage {
-            cumulative: TokenCounts { input: 1, output: 2, cache_creation: 3, cache_read: 4 },
-            month_to_date: TokenCounts { input: 5, output: 6, cache_creation: 7, cache_read: 8 },
+            cumulative: TokenCounts {
+                input: 1,
+                output: 2,
+                cache_creation: 3,
+                cache_read: 4,
+            },
+            month_to_date: TokenCounts {
+                input: 5,
+                output: 6,
+                cache_creation: 7,
+                cache_read: 8,
+            },
         };
         let joined = token_metric_lines(&usage).join("\n");
         assert!(joined.contains("# TYPE claude_code_tokens_total counter"));
@@ -809,7 +857,10 @@ mod tests {
         // One main transcript + one subagent transcript, both June.
         std::fs::write(
             slug.join("uuid-1.jsonl"),
-            format!("{}\n", line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0)),
+            format!(
+                "{}\n",
+                line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0)
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -854,8 +905,19 @@ mod tests {
         std::fs::create_dir_all(&projects).unwrap();
         let old = projects.join("old.jsonl");
         let live = projects.join("live.jsonl");
-        std::fs::write(&old, format!("{}\n", line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0))).unwrap();
-        std::fs::write(&live, format!("{}\n", line("2026-06-11T05:00:00.000Z", "m2", 40, 4, 0, 0))).unwrap();
+        std::fs::write(
+            &old,
+            format!(
+                "{}\n",
+                line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &live,
+            format!("{}\n", line("2026-06-11T05:00:00.000Z", "m2", 40, 4, 0, 0)),
+        )
+        .unwrap();
 
         let cache = tmp.path().join("cache.json");
         let before = collect_token_usage_at(&projects, &cache, "2026-06", NOW);
@@ -878,10 +940,21 @@ mod tests {
         std::fs::create_dir_all(&projects).unwrap();
         let old = projects.join("old.jsonl");
         let live = projects.join("live.jsonl");
-        std::fs::write(&old, format!("{}\n", line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0))).unwrap();
+        std::fs::write(
+            &old,
+            format!(
+                "{}\n",
+                line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0)
+            ),
+        )
+        .unwrap();
         // A surviving transcript, so the post-deletion scans are non-empty and
         // therefore not treated as broken.
-        std::fs::write(&live, format!("{}\n", line("2026-06-11T05:00:00.000Z", "m2", 40, 4, 0, 0))).unwrap();
+        std::fs::write(
+            &live,
+            format!("{}\n", line("2026-06-11T05:00:00.000Z", "m2", 40, 4, 0, 0)),
+        )
+        .unwrap();
         let cache = tmp.path().join("cache.json");
         let before = collect_token_usage_at(&projects, &cache, "2026-06", NOW);
         assert_eq!(before.cumulative.input, 140);
@@ -890,21 +963,31 @@ mod tests {
         // First pass after the deletion stamps missing_since; still per-file.
         let mid = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 60);
         assert_eq!(mid.cumulative, before.cumulative);
-        assert!(std::fs::read_to_string(&cache).unwrap().contains("old.jsonl"));
+        assert!(std::fs::read_to_string(&cache)
+            .unwrap()
+            .contains("old.jsonl"));
 
         // Past the horizon: the per-file entry is dropped, the tokens are not.
-        let after = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 60 + RETIRE_AFTER_SECS);
+        let after =
+            collect_token_usage_at(&projects, &cache, "2026-06", NOW + 60 + RETIRE_AFTER_SECS);
         assert_eq!(
             after.cumulative, before.cumulative,
             "retiring an entry must preserve its tokens"
         );
         assert_eq!(after.month_to_date, before.month_to_date);
         let raw = std::fs::read_to_string(&cache).unwrap();
-        assert!(!raw.contains("old.jsonl"), "retired entry not pruned: {raw}");
-        assert!(raw.contains("retired"), "retired buckets not persisted: {raw}");
+        assert!(
+            !raw.contains("old.jsonl"),
+            "retired entry not pruned: {raw}"
+        );
+        assert!(
+            raw.contains("retired"),
+            "retired buckets not persisted: {raw}"
+        );
 
         // And it stays put on later passes rather than accruing twice.
-        let later = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 2 * RETIRE_AFTER_SECS);
+        let later =
+            collect_token_usage_at(&projects, &cache, "2026-06", NOW + 2 * RETIRE_AFTER_SECS);
         assert_eq!(later.cumulative, before.cumulative);
     }
 
@@ -914,7 +997,14 @@ mod tests {
         let projects = tmp.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
         let f = projects.join("s.jsonl");
-        std::fs::write(&f, format!("{}\n", line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0))).unwrap();
+        std::fs::write(
+            &f,
+            format!(
+                "{}\n",
+                line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 0, 0)
+            ),
+        )
+        .unwrap();
         let cache = tmp.path().join("cache.json");
         let before = collect_token_usage_at(&projects, &cache, "2026-06", NOW);
 
@@ -923,7 +1013,8 @@ mod tests {
         // must NOT mass-retire on the strength of one empty scan, even weeks
         // later.
         std::fs::remove_dir_all(&projects).unwrap();
-        let after = collect_token_usage_at(&projects, &cache, "2026-06", NOW + 4 * RETIRE_AFTER_SECS);
+        let after =
+            collect_token_usage_at(&projects, &cache, "2026-06", NOW + 4 * RETIRE_AFTER_SECS);
         assert_eq!(after.cumulative, before.cumulative);
         assert!(
             std::fs::read_to_string(&cache).unwrap().contains("s.jsonl"),
@@ -937,7 +1028,14 @@ mod tests {
     #[test]
     fn cache_reads_never_enter_the_excl_cache_read_series() {
         let base = parse_transcript_days(&line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 20, 0));
-        let huge = parse_transcript_days(&line("2026-06-10T05:00:00.000Z", "m1", 100, 10, 20, 900_000_000));
+        let huge = parse_transcript_days(&line(
+            "2026-06-10T05:00:00.000Z",
+            "m1",
+            100,
+            10,
+            20,
+            900_000_000,
+        ));
 
         let excl = |days: &HashMap<String, TokenCounts>| -> u64 {
             let u = summarize(days, "2026-06");
@@ -1008,7 +1106,10 @@ mod tests {
         std::fs::write(&newer, "{}\n").unwrap();
 
         let found = find_main_transcript(&projects).expect("a transcript should be found");
-        assert_eq!(found, newer, "expected the newer top-level transcript across slugs");
+        assert_eq!(
+            found, newer,
+            "expected the newer top-level transcript across slugs"
+        );
     }
 
     #[test]
@@ -1046,7 +1147,10 @@ mod tests {
     #[test]
     fn current_context_tokens_at_missing_projects_dir_is_none() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(current_context_tokens_at(&tmp.path().join("does-not-exist")), None);
+        assert_eq!(
+            current_context_tokens_at(&tmp.path().join("does-not-exist")),
+            None
+        );
     }
 
     #[test]
@@ -1064,10 +1168,16 @@ mod tests {
         content.push_str(&line("2026-06-27T05:00:00.000Z", "msg_tail", 77, 1, 0, 0));
         content.push('\n');
         std::fs::write(&path, &content).unwrap();
-        assert!(content.len() as u64 > MAIN_TAIL_BYTES, "test file must exceed the tail window");
+        assert!(
+            content.len() as u64 > MAIN_TAIL_BYTES,
+            "test file must exceed the tail window"
+        );
 
         let tail = read_tail(&path, MAIN_TAIL_BYTES).expect("tail read should succeed");
-        assert!(tail.contains("msg_tail"), "the real usage line must survive truncation");
+        assert!(
+            tail.contains("msg_tail"),
+            "the real usage line must survive truncation"
+        );
         assert_eq!(latest_context_tokens(&tail), Some(77));
     }
 
@@ -1230,7 +1340,10 @@ mod tests {
         content.push('\n');
         content.push_str(&failure_line("2026-09-17T21:15:06.213Z", "u2"));
         content.push('\n');
-        assert!(content.len() as u64 > MAIN_TAIL_BYTES, "must exceed the tail window");
+        assert!(
+            content.len() as u64 > MAIN_TAIL_BYTES,
+            "must exceed the tail window"
+        );
         std::fs::write(slug.join("uuid-1.jsonl"), content).unwrap();
         assert_eq!(
             recent_credit_failures_at(&projects, CREDIT_NOW, CREDIT_WINDOW),

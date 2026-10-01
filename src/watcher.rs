@@ -161,9 +161,7 @@ impl WatcherStatus {
     /// command) are the honest observable. A monitor process orphaned by a
     /// session restart still counts here; that matches `watcher-ctl status`.
     pub fn is_monitor_live(&self) -> bool {
-        self.enabled
-            && self.mode == "monitor"
-            && matches!(self.status.as_str(), "ok" | "DUPLICATE")
+        self.enabled && self.mode == "monitor" && matches!(self.status.as_str(), "ok" | "DUPLICATE")
     }
 }
 
@@ -371,8 +369,7 @@ pub(crate) fn pattern_matches_argv_tokens(argv: &[String], pattern: &str) -> boo
         // at a `/` boundary (`bin/claude-event-watch` inside
         // `/home/u/bin/claude-event-watch`). The boundary requirement is what
         // rejects the same text appearing mid-argument.
-        let head_ok =
-            argv[start] == pat[0] || argv[start].ends_with(&format!("/{}", pat[0]));
+        let head_ok = argv[start] == pat[0] || argv[start].ends_with(&format!("/{}", pat[0]));
         if !head_ok {
             continue;
         }
@@ -648,7 +645,10 @@ pub fn watcher_list(config_path: &str, extra_config_path: Option<&str>) -> Vec<W
 ///
 /// Both fans run as `tokio::spawn` tasks so the wall-clock per status call
 /// stays near one pgrep round-trip even with many watchers configured.
-pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) -> Vec<WatcherStatus> {
+pub async fn watcher_status(
+    config_path: &str,
+    extra_config_path: Option<&str>,
+) -> Vec<WatcherStatus> {
     let arming_grace = crate::status::resolve_monitor_arming_grace_secs();
     watcher_status_with(config_path, extra_config_path, arming_grace).await
 }
@@ -975,7 +975,10 @@ impl PidFileVerdict {
 /// actually this watcher?" — kept as a closure so the decision is unit-testable
 /// without touching `/proc`, and so PID reuse (a live pid running something
 /// else) is rejected by the same path as a dead pid.
-pub fn classify_pid_file(content: Option<&str>, is_live_instance: impl Fn(u32) -> bool) -> PidFileVerdict {
+pub fn classify_pid_file(
+    content: Option<&str>,
+    is_live_instance: impl Fn(u32) -> bool,
+) -> PidFileVerdict {
     let content = match content {
         Some(c) => c,
         None => return PidFileVerdict::Absent,
@@ -1180,7 +1183,11 @@ impl WatcherLock {
 /// (process dead, or recycled to an unrelated PID) is cleared and the watcher
 /// starts normally. The PID file is claimed atomically (`O_EXCL`) so two
 /// near-simultaneous `run` invocations can't both win.
-pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, name: &str) -> Result<i32, String> {
+pub async fn watcher_run(
+    config_path: &str,
+    extra_config_path: Option<&str>,
+    name: &str,
+) -> Result<i32, String> {
     let entries = load_entries(config_path, extra_config_path);
     let entry = entries
         .iter()
@@ -1495,7 +1502,9 @@ async fn monitor_arm(entry: &WatcherEntry) -> Result<i32, String> {
              If that is the one-shot instance and you want the monitor: `watcher-restart` \
              (stops it), then `watcher-ctl run {}` again to get the Monitor command.",
             entry.name,
-            recorded_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+            recorded_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string()),
             entry.name
         );
         return Ok(0);
@@ -1510,11 +1519,8 @@ async fn monitor_arm(entry: &WatcherEntry) -> Result<i32, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let intent_written = std::fs::write(
-        &intent_path,
-        format!("epoch={}\ncommand={}\n", epoch, cmd),
-    )
-    .is_ok();
+    let intent_written =
+        std::fs::write(&intent_path, format!("epoch={}\ncommand={}\n", epoch, cmd)).is_ok();
 
     print!(
         "{}",
@@ -1566,7 +1572,10 @@ pub fn format_monitor_arm_instructions(
         "ARM IT NOW from the main loop with the Monitor tool (not a background Bash task, not `&`):\n",
     );
     out.push_str("  Monitor\n");
-    out.push_str(&format!("    command:     {}\n", monitor_launch_command(cmd)));
+    out.push_str(&format!(
+        "    command:     {}\n",
+        monitor_launch_command(cmd)
+    ));
     out.push_str(&format!(
         "    description: {} (monitor-mode watcher)\n",
         entry.name
@@ -2136,7 +2145,11 @@ pub fn entry_source_label(e: &WatcherEntry) -> String {
 /// the `SOURCE` column says which layer set them, and the trailing `layers:`
 /// block names both files and whether the override is present, so "which
 /// file do I edit to flip this?" is answered by the listing itself.
-pub fn format_list(entries: &[WatcherEntry], base_path: &str, override_path: Option<&str>) -> String {
+pub fn format_list(
+    entries: &[WatcherEntry],
+    base_path: &str,
+    override_path: Option<&str>,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{:<20} {:<8} {:<8} {:<24} {}\n",
@@ -2245,7 +2258,11 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
             // Oneshot rows keep their historical byte-exact shape; a
             // monitor-mode row carries a trailing ` [monitor]` tag so a
             // reader knows it is re-ARMED (Monitor tool), not re-run.
-            let mode_tag = if s.mode == "monitor" { "  [monitor]" } else { "" };
+            let mode_tag = if s.mode == "monitor" {
+                "  [monitor]"
+            } else {
+                ""
+            };
             out.push_str(&format!(
                 "{:<20} {:<9} ({}/{})  {}{}\n",
                 s.name, s.status, s.count, s.required, s.pids, mode_tag
@@ -2269,10 +2286,7 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
                     .map(|p| p.to_string())
                     .collect::<Vec<_>>()
                     .join(" ");
-                out.push_str(&format!(
-                    "{:<21}duplicate supervisors: {}\n",
-                    "", pids
-                ));
+                out.push_str(&format!("{:<21}duplicate supervisors: {}\n", "", pids));
             }
         }
     }
@@ -2402,7 +2416,10 @@ mod tests {
 
     #[test]
     fn test_expected_comms_from_start_cmd_basename() {
-        let e = comms("bin/claude-event-watch", Some("claude-event-watch --quiet 10"));
+        let e = comms(
+            "bin/claude-event-watch",
+            Some("claude-event-watch --quiet 10"),
+        );
         assert!(e.contains(&"claude-event-watch".to_string()), "got {:?}", e);
     }
 
@@ -2447,7 +2464,12 @@ mod tests {
     #[test]
     fn test_pattern_matches_argv_tokens_whole_token_and_path_suffix() {
         assert!(pattern_matches_argv_tokens(
-            &argv(&["/bin/bash", "/home/u/bin/claude-event-watch", "--quiet", "10"]),
+            &argv(&[
+                "/bin/bash",
+                "/home/u/bin/claude-event-watch",
+                "--quiet",
+                "10"
+            ]),
             "bin/claude-event-watch"
         ));
         // A multi-token pattern must line up across consecutive arguments.
@@ -2463,7 +2485,11 @@ mod tests {
         // quoted argument (a drafted message, a scratch test) rather than as
         // the program being run.
         assert!(!pattern_matches_argv_tokens(
-            &argv(&["some-tool", "--message", "restart bin/claude-event-watch please"]),
+            &argv(&[
+                "some-tool",
+                "--message",
+                "restart bin/claude-event-watch please"
+            ]),
             "bin/claude-event-watch"
         ));
         // Same text, not at a path boundary.
@@ -2481,11 +2507,19 @@ mod tests {
 
     #[test]
     fn test_is_poller_candidate_accepts_real_watcher() {
-        let e = comms("bin/claude-event-watch", Some("claude-event-watch --quiet 10"));
+        let e = comms(
+            "bin/claude-event-watch",
+            Some("claude-event-watch --quiet 10"),
+        );
         // Shebang launch: kernel sets comm from the script name (truncated).
         assert!(is_poller_candidate(
             Some("claude-event-wa"),
-            Some(&argv(&["/bin/bash", "/home/u/bin/claude-event-watch", "--quiet", "10"])),
+            Some(&argv(&[
+                "/bin/bash",
+                "/home/u/bin/claude-event-watch",
+                "--quiet",
+                "10"
+            ])),
             "bin/claude-event-watch",
             &e
         ));
@@ -2494,10 +2528,18 @@ mod tests {
     #[test]
     fn test_is_poller_candidate_accepts_interpreter_launch() {
         // `bash /path/to/watcher` -> comm is the interpreter, identity is argv.
-        let e = comms("bin/claude-event-watch", Some("claude-event-watch --quiet 10"));
+        let e = comms(
+            "bin/claude-event-watch",
+            Some("claude-event-watch --quiet 10"),
+        );
         assert!(is_poller_candidate(
             Some("bash"),
-            Some(&argv(&["bash", "/home/u/bin/claude-event-watch", "--quiet", "10"])),
+            Some(&argv(&[
+                "bash",
+                "/home/u/bin/claude-event-watch",
+                "--quiet",
+                "10"
+            ])),
             "bin/claude-event-watch",
             &e
         ));
@@ -2505,12 +2547,20 @@ mod tests {
 
     #[test]
     fn test_is_poller_candidate_rejects_unrelated_process_quoting_pattern() {
-        let e = comms("bin/claude-event-watch", Some("claude-event-watch --quiet 10"));
+        let e = comms(
+            "bin/claude-event-watch",
+            Some("claude-event-watch --quiet 10"),
+        );
         // A message-sending tool whose argument names the watcher. Rejected
         // on comm alone -- it is not the watcher and not an interpreter.
         assert!(!is_poller_candidate(
             Some("signal-send"),
-            Some(&argv(&["signal-send", "--dm", "andrew", "restart bin/claude-event-watch now"])),
+            Some(&argv(&[
+                "signal-send",
+                "--dm",
+                "andrew",
+                "restart bin/claude-event-watch now"
+            ])),
             "bin/claude-event-watch",
             &e
         ));
@@ -2530,11 +2580,26 @@ mod tests {
         // as something else. Unknown comm, or nothing derivable from config,
         // must keep the candidate so we can never invent a false DOWN.
         let e = comms("bin/claude-event-watch", Some("claude-event-watch"));
-        assert!(is_poller_candidate(None, None, "bin/claude-event-watch", &e));
-        assert!(is_poller_candidate(Some(""), None, "bin/claude-event-watch", &e));
+        assert!(is_poller_candidate(
+            None,
+            None,
+            "bin/claude-event-watch",
+            &e
+        ));
+        assert!(is_poller_candidate(
+            Some(""),
+            None,
+            "bin/claude-event-watch",
+            &e
+        ));
         assert!(is_poller_candidate(Some("anything"), None, "--tag dm", &[]));
         // Interpreter comm with an unreadable argv is also kept.
-        assert!(is_poller_candidate(Some("bash"), None, "bin/claude-event-watch", &e));
+        assert!(is_poller_candidate(
+            Some("bash"),
+            None,
+            "bin/claude-event-watch",
+            &e
+        ));
     }
 
     #[test]
@@ -2577,19 +2642,25 @@ mod tests {
             table
                 .iter()
                 .find(|(p, _, _)| *p == pid)
-                .map(|(_, alive, age)| PidFacts { alive: *alive, age_secs: *age })
-                .unwrap_or(PidFacts { alive: false, age_secs: None })
+                .map(|(_, alive, age)| PidFacts {
+                    alive: *alive,
+                    age_secs: *age,
+                })
+                .unwrap_or(PidFacts {
+                    alive: false,
+                    age_secs: None,
+                })
         }
     }
 
     #[test]
     fn test_stable_duplicate_pids_drops_own_tree_dead_and_young() {
         let table = [
-            (100, true, Some(86400.0)),  // the real, long-lived poller
-            (200, true, Some(0.01)),     // concurrent prober's pgrep, still alive
-            (300, false, None),          // transient, already gone
-            (400, true, Some(3600.0)),   // OUR ancestor shell (in own_tree)
-            (500, true, Some(1.99)),     // just under the floor
+            (100, true, Some(86400.0)), // the real, long-lived poller
+            (200, true, Some(0.01)),    // concurrent prober's pgrep, still alive
+            (300, false, None),         // transient, already gone
+            (400, true, Some(3600.0)),  // OUR ancestor shell (in own_tree)
+            (500, true, Some(1.99)),    // just under the floor
         ];
         let own_tree = [std::process::id(), 400];
         let kept = stable_duplicate_pids(
@@ -2613,10 +2684,17 @@ mod tests {
         // Two long-lived pollers for one watcher is the genuine DUPLICATE
         // case and MUST survive the filter.
         let table = [(100, true, Some(86400.0)), (101, true, Some(2.0))];
-        let kept =
-            stable_duplicate_pids(&[100, 101], &[std::process::id()], DUPLICATE_MIN_AGE_SECS, facts_table(&table));
+        let kept = stable_duplicate_pids(
+            &[100, 101],
+            &[std::process::id()],
+            DUPLICATE_MIN_AGE_SECS,
+            facts_table(&table),
+        );
         assert_eq!(kept, vec![100, 101]);
-        assert!(kept.len() > 1, "two stable pollers must still read as DUPLICATE");
+        assert!(
+            kept.len() > 1,
+            "two stable pollers must still read as DUPLICATE"
+        );
     }
 
     #[test]
@@ -2624,7 +2702,12 @@ mod tests {
         // Unknown age (no /proc) must not hide a live duplicate — we can only
         // remove what we can positively identify as transient.
         let table = [(100, true, None), (101, true, None)];
-        let kept = stable_duplicate_pids(&[100, 101], &[], DUPLICATE_MIN_AGE_SECS, facts_table(&table));
+        let kept = stable_duplicate_pids(
+            &[100, 101],
+            &[],
+            DUPLICATE_MIN_AGE_SECS,
+            facts_table(&table),
+        );
         assert_eq!(kept, vec![100, 101]);
     }
 
@@ -2650,7 +2733,11 @@ mod tests {
         assert_eq!(descendants_of(&[100], &map), vec![200]);
         // A pid that is itself a root is never reported as a descendant.
         let d = descendants_of(&[100, 200], &map);
-        assert!(d.is_empty(), "roots must not be reported as descendants: {:?}", d);
+        assert!(
+            d.is_empty(),
+            "roots must not be reported as descendants: {:?}",
+            d
+        );
     }
 
     #[test]
@@ -2689,17 +2776,33 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let output = format_list(&entries, "/etc/x/watchers.conf", Some("/nonexistent/override.conf"));
+        let output = format_list(
+            &entries,
+            "/etc/x/watchers.conf",
+            Some("/nonexistent/override.conf"),
+        );
         assert!(output.contains("alerts"));
         assert!(output.contains("torrent"));
         assert!(output.contains("true"));
         assert!(output.contains("false"));
         // Mode + which-layer-won are visible per row, and both layer paths
         // are named in the footer (override reported absent here).
-        assert!(output.contains("MODE"), "header has MODE column: {}", output);
-        assert!(output.contains("SOURCE"), "header has SOURCE column: {}", output);
+        assert!(
+            output.contains("MODE"),
+            "header has MODE column: {}",
+            output
+        );
+        assert!(
+            output.contains("SOURCE"),
+            "header has SOURCE column: {}",
+            output
+        );
         let torrent_row = output.lines().find(|l| l.starts_with("torrent")).unwrap();
-        assert!(torrent_row.contains("monitor"), "row shows mode: {}", torrent_row);
+        assert!(
+            torrent_row.contains("monitor"),
+            "row shows mode: {}",
+            torrent_row
+        );
         assert!(
             torrent_row.contains("base+override(mode,enabled)"),
             "row names the overriding layer + fields: {}",
@@ -2732,11 +2835,20 @@ mod tests {
             ..Default::default()
         };
         let cmd = e.effective_monitor_cmd().unwrap();
-        assert_eq!(cmd, "claude-event-watch --debounce 60 --quiet 10 --mode monitor");
-        let text = format_monitor_arm_instructions(&e, &cmd, Some("/run/x/claude-event-watch.monitor-intent"));
+        assert_eq!(
+            cmd,
+            "claude-event-watch --debounce 60 --quiet 10 --mode monitor"
+        );
+        let text = format_monitor_arm_instructions(
+            &e,
+            &cmd,
+            Some("/run/x/claude-event-watch.monitor-intent"),
+        );
         // The exact command string the main loop must arm, stderr merged.
         assert!(
-            text.contains("command:     claude-event-watch --debounce 60 --quiet 10 --mode monitor 2>&1"),
+            text.contains(
+                "command:     claude-event-watch --debounce 60 --quiet 10 --mode monitor 2>&1"
+            ),
             "{}",
             text
         );
@@ -2750,19 +2862,41 @@ mod tests {
         // The visible-reply admonition: a human reading the terminal only sees
         // the operator's one-line reply (the Monitor event collapses to its
         // static description), so the arm text demands the lead be quoted.
-        assert!(text.contains("your visible reply MUST quote its lead"), "{}", text);
-        assert!(text.contains("never a bare 'Acknowledged' / 'Idle'"), "{}", text);
-        assert!(text.contains("a human reading the terminal can see what was handled"), "{}", text);
+        assert!(
+            text.contains("your visible reply MUST quote its lead"),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains("never a bare 'Acknowledged' / 'Idle'"),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains("a human reading the terminal can see what was handled"),
+            "{}",
+            text
+        );
         assert!(text.contains("mode set by the override layer"), "{}", text);
-        assert!(text.contains("intent recorded: /run/x/claude-event-watch.monitor-intent"), "{}", text);
+        assert!(
+            text.contains("intent recorded: /run/x/claude-event-watch.monitor-intent"),
+            "{}",
+            text
+        );
         // Explicit monitor_cmd wins over the derived `--mode monitor` form,
         // and an already-merged stderr is not doubled.
         let e2 = WatcherEntry {
             monitor_cmd: Some("my-watch --stream 2>&1".to_string()),
             ..e.clone()
         };
-        assert_eq!(e2.effective_monitor_cmd().unwrap(), "my-watch --stream 2>&1");
-        assert_eq!(monitor_launch_command("my-watch --stream 2>&1"), "my-watch --stream 2>&1");
+        assert_eq!(
+            e2.effective_monitor_cmd().unwrap(),
+            "my-watch --stream 2>&1"
+        );
+        assert_eq!(
+            monitor_launch_command("my-watch --stream 2>&1"),
+            "my-watch --stream 2>&1"
+        );
     }
 
     #[test]
@@ -2801,11 +2935,22 @@ mod tests {
         assert!(row.starts_with("evw"), "{}", row);
         assert!(row.contains(" ARMING "), "{}", row);
         assert!(row.ends_with("[monitor]"), "{}", row);
-        assert!(out.contains("All watchers healthy."), "ARMING is not unhealthy: {}", out);
+        assert!(
+            out.contains("All watchers healthy."),
+            "ARMING is not unhealthy: {}",
+            out
+        );
         assert!(!out.contains("WARNING"), "{}", out);
-        assert!(out.contains("Monitor-mode watcher(s) ARMING: evw"), "{}", out);
+        assert!(
+            out.contains("Monitor-mode watcher(s) ARMING: evw"),
+            "{}",
+            out
+        );
         assert!(out.contains("arm it NOW"), "{}", out);
-        assert!(!any_unhealthy(std::slice::from_ref(&arming)), "ARMING must not count as unhealthy");
+        assert!(
+            !any_unhealthy(std::slice::from_ref(&arming)),
+            "ARMING must not count as unhealthy"
+        );
 
         // Mixed: a genuinely DOWN oneshot + an ARMING monitor -> WARNING for
         // the DOWN one, ARMING footer still present, DOWN recovery names only
@@ -2815,7 +2960,11 @@ mod tests {
         assert!(out.contains("Recovery for DOWN state"), "{}", out);
         assert!(out.contains("(e.g. sig)"), "{}", out);
         assert!(!out.contains("Monitor-mode watcher(s) DOWN"), "{}", out);
-        assert!(out.contains("Monitor-mode watcher(s) ARMING: evw"), "{}", out);
+        assert!(
+            out.contains("Monitor-mode watcher(s) ARMING: evw"),
+            "{}",
+            out
+        );
     }
 
     /// Test helper: build a healthy `ok` watcher status.
@@ -2912,7 +3061,10 @@ mod tests {
             off_status("tv-remind"),
         ];
         let output = format_status(&statuses, false);
-        assert!(output.contains("alerts"), "enabled watcher must show, got:\n{output}");
+        assert!(
+            output.contains("alerts"),
+            "enabled watcher must show, got:\n{output}"
+        );
         assert!(
             !output.contains("torrent-wait"),
             "disabled watcher must be hidden in default view, got:\n{output}"
@@ -2933,7 +3085,10 @@ mod tests {
     #[test]
     fn test_format_status_all_shows_disabled() {
         // `--all` (show_all=true): the disabled rows reappear.
-        let statuses = vec![ok_status("alerts", 1, 1, "1234"), off_status("torrent-wait")];
+        let statuses = vec![
+            ok_status("alerts", 1, 1, "1234"),
+            off_status("torrent-wait"),
+        ];
         let output = format_status(&statuses, true);
         assert!(output.contains("alerts"));
         assert!(
@@ -3399,11 +3554,7 @@ mod tests {
         // the start_cmd) wouldn't show up here either — what we're actually
         // asserting is the success-message text and the absence of a
         // `started, pid` substring that the old nohup path emitted.
-        std::fs::write(
-            &cfg,
-            format!("toggle-test|{}|1|false|true\n", sentinel),
-        )
-        .unwrap();
+        std::fs::write(&cfg, format!("toggle-test|{}|1|false|true\n", sentinel)).unwrap();
 
         let msg = watcher_toggle(cfg.to_str().unwrap(), None, "toggle-test", true)
             .await
@@ -3439,8 +3590,14 @@ mod tests {
         // spawn path.
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("watchers.conf");
-        let sentinel = format!("cw-test-no-spawn-{}-{}", std::process::id(), std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let sentinel = format!(
+            "cw-test-no-spawn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         // start_cmd that, IF spawned, would be visible to pgrep.
         let start = format!("sleep 30 # {}", sentinel);
         std::fs::write(
@@ -3700,8 +3857,7 @@ mod tests {
         } // _first dropped here → kernel releases the flock.
 
         // Now the slot is free; re-acquire must succeed.
-        let reacquired = WatcherLock::try_acquire(pid_dir, "claude-event-watch")
-            .unwrap();
+        let reacquired = WatcherLock::try_acquire(pid_dir, "claude-event-watch").unwrap();
         assert!(
             reacquired.is_some(),
             "after the holder drops, the spawn lock must be re-acquirable so a \
@@ -3775,8 +3931,7 @@ mod tests {
             .truncate(false)
             .open(&run_lock_path)
             .expect("open runlock path");
-        let run_rc =
-            unsafe { libc::flock(run_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let run_rc = unsafe { libc::flock(run_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_ne!(
             run_rc, 0,
             "the parent's run-lock path must be <name>.runlock and be held              (a concurrent flock on it must fail)"
@@ -3948,7 +4103,11 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n != "w.pid")
             .collect();
-        assert!(leftovers.is_empty(), "unexpected leftovers: {:?}", leftovers);
+        assert!(
+            leftovers.is_empty(),
+            "unexpected leftovers: {:?}",
+            leftovers
+        );
     }
 
     #[test]
@@ -3978,7 +4137,11 @@ mod tests {
         let dirs = vec![dir.path().to_string_lossy().into_owned()];
         let name = "cw-clear-test";
         std::fs::write(dir.path().join(format!("{}.pid", name)), "4242").unwrap();
-        std::fs::write(dir.path().join(format!("{}.monitor-intent", name)), "epoch=1").unwrap();
+        std::fs::write(
+            dir.path().join(format!("{}.monitor-intent", name)),
+            "epoch=1",
+        )
+        .unwrap();
         // A lock naming a pid that cannot be alive.
         std::fs::write(
             dir.path().join(format!("{}.lock", name)),
@@ -4130,9 +4293,8 @@ mod tests {
 
         let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
         let (cfg_path, extra) = (config_path(), config_path_extra());
-        let run = tokio::spawn(async move {
-            watcher_run(&cfg_path, extra.as_deref(), "runtest").await
-        });
+        let run =
+            tokio::spawn(async move { watcher_run(&cfg_path, extra.as_deref(), "runtest").await });
 
         let child = await_recorded_child(&pid_file).await;
         sigterm(child);
@@ -4161,9 +4323,8 @@ mod tests {
 
         let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
         let (cfg_path, extra) = (config_path(), config_path_extra());
-        let run = tokio::spawn(async move {
-            watcher_run(&cfg_path, extra.as_deref(), "runtest").await
-        });
+        let run =
+            tokio::spawn(async move { watcher_run(&cfg_path, extra.as_deref(), "runtest").await });
 
         let child = await_recorded_child(&pid_file).await;
         // `watcher-restart` order: sweep the records, THEN signal.
@@ -4177,7 +4338,10 @@ mod tests {
 
         // And a successor's record planted in the same window survives.
         std::fs::write(&pid_file, "424242").unwrap();
-        assert!(!remove_pid_file_if_matches(pid_file.to_str().unwrap(), child));
+        assert!(!remove_pid_file_if_matches(
+            pid_file.to_str().unwrap(),
+            child
+        ));
         assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "424242");
     }
 
@@ -4197,9 +4361,8 @@ mod tests {
 
         let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
         let (cfg_path, extra) = (config_path(), config_path_extra());
-        let run = tokio::spawn(async move {
-            watcher_run(&cfg_path, extra.as_deref(), "runtest").await
-        });
+        let run =
+            tokio::spawn(async move { watcher_run(&cfg_path, extra.as_deref(), "runtest").await });
         let child = await_recorded_child(&pid_file).await;
 
         let msg = watcher_stop(&config_path(), config_path_extra().as_deref(), "runtest")
@@ -4245,7 +4408,11 @@ mod tests {
         let ov = dir.path().join("watchers.override.conf");
         let sentinel = format!("cw-runtest-monitor-{}", unique_token("w"));
         let script = make_poller_script(dir.path(), &sentinel, "30");
-        std::fs::write(&cfg, format!("runtest|{}|1|true|{} --quiet 10\n", sentinel, script)).unwrap();
+        std::fs::write(
+            &cfg,
+            format!("runtest|{}|1|true|{} --quiet 10\n", sentinel, script),
+        )
+        .unwrap();
         std::fs::write(&ov, "runtest|mode=monitor\n").unwrap();
 
         let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
@@ -4266,10 +4433,17 @@ mod tests {
             intent
         );
         // Nothing was spawned: no pid file, no live poller matching the sentinel.
-        assert!(!pid_dir.join("runtest.pid").exists(), "monitor mode must not claim the one-shot pid slot");
+        assert!(
+            !pid_dir.join("runtest.pid").exists(),
+            "monitor mode must not claim the one-shot pid slot"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let pids = process_pids(&sentinel).await;
-        assert!(pids.is_empty(), "monitor mode must not exec the start_cmd, found {:?}", pids);
+        assert!(
+            pids.is_empty(),
+            "monitor mode must not exec the start_cmd, found {:?}",
+            pids
+        );
     }
 
     /// `watcher_run` for a watcher with no PID file and no poller → starts.
@@ -4502,7 +4676,10 @@ mod tests {
             }
             for j in joins {
                 let statuses = j.await.expect("status task");
-                let s = statuses.iter().find(|s| s.name == "dups").expect("dups row");
+                let s = statuses
+                    .iter()
+                    .find(|s| s.name == "dups")
+                    .expect("dups row");
                 assert_eq!(
                     s.status, "ok",
                     "one real poller under concurrent probing must never read \
@@ -4553,15 +4730,28 @@ mod tests {
 
         // Fresh pollers are under the transient floor: the status must NOT
         // flag them yet (this is exactly the window a probe child lives in).
-        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let statuses =
+            watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
         let s = statuses.iter().find(|s| s.name == "dupr").unwrap();
-        assert_eq!(s.status, "ok", "pollers younger than the floor are not yet DUPLICATE: {:?}", s);
+        assert_eq!(
+            s.status, "ok",
+            "pollers younger than the floor are not yet DUPLICATE: {:?}",
+            s
+        );
 
         // Let them age past the floor; a real duplicate is long-lived.
-        tokio::time::sleep(std::time::Duration::from_secs_f64(DUPLICATE_MIN_AGE_SECS + 0.5)).await;
-        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        tokio::time::sleep(std::time::Duration::from_secs_f64(
+            DUPLICATE_MIN_AGE_SECS + 0.5,
+        ))
+        .await;
+        let statuses =
+            watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
         let s = statuses.iter().find(|s| s.name == "dupr").unwrap();
-        assert_eq!(s.status, "DUPLICATE", "two long-lived pollers must read DUPLICATE: {:?}", s);
+        assert_eq!(
+            s.status, "DUPLICATE",
+            "two long-lived pollers must read DUPLICATE: {:?}",
+            s
+        );
         let mut dups = s.dup_pollers.clone();
         dups.sort_unstable();
         let mut want = vec![pid_a, pid_b];
@@ -4587,7 +4777,11 @@ mod tests {
 
         let stem = format!("claude-event-watch-{}", unique_token("dead"));
         let launcher_sh = format!("/opt/x/{}.sh", stem);
-        std::fs::write(&cfg, format!("evw|{}|1|true|{}\n", launcher_sh, launcher_sh)).unwrap();
+        std::fs::write(
+            &cfg,
+            format!("evw|{}|1|true|{}\n", launcher_sh, launcher_sh),
+        )
+        .unwrap();
 
         // Record a definitely-dead PID in <name>.lock.
         let lock_file = pid_dir.join("evw.lock");
@@ -4596,7 +4790,10 @@ mod tests {
         let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
 
         let statuses = watcher_status(&config_path(), config_path_extra().as_deref()).await;
-        let evw = statuses.iter().find(|s| s.name == "evw").expect("evw present");
+        let evw = statuses
+            .iter()
+            .find(|s| s.name == "evw")
+            .expect("evw present");
         assert_eq!(
             evw.status, "DOWN",
             "a stale <name>.lock (dead recorded PID) must read as DOWN, got {:?}",
@@ -4621,7 +4818,9 @@ mod tests {
 
     /// Write a monitor-mode fixture (base line + override flip) + pid dir and
     /// return (pid_dir, cfg, ov).
-    fn monitor_fixture(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    fn monitor_fixture(
+        dir: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let pid_dir = dir.join("pids");
         std::fs::create_dir_all(&pid_dir).unwrap();
         let cfg = dir.join("watchers.conf");
@@ -4634,14 +4833,21 @@ mod tests {
     fn write_intent(pid_dir: &std::path::Path, age_secs: u64) {
         std::fs::write(
             pid_dir.join("evw.monitor-intent"),
-            format!("epoch={}\ncommand=/opt/x/evw.sh --mode monitor\n", epoch_now() - age_secs),
+            format!(
+                "epoch={}\ncommand=/opt/x/evw.sh --mode monitor\n",
+                epoch_now() - age_secs
+            ),
         )
         .unwrap();
     }
 
     async fn evw_status(grace: f64) -> WatcherStatus {
-        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), grace).await;
-        statuses.into_iter().find(|s| s.name == "evw").expect("evw present")
+        let statuses =
+            watcher_status_with(&config_path(), config_path_extra().as_deref(), grace).await;
+        statuses
+            .into_iter()
+            .find(|s| s.name == "evw")
+            .expect("evw present")
     }
 
     /// Fresh intent, no runtime file: the loop just ran `watcher-ctl run` and
@@ -4658,7 +4864,10 @@ mod tests {
         assert_eq!(evw.status, "ARMING", "{:?}", evw);
         assert_eq!(evw.count, 0);
         assert_eq!(evw.mode, "monitor");
-        assert!(!any_unhealthy(std::slice::from_ref(&evw)), "ARMING must not trip --unhealthy-only");
+        assert!(
+            !any_unhealthy(std::slice::from_ref(&evw)),
+            "ARMING must not trip --unhealthy-only"
+        );
 
         // A STALE lock (dead pid, older than the intent — e.g. left by the
         // one-shot era) does not consume the intent: still ARMING.
@@ -4670,7 +4879,11 @@ mod tests {
         )
         .unwrap();
         let evw = evw_status(120.0).await;
-        assert_eq!(evw.status, "ARMING", "stale lock older than intent: {:?}", evw);
+        assert_eq!(
+            evw.status, "ARMING",
+            "stale lock older than intent: {:?}",
+            evw
+        );
 
         // Grace 0 disables the state entirely -> plain DOWN.
         let evw = evw_status(0.0).await;
@@ -4715,7 +4928,11 @@ mod tests {
         std::env::set_var("WATCHERS_CONFIG_EXTRA", ov.to_str().unwrap());
 
         let evw = evw_status(120.0).await;
-        assert_eq!(evw.status, "DOWN", "consumed intent + dead monitor => DOWN: {:?}", evw);
+        assert_eq!(
+            evw.status, "DOWN",
+            "consumed intent + dead monitor => DOWN: {:?}",
+            evw
+        );
     }
 
     /// A ONESHOT watcher never reads ARMING, even with a (stray) intent file:
@@ -4731,14 +4948,21 @@ mod tests {
         let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
 
         let evw = evw_status(120.0).await;
-        assert_eq!(evw.status, "DOWN", "oneshot + intent => still DOWN: {:?}", evw);
+        assert_eq!(
+            evw.status, "DOWN",
+            "oneshot + intent => still DOWN: {:?}",
+            evw
+        );
     }
 
     /// Fixture for the live-count tests: ONE enabled watcher named `evw` with
     /// NO start_cmd (so a live recorded pid is itself evidence of UP — the
     /// test process's own pid stands in for the watcher) and a pgrep pattern
     /// nothing on the host matches. `monitor` layers `mode=monitor` over it.
-    fn live_count_fixture(dir: &std::path::Path, monitor: bool) -> (std::path::PathBuf, String, String) {
+    fn live_count_fixture(
+        dir: &std::path::Path,
+        monitor: bool,
+    ) -> (std::path::PathBuf, String, String) {
         let pid_dir = dir.join("pids");
         std::fs::create_dir_all(&pid_dir).unwrap();
         let cfg = dir.join("watchers.conf");
@@ -4771,8 +4995,12 @@ mod tests {
         let _env = RunEnv::new(pid_dir.to_str().unwrap(), &cfg);
         std::env::set_var("WATCHERS_CONFIG_EXTRA", &ov);
 
-        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
-        let evw = statuses.iter().find(|s| s.name == "evw").expect("evw present");
+        let statuses =
+            watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let evw = statuses
+            .iter()
+            .find(|s| s.name == "evw")
+            .expect("evw present");
         assert_eq!(evw.status, "ok", "{:?}", evw);
         assert_eq!(evw.mode, "monitor");
         assert_eq!(evw.count, 1);
@@ -4782,14 +5010,16 @@ mod tests {
         // ARMING (fresh intent, no live pid) is healthy-pending: still LIVE.
         std::fs::remove_file(pid_dir.join("evw.lock")).unwrap();
         write_intent(&pid_dir, 10);
-        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let statuses =
+            watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
         let evw = statuses.iter().find(|s| s.name == "evw").unwrap();
         assert_eq!(evw.status, "ARMING", "{:?}", evw);
         assert!(evw.is_live(), "ARMING must count as live");
         assert_eq!(count_live_and_enabled(&statuses), (1, 1));
 
         // Past the grace with nothing live → DOWN → not live, still enabled.
-        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 0.0).await;
+        let statuses =
+            watcher_status_with(&config_path(), config_path_extra().as_deref(), 0.0).await;
         let evw = statuses.iter().find(|s| s.name == "evw").unwrap();
         assert_eq!(evw.status, "DOWN", "{:?}", evw);
         assert!(!evw.is_live());
@@ -4807,8 +5037,12 @@ mod tests {
         let _env = RunEnv::new(pid_dir.to_str().unwrap(), &cfg);
         std::env::set_var("WATCHERS_CONFIG_EXTRA", &ov);
 
-        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
-        let evw = statuses.iter().find(|s| s.name == "evw").expect("evw present");
+        let statuses =
+            watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let evw = statuses
+            .iter()
+            .find(|s| s.name == "evw")
+            .expect("evw present");
         assert_eq!(evw.status, "ok", "{:?}", evw);
         assert_eq!(evw.mode, "oneshot");
         assert!(evw.is_live());
@@ -4816,7 +5050,8 @@ mod tests {
 
         // Dead recorded pid → DOWN → not live.
         std::fs::write(pid_dir.join("evw.pid"), (u32::MAX - 1).to_string()).unwrap();
-        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let statuses =
+            watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
         let evw = statuses.iter().find(|s| s.name == "evw").unwrap();
         assert_eq!(evw.status, "DOWN", "{:?}", evw);
         assert_eq!(count_live_and_enabled(&statuses), (0, 1));
@@ -4918,10 +5153,20 @@ mod tests {
 
         let msg = watcher_restart(&config_path(), config_path_extra().as_deref()).await;
         assert!(msg.contains("Cleaned PID files"), "{}", msg);
-        assert!(!pid_dir.join("evw.monitor-intent").exists(), "intent removed by restart");
-        assert!(!pid_dir.join("other.pid").exists(), "pid files still cleaned");
+        assert!(
+            !pid_dir.join("evw.monitor-intent").exists(),
+            "intent removed by restart"
+        );
+        assert!(
+            !pid_dir.join("other.pid").exists(),
+            "pid files still cleaned"
+        );
         let evw = evw_status(120.0).await;
-        assert_eq!(evw.status, "DOWN", "after restart, no intent => DOWN: {:?}", evw);
+        assert_eq!(
+            evw.status, "DOWN",
+            "after restart, no intent => DOWN: {:?}",
+            evw
+        );
     }
 
     /// Portable (macOS + Linux) PURE coverage of the exec-argv fix decision
@@ -4955,9 +5200,17 @@ mod tests {
         // Missing pidfile → DOWN.
         assert!(crate::status::pidfile_watcher_is_down(None, false, false));
         // Stale pidfile (recorded PID dead) → DOWN.
-        assert!(crate::status::pidfile_watcher_is_down(Some(4242), false, false));
+        assert!(crate::status::pidfile_watcher_is_down(
+            Some(4242),
+            false,
+            false
+        ));
         // Recycled PID (alive but cmdline mismatch) → DOWN.
-        assert!(crate::status::pidfile_watcher_is_down(Some(4242), true, false));
+        assert!(crate::status::pidfile_watcher_is_down(
+            Some(4242),
+            true,
+            false
+        ));
     }
 
     /// `pid_matches_watcher` must tolerate the exec-to-binary transform too:
@@ -4977,10 +5230,7 @@ mod tests {
             crate::status::strip_script_suffix("memory-remind.bash"),
             "memory-remind"
         );
-        assert_eq!(
-            crate::status::strip_script_suffix("emit.py"),
-            "emit"
-        );
+        assert_eq!(crate::status::strip_script_suffix("emit.py"), "emit");
         // No known extension → unchanged.
         assert_eq!(
             crate::status::strip_script_suffix("claude-event-watch"),

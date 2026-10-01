@@ -290,7 +290,10 @@ mod tests {
     fn already_lapsed_is_expired_not_expiring() {
         // The reactive reauth path owns a dead credential. If this returned
         // Expiring, the proactive path would race it into the same modal.
-        assert_eq!(classify(Some(NOW - 1), None, NOW), CredentialExpiry::Expired);
+        assert_eq!(
+            classify(Some(NOW - 1), None, NOW),
+            CredentialExpiry::Expired
+        );
         assert_eq!(
             classify(Some(NOW - 10 * DAY_MS), None, NOW),
             CredentialExpiry::Expired

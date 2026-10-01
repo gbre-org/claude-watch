@@ -416,7 +416,15 @@ where
                 .filter(|r| !r.trim().is_empty())
                 .map(|r| format!("wedged: {r}"))
                 .unwrap_or_else(|| "wedged (no reason given)".to_string());
-            push_unique(&mut out, already_emitted, it, &summary, Condition::Stuck, detail, None);
+            push_unique(
+                &mut out,
+                already_emitted,
+                it,
+                &summary,
+                Condition::Stuck,
+                detail,
+                None,
+            );
             continue;
         }
 
@@ -453,7 +461,11 @@ where
                 // path would false-positive here).
                 continue;
             }
-            AgentLiveness::Dead { agent_id, age_secs, in_flight_tool_use } => {
+            AgentLiveness::Dead {
+                agent_id,
+                age_secs,
+                in_flight_tool_use,
+            } => {
                 // Parked inside a long-running tool call → alive-in-spirit;
                 // NEVER a soft orphan either. Mirrors the load-bearing
                 // exclusion in `compute_hard_gate_orphans`: an agent that is
@@ -617,7 +629,13 @@ pub fn build_message(condition: Condition, qualifying: &[Qualifying]) -> String 
         .take(TOP_N)
         .map(|q| format!("{} [{}] ({})", q.id, q.summary, q.detail))
         .collect();
-    let mut msg = format!("{} queue {} {}: {}", n, plural, condition.label(), shown.join("; "));
+    let mut msg = format!(
+        "{} queue {} {}: {}",
+        n,
+        plural,
+        condition.label(),
+        shown.join("; ")
+    );
     if n > TOP_N {
         msg.push_str(&format!(" (+{} more)", n - TOP_N));
     }
@@ -794,7 +812,10 @@ fn pid_is_alive(pid: i64) -> bool {
 /// yields `NoRecord`, a fresh record `Alive`, a stale record `Dead`.
 fn build_agent_liveness(
     state_dir: &Path,
-) -> (std::collections::HashMap<String, crate::active_agents::AgentRecord>, bool) {
+) -> (
+    std::collections::HashMap<String, crate::active_agents::AgentRecord>,
+    bool,
+) {
     let path = state_dir.join("active-agents.json");
     match crate::active_agents::load_agent_state(&path) {
         Some(state) => (crate::active_agents::agents_by_queue_id(&state), true),
@@ -968,7 +989,9 @@ pub fn compute_escalations(
     let mut to_alert: Vec<String> = Vec::new();
     let mut next: State = State::new();
     for o in orphans {
-        let last = escalate_state.get(&o.id).and_then(|s| parse_iso_epoch_secs(s));
+        let last = escalate_state
+            .get(&o.id)
+            .and_then(|s| parse_iso_epoch_secs(s));
         let due = match last {
             Some(prev) => (now_epoch_secs - prev) >= cooldown_secs,
             None => true,
@@ -1086,7 +1109,12 @@ fn run_hard_gate(
             pending_path.display()
         );
         for o in &orphans {
-            println!("  - {} (agent {}, {})", o.id, o.agent_id, fmt_age(o.age_secs));
+            println!(
+                "  - {} (agent {}, {})",
+                o.id,
+                o.agent_id,
+                fmt_age(o.age_secs)
+            );
         }
         return;
     }
@@ -1125,7 +1153,10 @@ fn run_hard_gate(
     // somehow alive -- so this can never abandon a live item.
     if auto_abandon > 0 {
         for o in &orphans {
-            if o.age_secs.map(|a| a as i64 >= auto_abandon).unwrap_or(false) {
+            if o.age_secs
+                .map(|a| a as i64 >= auto_abandon)
+                .unwrap_or(false)
+            {
                 let reason = format!(
                     "auto-abandoned by claude-watch: orphaned-running, agent {} dead {} (> {}s grace)",
                     o.agent_id,
@@ -1134,7 +1165,14 @@ fn run_hard_gate(
                 );
                 match run_session_task_raw(
                     cli,
-                    &["queue", "abandon", &o.id, "--confirmed-dead", "--reason", &reason],
+                    &[
+                        "queue",
+                        "abandon",
+                        &o.id,
+                        "--confirmed-dead",
+                        "--reason",
+                        &reason,
+                    ],
                     15,
                 ) {
                     Ok(_) => eprintln!("[hard-gate] auto-abandoned orphan {}", o.id),
@@ -1144,7 +1182,6 @@ fn run_hard_gate(
         }
     }
 }
-
 
 /// CLI entry point. Returns the process exit code.
 ///
@@ -1188,8 +1225,7 @@ pub fn corroborate_soft_orphans(
     let mut next_sightings: State = State::new();
     let mut held_for_corroboration: Vec<String> = Vec::new();
     qualifying.retain(|q| {
-        let soft_transcript_orphan =
-            q.condition == Condition::Orphaned && q.agent_id.is_some();
+        let soft_transcript_orphan = q.condition == Condition::Orphaned && q.agent_id.is_some();
         if !soft_transcript_orphan {
             return true; // authoritative orphan or stuck — never gated
         }
@@ -1235,7 +1271,9 @@ pub fn cmd_queue_check(
     };
     let current_ids: HashSet<String> = all_items.iter().map(|it| it.id.clone()).collect();
 
-    let state_dir = state_dir.map(PathBuf::from).unwrap_or_else(default_state_dir);
+    let state_dir = state_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_state_dir);
     let state_file = state_dir.join("queue-check-state.json");
     let state = load_state(&state_file);
     let pruned = prune_state(&state, &current_ids);
@@ -1371,10 +1409,7 @@ pub fn cmd_queue_check(
     let user = std::env::var("USER").unwrap_or_default();
     let pid = std::process::id();
 
-    for (condition, batch) in [
-        (Condition::Orphaned, &orphaned),
-        (Condition::Stuck, &stuck),
-    ] {
+    for (condition, batch) in [(Condition::Orphaned, &orphaned), (Condition::Stuck, &stuck)] {
         if batch.is_empty() {
             continue;
         }
@@ -1523,7 +1558,13 @@ mod tests {
     fn hard_gate_flags_confirmed_dead() {
         let items = vec![running_item_registered("q-1", 60)];
         let now = Utc::now().timestamp();
-        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(Some(5683), false));
+        let o = compute_hard_gate_orphans(
+            &items,
+            now,
+            GRACE,
+            HARD_GRACE,
+            dead_lookup(Some(5683), false),
+        );
         assert_eq!(o.len(), 1);
         assert_eq!(o[0].id, "q-1");
         assert_eq!(o[0].agent_id, "agent-x");
@@ -1535,7 +1576,13 @@ mod tests {
         // NEVER a hard orphan (the load-bearing exclusion).
         let items = vec![running_item_registered("q-1", 60)];
         let now = Utc::now().timestamp();
-        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(Some(5683), true));
+        let o = compute_hard_gate_orphans(
+            &items,
+            now,
+            GRACE,
+            HARD_GRACE,
+            dead_lookup(Some(5683), true),
+        );
         assert!(o.is_empty());
     }
 
@@ -1552,7 +1599,13 @@ mod tests {
         // age 300s < hard grace 600s -> not yet a hard orphan.
         let items = vec![running_item_registered("q-1", 60)];
         let now = Utc::now().timestamp();
-        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(Some(300), false));
+        let o = compute_hard_gate_orphans(
+            &items,
+            now,
+            GRACE,
+            HARD_GRACE,
+            dead_lookup(Some(300), false),
+        );
         assert!(o.is_empty());
     }
 
@@ -1562,7 +1615,13 @@ mod tests {
         // suppresses even a dead verdict.
         let items = vec![running_item_registered("q-1", 0)];
         let now = Utc::now().timestamp();
-        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(Some(5683), false));
+        let o = compute_hard_gate_orphans(
+            &items,
+            now,
+            GRACE,
+            HARD_GRACE,
+            dead_lookup(Some(5683), false),
+        );
         assert!(o.is_empty());
     }
 
@@ -1570,8 +1629,13 @@ mod tests {
     fn hard_gate_default_open_alive_norecord_unknown() {
         let items = vec![running_item_registered("q-1", 60)];
         let now = Utc::now().timestamp();
-        assert!(compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, all_agents_alive).is_empty());
-        assert!(compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, all_agents_no_record).is_empty());
+        assert!(
+            compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, all_agents_alive).is_empty()
+        );
+        assert!(
+            compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, all_agents_no_record)
+                .is_empty()
+        );
         assert!(compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, no_agents).is_empty());
     }
 
@@ -1580,7 +1644,13 @@ mod tests {
         let mut it = running_item_registered("q-1", 60);
         it.status = "blocked".to_string();
         let now = Utc::now().timestamp();
-        let o = compute_hard_gate_orphans(&[it], now, GRACE, HARD_GRACE, dead_lookup(Some(5683), false));
+        let o = compute_hard_gate_orphans(
+            &[it],
+            now,
+            GRACE,
+            HARD_GRACE,
+            dead_lookup(Some(5683), false),
+        );
         assert!(o.is_empty());
     }
 
@@ -1601,8 +1671,13 @@ mod tests {
         let (alert2, _s2) = compute_escalations(&orphans, &state1, now + 60, 1800, &now_iso);
         assert!(alert2.is_empty());
         // past cooldown -> fires again
-        let (alert3, _s3) =
-            compute_escalations(&orphans, &state1, now + 2000, 1800, &Utc::now().to_rfc3339());
+        let (alert3, _s3) = compute_escalations(
+            &orphans,
+            &state1,
+            now + 2000,
+            1800,
+            &Utc::now().to_rfc3339(),
+        );
         assert_eq!(alert3, vec!["q-1".to_string()]);
     }
 
@@ -1612,7 +1687,8 @@ mod tests {
         let mut prev = State::new();
         prev.insert("q-old".to_string(), Utc::now().to_rfc3339());
         let now = Utc::now().timestamp();
-        let (alert, next) = compute_escalations(&orphans, &prev, now, 1800, &Utc::now().to_rfc3339());
+        let (alert, next) =
+            compute_escalations(&orphans, &prev, now, 1800, &Utc::now().to_rfc3339());
         assert!(alert.is_empty());
         assert!(next.is_empty(), "resolved qid pruned from escalate ledger");
     }
@@ -1641,12 +1717,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn orphaned_when_pid_dead() {
         let items = vec![item("q-1", "running", Some(4242), None)];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_dead,
+            no_agents,
+        );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].id, "q-1");
         assert_eq!(q[0].condition, Condition::Orphaned);
@@ -1657,7 +1740,15 @@ mod tests {
     fn not_orphaned_when_pid_alive() {
         let items = vec![item("q-1", "running", Some(4242), None)];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_alive, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            no_agents,
+        );
         assert!(q.is_empty());
     }
 
@@ -1667,7 +1758,15 @@ mod tests {
         let hb = iso_n_min_ago(0);
         let items = vec![item("q-1", "running", None, Some(&hb))];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_dead,
+            no_agents,
+        );
         assert!(q.is_empty());
     }
 
@@ -1691,7 +1790,13 @@ mod tests {
         it.last_heartbeat_at = Some(iso_n_min_ago(30));
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_alive,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_alive,
         );
         assert!(q.is_empty(), "{:?}", q);
     }
@@ -1702,7 +1807,13 @@ mod tests {
         let it = running_reg("q-died", 30, &[]);
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_dead,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_dead,
         );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].id, "q-died");
@@ -1718,7 +1829,13 @@ mod tests {
         let it = running_reg("q-died", 30, &[]);
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_dead,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_dead,
         );
         assert_eq!(q.len(), 1);
         assert!(q[0].detail.contains("agent-dead01"), "{}", q[0].detail);
@@ -1737,7 +1854,13 @@ mod tests {
         it.last_heartbeat_at = Some(iso_n_min_ago(0));
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_dead,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_dead,
         );
         assert!(q.is_empty(), "{:?}", q);
     }
@@ -1749,7 +1872,13 @@ mod tests {
         let it = running_reg("q-old-dead", 10, &[]); // 10 min > 150s grace
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_dead,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_dead,
         );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Orphaned);
@@ -1762,7 +1891,13 @@ mod tests {
         let it = running_reg("q-never", 10, &[]); // 10 min > 150s grace
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_no_record,
         );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].id, "q-never");
@@ -1777,7 +1912,13 @@ mod tests {
         let it = running_reg("q-fresh", 1, &[]);
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_no_record,
         );
         assert!(q.is_empty(), "{:?}", q);
     }
@@ -1789,7 +1930,13 @@ mod tests {
         let it = running_reg("q-wl", 60, &["workload:stv-promote"]);
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_no_record,
         );
         assert!(q.is_empty(), "{:?}", q);
     }
@@ -1799,7 +1946,13 @@ mod tests {
         let it = running_reg("q-hj", 60, &["hostjob:qc-build"]);
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_no_record,
         );
         assert!(q.is_empty(), "{:?}", q);
     }
@@ -1813,7 +1966,13 @@ mod tests {
         it.last_heartbeat_at = Some(iso_n_min_ago(30));
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, no_agents,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            no_agents,
         );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Stuck);
@@ -1827,7 +1986,13 @@ mod tests {
         it.last_heartbeat_at = Some(iso_n_min_ago(1));
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, no_agents,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            no_agents,
         );
         assert!(q.is_empty(), "{:?}", q);
     }
@@ -1840,7 +2005,13 @@ mod tests {
         it.registered_at = Some(iso_n_min_ago(30));
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_dead, all_agents_alive,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_dead,
+            all_agents_alive,
         );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Orphaned);
@@ -1857,7 +2028,13 @@ mod tests {
         it.started_at = None;
         let now = Utc::now().timestamp();
         let q = compute_qualifying(
-            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            all_agents_no_record,
         );
         assert!(q.is_empty(), "{:?}", q);
     }
@@ -1867,7 +2044,15 @@ mod tests {
         let mut it = item("q-w", "wedged", None, None);
         it.wedged_reason = Some("context-limit".to_string());
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&[it], &State::new(), now, 15 * 60, GRACE, all_alive, no_agents);
+        let q = compute_qualifying(
+            &[it],
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            no_agents,
+        );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Stuck);
         assert!(q[0].detail.contains("context-limit"));
@@ -1878,7 +2063,15 @@ mod tests {
         let hb = iso_n_min_ago(30); // 30 min old, threshold 15
         let items = vec![item("q-s", "running", None, Some(&hb))];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_alive, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            no_agents,
+        );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Stuck);
         assert!(q[0].detail.contains("min"));
@@ -1889,7 +2082,15 @@ mod tests {
         let hb = iso_n_min_ago(2);
         let items = vec![item("q-s", "running", None, Some(&hb))];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_alive, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_alive,
+            no_agents,
+        );
         assert!(q.is_empty());
     }
 
@@ -1899,7 +2100,15 @@ mod tests {
         let hb = iso_n_min_ago(30);
         let items = vec![item("q-1", "running", Some(9999), Some(&hb))];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_dead,
+            no_agents,
+        );
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Orphaned);
     }
@@ -1908,7 +2117,15 @@ mod tests {
     fn pending_items_ignored() {
         let items = vec![item("q-p", "pending", Some(1), None)];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_dead,
+            no_agents,
+        );
         assert!(q.is_empty());
     }
 
@@ -1916,7 +2133,15 @@ mod tests {
     fn completed_items_ignored() {
         let items = vec![item("q-c", "completed", Some(1), None)];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_dead,
+            no_agents,
+        );
         assert!(q.is_empty());
     }
 
@@ -1924,7 +2149,10 @@ mod tests {
     fn dedup_skips_already_emitted_same_condition() {
         let items = vec![item("q-1", "running", Some(4242), None)];
         let mut state = State::new();
-        state.insert("q-1::orphaned".to_string(), "2026-06-03T00:00:00Z".to_string());
+        state.insert(
+            "q-1::orphaned".to_string(),
+            "2026-06-03T00:00:00Z".to_string(),
+        );
         let now = Utc::now().timestamp();
         let q = compute_qualifying(&items, &state, now, 15 * 60, GRACE, all_dead, no_agents);
         assert!(q.is_empty());
@@ -1950,7 +2178,15 @@ mod tests {
             item("q-orphan", "running", Some(8888), None),
         ];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
+        let q = compute_qualifying(
+            &items,
+            &State::new(),
+            now,
+            15 * 60,
+            GRACE,
+            all_dead,
+            no_agents,
+        );
         assert_eq!(q.len(), 2);
         assert_eq!(q[0].condition, Condition::Orphaned);
         assert_eq!(q[1].condition, Condition::Stuck);
@@ -2017,7 +2253,10 @@ mod tests {
             })
             .collect();
         let msg = build_message(Condition::Orphaned, &q);
-        assert!(msg.contains(&format!("{} queue items orphaned", TOP_N + 2)), "{msg}");
+        assert!(
+            msg.contains(&format!("{} queue items orphaned", TOP_N + 2)),
+            "{msg}"
+        );
         assert!(msg.contains("(+2 more)"), "{msg}");
     }
 
@@ -2037,7 +2276,14 @@ mod tests {
             detail: "agent agent-xyz transcript stale 3m ago (died after spawn)".to_string(),
             agent_id: Some("agent-xyz".to_string()),
         }];
-        let v = build_event_json(Condition::Orphaned, &q, "2026-06-03T01:30:00Z", "host", "user", 1234);
+        let v = build_event_json(
+            Condition::Orphaned,
+            &q,
+            "2026-06-03T01:30:00Z",
+            "host",
+            "user",
+            1234,
+        );
         assert_eq!(v["tag"], EVENT_TAG_ORPHANED);
         assert_eq!(v["source"], EVENT_SOURCE);
         assert_eq!(v["source_name"], EVENT_SOURCE_NAME);
@@ -2141,15 +2387,15 @@ mod tests {
         assert_eq!(q[0].id, "q-1");
         assert!(out.held_for_corroboration.is_empty());
         // First-seen timestamp is preserved across ticks (audit).
-        assert_eq!(out.next_sightings.get("q-1").unwrap(), "2026-09-28T00:00:00Z");
+        assert_eq!(
+            out.next_sightings.get("q-1").unwrap(),
+            "2026-09-28T00:00:00Z"
+        );
     }
 
     #[test]
     fn corroborate_never_gates_authoritative_or_stuck() {
-        let mut q = vec![
-            authoritative_orphan("q-pid"),
-            stuck_item("q-stuck"),
-        ];
+        let mut q = vec![authoritative_orphan("q-pid"), stuck_item("q-stuck")];
         let out = corroborate_soft_orphans(&mut q, &State::new(), "2026-09-28T00:00:00Z");
         // Both retained on the very first tick — never gated.
         assert_eq!(q.len(), 2);
@@ -2168,8 +2414,10 @@ mod tests {
         let mut q = vec![soft_orphan("q-new")];
         let out = corroborate_soft_orphans(&mut q, &prior, "2026-09-28T00:05:00Z");
         assert!(q.is_empty(), "a different qid is a first sighting");
-        assert!(!out.next_sightings.contains_key("q-old"), "cleared qid resets");
+        assert!(
+            !out.next_sightings.contains_key("q-old"),
+            "cleared qid resets"
+        );
         assert!(out.next_sightings.contains_key("q-new"));
     }
-
 }

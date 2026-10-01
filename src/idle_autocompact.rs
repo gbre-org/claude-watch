@@ -225,8 +225,8 @@ pub fn queue_is_empty(timeout_secs: u64) -> Option<bool> {
     let cli = find_session_task_cli()?;
 
     // Running items: any item in the full list with status "running".
-    let all = run_session_task_json(&cli, &["queue", "list", "--all", "--json"], timeout_secs)
-        .ok()?;
+    let all =
+        run_session_task_json(&cli, &["queue", "list", "--all", "--json"], timeout_secs).ok()?;
     let any_running = all.iter().any(|it| it.status == "running");
     if any_running {
         return Some(false);

@@ -135,11 +135,7 @@ pub const MEMORY_REMINDER_IDLE_INTERVAL_SECS: u64 = 7200;
 /// [`CadenceTracker::apply_intervals`], which preserves the last-fired instant,
 /// so switching regimes never replays a startup burst and a shortened interval
 /// (operator returns) takes effect measured from the real last emission.
-pub fn effective_memory_interval_secs(
-    base_secs: u64,
-    idle_secs: u64,
-    operator_away: bool,
-) -> u64 {
+pub fn effective_memory_interval_secs(base_secs: u64, idle_secs: u64, operator_away: bool) -> u64 {
     if operator_away && idle_secs > 0 {
         base_secs.max(idle_secs)
     } else {
@@ -333,19 +329,13 @@ mod tests {
         // Operator PRESENT => always the base interval, even if an idle
         // interval is configured. Responsiveness is never harmed by the
         // backoff while someone is at the desk.
-        assert_eq!(
-            effective_memory_interval_secs(1800, 7200, false),
-            1800
-        );
+        assert_eq!(effective_memory_interval_secs(1800, 7200, false), 1800);
     }
 
     #[test]
     fn effective_memory_interval_backs_off_when_away() {
         // Operator AWAY + idle configured => the longer idle interval.
-        assert_eq!(
-            effective_memory_interval_secs(1800, 7200, true),
-            7200
-        );
+        assert_eq!(effective_memory_interval_secs(1800, 7200, true), 7200);
     }
 
     #[test]
@@ -353,10 +343,7 @@ mod tests {
         // idle == 0 means "no backoff": use the base even when away. This is
         // the field default, so a deployment that does not opt in behaves
         // exactly as before this change.
-        assert_eq!(
-            effective_memory_interval_secs(1800, 0, true),
-            1800
-        );
+        assert_eq!(effective_memory_interval_secs(1800, 0, true), 1800);
     }
 
     #[test]
@@ -383,12 +370,8 @@ mod tests {
     fn effective_memory_interval_never_shortens_base() {
         // A mis-set idle interval SHORTER than the base must never shorten the
         // base (that would INCREASE idle spend). The max() guards it.
-        assert_eq!(
-            effective_memory_interval_secs(1800, 600, true),
-            1800
-        );
+        assert_eq!(effective_memory_interval_secs(1800, 600, true), 1800);
     }
-
 
     /// Model the daemon's loop pass with keepalive emission UNCONDITIONAL
     /// (as if the ack gate always let it through): call `due` and, when
@@ -430,10 +413,8 @@ mod tests {
 
     #[test]
     fn keepalive_fires_at_its_interval_but_not_reminder() {
-        let mut t = CadenceTracker::with_intervals(
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-        );
+        let mut t =
+            CadenceTracker::with_intervals(Duration::from_secs(60), Duration::from_secs(900));
         let start = Instant::now();
         let _ = tick(&mut t, start); // arm both
 
@@ -450,10 +431,8 @@ mod tests {
 
     #[test]
     fn reminder_fires_at_its_interval() {
-        let mut t = CadenceTracker::with_intervals(
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-        );
+        let mut t =
+            CadenceTracker::with_intervals(Duration::from_secs(60), Duration::from_secs(900));
         let start = Instant::now();
         let _ = tick(&mut t, start); // arm both
 
@@ -470,10 +449,8 @@ mod tests {
 
     #[test]
     fn timers_are_independent() {
-        let mut t = CadenceTracker::with_intervals(
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-        );
+        let mut t =
+            CadenceTracker::with_intervals(Duration::from_secs(60), Duration::from_secs(900));
         let start = Instant::now();
         let _ = tick(&mut t, start);
 
@@ -494,10 +471,8 @@ mod tests {
     fn slow_loop_does_not_replay_missed_ticks() {
         // If the loop stalls and we call due() once after a long gap, we
         // get at most one event of each kind — not one per missed interval.
-        let mut t = CadenceTracker::with_intervals(
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-        );
+        let mut t =
+            CadenceTracker::with_intervals(Duration::from_secs(60), Duration::from_secs(900));
         let start = Instant::now();
         let _ = tick(&mut t, start);
 

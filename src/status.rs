@@ -246,8 +246,7 @@ fn line_contains_word(line: &str, word: &str) -> bool {
 }
 
 pub(crate) fn pane_shows_active_ui(pane_text: &str) -> bool {
-    let thinking_re =
-        Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
+    let thinking_re = Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
     // Bare status-bar concurrent-task counters that are NOT already covered
     // by a more specific check below (`monitor(?:s)?` mirrors the
     // `bash_re` alternation added to `parse_status_bar_with_diag`'s
@@ -339,8 +338,7 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
     // generic status-bar match. The dedicated `token_thinking_re` pass below
     // still recovers a thinking-indicator count when the status bar carries
     // no total of its own, so no coverage is lost.
-    let arrow_counter_re =
-        Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
+    let arrow_counter_re = Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
     // Claude Code has used multiple names for the concurrent-task counter:
     // `bashes` (old), `background tasks` (mid), and `shells` (2.1.94+). Match
     // all of them — including the singular forms (status bar shows
@@ -528,7 +526,8 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
     // status-bar marker: even though none of them carries a trustworthy
     // token total, they're all known UI states, and we don't want
     // `is_parse_miss` to flag a pane that's simply mid-turn.
-    let saw_status_bar = has_status_bar || overlay_visible || saw_thinking_indicator || saw_agent_roster;
+    let saw_status_bar =
+        has_status_bar || overlay_visible || saw_thinking_indicator || saw_agent_roster;
 
     (result, saw_status_bar)
 }
@@ -896,7 +895,9 @@ pub(crate) fn is_claude_tui_exe(exe_path: &str) -> bool {
 /// so `2.1.245 > 2.1.99` (numeric, not lexical).
 pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     fn parts(s: &str) -> Vec<u64> {
-        s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect()
+        s.split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect()
     }
     parts(a).cmp(&parts(b))
 }
@@ -1997,7 +1998,9 @@ pub(crate) fn watcher_pidfile_liveness_multi(
 pub(crate) fn watcher_runtime_file_age_secs_multi(dirs: &[String], name: &str) -> Option<f64> {
     dirs.iter()
         .filter_map(|d| watcher_runtime_file_age_secs(d, name))
-        .fold(None, |acc, age| Some(acc.map_or(age, |cur: f64| cur.min(age))))
+        .fold(None, |acc, age| {
+            Some(acc.map_or(age, |cur: f64| cur.min(age)))
+        })
 }
 
 /// Age (seconds) since the most-recently-modified watcher runtime file
@@ -2063,8 +2066,7 @@ pub(crate) fn watcher_in_grace(
     pidfile_age: Option<f64>,
     grace_secs: f64,
 ) -> bool {
-    last_seen_age.is_some_and(|e| e < grace_secs)
-        || pidfile_age.is_some_and(|e| e < grace_secs)
+    last_seen_age.is_some_and(|e| e < grace_secs) || pidfile_age.is_some_and(|e| e < grace_secs)
 }
 
 /// Age (seconds) since the freshest clean-exit marker (`<name>.exit`) for
@@ -2095,7 +2097,9 @@ pub(crate) fn watcher_clean_exit_age_secs_multi(dirs: &[String], name: &str) -> 
                     .unwrap_or(0.0),
             )
         })
-        .fold(None, |acc, age| Some(acc.map_or(age, |cur: f64| cur.min(age))))
+        .fold(None, |acc, age| {
+            Some(acc.map_or(age, |cur: f64| cur.min(age)))
+        })
 }
 
 /// Pure decision: is the watcher in the benign "cleanly exited, restart
@@ -2166,7 +2170,9 @@ pub(crate) fn watcher_monitor_intent_age_secs_multi(dirs: &[String], name: &str)
                 })
             })
         })
-        .fold(None, |acc, age| Some(acc.map_or(age, |cur: f64| cur.min(age))))
+        .fold(None, |acc, age| {
+            Some(acc.map_or(age, |cur: f64| cur.min(age)))
+        })
 }
 
 /// Pure decision: is a `mode=monitor` watcher that currently has NO live pid
@@ -2240,7 +2246,10 @@ mod tests {
     fn discovered_verb_requires_a_whole_word_match() {
         let verbs = vec!["Doing".to_string()];
         // "Undoing" contains "Doing" as a substring but is not the verb.
-        assert!(!pane_shows_a_discovered_thinking_verb("Undoing work…", &verbs));
+        assert!(!pane_shows_a_discovered_thinking_verb(
+            "Undoing work…",
+            &verbs
+        ));
     }
 
     #[test]
@@ -2368,7 +2377,8 @@ mod tests {
 
     #[test]
     fn active_ui_true_for_background_tasks_still_running_completion_tail() {
-        let pane = "\u{273b} Cogitated for 2m 11s \u{00b7} 6 background tasks still running\n\u{276f} ";
+        let pane =
+            "\u{273b} Cogitated for 2m 11s \u{00b7} 6 background tasks still running\n\u{276f} ";
         assert!(pane_shows_active_ui(pane));
     }
 
@@ -2533,19 +2543,33 @@ mod tests {
     #[test]
     fn monitor_intent_age_falls_back_to_mtime_without_epoch_line() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("evw.monitor-intent"), "command=evw --mode monitor\n")
-            .unwrap();
+        std::fs::write(
+            d.path().join("evw.monitor-intent"),
+            "command=evw --mode monitor\n",
+        )
+        .unwrap();
         let dirs = vec![d.path().to_str().unwrap().to_string()];
         let age = watcher_monitor_intent_age_secs_multi(&dirs, "evw").expect("intent present");
-        assert!(age < 5.0, "just-written file reads fresh via mtime: {}", age);
+        assert!(
+            age < 5.0,
+            "just-written file reads fresh via mtime: {}",
+            age
+        );
         // A future-dated epoch clamps to 0, never negative.
         let far = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 10_000;
-        std::fs::write(d.path().join("evw.monitor-intent"), format!("epoch={}\n", far)).unwrap();
-        assert_eq!(watcher_monitor_intent_age_secs_multi(&dirs, "evw"), Some(0.0));
+        std::fs::write(
+            d.path().join("evw.monitor-intent"),
+            format!("epoch={}\n", far),
+        )
+        .unwrap();
+        assert_eq!(
+            watcher_monitor_intent_age_secs_multi(&dirs, "evw"),
+            Some(0.0)
+        );
     }
 
     // --- clean-exit grace (block-print-exit flap fix) tests ---
@@ -2556,7 +2580,11 @@ mod tests {
         // restart (marker fresher than pidfile) and recently (within window).
         // clean_exit_age = 20s, pidfile_age = 90s (restart 90s ago, exited 20s
         // ago), window = 600 -> in clean-exit grace.
-        assert!(watcher_cleanly_exited_recently(Some(20.0), Some(90.0), 600.0));
+        assert!(watcher_cleanly_exited_recently(
+            Some(20.0),
+            Some(90.0),
+            600.0
+        ));
     }
 
     #[test]
@@ -2564,7 +2592,11 @@ mod tests {
         // Crash-after-restart: pidfile fresh (restart 10s ago) but the newest
         // marker is from a PREVIOUS clean exit (120s ago) -> marker OLDER than
         // pidfile -> NOT clean-exited, so DOWN still fires promptly.
-        assert!(!watcher_cleanly_exited_recently(Some(120.0), Some(10.0), 600.0));
+        assert!(!watcher_cleanly_exited_recently(
+            Some(120.0),
+            Some(10.0),
+            600.0
+        ));
     }
 
     #[test]
@@ -2572,7 +2604,11 @@ mod tests {
         // Dead session: watcher exited cleanly, never restarted. The marker is
         // fresher than the (also stale) pidfile but has aged past the window ->
         // NOT graced, so a sustained down is still surfaced.
-        assert!(!watcher_cleanly_exited_recently(Some(700.0), Some(900.0), 600.0));
+        assert!(!watcher_cleanly_exited_recently(
+            Some(700.0),
+            Some(900.0),
+            600.0
+        ));
     }
 
     #[test]
@@ -2594,7 +2630,10 @@ mod tests {
         std::fs::write(dir.path().join("cew.exit"), "1786518000").unwrap();
         let age = watcher_clean_exit_age_secs_multi(&dirs, "cew")
             .expect("a just-written .exit marker must yield Some(age)");
-        assert!(age >= 0.0 && age < 5.0, "fresh marker should be young, got {age}");
+        assert!(
+            age >= 0.0 && age < 5.0,
+            "fresh marker should be young, got {age}"
+        );
     }
 
     #[test]
@@ -2740,9 +2779,7 @@ mod tests {
         // A roster row with no token count yet is not a token source.
         assert!(!is_agent_roster_row("  \u{25cf} main"));
         // Ordinary tool-call output lines share the bullet.
-        assert!(!is_agent_roster_row(
-            "\u{25cf} Read agent output bbow3km6m"
-        ));
+        assert!(!is_agent_roster_row("\u{25cf} Read agent output bbow3km6m"));
     }
 
     /// The PRIMARY per-line (bottom-10) pass must refuse both kinds of
@@ -3233,7 +3270,8 @@ mod tests {
     /// fresh-/clear detection in the low-token window is preserved.
     #[test]
     fn test_genuine_low_token_fresh_session_still_detected() {
-        let input = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 0 shells \u{00b7} 1,200 tokens";
+        let input =
+            "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 0 shells \u{00b7} 1,200 tokens";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.tokens, Some(1200));
     }
@@ -3463,10 +3501,7 @@ mod tests {
   "version": "2.1.178",
   "bin": { "claude": "bin/claude.exe" }
 }"#;
-        assert_eq!(
-            extract_version_from_json(json),
-            Some("2.1.178".to_string())
-        );
+        assert_eq!(extract_version_from_json(json), Some("2.1.178".to_string()));
     }
 
     #[test]
@@ -3474,10 +3509,7 @@ mod tests {
         // Shape of ~/.claude/sessions/<PID>.json (the running-version source
         // for the npm-global layout).
         let json = r#"{"pid":68,"sessionId":"5d5f5863","cwd":"/repos","version":"2.1.175","kind":"interactive","status":"busy"}"#;
-        assert_eq!(
-            extract_version_from_json(json),
-            Some("2.1.175".to_string())
-        );
+        assert_eq!(extract_version_from_json(json), Some("2.1.175".to_string()));
     }
 
     #[test]
@@ -3497,10 +3529,7 @@ mod tests {
     fn test_extract_version_from_json_non_numeric_ignored() {
         // A "version" that isn't a numeric semver (e.g. an unrelated field)
         // must not be mistaken for the package version.
-        assert_eq!(
-            extract_version_from_json(r#"{"version":"latest"}"#),
-            None
-        );
+        assert_eq!(extract_version_from_json(r#"{"version":"latest"}"#), None);
     }
 
     // --- is_claude_hooks_shim tests ---
@@ -3562,8 +3591,14 @@ mod tests {
         // (pid 99 on 2.1.241) is still executable and also resolved. The pane
         // PID must win regardless of scan order.
         let candidates = vec![
-            RunningCandidate { pid: "99".into(), version: "2.1.241".into() },
-            RunningCandidate { pid: "143".into(), version: "2.1.245".into() },
+            RunningCandidate {
+                pid: "99".into(),
+                version: "2.1.241".into(),
+            },
+            RunningCandidate {
+                pid: "143".into(),
+                version: "2.1.245".into(),
+            },
         ];
         assert_eq!(
             select_running_version(&candidates, Some("143")),
@@ -3577,8 +3612,14 @@ mod tests {
         // running behind installed), report THAT — a real mismatch the updater
         // should act on — not some other process's newer version.
         let candidates = vec![
-            RunningCandidate { pid: "143".into(), version: "2.1.241".into() },
-            RunningCandidate { pid: "200".into(), version: "2.1.245".into() },
+            RunningCandidate {
+                pid: "143".into(),
+                version: "2.1.241".into(),
+            },
+            RunningCandidate {
+                pid: "200".into(),
+                version: "2.1.245".into(),
+            },
         ];
         assert_eq!(
             select_running_version(&candidates, Some("143")),
@@ -3592,9 +3633,18 @@ mod tests {
         // (2.1.241) must NOT mask the live NEW one (2.1.245). Highest wins —
         // the exact orphan-masks-live failure mode of the global first-match.
         let candidates = vec![
-            RunningCandidate { pid: "99".into(), version: "2.1.241".into() },
-            RunningCandidate { pid: "143".into(), version: "2.1.245".into() },
-            RunningCandidate { pid: "150".into(), version: "2.1.243".into() },
+            RunningCandidate {
+                pid: "99".into(),
+                version: "2.1.241".into(),
+            },
+            RunningCandidate {
+                pid: "143".into(),
+                version: "2.1.245".into(),
+            },
+            RunningCandidate {
+                pid: "150".into(),
+                version: "2.1.243".into(),
+            },
         ];
         assert_eq!(
             select_running_version(&candidates, None),
@@ -3630,10 +3680,7 @@ mod tests {
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&real_bin, &link).unwrap();
 
-        assert_eq!(
-            resolve_installed_version(&link),
-            Some("2.1.77".to_string())
-        );
+        assert_eq!(resolve_installed_version(&link), Some("2.1.77".to_string()));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -3807,12 +3854,16 @@ mod tests {
 
     #[test]
     fn test_parse_watchers_mode_positional_seventh_field() {
-        let entries =
-            parse_watchers_config_str("evw|bin/evw|1|true|evw --quiet 10|hist|monitor|evw --stream");
+        let entries = parse_watchers_config_str(
+            "evw|bin/evw|1|true|evw --quiet 10|hist|monitor|evw --stream",
+        );
         assert_eq!(entries[0].mode, WatcherMode::Monitor);
         assert_eq!(entries[0].on_restart_cmd.as_deref(), Some("hist"));
         assert_eq!(entries[0].monitor_cmd.as_deref(), Some("evw --stream"));
-        assert_eq!(entries[0].effective_monitor_cmd().as_deref(), Some("evw --stream"));
+        assert_eq!(
+            entries[0].effective_monitor_cmd().as_deref(),
+            Some("evw --stream")
+        );
         // Blank on_restart_cmd slot still lets mode land in slot 7.
         let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw||monitor");
         assert_eq!(entries[0].mode, WatcherMode::Monitor);
@@ -3927,7 +3978,8 @@ mod tests {
         // Dangling symlink (target outside the mounted tree) == absent.
         let dangling = dir.path().join("dangling.override.conf");
         std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
-        let entries = load_watchers_config(base.to_str().unwrap(), Some(dangling.to_str().unwrap()));
+        let entries =
+            load_watchers_config(base.to_str().unwrap(), Some(dangling.to_str().unwrap()));
         assert_eq!(entries[0].mode, WatcherMode::Oneshot);
     }
 
@@ -3935,7 +3987,10 @@ mod tests {
 
     #[test]
     fn test_strip_script_suffix() {
-        assert_eq!(strip_script_suffix("claude-event-watch.sh"), "claude-event-watch");
+        assert_eq!(
+            strip_script_suffix("claude-event-watch.sh"),
+            "claude-event-watch"
+        );
         assert_eq!(strip_script_suffix("x.bash"), "x");
         assert_eq!(strip_script_suffix("y.py"), "y");
         assert_eq!(strip_script_suffix("no-ext"), "no-ext");
@@ -3964,7 +4019,10 @@ mod tests {
         ));
         // Empty start_cmd rejected.
         assert!(!cmdline_matches_watcher("/bin/bash /usr/local/bin/x", ""));
-        assert!(!cmdline_matches_watcher("/bin/bash /usr/local/bin/x", "   "));
+        assert!(!cmdline_matches_watcher(
+            "/bin/bash /usr/local/bin/x",
+            "   "
+        ));
     }
 
     #[test]
@@ -4022,7 +4080,11 @@ mod tests {
         // Both env vars distinct → both, then the fallback.
         assert_eq!(
             pid_dir_candidates(Some("/a"), Some("/b"), None),
-            vec!["/a".to_string(), "/b".to_string(), "/var/run/claude".to_string()]
+            vec![
+                "/a".to_string(),
+                "/b".to_string(),
+                "/var/run/claude".to_string()
+            ]
         );
         // XDG only → XDG then fallback.
         assert_eq!(
@@ -4138,8 +4200,11 @@ mod tests {
         // pick returned the dead pid → false-DOWN; the multi reader considers
         // every recorded pid and picks the alive one → UP.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("botchat-wait.lock"), (u32::MAX - 1).to_string())
-            .unwrap();
+        std::fs::write(
+            dir.path().join("botchat-wait.lock"),
+            (u32::MAX - 1).to_string(),
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("botchat-wait.pid"),
             std::process::id().to_string(),
@@ -4162,7 +4227,11 @@ mod tests {
         let dirs = vec![dir.path().to_str().unwrap().to_string()];
         let (pid, down) = watcher_pidfile_liveness_multi(&dirs, "w", None);
         assert!(down, "all-dead recorded pids must read as DOWN");
-        assert_eq!(pid, Some(u32::MAX - 1), "first recorded pid surfaced for diagnostics");
+        assert_eq!(
+            pid,
+            Some(u32::MAX - 1),
+            "first recorded pid surfaced for diagnostics"
+        );
     }
 
     #[test]
@@ -4193,6 +4262,9 @@ mod tests {
         ];
         let age = watcher_runtime_file_age_secs_multi(&dirs, "w")
             .expect("at least one runtime file exists");
-        assert!(age < 60.0, "must report the youngest (fresh) file's age, got {age}");
+        assert!(
+            age < 60.0,
+            "must report the youngest (fresh) file's age, got {age}"
+        );
     }
 }

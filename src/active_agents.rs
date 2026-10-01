@@ -40,9 +40,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::agent::{
-    find_claude_pid, get_children, is_own_command, is_watcher, ChildProcess,
-};
+use crate::agent::{find_claude_pid, get_children, is_own_command, is_watcher, ChildProcess};
 use crate::workload::{load_state, WorkloadState};
 
 /// Default freshness window for `find_active_subagents_dirs`. Any
@@ -78,10 +76,7 @@ pub const DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS: u64 = 24 * 60 * 60;
 /// drop the marker for the affected agents. Merging across all recent
 /// dirs (with a preference for records that DO have a queue id) lets
 /// the resolver recover the original marker.
-pub fn find_active_subagents_dirs(
-    now: SystemTime,
-    freshness_secs: u64,
-) -> Vec<PathBuf> {
+pub fn find_active_subagents_dirs(now: SystemTime, freshness_secs: u64) -> Vec<PathBuf> {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => return Vec::new(),
@@ -146,7 +141,9 @@ pub fn find_active_subagents_dirs_in(
 ///
 /// Returns `None` only when the directory itself has no readable mtime.
 pub fn dir_newest_mtime(dir: &Path) -> Option<SystemTime> {
-    let mut newest = std::fs::metadata(dir).ok().and_then(|m| m.modified().ok())?;
+    let mut newest = std::fs::metadata(dir)
+        .ok()
+        .and_then(|m| m.modified().ok())?;
     if let Ok(children) = std::fs::read_dir(dir) {
         for child in children.flatten() {
             if let Ok(meta) = child.metadata() {
@@ -502,9 +499,9 @@ pub fn tail_ends_on_pending_tool_use(tail: &str) -> bool {
             None => return false,
         };
         return match content.as_array() {
-            Some(blocks) => blocks.iter().any(|b| {
-                b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-            }),
+            Some(blocks) => blocks
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use")),
             // A plain-string assistant content block is a text turn.
             None => false,
         };
@@ -592,7 +589,9 @@ pub fn collect_agent_records(
             None => continue,
         };
         let path = entry.path();
-        let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        let mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
         let (mtime_alive, age) = agent_alive_from_mtime(mtime, now, max_age_secs);
         // Only inspect the tail when the plain mtime verdict was
         // "stale" — a fresh agent is already alive, so the healthy
@@ -869,8 +868,7 @@ pub fn cmd_active_agents(json: bool, max_age_secs: u64, write_state: Option<&str
     let agents = collect_with_max_age(max_age_secs);
 
     // Always render JSON for the state file (machine-readable contract).
-    let json_str =
-        serde_json::to_string_pretty(&agents).unwrap_or_else(|_| "{}".to_string());
+    let json_str = serde_json::to_string_pretty(&agents).unwrap_or_else(|_| "{}".to_string());
 
     if let Some(path) = write_state {
         if let Err(e) = atomic_write(Path::new(path), &(json_str.clone() + "\n")) {
@@ -939,9 +937,15 @@ mod tests {
     #[test]
     fn filter_subagent_pids_excludes_watchers() {
         let children = vec![
-            cp(100, "zsh -c eval 'watcher-ctl run alerts-watcher' < /dev/null"),
+            cp(
+                100,
+                "zsh -c eval 'watcher-ctl run alerts-watcher' < /dev/null",
+            ),
             cp(200, "python3 /home/user/.claude/sidechain-agent.py"),
-            cp(300, "zsh -c eval 'watcher-ctl run torrent-wait' < /dev/null"),
+            cp(
+                300,
+                "zsh -c eval 'watcher-ctl run torrent-wait' < /dev/null",
+            ),
         ];
         // 100 + 300 are watchers; only 200 should remain.
         assert_eq!(filter_subagent_pids(&children), vec![200]);
@@ -976,7 +980,10 @@ mod tests {
     #[test]
     fn filter_subagent_pids_all_watchers() {
         let children = vec![
-            cp(1, "zsh -c eval 'watcher-ctl run alerts-watcher' < /dev/null"),
+            cp(
+                1,
+                "zsh -c eval 'watcher-ctl run alerts-watcher' < /dev/null",
+            ),
             cp(2, "zsh -c eval 'memory-remind' < /dev/null"),
             cp(3, "zsh -c eval 'context-watch' < /dev/null"),
         ];
@@ -1096,10 +1103,7 @@ mod tests {
             agents: vec![],
         };
         let json = serde_json::to_string(&agents).expect("serialize");
-        assert_eq!(
-            json,
-            r#"{"subagents":[],"workloads":[],"agents":[]}"#
-        );
+        assert_eq!(json, r#"{"subagents":[],"workloads":[],"agents":[]}"#);
     }
 
     // --- queue id extraction ---
@@ -1107,10 +1111,7 @@ mod tests {
     #[test]
     fn extract_queue_id_basic() {
         let s = "Queue item: q-2026-05-01-6087\n\nAndrew DM 15:57";
-        assert_eq!(
-            extract_queue_id(s).as_deref(),
-            Some("q-2026-05-01-6087")
-        );
+        assert_eq!(extract_queue_id(s).as_deref(), Some("q-2026-05-01-6087"));
     }
 
     #[test]
@@ -1142,10 +1143,7 @@ mod tests {
     fn extract_queue_id_terminator_punctuation() {
         // Trailing comma should NOT be part of the id.
         let s = "Queue item: q-2026-05-01-a50a, please do X";
-        assert_eq!(
-            extract_queue_id(s).as_deref(),
-            Some("q-2026-05-01-a50a")
-        );
+        assert_eq!(extract_queue_id(s).as_deref(), Some("q-2026-05-01-a50a"));
     }
 
     #[test]
@@ -1393,7 +1391,10 @@ mod tests {
         assert_eq!(a.agent_id, "awaiting1");
         assert!(a.in_flight_tool_use, "pending tool_use must be detected");
         assert!(a.alive, "agent inside a long tool call is NOT orphaned");
-        assert!(a.jsonl_age_seconds.unwrap_or(0) >= 443, "age is still reported honestly");
+        assert!(
+            a.jsonl_age_seconds.unwrap_or(0) >= 443,
+            "age is still reported honestly"
+        );
 
         let b = &records[1];
         assert_eq!(b.agent_id, "bsettled1");
@@ -1570,8 +1571,7 @@ mod tests {
     fn read_head_returns_a_short_file_whole() {
         let body = "{\"message\":{\"content\":\"Queue item: q-tiny\"}}\n";
         let (head, truncated) =
-            read_head(std::io::Cursor::new(body.as_bytes()), TRANSCRIPT_HEAD_BYTES)
-                .expect("head");
+            read_head(std::io::Cursor::new(body.as_bytes()), TRANSCRIPT_HEAD_BYTES).expect("head");
         assert_eq!(head, body);
         assert!(!truncated);
     }
@@ -1688,14 +1688,19 @@ mod tests {
         std::fs::write(&newer_jsonl, PENDING_TOOL_USE_TAIL).unwrap();
         backdate(&newer_jsonl, 443);
 
-        let records =
-            collect_agent_records_merged(&[older, newer], SystemTime::now(), 120);
+        let records = collect_agent_records_merged(&[older, newer], SystemTime::now(), 120);
         assert_eq!(records.len(), 1, "{:?}", records);
         let r = &records[0];
         assert_eq!(r.queue_id.as_deref(), Some("q-test-888"));
         assert!(r.in_flight_tool_use);
-        assert!(r.alive, "live agent mid-tool-call must not read as orphaned");
-        assert!(r.jsonl_age_seconds.unwrap_or(0) < 45 * 60, "age from the newer file");
+        assert!(
+            r.alive,
+            "live agent mid-tool-call must not read as orphaned"
+        );
+        assert!(
+            r.jsonl_age_seconds.unwrap_or(0) < 45 * 60,
+            "age from the newer file"
+        );
     }
 
     #[test]
@@ -1834,8 +1839,7 @@ mod tests {
             vec![older.clone(), newer.clone()],
             vec![newer.clone(), older.clone()],
         ] {
-            let records =
-                collect_agent_records_merged(&dirs, SystemTime::now(), 120);
+            let records = collect_agent_records_merged(&dirs, SystemTime::now(), 120);
             assert_eq!(records.len(), 1, "{:?}", records);
             let r = &records[0];
             assert_eq!(r.agent_id, id);
@@ -1900,10 +1904,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         let r = &records[0];
         assert_eq!(r.agent_id, id);
-        assert!(
-            r.queue_id.is_none(),
-            "merge must not fabricate a queue id",
-        );
+        assert!(r.queue_id.is_none(), "merge must not fabricate a queue id",);
     }
 
     #[test]
@@ -1994,11 +1995,7 @@ mod tests {
         // compares — make sure that's also stale.
         backdate(&older, 48 * 60 * 60);
 
-        let dirs = find_active_subagents_dirs_in(
-            tmp.path(),
-            SystemTime::now(),
-            24 * 60 * 60,
-        );
+        let dirs = find_active_subagents_dirs_in(tmp.path(), SystemTime::now(), 24 * 60 * 60);
         // Only the newer dir should appear.
         assert_eq!(dirs.len(), 1, "{:?}", dirs);
         assert_eq!(dirs[0], newer);
@@ -2011,11 +2008,7 @@ mod tests {
         write_continuation_jsonl(&older.join("agent-a.jsonl"));
         write_continuation_jsonl(&newer.join("agent-b.jsonl"));
         // Both within the window.
-        let dirs = find_active_subagents_dirs_in(
-            tmp.path(),
-            SystemTime::now(),
-            24 * 60 * 60,
-        );
+        let dirs = find_active_subagents_dirs_in(tmp.path(), SystemTime::now(), 24 * 60 * 60);
         assert_eq!(dirs.len(), 2);
         // Sorted newest-first: `newer` was written second, so its
         // newest-file mtime should be greater than `older`'s. (We rely

@@ -239,9 +239,11 @@ pub async fn dispatch_inject(
             }
             match backends.pidfd_inject(pid, text) {
                 ProbeOutcome::Ok { .. } => InjectBackend::Pidfd,
-                ProbeOutcome::SyscallFailed { stage, errno, ref msg }
-                    if stage == "pidfd_open" =>
-                {
+                ProbeOutcome::SyscallFailed {
+                    stage,
+                    errno,
+                    ref msg,
+                } if stage == "pidfd_open" => {
                     warn!(
                         agent_pid = pid,
                         stage = stage,

@@ -279,9 +279,7 @@ mod tests {
 
         // Write a marker with a timestamp 1 hour ago
         let stale = ReminderMarker {
-            last_fired: Some(
-                (Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339(),
-            ),
+            last_fired: Some((Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339()),
             fire_count: 1,
             last_context: None,
         };

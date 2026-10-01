@@ -655,7 +655,10 @@ fn build_metrics(
                 .to_string(),
         );
         lines.push("# TYPE claude_mainloop_last_ack_timestamp_seconds gauge".to_string());
-        lines.push(format!("claude_mainloop_last_ack_timestamp_seconds {:.3}", ts));
+        lines.push(format!(
+            "claude_mainloop_last_ack_timestamp_seconds {:.3}",
+            ts
+        ));
     }
 
     // Last context-clear timestamp (with session-start fallback -- see the
@@ -1497,10 +1500,7 @@ struct PresenceSample {
 /// node-exporter's textfile collector yields a single series, so only the first
 /// series' `values` are read. Point values use Prometheus' string encoding
 /// ("1"/"0"); `>= 0.5` counts as present. Samples are returned sorted by ts.
-fn parse_prom_presence(
-    json: &str,
-    week_fn: &dyn Fn(f64) -> String,
-) -> Option<Vec<PresenceSample>> {
+fn parse_prom_presence(json: &str, week_fn: &dyn Fn(f64) -> String) -> Option<Vec<PresenceSample>> {
     let v: Value = serde_json::from_str(json).ok()?;
     if v.get("status").and_then(|s| s.as_str()) != Some("success") {
         return None;
@@ -1884,7 +1884,10 @@ mod tests {
         let (s, c) = advance_streak(&s, true, 150.0, max_gap, D0);
         assert_eq!(c, 150.0);
         let (s, c) = advance_streak(&s, true, 300.0, max_gap, D0);
-        assert_eq!(c, 300.0, "continuous run keeps growing across sub-threshold gaps");
+        assert_eq!(
+            c, 300.0,
+            "continuous run keeps growing across sub-threshold gaps"
+        );
         assert_eq!(s.run_start, Some(0.0));
         assert_eq!(s.weekly_max_secs, 300.0);
         assert_eq!(s.alltime_max_secs, 300.0);
@@ -1944,8 +1947,14 @@ mod tests {
         assert_eq!(s.week_start.as_deref(), Some(D1));
         let (s, c) = advance_streak(&s, true, 1030.0, 200.0, D1);
         assert_eq!(c, 30.0);
-        assert_eq!(s.weekly_max_secs, 30.0, "this week's max is this week's longest run");
-        assert_eq!(s.alltime_max_secs, 100.0, "all-time still holds the 100s peak");
+        assert_eq!(
+            s.weekly_max_secs, 30.0,
+            "this week's max is this week's longest run"
+        );
+        assert_eq!(
+            s.alltime_max_secs, 100.0,
+            "all-time still holds the 100s peak"
+        );
         assert_eq!(s.week_start.as_deref(), Some(D1));
     }
 
@@ -2007,8 +2016,7 @@ mod tests {
 
     #[test]
     fn parse_prom_presence_sorts_by_timestamp() {
-        let json =
-            r#"{"status":"success","data":{"result":[{"values":[[200,"1"],[100,"0"],[300,"1"]]}]}}"#;
+        let json = r#"{"status":"success","data":{"result":[{"values":[[200,"1"],[100,"0"],[300,"1"]]}]}}"#;
         let s = parse_prom_presence(json, &|_| "d".to_string()).unwrap();
         assert_eq!(
             s.iter().map(|x| x.ts).collect::<Vec<_>>(),
@@ -2040,22 +2048,49 @@ mod tests {
     #[test]
     fn rehydrate_breaks_continuity_on_scrape_gap() {
         let samples = vec![
-            PresenceSample { ts: 0.0, present: true, week: D0.to_string() },
-            PresenceSample { ts: 60.0, present: true, week: D0.to_string() },
+            PresenceSample {
+                ts: 0.0,
+                present: true,
+                week: D0.to_string(),
+            },
+            PresenceSample {
+                ts: 60.0,
+                present: true,
+                week: D0.to_string(),
+            },
             // 300s gap > max_gap 100 (cron/scrape outage): continuity broken.
-            PresenceSample { ts: 360.0, present: true, week: D0.to_string() },
-            PresenceSample { ts: 420.0, present: true, week: D0.to_string() },
+            PresenceSample {
+                ts: 360.0,
+                present: true,
+                week: D0.to_string(),
+            },
+            PresenceSample {
+                ts: 420.0,
+                present: true,
+                week: D0.to_string(),
+            },
         ];
         let (state, current) = compute_streak_from_samples(&samples, 480.0, true, D0, 100.0);
-        assert_eq!(current, 120.0, "trailing run restarts after the gap (360..480)");
+        assert_eq!(
+            current, 120.0,
+            "trailing run restarts after the gap (360..480)"
+        );
         assert_eq!(state.weekly_max_secs, 120.0);
     }
 
     #[test]
     fn rehydrate_current_zero_when_away_now() {
         let samples = vec![
-            PresenceSample { ts: 0.0, present: true, week: D0.to_string() },
-            PresenceSample { ts: 60.0, present: true, week: D0.to_string() },
+            PresenceSample {
+                ts: 0.0,
+                present: true,
+                week: D0.to_string(),
+            },
+            PresenceSample {
+                ts: 60.0,
+                present: true,
+                week: D0.to_string(),
+            },
         ];
         // Live sample = away: current resets, this week's max is preserved.
         let (state, current) = compute_streak_from_samples(&samples, 120.0, false, D0, 200.0);
@@ -2067,11 +2102,27 @@ mod tests {
     #[test]
     fn rehydrate_weekly_max_resets_across_week_boundary() {
         let samples = vec![
-            PresenceSample { ts: 0.0, present: true, week: "2026-01-04".to_string() },
-            PresenceSample { ts: 60.0, present: true, week: "2026-01-04".to_string() },
-            PresenceSample { ts: 120.0, present: true, week: "2026-01-04".to_string() },
+            PresenceSample {
+                ts: 0.0,
+                present: true,
+                week: "2026-01-04".to_string(),
+            },
+            PresenceSample {
+                ts: 60.0,
+                present: true,
+                week: "2026-01-04".to_string(),
+            },
+            PresenceSample {
+                ts: 120.0,
+                present: true,
+                week: "2026-01-04".to_string(),
+            },
             // Next local week, after a gap.
-            PresenceSample { ts: 1000.0, present: true, week: "2026-01-11".to_string() },
+            PresenceSample {
+                ts: 1000.0,
+                present: true,
+                week: "2026-01-11".to_string(),
+            },
         ];
         let (state, current) =
             compute_streak_from_samples(&samples, 1060.0, true, "2026-01-11", 200.0);
@@ -2089,8 +2140,16 @@ mod tests {
     fn rehydrate_ignores_samples_at_or_after_now() {
         // A stray sample >= now (clock skew) must not corrupt the fold.
         let samples = vec![
-            PresenceSample { ts: 1000.0, present: true, week: D0.to_string() },
-            PresenceSample { ts: 2000.0, present: true, week: D0.to_string() }, // == now, skipped
+            PresenceSample {
+                ts: 1000.0,
+                present: true,
+                week: D0.to_string(),
+            },
+            PresenceSample {
+                ts: 2000.0,
+                present: true,
+                week: D0.to_string(),
+            }, // == now, skipped
         ];
         let (_, current) = compute_streak_from_samples(&samples, 2000.0, true, D0, 5000.0);
         assert_eq!(current, 1000.0);
@@ -2260,7 +2319,9 @@ mod tests {
         let key = sunday_week_key(NaiveDate::from_ymd_opt(2026, 8, 18).unwrap());
         assert_eq!(key, "2026-08-16");
         assert_eq!(
-            NaiveDate::parse_from_str(&key, "%Y-%m-%d").unwrap().weekday(),
+            NaiveDate::parse_from_str(&key, "%Y-%m-%d")
+                .unwrap()
+                .weekday(),
             Weekday::Sun
         );
     }
@@ -2285,7 +2346,10 @@ mod tests {
             last_present: false,
         };
         let m = merge_persisted_maxes(computed, &persisted);
-        assert_eq!(m.weekly_max_secs, 300.0, "same-week persisted weekly floors");
+        assert_eq!(
+            m.weekly_max_secs, 300.0,
+            "same-week persisted weekly floors"
+        );
         assert_eq!(m.alltime_max_secs, 9000.0, "all-time persisted floors");
     }
 
@@ -2308,8 +2372,14 @@ mod tests {
             last_present: false,
         };
         let m = merge_persisted_maxes(computed, &persisted);
-        assert_eq!(m.weekly_max_secs, 40.0, "stale-week persisted weekly is NOT merged");
-        assert_eq!(m.alltime_max_secs, 9000.0, "all-time floors regardless of week");
+        assert_eq!(
+            m.weekly_max_secs, 40.0,
+            "stale-week persisted weekly is NOT merged"
+        );
+        assert_eq!(
+            m.alltime_max_secs, 9000.0,
+            "all-time floors regardless of week"
+        );
     }
 
     #[test]
@@ -2324,8 +2394,14 @@ mod tests {
         )
         .unwrap();
         let st = load_streak_state(&p);
-        assert_eq!(st.alltime_max_secs, 1234.0, "legacy daily max seeds all-time floor");
-        assert_eq!(st.weekly_max_secs, 0.0, "no legacy weekly field -> starts fresh");
+        assert_eq!(
+            st.alltime_max_secs, 1234.0,
+            "legacy daily max seeds all-time floor"
+        );
+        assert_eq!(
+            st.weekly_max_secs, 0.0,
+            "no legacy weekly field -> starts fresh"
+        );
         assert_eq!(st.week_start, None);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2358,7 +2434,9 @@ mod tests {
             .any(|l| l.contains("claude_version_info{current=\"1.2.3\",latest=\"1.2.4\"} 1")));
         // Build-info gauge is emitted with version/commit/pr labels and value 1.
         // commit/pr come from build.rs env stamping (fall back to "unknown"/"").
-        assert!(lines.iter().any(|l| l == "# TYPE claude_watch_build_info gauge"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "# TYPE claude_watch_build_info gauge"));
         assert!(lines.iter().any(|l| {
             l.starts_with("claude_watch_build_info{version=\"")
                 && l.contains(",commit=\"")
@@ -2542,13 +2620,20 @@ mod tests {
         // still proves an ack HAPPENED, so mtime is the fallback rather than
         // discarding the signal entirely.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(crate::config::LAST_ACK_FILE), b"not-a-number").unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::LAST_ACK_FILE),
+            b"not-a-number",
+        )
+        .unwrap();
         let ts = last_ack_epoch_secs(dir.path()).expect("garbled file should fall back to mtime");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
-        assert!((now - ts).abs() < 60.0, "mtime {ts} should be near now {now}");
+        assert!(
+            (now - ts).abs() < 60.0,
+            "mtime {ts} should be near now {now}"
+        );
     }
 
     #[test]
@@ -2564,14 +2649,7 @@ mod tests {
         // The gauge that backs the dashboard's LAST ACK tile.
         let state = serde_json::json!({});
         let live = LiveCounts::default();
-        let with_ack = build_metrics(
-            &state,
-            "1.0.0",
-            "1.0.0",
-            &live,
-            Some(1767225600.0),
-            None,
-        );
+        let with_ack = build_metrics(&state, "1.0.0", "1.0.0", &live, Some(1767225600.0), None);
         assert!(with_ack
             .iter()
             .any(|l| l == "claude_mainloop_last_ack_timestamp_seconds 1767225600.000"));
@@ -2622,7 +2700,11 @@ mod tests {
     #[test]
     fn pid_start_epoch_none_on_zero_clk_tck() {
         assert_eq!(
-            pid_start_epoch("1 (x) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 5", "btime 1\n", 0),
+            pid_start_epoch(
+                "1 (x) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 5",
+                "btime 1\n",
+                0
+            ),
             None
         );
     }
@@ -2667,7 +2749,10 @@ mod tests {
         // this from a 12s blip.
         let now = 1_757_000_000.0;
         let lines = api_retry_lines(now - 10.0, now - 1020.0, 102, 7, now, 120.0);
-        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 1.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_active"),
+            1.0
+        );
         assert_eq!(
             api_retry_sample(&lines, "claude_watch_api_retry_episode_seconds"),
             1020.0
@@ -2696,7 +2781,10 @@ mod tests {
         // still reads 1.
         let now = 1_757_000_000.0;
         let lines = api_retry_lines(now - 5.0, now - 2400.0, 240, 1, now, 120.0);
-        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 1.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_active"),
+            1.0
+        );
         assert_eq!(
             api_retry_sample(&lines, "claude_watch_api_retry_episode_seconds"),
             2400.0
@@ -2710,7 +2798,10 @@ mod tests {
         // pin the gauge at 1 forever.
         let now = 1_757_000_000.0;
         let lines = api_retry_lines(now - 600.0, now - 900.0, 90, 3, now, 120.0);
-        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 0.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_active"),
+            0.0
+        );
         // Episode duration and cycle count are episode-scoped: zeroed when
         // inactive so a graph can't read a stale duration as a live one.
         assert_eq!(
@@ -2736,7 +2827,10 @@ mod tests {
         let now = 1_757_000_000.0;
         // Never observed at all.
         let never = api_retry_lines(0.0, 0.0, 0, 0, now, 120.0);
-        assert_eq!(api_retry_sample(&never, "claude_watch_api_retry_active"), 0.0);
+        assert_eq!(
+            api_retry_sample(&never, "claude_watch_api_retry_active"),
+            0.0
+        );
         assert_eq!(
             api_retry_sample(&never, "claude_watch_api_retry_episode_seconds"),
             0.0
@@ -2789,7 +2883,9 @@ mod tests {
                 "{metric} missing HELP"
             );
             assert!(
-                lines.iter().any(|l| l.starts_with(&format!("# TYPE {metric} "))),
+                lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("# TYPE {metric} "))),
                 "{metric} missing TYPE"
             );
             assert!(
@@ -2818,7 +2914,10 @@ mod tests {
             "api_retry_episodes_total": 4,
         });
         let lines = api_retry_block(&state);
-        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 1.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_active"),
+            1.0
+        );
         assert_eq!(
             api_retry_sample(&lines, "claude_watch_api_retry_consecutive_cycles"),
             30.0
@@ -2839,7 +2938,10 @@ mod tests {
         // A state file written before these fields existed must read as
         // "no storm", not as a storm that started at the epoch.
         let lines = api_retry_block(&serde_json::json!({}));
-        assert_eq!(api_retry_sample(&lines, "claude_watch_api_retry_active"), 0.0);
+        assert_eq!(
+            api_retry_sample(&lines, "claude_watch_api_retry_active"),
+            0.0
+        );
         assert_eq!(
             api_retry_sample(&lines, "claude_watch_api_retry_episode_seconds"),
             0.0
@@ -2933,18 +3035,13 @@ mod tests {
         });
         let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         let joined = lines.join("\n");
-        assert!(joined.contains(
-            "claude_watch_fallback_injections_total{type=\"clear\"} 4"
-        ));
-        assert!(joined.contains(
-            "claude_watch_fallback_injections_total{type=\"update\"} 2"
-        ));
+        assert!(joined.contains("claude_watch_fallback_injections_total{type=\"clear\"} 4"));
+        assert!(joined.contains("claude_watch_fallback_injections_total{type=\"update\"} 2"));
         assert!(joined.contains(
             "claude_watch_reminder_to_action_latency_seconds_sum{type=\"clear\"} 123.500"
         ));
-        assert!(joined.contains(
-            "claude_watch_reminder_to_action_latency_seconds_count{type=\"clear\"} 3"
-        ));
+        assert!(joined
+            .contains("claude_watch_reminder_to_action_latency_seconds_count{type=\"clear\"} 3"));
     }
 
     #[test]
@@ -2991,10 +3088,7 @@ mod tests {
             ("fresh_clear_resume_inject", 6),
             ("restart_claude", 8),
         ] {
-            let needle = format!(
-                "claude_interrupts_total{{kind=\"{}\"}} {}",
-                kind, value
-            );
+            let needle = format!("claude_interrupts_total{{kind=\"{}\"}} {}", kind, value);
             assert!(
                 joined.contains(&needle),
                 "missing interrupt line {:?} in:\n{}",
@@ -3084,11 +3178,16 @@ mod tests {
         assert!(joined.contains("claude_code_active_agents 2"), "{joined}");
         assert!(joined.contains("claude_code_running_tasks 1"), "{joined}");
         assert!(joined.contains("claude_code_live_watchers 3"), "{joined}");
-        assert!(joined.contains("claude_code_enabled_watchers 3"), "{joined}");
+        assert!(
+            joined.contains("claude_code_enabled_watchers 3"),
+            "{joined}"
+        );
         assert!(joined.contains("claude_code_live_monitors 5"), "{joined}");
         assert!(joined.contains("claude_code_open_bashes 4"), "{joined}");
         assert!(
-            joined.lines().any(|l| l == "# TYPE claude_code_live_monitors gauge"),
+            joined
+                .lines()
+                .any(|l| l == "# TYPE claude_code_live_monitors gauge"),
             "{joined}"
         );
     }

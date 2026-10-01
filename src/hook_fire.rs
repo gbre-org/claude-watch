@@ -230,12 +230,10 @@ mod tests {
     use super::*;
 
     /// Events that accept `hookSpecificOutput.additionalContext`.
-    const ADDITIONAL_CONTEXT_EVENTS: &[&str] =
-        &["UserPromptSubmit", "PostToolUse", "SessionStart"];
+    const ADDITIONAL_CONTEXT_EVENTS: &[&str] = &["UserPromptSubmit", "PostToolUse", "SessionStart"];
 
     /// Events that must use top-level `systemMessage` instead.
-    const SYSTEM_MESSAGE_EVENTS: &[&str] =
-        &["Stop", "PreCompact", "Notification", "PreToolUse"];
+    const SYSTEM_MESSAGE_EVENTS: &[&str] = &["Stop", "PreCompact", "Notification", "PreToolUse"];
 
     /// Validate that a hook JSON response conforms to the Claude Code hook
     /// schema: no top-level unknown fields, `hookSpecificOutput` (when
@@ -286,9 +284,7 @@ mod tests {
 
         if obj.contains_key("systemMessage") {
             assert!(
-                obj.get("systemMessage")
-                    .and_then(|v| v.as_str())
-                    .is_some(),
+                obj.get("systemMessage").and_then(|v| v.as_str()).is_some(),
                 "systemMessage must be a string for {event}"
             );
         }

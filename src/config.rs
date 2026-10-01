@@ -2328,10 +2328,7 @@ const RETIRED_CONFIG_KEYS: &[(&str, &str, &str)] = &[(
 /// Warn (once per load) about retired keys still present in the merged config.
 fn warn_retired_keys(value: &toml::Value, loaded_from: &[String]) {
     for (section, key, why) in RETIRED_CONFIG_KEYS {
-        let present = value
-            .get(section)
-            .and_then(|t| t.get(key))
-            .is_some();
+        let present = value.get(section).and_then(|t| t.get(key)).is_some();
         if present {
             tracing::warn!(
                 section = section,
@@ -2970,7 +2967,10 @@ cooldown = 300
         assert!(!config.reauth.auth_error_auto_self_login);
         assert_eq!(config.reauth.expiry_auto_days, 2);
         assert_eq!(config.reauth.self_login_abandon_seconds, 0);
-        assert_eq!(config.reauth.self_login_command, "/usr/local/bin/self-login");
+        assert_eq!(
+            config.reauth.self_login_command,
+            "/usr/local/bin/self-login"
+        );
     }
 
     #[test]
@@ -3523,8 +3523,7 @@ cooldown = 300
             "must discriminate repo:* vs workload:* scopes"
         );
         assert!(
-            prompt.contains("PR")
-                && (prompt.contains("CI") || prompt.contains("green")),
+            prompt.contains("PR") && (prompt.contains("CI") || prompt.contains("green")),
             "must mention PR state + CI for recovery probe"
         );
         assert!(
@@ -3851,22 +3850,30 @@ cooldown = 300
             "[general]\ncheck_interval = 10\npost_interrupt_cooldown_secs = 60\n             [tmux]\ndashboard_session = \"base\"\n",
         )
         .unwrap();
-        let overlay: toml::Value = toml::from_str(
-            "[general]\npost_interrupt_cooldown_secs = 999\n",
-        )
-        .unwrap();
+        let overlay: toml::Value =
+            toml::from_str("[general]\npost_interrupt_cooldown_secs = 999\n").unwrap();
         merge_toml(&mut base, overlay);
         let general = base.get("general").unwrap();
         // overridden field wins
         assert_eq!(
-            general.get("post_interrupt_cooldown_secs").unwrap().as_integer(),
+            general
+                .get("post_interrupt_cooldown_secs")
+                .unwrap()
+                .as_integer(),
             Some(999)
         );
         // base-only field in the same table is preserved
-        assert_eq!(general.get("check_interval").unwrap().as_integer(), Some(10));
+        assert_eq!(
+            general.get("check_interval").unwrap().as_integer(),
+            Some(10)
+        );
         // base-only TABLE is preserved
         assert_eq!(
-            base.get("tmux").unwrap().get("dashboard_session").unwrap().as_str(),
+            base.get("tmux")
+                .unwrap()
+                .get("dashboard_session")
+                .unwrap()
+                .as_str(),
             Some("base")
         );
     }
@@ -3917,7 +3924,10 @@ legacy_log_file = "/tmp/ll"
         // literal send_keys -l call, so neither corrective text may contain a
         // newline.
         assert!(!nudge.contains('\n'), "phase-1 nudge must stay single-line");
-        assert!(!hard.contains('\n'), "phase-2 hard block must stay single-line");
+        assert!(
+            !hard.contains('\n'),
+            "phase-2 hard block must stay single-line"
+        );
     }
 
     #[test]

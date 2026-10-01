@@ -62,8 +62,8 @@
 //!     `command_name`, etc. — exactly the structural primitives this spike
 //!     needs. In-process, no subprocess overhead.
 
-use std::sync::OnceLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use tree_sitter::{Node, Parser, Tree};
 
@@ -122,10 +122,16 @@ pub struct EvalResult {
 
 impl EvalResult {
     fn ok(why: impl Into<String>) -> Self {
-        Self { satisfied: true, why: why.into() }
+        Self {
+            satisfied: true,
+            why: why.into(),
+        }
     }
     fn deny(why: impl Into<String>) -> Self {
-        Self { satisfied: false, why: why.into() }
+        Self {
+            satisfied: false,
+            why: why.into(),
+        }
     }
 }
 
@@ -181,9 +187,10 @@ fn parse(command: &str) -> Option<Tree> {
 
 fn walk_root(predicate: &AstPredicate, root: &Node, src: &[u8]) -> EvalResult {
     match predicate {
-        AstPredicate::BanPipeTo { bin_names, require_dash_arg } => {
-            check_ban_pipe_to(root, src, bin_names, *require_dash_arg)
-        }
+        AstPredicate::BanPipeTo {
+            bin_names,
+            require_dash_arg,
+        } => check_ban_pipe_to(root, src, bin_names, *require_dash_arg),
         AstPredicate::BanEnvVarPrefix { var_names } => {
             check_ban_env_var_prefix(root, src, var_names)
         }
@@ -249,11 +256,7 @@ fn check_ban_pipe_to(
 /// (`FOO=bar` on its own line) — those are NOT what we're after. We only
 /// flag assignments that are children of a `command` node (i.e. command
 /// prefixes).
-fn check_ban_env_var_prefix(
-    root: &Node,
-    src: &[u8],
-    var_names: &[String],
-) -> EvalResult {
+fn check_ban_env_var_prefix(root: &Node, src: &[u8], var_names: &[String]) -> EvalResult {
     let mut hits: Vec<String> = Vec::new();
     visit(root, &mut |node| {
         if node.kind() == "command" {
@@ -262,10 +265,7 @@ fn check_ban_env_var_prefix(
                 if child.kind() == "variable_assignment" {
                     if let Some(vname) = first_named_child_text(&child, "variable_name", src) {
                         if var_names.iter().any(|v| v == &vname) {
-                            hits.push(format!(
-                                "command-prefix env-var assignment `{}=...`",
-                                vname
-                            ));
+                            hits.push(format!("command-prefix env-var assignment `{}=...`", vname));
                         }
                     }
                 }
@@ -376,13 +376,19 @@ mod tests {
 
     #[test]
     fn ban_pipe_to_tail_dash_n() {
-        let r = evaluate(&pipe_to_tail_or_head(), "signal-history --group abo | tail -20");
+        let r = evaluate(
+            &pipe_to_tail_or_head(),
+            "signal-history --group abo | tail -20",
+        );
         assert!(!r.satisfied, "should deny pipe to tail: {:?}", r);
     }
 
     #[test]
     fn ban_pipe_to_head_dash_n() {
-        let r = evaluate(&pipe_to_tail_or_head(), "signal-history --group abo | head -n 5");
+        let r = evaluate(
+            &pipe_to_tail_or_head(),
+            "signal-history --group abo | head -n 5",
+        );
         assert!(!r.satisfied, "should deny pipe to head -n: {:?}", r);
     }
 
@@ -392,7 +398,11 @@ mod tests {
             &pipe_to_tail_or_head(),
             "signal-history --group abo | grep ale | tail -5",
         );
-        assert!(!r.satisfied, "should deny multi-stage pipe ending in tail: {:?}", r);
+        assert!(
+            !r.satisfied,
+            "should deny multi-stage pipe ending in tail: {:?}",
+            r
+        );
     }
 
     // -- BanPipeTo true negatives -------------------------------------------
@@ -403,7 +413,10 @@ mod tests {
         // /\|\s*(tail|head)\s+-/ ALSO allows this, but the AST version must
         // continue to allow it: `tail` here is a plain `word` arg, not a
         // command_name.
-        let r = evaluate(&pipe_to_tail_or_head(), "signal-history --tail 20 --group abo");
+        let r = evaluate(
+            &pipe_to_tail_or_head(),
+            "signal-history --tail 20 --group abo",
+        );
         assert!(r.satisfied, "should allow --tail arg: {:?}", r);
     }
 
@@ -415,7 +428,10 @@ mod tests {
 
     #[test]
     fn allow_pipe_to_other_consumer() {
-        let r = evaluate(&pipe_to_tail_or_head(), "signal-history --group abo | grep ale");
+        let r = evaluate(
+            &pipe_to_tail_or_head(),
+            "signal-history --group abo | grep ale",
+        );
         assert!(r.satisfied, "should allow pipe to grep: {:?}", r);
     }
 
@@ -443,7 +459,11 @@ mod tests {
             &pipe_to_tail_or_head(),
             "signal-send andrew 'snippet: cmd | tail -20'",
         );
-        assert!(r.satisfied, "tail inside string literal must NOT match: {:?}", r);
+        assert!(
+            r.satisfied,
+            "tail inside string literal must NOT match: {:?}",
+            r
+        );
     }
 
     #[test]
@@ -466,8 +486,15 @@ mod tests {
 
     #[test]
     fn ban_obligations_bypass_prefix() {
-        let r = evaluate(&ban_obligations_bypass(), "OBLIGATIONS_BYPASS=1 signal-send foo");
-        assert!(!r.satisfied, "should deny OBLIGATIONS_BYPASS prefix: {:?}", r);
+        let r = evaluate(
+            &ban_obligations_bypass(),
+            "OBLIGATIONS_BYPASS=1 signal-send foo",
+        );
+        assert!(
+            !r.satisfied,
+            "should deny OBLIGATIONS_BYPASS prefix: {:?}",
+            r
+        );
     }
 
     #[test]

@@ -131,18 +131,14 @@ pub fn arm_alert_obligation(message: &str, source: &str) -> std::io::Result<bool
 
 /// Dir-explicit variant of [`arm_alert_obligation`] so tests avoid mutating
 /// the process-global env.
-pub fn arm_alert_obligation_in(
-    dir: &Path,
-    message: &str,
-    source: &str,
-) -> std::io::Result<bool> {
+pub fn arm_alert_obligation_in(dir: &Path, message: &str, source: &str) -> std::io::Result<bool> {
     let path = state_path(dir);
     let mut alerts = load_alerts(&path);
 
     // Idempotent: if an alert with this source already exists, no-op.
-    let already = alerts.iter().any(|a| {
-        a.get("source").and_then(|s| s.as_str()) == Some(source)
-    });
+    let already = alerts
+        .iter()
+        .any(|a| a.get("source").and_then(|s| s.as_str()) == Some(source));
     if already {
         return Ok(false);
     }
@@ -186,9 +182,9 @@ pub fn is_obligation_armed(source: &str) -> bool {
 #[allow(dead_code)]
 pub fn is_obligation_armed_in(dir: &Path, source: &str) -> bool {
     let path = state_path(dir);
-    load_alerts(&path).iter().any(|a| {
-        a.get("source").and_then(|s| s.as_str()) == Some(source)
-    })
+    load_alerts(&path)
+        .iter()
+        .any(|a| a.get("source").and_then(|s| s.as_str()) == Some(source))
 }
 
 #[cfg(test)]

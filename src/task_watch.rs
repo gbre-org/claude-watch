@@ -1459,16 +1459,17 @@ pub async fn cmd_task_init(
                 // it runs off the async runtime's worker thread.
                 let grace = crate::workload::resolve_kill_grace(kill_grace_secs);
                 let labels = running.clone();
-                let outcomes =
-                    tokio::task::spawn_blocking(move || crate::workload::kill_workloads(&labels, grace))
-                        .await
-                        .unwrap_or_else(|e| {
-                            // A panic in the teardown must not silently
-                            // become "recreated cleanly" — say so, and
-                            // fail the command.
-                            warn!(error = %e, "workload teardown task failed before recreate");
-                            Vec::new()
-                        });
+                let outcomes = tokio::task::spawn_blocking(move || {
+                    crate::workload::kill_workloads(&labels, grace)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    // A panic in the teardown must not silently
+                    // become "recreated cleanly" — say so, and
+                    // fail the command.
+                    warn!(error = %e, "workload teardown task failed before recreate");
+                    Vec::new()
+                });
                 let mut survivors = false;
                 for outcome in &outcomes {
                     survivors |= crate::workload::report_kill_outcome(outcome);

@@ -305,8 +305,7 @@ fn write_event_file(body: &serde_json::Value) -> std::io::Result<PathBuf> {
     let final_name = format!("{}_{}.json", ts_ns, EVENT_TAG);
     let final_path = dir.join(&final_name);
     let tmp_path = dir.join(format!(".{}.tmp", final_name));
-    let body_str = serde_json::to_string_pretty(body)
-        .unwrap_or_else(|_| "{}".to_string());
+    let body_str = serde_json::to_string_pretty(body).unwrap_or_else(|_| "{}".to_string());
     std::fs::write(&tmp_path, body_str.as_bytes())?;
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(final_path)
@@ -384,11 +383,7 @@ fn run_session_task_json(
 }
 
 /// CLI entry point. Returns process exit code.
-pub fn cmd_stale_ready_check(
-    threshold_min: u64,
-    state_dir: Option<&str>,
-    dry_run: bool,
-) -> i32 {
+pub fn cmd_stale_ready_check(threshold_min: u64, state_dir: Option<&str>, dry_run: bool) -> i32 {
     let cli = match find_session_task_cli() {
         Some(c) => c,
         None => {
@@ -446,10 +441,7 @@ pub fn cmd_stale_ready_check(
     if qualifying.is_empty() {
         if next_state != state {
             if let Err(e) = save_state(&state_file, &next_state) {
-                eprintln!(
-                    "stale-ready-check: state save failed ({}); continuing",
-                    e
-                );
+                eprintln!("stale-ready-check: state save failed ({}); continuing", e);
                 return 1;
             }
         }
@@ -462,14 +454,7 @@ pub fn cmd_stale_ready_check(
     let hostname = hostname_string();
     let user = std::env::var("USER").unwrap_or_default();
     let pid = std::process::id();
-    let event = build_event_json(
-        &qualifying,
-        threshold_min,
-        &now_iso,
-        &hostname,
-        &user,
-        pid,
-    );
+    let event = build_event_json(&qualifying, threshold_min, &now_iso, &hostname, &user, pid);
 
     if dry_run {
         // Print event body to stdout, leave state untouched.
@@ -721,10 +706,7 @@ mod tests {
         assert_eq!(v["data"]["qualifying_count"], 2);
         assert_eq!(v["data"]["oldest_age_min"], 30);
         assert_eq!(v["data"]["threshold_min"], 6);
-        assert_eq!(
-            v["data"]["all_ids"],
-            serde_json::json!(["q-a", "q-b"])
-        );
+        assert_eq!(v["data"]["all_ids"], serde_json::json!(["q-a", "q-b"]));
         assert_eq!(v["data"]["top_ids"], serde_json::json!(["q-a", "q-b"]));
     }
 

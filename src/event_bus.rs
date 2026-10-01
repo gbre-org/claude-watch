@@ -353,7 +353,13 @@ pub fn emit_cadence(ev: &CadenceEvent<'_>) {
     let safe_tag: String = ev
         .tag
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let final_name = format!("{}_{}.json", ts_ns, safe_tag);
     let final_path = dir.join(&final_name);
@@ -646,11 +652,10 @@ pub fn drain_obligations_bypass(
         .unwrap_or(0);
 
     // Ledger shape: { "<override_id>": <processed_at_epoch_secs>, ... }.
-    let mut ledger: std::collections::BTreeMap<String, u64> =
-        std::fs::read_to_string(ledger_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+    let mut ledger: std::collections::BTreeMap<String, u64> = std::fs::read_to_string(ledger_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
 
     let mut fresh: Vec<OverrideBypassEvent> = Vec::new();
 
@@ -685,14 +690,12 @@ pub fn drain_obligations_bypass(
             .unwrap_or_else(|| serde_json::json!({}));
         // Dedup key: the override id, falling back to the filename so a
         // malformed event (no override_id) still fires at most once.
-        let override_id =
-            data_str(&data, "override_id").unwrap_or_else(|| name.to_string());
+        let override_id = data_str(&data, "override_id").unwrap_or_else(|| name.to_string());
         if ledger.contains_key(&override_id) {
             continue;
         }
         let reason = data_str(&data, "reason").unwrap_or_default();
-        let duration_secs =
-            data_str(&data, "duration_secs").and_then(|s| s.parse::<i64>().ok());
+        let duration_secs = data_str(&data, "duration_secs").and_then(|s| s.parse::<i64>().ok());
         let created_by = data_str(&data, "created_by").unwrap_or_default();
         let priority = ev
             .get("priority")
@@ -972,8 +975,10 @@ mod tests {
             "/tmp/claude-workloads/ebook-twilight.output"
         );
         // Without --queue-id, no queue_id key appears in data.
-        assert!(data.get("queue_id").is_none(),
-            "queue_id must be absent when not bound");
+        assert!(
+            data.get("queue_id").is_none(),
+            "queue_id must be absent when not bound"
+        );
     }
 
     #[test]
@@ -1250,7 +1255,10 @@ mod tests {
         // The body must TELL the loop the ritual, not assume it remembers.
         // claude-event-watch renders every scalar in `data` on the EVENT line,
         // so this is what makes the instruction visible.
-        assert_eq!(parsed["data"]["ack_command"], "event-ack ack \"<key>\" --action \"<what you did>\"");
+        assert_eq!(
+            parsed["data"]["ack_command"],
+            "event-ack ack \"<key>\" --action \"<what you did>\""
+        );
     }
 
     #[test]
@@ -1280,7 +1288,6 @@ mod tests {
         assert_eq!(data["ack_command"], ACK_COMMAND);
     }
 }
-
 
 #[cfg(test)]
 mod obligations_bypass_tests {
@@ -1334,7 +1341,10 @@ mod obligations_bypass_tests {
         // File still on disk (we do NOT delete -- claude-event-watch owns that),
         // but the ledger makes a second scan a no-op.
         let second = drain_obligations_bypass(&dir, &ledger);
-        assert!(second.is_empty(), "already-notified override must not re-fire");
+        assert!(
+            second.is_empty(),
+            "already-notified override must not re-fire"
+        );
     }
 
     #[test]

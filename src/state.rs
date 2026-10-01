@@ -950,14 +950,18 @@ mod tests {
         // existed (serde default).
         let path = "/tmp/claude-watch-test-down-since.json";
         let mut state = State::default();
-        state
-            .watcher_down_since
-            .insert("signal-wait-dm".to_string(), "2026-05-30T17:00:00Z".to_string());
+        state.watcher_down_since.insert(
+            "signal-wait-dm".to_string(),
+            "2026-05-30T17:00:00Z".to_string(),
+        );
         save_state(path, &state);
 
         let loaded = load_state(path);
         assert_eq!(
-            loaded.watcher_down_since.get("signal-wait-dm").map(String::as_str),
+            loaded
+                .watcher_down_since
+                .get("signal-wait-dm")
+                .map(String::as_str),
             Some("2026-05-30T17:00:00Z")
         );
         let _ = std::fs::remove_file(path);
@@ -1096,10 +1100,8 @@ mod tests {
         let startup_now = "2026-06-24T12:00:00+00:00";
 
         // (a) missing state file (brand-new daemon) -> seeded, not None.
-        let loaded = load_state_with_now(
-            "/tmp/nonexistent-claude-watch-cold-start.json",
-            startup_now,
-        );
+        let loaded =
+            load_state_with_now("/tmp/nonexistent-claude-watch-cold-start.json", startup_now);
         assert_eq!(
             loaded.last_interrupt_at.as_deref(),
             Some(startup_now),
@@ -1281,7 +1283,6 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-
     #[test]
     fn test_ask_question_fields_roundtrip_and_default() {
         // The AskUserQuestion stale-monitor timer field round-trips through
@@ -1341,7 +1342,6 @@ mod tests {
         assert_eq!(loaded2.permission_prompt_deny_attempts, 0);
         let _ = std::fs::remove_file(path2);
     }
-
 
     // -----------------------------------------------------------------------
     // watcher_health reconciliation

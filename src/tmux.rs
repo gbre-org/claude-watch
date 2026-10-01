@@ -1034,10 +1034,8 @@ const PERMISSION_DIALOG_TOOL_HEADERS: &[&str] = &[
 /// the question marker today; the veto is here so that a future rewording
 /// (`Do you want to trust the files in this folder?`) cannot quietly promote
 /// either one into the auto-deny path.
-const PERMISSION_DIALOG_NEVER_MATCH: &[&str] = &[
-    "trust the files in this folder",
-    "bypass permissions",
-];
+const PERMISSION_DIALOG_NEVER_MATCH: &[&str] =
+    &["trust the files in this folder", "bypass permissions"];
 
 /// Pure function: does the pane show a TOOL-PERMISSION dialog that is safe to
 /// decline unattended? Returns the parsed dialog (question + context +
@@ -1174,9 +1172,7 @@ pub(crate) fn permission_prompt_visible(
             // "Deny, and tell Claude what to do differently" is the same row
             // under a different word; accepting both keeps a rename from
             // silencing the monitor the way the missing Escape hint did.
-            if n > 1
-                && (label.starts_with("no") || label.starts_with("deny"))
-                && deny_row.is_none()
+            if n > 1 && (label.starts_with("no") || label.starts_with("deny")) && deny_row.is_none()
             {
                 deny_row = Some(n);
             }
@@ -1260,7 +1256,10 @@ pub(crate) fn permission_prompt_visible(
 }
 
 /// Async wrapper: capture the pane and run `permission_prompt_visible`.
-pub async fn detect_permission_prompt(pane: &str, context_lines: usize) -> Option<PermissionPrompt> {
+pub async fn detect_permission_prompt(
+    pane: &str,
+    context_lines: usize,
+) -> Option<PermissionPrompt> {
     let out = capture_pane(pane).await?;
     permission_prompt_visible(&out, context_lines)
 }
@@ -1276,7 +1275,9 @@ pub async fn detect_permission_prompt(pane: &str, context_lines: usize) -> Optio
 pub async fn deny_permission_prompt(pane: &str, context_lines: usize) -> bool {
     send_keys(pane, &[PERMISSION_PROMPT_DENY_KEY]).await;
     sleep(std::time::Duration::from_millis(1500)).await;
-    detect_permission_prompt(pane, context_lines).await.is_none()
+    detect_permission_prompt(pane, context_lines)
+        .await
+        .is_none()
 }
 
 /// Check if pane shows exit teardown indicators ("Goodbye!" or "Background command was stopped").
@@ -1752,8 +1753,7 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
     // mid-handoff (holding its lockfile), DEFER -- an Escape blast here would
     // clobber the `/clear`->resume-prompt sequence it drives into this same pane
     // (operator-reported, 2026-08-17). Fail-open. See `self_clear_in_progress`.
-    if self_clear_in_progress() || self_clear_handoff_recent(self_clear_handoff_grace_secs_env())
-    {
+    if self_clear_in_progress() || self_clear_handoff_recent(self_clear_handoff_grace_secs_env()) {
         info!(
             pane = %pane,
             "interrupt_and_wait: self-clear in progress or recent handoff -- deferring interrupt (not seizing pane)"
@@ -1832,7 +1832,9 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
 /// only safe move is to not send it at all. Skipping this cycle costs
 /// nothing; the daemon re-evaluates on the next tick.
 async fn operator_typing_in_progress(pane: &str) -> bool {
-    let prompt = capture_pane(pane).await.and_then(|out| prompt_line_text(&out));
+    let prompt = capture_pane(pane)
+        .await
+        .and_then(|out| prompt_line_text(&out));
     if prompt_has_unsubmitted_text(prompt.as_deref()) {
         info!(
             pane = %pane,
@@ -3661,7 +3663,8 @@ pub(crate) fn check_lines_for_wedged(pane_output: &str) -> Option<WedgedReason> 
     // marker so that incidental mentions of the strings (e.g. an HTTP status
     // table in chat history) don't trip the detector.
     let has_reject = lower.contains("request rejected") || lower.contains("api error");
-    let has_429 = lower.contains("(429)") || lower.contains(" 429 ") || lower.contains("rate limit");
+    let has_429 =
+        lower.contains("(429)") || lower.contains(" 429 ") || lower.contains("rate limit");
     if has_reject && has_429 {
         return Some(WedgedReason::RateLimited);
     }
@@ -3714,27 +3717,117 @@ fn has_alnum(s: &str) -> bool {
 /// so a repeated block scrolled up in history cannot trip it. The caller still
 /// requires multiple consecutive CYCLES (`wedged_consecutive`) before acting, so
 /// a one-frame fluke never fires a clear.
+#[cfg(test)]
 pub(crate) fn check_lines_for_degenerate_output(
     pane_output: &str,
     min_repeats: usize,
     max_line_len: usize,
     max_token_len: usize,
 ) -> bool {
+    !degenerate_output_evidence(pane_output, min_repeats, max_line_len, max_token_len).is_empty()
+}
+
+/// Max evidence lines logged per detection, and max chars per logged line.
+const DEGEN_EVIDENCE_MAX_LINES: usize = 6;
+const DEGEN_EVIDENCE_MAX_CHARS: usize = 120;
+
+fn truncate_evidence(line: &str) -> String {
+    let norm = normalize_degen_line(line);
+    if norm.chars().count() > DEGEN_EVIDENCE_MAX_CHARS {
+        let mut t: String = norm.chars().take(DEGEN_EVIDENCE_MAX_CHARS).collect();
+        t.push('\u{2026}');
+        t
+    } else {
+        norm
+    }
+}
+
+/// Is this pane line TUI chrome / tool output rather than assistant prose?
+/// Chrome never counts toward (and always breaks) a degenerate run:
+///  * spinner / thinking-indicator lines and "esc to interrupt" status rows,
+///  * table rows and box drawing (any box-drawing / block glyph in the line),
+///  * progress bars (`[=====>   ]`, block glyphs, bare `NN%`),
+///  * tool-result rows (`⎿ ...`) and their deeper-indented continuation lines
+///    (4+ leading spaces), including subagent status rows,
+///  * the prompt line (`❯`), and markdown table pipes.
+fn is_degen_chrome_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if line.chars().take_while(|c| *c == ' ').count() >= 4 {
+        return true;
+    }
+    if trimmed.starts_with('\u{23bf}') || trimmed.starts_with('\u{276f}') {
+        return true;
+    }
+    if trimmed.contains("esc to interrupt") || is_active_thinking_line(trimmed) {
+        return true;
+    }
+    if SPINNER_CHARS.iter().any(|c| trimmed.contains(*c)) {
+        return true;
+    }
+    // Box-drawing (U+2500..U+257F), block elements (U+2580..U+259F).
+    if trimmed
+        .chars()
+        .any(|c| ('\u{2500}'..='\u{259f}').contains(&c))
+    {
+        return true;
+    }
+    if trimmed.starts_with('|') || trimmed.ends_with('|') {
+        return true;
+    }
+    if trimmed.starts_with('[')
+        && trimmed.contains(']')
+        && trimmed
+            .chars()
+            .filter(|c| matches!(c, '=' | '#' | '>' | '-'))
+            .count()
+            >= 4
+    {
+        return true;
+    }
+    if trimmed.ends_with('%')
+        && trimmed.chars().filter(|c| c.is_ascii_digit()).count() >= 1
+        && trimmed.chars().count() <= 8
+    {
+        return true;
+    }
+    false
+}
+
+/// Restrict a pane tail to the assistant-output region: everything above the
+/// bottom prompt box (the separator line that precedes the `❯` prompt).
+fn assistant_region<'a>(tail: &'a [&'a str]) -> &'a [&'a str] {
+    let prompt_idx = tail.iter().rposition(|l| l.contains('\u{276f}'));
+    if let Some(pi) = prompt_idx {
+        let sep = tail[..pi].iter().rposition(|l| is_separator_line(l));
+        return &tail[..sep.unwrap_or(pi)];
+    }
+    tail
+}
+
+/// Evidence-returning core of `check_lines_for_degenerate_output`. Returns the
+/// (truncated, bounded) matching lines, or an empty Vec when nothing trips.
+pub(crate) fn degenerate_output_evidence(
+    pane_output: &str,
+    min_repeats: usize,
+    max_line_len: usize,
+    max_token_len: usize,
+) -> Vec<String> {
     if min_repeats < 2 {
-        return false;
+        return Vec::new();
     }
     let lines: Vec<&str> = pane_output.lines().collect();
     let start = lines.len().saturating_sub(40);
-    let tail = &lines[start..];
+    let region = assistant_region(&lines[start..]);
 
     // --- Signature 1: consecutive identical substantive lines. ---
     let mut run_key: Option<String> = None;
     let mut run_len: usize = 0;
-    for line in tail {
+    for line in region {
         let norm = normalize_degen_line(line);
-        // Blank / pure-separator / oversized lines break and do not extend a
-        // run: they are chrome or legitimately-long content, never filler spew.
-        if norm.is_empty() || !has_alnum(&norm) || norm.chars().count() > max_line_len {
+        if is_degen_chrome_line(line) || !has_alnum(&norm) || norm.chars().count() > max_line_len {
             run_key = None;
             run_len = 0;
             continue;
@@ -3746,12 +3839,17 @@ pub(crate) fn check_lines_for_degenerate_output(
             run_len = 1;
         }
         if run_len >= min_repeats {
-            return true;
+            let ev = truncate_evidence(line);
+            return vec![format!("line x{run_len}+: {ev}")];
         }
     }
 
     // --- Signature 2: one short token repeated consecutively within a line. ---
-    for line in tail {
+    let mut evidence = Vec::new();
+    for line in region {
+        if is_degen_chrome_line(line) {
+            continue;
+        }
         let toks: Vec<&str> = line.split_whitespace().collect();
         if toks.len() < min_repeats {
             continue;
@@ -3759,7 +3857,10 @@ pub(crate) fn check_lines_for_degenerate_output(
         let mut tok_key: Option<&str> = None;
         let mut tok_run: usize = 0;
         for t in toks {
-            let is_candidate = t.chars().count() <= max_token_len && has_alnum(t);
+            // Candidate tokens must contain a letter: digit/punctuation runs
+            // ("0 0 0 0", "- - - -") are table/number chrome, not filler spew.
+            let is_candidate =
+                t.chars().count() <= max_token_len && t.chars().any(|c| c.is_alphabetic());
             if is_candidate && tok_key == Some(t) {
                 tok_run += 1;
             } else {
@@ -3767,12 +3868,15 @@ pub(crate) fn check_lines_for_degenerate_output(
                 tok_run = if is_candidate { 1 } else { 0 };
             }
             if tok_run >= min_repeats {
-                return true;
+                evidence.push(format!("token x{tok_run}+: {}", truncate_evidence(line)));
+                break;
             }
         }
+        if evidence.len() >= DEGEN_EVIDENCE_MAX_LINES {
+            break;
+        }
     }
-
-    false
+    evidence
 }
 
 /// Capture the pane and check whether Claude Code is wedged (context limit /
@@ -3791,19 +3895,40 @@ pub async fn detect_wedged(
     degen_max_line_len: usize,
     degen_max_token_len: usize,
 ) -> Option<WedgedReason> {
+    detect_wedged_detailed(
+        pane,
+        degen_enabled,
+        degen_min_repeats,
+        degen_max_line_len,
+        degen_max_token_len,
+    )
+    .await
+    .map(|(r, _)| r)
+}
+
+/// Like `detect_wedged`, but also returns bounded evidence lines (non-empty only
+/// for `DegenerateOutput`) so the caller can log what tripped the heuristic.
+pub async fn detect_wedged_detailed(
+    pane: &str,
+    degen_enabled: bool,
+    degen_min_repeats: usize,
+    degen_max_line_len: usize,
+    degen_max_token_len: usize,
+) -> Option<(WedgedReason, Vec<String>)> {
     let out = capture_pane_history(pane, 80).await?;
     if let Some(reason) = check_lines_for_wedged(&out) {
-        return Some(reason);
+        return Some((reason, Vec::new()));
     }
-    if degen_enabled
-        && check_lines_for_degenerate_output(
+    if degen_enabled {
+        let ev = degenerate_output_evidence(
             &out,
             degen_min_repeats,
             degen_max_line_len,
             degen_max_token_len,
-        )
-    {
-        return Some(WedgedReason::DegenerateOutput);
+        );
+        if !ev.is_empty() {
+            return Some((WedgedReason::DegenerateOutput, ev));
+        }
     }
     None
 }
@@ -4590,7 +4715,9 @@ mod tests {
 
     #[test]
     fn prompt_has_unsubmitted_text_detects_real_typed_content() {
-        assert!(prompt_has_unsubmitted_text(Some("half-typed operator input")));
+        assert!(prompt_has_unsubmitted_text(Some(
+            "half-typed operator input"
+        )));
         assert!(prompt_has_unsubmitted_text(Some("/config theme=light")));
     }
 
@@ -5169,8 +5296,7 @@ mod tests {
     /// `Esc to cancel` footer. The monitor failed closed, logged nothing, and
     /// the dialog blocked the pane for eighteen minutes until a human cleared
     /// it. The `Bash command` header is what now identifies it.
-    const GUARDED_RM_DIALOG_NO_ESC_HINT: &str =
-        "\u{25cf} Bash(rm -f $SP/*.m4v $SP/*.mkv)\n\
+    const GUARDED_RM_DIALOG_NO_ESC_HINT: &str = "\u{25cf} Bash(rm -f $SP/*.m4v $SP/*.mkv)\n\
          \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}\n\
          \u{2502} Bash command                                          \u{2502}\n\
          \u{2502}                                                       \u{2502}\n\
@@ -5482,7 +5608,8 @@ mod tests {
     // acceptance is not persisted in settings. Verbatim capture of the pane
     // the daemon injected into on 2026-08-29 (Claude Code 2.1.251), which
     // exited Claude because the default selection is "No, exit".
-    const BYPASS_DIALOG_PANE: &str = include_str!("../tests/fixtures/bypass_permissions_dialog.txt");
+    const BYPASS_DIALOG_PANE: &str =
+        include_str!("../tests/fixtures/bypass_permissions_dialog.txt");
 
     #[test]
     fn bypass_permissions_dialog_matches_the_captured_pane() {
@@ -5562,7 +5689,9 @@ mod tests {
 
     #[test]
     fn login_dialog_matches_the_ascii_and_typographic_apostrophe() {
-        assert!(login_dialog_visible("  Browser didn't open? Use the url below"));
+        assert!(login_dialog_visible(
+            "  Browser didn't open? Use the url below"
+        ));
         assert!(login_dialog_visible(
             "  Browser didn\u{2019}t open? Use the url below"
         ));
@@ -5638,9 +5767,15 @@ mod tests {
             .position(|l| l.contains("Yes, I accept"))
             .expect("confirm row");
         let downs = confirm_row - cursor_row;
-        assert_eq!(downs, 1, "one Down moves from the default to the confirm row");
         assert_eq!(
-            BYPASS_PERMISSIONS_ACCEPT_KEYS.iter().filter(|k| **k == "Down").count(),
+            downs, 1,
+            "one Down moves from the default to the confirm row"
+        );
+        assert_eq!(
+            BYPASS_PERMISSIONS_ACCEPT_KEYS
+                .iter()
+                .filter(|k| **k == "Down")
+                .count(),
             downs
         );
         assert_eq!(*BYPASS_PERMISSIONS_ACCEPT_KEYS.last().unwrap(), "Enter");
@@ -6129,7 +6264,9 @@ mod tests {
         assert!(!is_active_thinking_line(
             "\u{25cf} Interrupt ack \u{2014} same false positive flagged earlier."
         ));
-        assert!(!is_active_thinking_line("\u{25cf} No new messages. Idling."));
+        assert!(!is_active_thinking_line(
+            "\u{25cf} No new messages. Idling."
+        ));
         // `●`-prefix with paren but NO ellipsis — the feedback prompt widget.
         assert!(!is_active_thinking_line(
             "\u{25cf} How is Claude doing this session? (optional)"
@@ -6363,7 +6500,9 @@ mod tests {
         assert!(!check_lines_for_401_banner(
             "Your login expires in 2 days · run /login to renew\n❯ \n 1,234 tokens"
         ));
-        assert!(!check_lines_for_401_banner("Please run /login\n❯ \n 1,234 tokens"));
+        assert!(!check_lines_for_401_banner(
+            "Please run /login\n❯ \n 1,234 tokens"
+        ));
         // A 401 alone (a curl in the conversation) is not the banner.
         assert!(!check_lines_for_401_banner(
             "curl: HTTP/1.1 401 Unauthorized\nAPI Error: 401\n❯ \n 1,234 tokens"
@@ -6386,7 +6525,10 @@ mod tests {
         );
         match classify_reauth_frame(frame) {
             ReauthSignal::LoginScreen { url } => {
-                assert!(url.starts_with("https://claude.com/cai/oauth/authorize"), "{url}")
+                assert!(
+                    url.starts_with("https://claude.com/cai/oauth/authorize"),
+                    "{url}"
+                )
             }
             other => panic!("expected LoginScreen, got {other:?}"),
         }
@@ -6581,7 +6723,9 @@ mod tests {
         assert!(!model_switch_dialog_visible("  Yes, switch to Opus 5\n❯ "));
         // A healthy session, and the out-of-credits pane that PRECEDES the
         // dialog: neither is the dialog.
-        assert!(!model_switch_dialog_visible("● Done.\n❯ \n  57,129 tokens\n"));
+        assert!(!model_switch_dialog_visible(
+            "● Done.\n❯ \n  57,129 tokens\n"
+        ));
         assert!(!model_switch_dialog_visible(CREDITS_EXHAUSTED_PANE));
         assert!(!model_switch_dialog_visible(""));
     }
@@ -6602,7 +6746,10 @@ mod tests {
     fn model_switch_keys_are_produced_only_for_a_visible_answerable_dialog() {
         // Idle prompt, the credits banner, an unrelated permission menu,
         // the login modal, empty output -> press NOTHING.
-        assert_eq!(model_switch_answer_keys("● Done.\n❯ \n  57,129 tokens\n"), None);
+        assert_eq!(
+            model_switch_answer_keys("● Done.\n❯ \n  57,129 tokens\n"),
+            None
+        );
         assert_eq!(model_switch_answer_keys(CREDITS_EXHAUSTED_PANE), None);
         assert_eq!(
             model_switch_answer_keys("  Do you want to proceed?\n❯ 1. Yes\n  2. No\n"),
@@ -6613,7 +6760,10 @@ mod tests {
 
         // The real dialog, confirm row selected -> a single Enter. No digit is
         // ever sent: a stray `1` would land on the prompt as text.
-        assert_eq!(model_switch_answer_keys(MODEL_SWITCH_PANE), Some(&["Enter"][..]));
+        assert_eq!(
+            model_switch_answer_keys(MODEL_SWITCH_PANE),
+            Some(&["Enter"][..])
+        );
 
         // Cursor parked on "No, go back" -> move up first, then confirm.
         let declined = MODEL_SWITCH_PANE
@@ -6623,7 +6773,10 @@ mod tests {
             model_switch_cursor(&declined),
             Some(ModelSwitchCursor::Decline)
         );
-        assert_eq!(model_switch_answer_keys(&declined), Some(&["Up", "Enter"][..]));
+        assert_eq!(
+            model_switch_answer_keys(&declined),
+            Some(&["Up", "Enter"][..])
+        );
 
         // Dialog up but no cursor anywhere (a render this code does not know):
         // never guess a key.
@@ -6646,7 +6799,9 @@ mod tests {
 
     #[test]
     fn an_applied_model_switch_is_recognised() {
-        assert!(model_switch_applied("  ⎿  Set model to Opus 5 (1M context)\n❯ \n"));
+        assert!(model_switch_applied(
+            "  ⎿  Set model to Opus 5 (1M context)\n❯ \n"
+        ));
         assert!(model_switch_applied("  Model set to opus\n❯ \n"));
         // The dialog still being up is not an applied switch.
         assert!(!model_switch_applied(MODEL_SWITCH_PANE));
@@ -6675,7 +6830,8 @@ mod tests {
     #[test]
     fn test_reauth_not_detected_invalid_credentials_in_conversation() {
         // "Invalid authentication credentials" appearing in conversation text.
-        let output = "Claude responded: Invalid authentication credentials\n57,129 tokens  9 bashes\n❯ ";
+        let output =
+            "Claude responded: Invalid authentication credentials\n57,129 tokens  9 bashes\n❯ ";
         assert!(!check_lines_for_reauth(output));
     }
 
@@ -6894,7 +7050,8 @@ API Error: Request rejected (429)\n";
     fn test_wedged_only_checks_recent_lines() {
         // A "Context limit reached" 100 lines ago shouldn't count — only the
         // last ~40 lines are inspected.
-        let mut lines: Vec<String> = vec!["Context limit reached. /compact or /clear to continue".to_string()];
+        let mut lines: Vec<String> =
+            vec!["Context limit reached. /compact or /clear to continue".to_string()];
         for _ in 0..100 {
             lines.push("normal chat line".to_string());
         }
@@ -7034,6 +7191,66 @@ API Error: Request rejected (429)\n";
         assert!(!is_degen(""));
     }
 
+    // --- degenerate_output hardening: false-positive shapes must NOT fire ---
+
+    #[test]
+    fn test_degen_real_assistant_spew_still_fires_with_chrome() {
+        let out = "\u{25cf} Here is the answer\ncourt\ncourt\ncourt\ncourt\ncourt\ncourt\ncourt\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} \n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} bypass permissions on\n";
+        assert!(is_degen(out));
+        let ev = degenerate_output_evidence(out, DEGEN_MIN, DEGEN_MAX_LINE, DEGEN_MAX_TOK);
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].contains("court"));
+    }
+
+    #[test]
+    fn test_degen_fp_repeated_spinner_status_lines() {
+        let l = "\u{2819} Running agent\u{2026}\n";
+        assert!(!is_degen(&l.repeat(8)));
+        let l = "\u{273d} Thinking\u{2026} (12s \u{00b7} esc to interrupt)\n";
+        assert!(!is_degen(&l.repeat(8)));
+    }
+
+    #[test]
+    fn test_degen_fp_subagent_status_rows() {
+        let l = "     \u{23bf}  Done (3 tool uses)\n";
+        assert!(!is_degen(&l.repeat(8)));
+        let l = "  \u{23bf}  Running\u{2026}\n";
+        assert!(!is_degen(&l.repeat(8)));
+    }
+
+    #[test]
+    fn test_degen_fp_table_rows() {
+        let l = "\u{2502} ok ok ok ok ok ok ok \u{2502}\n";
+        assert!(!is_degen(&l.repeat(2)));
+        let l = "| ok | ok |\n";
+        assert!(!is_degen(&l.repeat(8)));
+        assert!(!is_degen("| yes yes yes yes yes yes yes |\n"));
+    }
+
+    #[test]
+    fn test_degen_fp_progress_bars_and_numbers() {
+        let l = "[=====>    ] 50\n";
+        assert!(!is_degen(&l.repeat(8)));
+        let l = "\u{2588}\u{2588}\u{2588}\u{2591}\u{2591} ok\n";
+        assert!(!is_degen(&l.repeat(8)));
+        assert!(!is_degen("0 0 0 0 0 0 0 0\n"));
+        assert!(!is_degen(&"100%\n".repeat(8)));
+    }
+
+    #[test]
+    fn test_degen_fp_indented_tool_output_logs() {
+        let l = "     retrying connection\n";
+        assert!(!is_degen(&l.repeat(8)));
+    }
+
+    #[test]
+    fn test_degen_fp_prompt_box_repeated_outside_region() {
+        // Repetition only in the bottom prompt/status area is not assistant output.
+        let out = "hello\n\u{2500}\u{2500}\u{2500}\n\u{276f} \nstatus line\nstatus line\nstatus line\nstatus line\nstatus line\nstatus line\n";
+        assert!(!is_degen(out));
+    }
+
     // --- check_lines_for_malformed_tool_call tests ---
     //
     // The raw, non-namespaced tag strings below are inert Rust string
@@ -7070,8 +7287,7 @@ court<invoke name=\"Bash\">\n\
     fn test_malformed_single_line_construct() {
         // A whole construct collapsed onto ONE line (no surrounding fence) is
         // still detected.
-        let output =
-            "x<invoke name=\"Bash\"><parameter name=\"command\">ls</parameter></invoke>\n";
+        let output = "x<invoke name=\"Bash\"><parameter name=\"command\">ls</parameter></invoke>\n";
         assert!(check_lines_for_malformed_tool_call(output));
     }
 
@@ -7700,7 +7916,10 @@ mod inject_and_selfclear_coord_tests {
             .open(&path)
             .unwrap();
         let hfd = holder.as_raw_fd();
-        assert_eq!(unsafe { libc::flock(hfd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        assert_eq!(
+            unsafe { libc::flock(hfd, libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
         assert!(lockfile_held(&path_s), "held lock must be detected");
         assert_eq!(unsafe { libc::flock(hfd, libc::LOCK_UN) }, 0);
         assert!(!lockfile_held(&path_s), "released lock must read as free");
