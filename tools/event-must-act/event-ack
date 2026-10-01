@@ -40,7 +40,28 @@ Subcommands:
   event-ack ack "<key>" --action "<text>"
                                   Mark ONE actionable as handled. Removes
                                   from pending-actions, resets the
-                                  N-counter to 0.
+                                  N-counter to 0. For a queue-orphaned key
+                                  whose item is still `running`, this is
+                                  REFUSED unless the item has actually been
+                                  resolved (done/abandon/resurrect) -- see
+                                  --verified-false-positive below.
+
+  event-ack ack "<key>" --action "<text>" --verified-false-positive
+                                  Escape hatch for a queue-orphaned key the
+                                  caller has independently confirmed is a
+                                  LIVE agent (e.g. verified via agent-tail /
+                                  agent-msg / a direct SendMessage reply),
+                                  not a dead one. Clears the pending event
+                                  WITHOUT touching the queue item itself --
+                                  does NOT call done/abandon/resurrect, so a
+                                  live agent is never stranded by a rotated
+                                  q-id. The destructive resolutions stay
+                                  available but become a CHOICE, not the
+                                  only way to clear a false-positive alert.
+                                  A no-op on a non-orphan key (nothing to
+                                  bypass). Still requires a substantive
+                                  --action (the ack must say what
+                                  verification was done).
 
   event-ack ack-batch             PERMANENTLY DISABLED (Andrew directive,
                                   2026-09-11, #7784/7786/7787): this became
@@ -354,7 +375,9 @@ def _resolve_session_task_cli() -> str | None:
     return None
 
 
-def verify_orphan_resolved(entry: dict | None, key: str) -> tuple[bool, str]:
+def verify_orphan_resolved(
+    entry: dict | None, key: str, *, verified_false_positive: bool = False,
+) -> tuple[bool, str]:
     """Gate the ack of a queue-orphaned event on the orphan being resolved.
 
     Returns ``(ok, message)``. ``ok=True`` allows the ack; ``ok=False`` refuses
@@ -368,6 +391,19 @@ def verify_orphan_resolved(entry: dict | None, key: str) -> tuple[bool, str]:
     orphan; the item must be resolved via done / abandon / resurrect first. Any
     other status (done, abandoned, blocked, pending, not-found, ...) is allowed.
 
+    ``verified_false_positive=True`` (``event-ack ack --verified-false-positive``)
+    is the escape hatch for the case the hard refusal otherwise forces into a
+    DESTRUCTIVE resolution: the caller has independently confirmed (agent-tail,
+    agent-msg, a live SendMessage reply, ...) that the bound agent is actually
+    alive -- the orphan alert is a false positive, not a dead agent. Acking
+    with this flag ALWAYS allows (bypasses the running-status lookup entirely)
+    and does NOT touch the queue item -- no done/abandon/resurrect is called,
+    so a live agent's q-id is never rotated out from under it (the da57->c740
+    strand: resurrect rotated the q-id of a verified-alive agent and required
+    an obligations-override to recover). The destructive resolutions
+    (done/abandon/resurrect) remain available as a CHOICE for a genuinely dead
+    agent; this flag is for the case they are the wrong choice.
+
     DEFAULT-OPEN: if the entry is not a queue-orphaned event, the q-id is
     unparseable, session-task is unavailable, or the lookup errors / times out /
     returns unparseable output, the ack is ALLOWED (and the reason logged to
@@ -376,6 +412,11 @@ def verify_orphan_resolved(entry: dict | None, key: str) -> tuple[bool, str]:
     source_event = (entry or {}).get("source_event", "") or ""
     if source_event not in QUEUE_ORPHANED_SOURCE_EVENTS:
         return (True, "")  # not a queue-orphaned event -- no gate
+
+    if verified_false_positive:
+        # Caller asserts they've confirmed liveness out-of-band. Allow
+        # unconditionally -- no session-task lookup, no queue mutation.
+        return (True, "")
 
     m = _QID_RE.search(key or "")
     if not m:
@@ -415,7 +456,10 @@ def verify_orphan_resolved(entry: dict | None, key: str) -> tuple[bool, str]:
     if status == "running":
         return (False,
                 f"{qid} still running-orphaned -- resolve via "
-                f"done/abandon/resurrect first; ack does not resolve it")
+                f"done/abandon/resurrect, OR if you have VERIFIED the agent "
+                f"is actually alive (agent-tail / agent-msg / a live reply), "
+                f"re-run with --verified-false-positive; ack alone does not "
+                f"resolve it")
     return (True, "")
 
 
@@ -617,6 +661,14 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("ack", help="Ack (remove) a pending entry.")
     sp.add_argument("key")
     sp.add_argument("--action", required=True)
+    sp.add_argument(
+        "--verified-false-positive", action="store_true",
+        help="For a queue-orphaned key: the caller has independently "
+             "confirmed the bound agent is actually alive (agent-tail / "
+             "agent-msg / a live reply) -- clear the pending event without "
+             "calling done/abandon/resurrect, so a live agent's q-id is "
+             "never rotated out from under it. Only affects queue-orphaned "
+             "keys; a no-op flag on any other key.")
 
     sp = sub.add_parser(
         "ack-batch",
@@ -758,9 +810,16 @@ def main(argv: list[str] | None = None) -> int:
         entry = _find_pending_entry(state_dir, args.key)
         # Queue-orphaned events: an ack does NOT resolve the orphan. Refuse the
         # ack while the underlying queue item is still `running` -- it must be
-        # resolved (done / abandon / resurrect) first. Default-open on any
-        # verification failure so a lookup problem never blackholes the ack.
-        ok, why = verify_orphan_resolved(entry, args.key)
+        # resolved (done / abandon / resurrect) first, UNLESS the caller passes
+        # --verified-false-positive to assert they've independently confirmed
+        # the agent is alive (the escape hatch for the case the hard refusal
+        # otherwise forces a destructive resurrect onto a live agent).
+        # Default-open on any verification failure so a lookup problem never
+        # blackholes the ack.
+        ok, why = verify_orphan_resolved(
+            entry, args.key,
+            verified_false_positive=bool(args.verified_false_positive),
+        )
         if not ok:
             print(f"REFUSED: {why}", file=sys.stderr)
             return 2
@@ -1264,6 +1323,73 @@ def _self_test() -> int:
             fail(f"main() ack of a resolved orphan must succeed, got rc={rc}")
         if any(e["key"] == okey for e in list_state(sd)["pending"]):
             fail("resolved-orphan ack must remove the entry")
+
+        # ---- --verified-false-positive escape hatch (q-0151 / da57->c740) -
+        # A running-orphan ack normally forces done/abandon/resurrect, which
+        # for a demonstrably LIVE agent means a destructive queue mutation
+        # (resurrect rotates the q-id, stranding the live agent -- the
+        # da57->c740 incident, recovered only via an obligations-override).
+        # --verified-false-positive asserts the caller independently
+        # confirmed liveness and clears the pending event WITHOUT touching
+        # the queue item at all.
+
+        # 32. verify_orphan_resolved(verified_false_positive=True) bypasses
+        #     the running check entirely -- allowed even with status=running
+        #     and even if session-task is made to error.
+        os.environ["FAKE_ST_STATUS"] = "running"
+        os.environ["FAKE_ST_RC"] = "0"
+        ok, _m = verify_orphan_resolved(
+            orphan_entry, orphan_key, verified_false_positive=True)
+        if not ok:
+            fail("verified_false_positive=True must bypass a running orphan")
+        ok, _m = verify_orphan_resolved(
+            cw_orphan_entry, orphan_key, verified_false_positive=True)
+        if not ok:
+            fail("verified_false_positive=True must bypass (claude-watch source)")
+
+        # 33. The flag is a harmless no-op on a NON-orphan entry (nothing to
+        #     bypass -- still just allowed, as it always was).
+        ok, _m = verify_orphan_resolved(
+            {"source_event": "torrent/torrent-completed"}, "k:x",
+            verified_false_positive=True)
+        if not ok:
+            fail("verified_false_positive=True must be a no-op on non-orphan")
+
+        # 34. End-to-end via main(): `ack --verified-false-positive` clears a
+        #     running-orphan pending entry WITHOUT ever calling session-task
+        #     (status stays "running" throughout -- if the CLI mutated the
+        #     queue, a bug would have to actively avoid doing so to pass;
+        #     the real assertion is that the ack SUCCEEDS and the entry is
+        #     gone despite status=running never changing).
+        clear_pending(sd)
+        os.environ["FAKE_ST_STATUS"] = "running"
+        ingest(sd, "queue", "queue-orphaned",
+               "q-2026-01-02-face running without owner")
+        fkey = list_state(sd)["pending"][0]["key"]
+        rc = main(["--state-dir", str(sd), "ack", fkey,
+                   "--action", "confirmed alive via agent-tail",
+                   "--verified-false-positive"])
+        if rc != 0:
+            fail(f"main() ack --verified-false-positive must succeed, got rc={rc}")
+        if any(e["key"] == fkey for e in list_state(sd)["pending"]):
+            fail("verified-false-positive ack must remove the entry")
+        if os.environ.get("FAKE_ST_STATUS") != "running":
+            fail("verified-false-positive ack must not have mutated session-task state")
+
+        # 35. Without --action, --verified-false-positive still requires the
+        #     substantive-action rule (the ack is the record of WHAT was
+        #     verified) -- rejected before verify_orphan_resolved is reached.
+        ingest(sd, "queue", "queue-orphaned",
+               "q-2026-01-02-cafe running without owner")
+        gkey = next(e["key"] for e in list_state(sd)["pending"]
+                    if e["key"] != fkey)
+        rc = main(["--state-dir", str(sd), "ack", gkey,
+                   "--action", "", "--verified-false-positive"])
+        if rc == 0:
+            fail("verified-false-positive ack with empty --action must still "
+                 "be rejected")
+        if not any(e["key"] == gkey for e in list_state(sd)["pending"]):
+            fail("rejected empty-action ack must not remove the entry")
 
         for _k in ("FAKE_ST_STATUS", "FAKE_ST_RC"):
             os.environ.pop(_k, None)
