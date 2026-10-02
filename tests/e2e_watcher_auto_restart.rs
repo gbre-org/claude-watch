@@ -169,8 +169,8 @@ fn watcher_down_triggers_inject_and_main_loop_restarts_it() {
         "watcher-restart",
         TestEnvOptions {
             check_interval: 1,
-            ack_stale_minutes: 9999, // disable ack-stale alerts
-            foreground_threshold: 9999,    // disable foreground monitor
+            ack_stale_minutes: 9999,    // disable ack-stale alerts
+            foreground_threshold: 9999, // disable foreground monitor
             // Watcher monitor: fast firing path.
             //   threshold=2 -> two consecutive missing checks -> ~2s
             //   grace=0     -> no warm-up after last_seen_running
@@ -368,10 +368,7 @@ sleep infinity
             stub_path.to_str().unwrap(),
         ])
         .env("PATH", &test_path)
-        .env(
-            "WATCHERS_CONFIG",
-            env.watchers_config.to_str().unwrap(),
-        )
+        .env("WATCHERS_CONFIG", env.watchers_config.to_str().unwrap())
         .status()
         .expect("create stub tmux session");
     assert!(status.success(), "tmux new-session failed");
@@ -433,9 +430,7 @@ sleep infinity
     assert!(initial_watcher_status.success(), "tmux new-window failed");
 
     // Wait for the watcher to be visible to pgrep.
-    let watcher_visible = wait_until(Duration::from_secs(5), || {
-        pgrep_count(&watcher_token) >= 1
-    });
+    let watcher_visible = wait_until(Duration::from_secs(5), || pgrep_count(&watcher_token) >= 1);
     assert!(
         watcher_visible,
         "synthetic watcher did not start (pgrep -fc -- {} == 0)",
@@ -443,7 +438,11 @@ sleep infinity
     );
     let initial_pids = pgrep_pids(&watcher_token);
     eprintln!("initial watcher PIDs: {:?}", initial_pids);
-    assert_eq!(initial_pids.len(), 1, "expected exactly one initial watcher");
+    assert_eq!(
+        initial_pids.len(),
+        1,
+        "expected exactly one initial watcher"
+    );
     let initial_pid = initial_pids[0];
 
     // Verify the parent chain ends at a tmux process under the test session.
@@ -560,9 +559,7 @@ sleep infinity
     );
 
     // Wait for the stub to react and the watcher to come back.
-    let recovered = wait_until(Duration::from_secs(10), || {
-        pgrep_count(&watcher_token) >= 1
-    });
+    let recovered = wait_until(Duration::from_secs(10), || pgrep_count(&watcher_token) >= 1);
     let total_recovery = kill_time.elapsed();
     eprintln!("recovery elapsed: {:?}", total_recovery);
     assert!(
@@ -610,9 +607,7 @@ sleep infinity
     // ancestor. Ensure tmux comes before PID 1 (i.e. tmux is an ancestor of the
     // watcher, and the watcher isn't directly parented to systemd).
     let tmux_idx = comms.iter().position(|c| c.contains("tmux"));
-    let init_idx = comms
-        .iter()
-        .position(|c| *c == "systemd" || *c == "init");
+    let init_idx = comms.iter().position(|c| *c == "systemd" || *c == "init");
     if let (Some(t), Some(i)) = (tmux_idx, init_idx) {
         assert!(
             t < i,
@@ -627,9 +622,8 @@ sleep infinity
         .args(["kill-session", "-t", &stub_session])
         .output();
 
-    let watcher_dies_with_session = wait_until(Duration::from_secs(10), || {
-        pgrep_count(&watcher_token) == 0
-    });
+    let watcher_dies_with_session =
+        wait_until(Duration::from_secs(10), || pgrep_count(&watcher_token) == 0);
     assert!(
         watcher_dies_with_session,
         "watcher survived tmux session teardown — heartbeat-liveness invariant violated. \

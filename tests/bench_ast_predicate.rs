@@ -63,7 +63,10 @@ fn time_one(label: &str, predicate: &AstPredicate, command: &str) {
 #[test]
 fn bench_representative_invocations() {
     println!();
-    println!("AST predicate benchmark — {} iterations per case, warm cache", ITERS);
+    println!(
+        "AST predicate benchmark — {} iterations per case, warm cache",
+        ITERS
+    );
     println!("{}", "-".repeat(96));
 
     // (a) plain signal-send
@@ -81,7 +84,11 @@ fn bench_representative_invocations() {
                    note, and references piping to tail -20 in passing.\n\
                    EOF_X\n\
                    signal-send --dm andrew -F \"$f\"";
-    time_one("(b) heredoc-staged signal-send", &ban_obligations_bypass(), heredoc);
+    time_one(
+        "(b) heredoc-staged signal-send",
+        &ban_obligations_bypass(),
+        heredoc,
+    );
 
     // (c) long pipeline
     time_one(
@@ -107,7 +114,11 @@ fn bench_representative_invocations() {
                 emphasis: OBLIGATIONS_BYPASS, OBLIGATIONS_BYPASS.\n\
                 EOF_X\n\
                 signal-send --dm andrew -F \"$f\"";
-    time_one("(e) heredoc w/ many bypass mentions", &ban_obligations_bypass(), many);
+    time_one(
+        "(e) heredoc w/ many bypass mentions",
+        &ban_obligations_bypass(),
+        many,
+    );
 
     // Also exercise the heredoc-FP DEMO so its timing is recorded.
     let demo = "f=$(signal-stage)\n\
@@ -115,7 +126,11 @@ fn bench_representative_invocations() {
                 I tried OBLIGATIONS_BYPASS=1 but it was not honored\n\
                 EOF_X\n\
                 signal-send -F \"$f\"";
-    time_one("    heredoc-FP demo (BanEnvVarPrefix)", &ban_obligations_bypass(), demo);
+    time_one(
+        "    heredoc-FP demo (BanEnvVarPrefix)",
+        &ban_obligations_bypass(),
+        demo,
+    );
 
     println!("{}", "-".repeat(96));
 }

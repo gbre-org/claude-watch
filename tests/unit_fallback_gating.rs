@@ -71,9 +71,7 @@ fn daemon_fallback_proceeds_when_hook_marker_is_stale() {
 
     // Marker fired an hour ago
     let stale = ReminderMarker {
-        last_fired: Some(
-            (Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339(),
-        ),
+        last_fired: Some((Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339()),
         fire_count: 5,
         last_context: None,
     };

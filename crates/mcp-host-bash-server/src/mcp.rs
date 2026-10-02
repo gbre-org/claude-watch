@@ -36,7 +36,10 @@ pub struct AppState {
 }
 
 pub fn router(config: ServerConfig) -> Router {
-    let state = Arc::new(AppState { config, session_counter: AtomicU64::new(1) });
+    let state = Arc::new(AppState {
+        config,
+        session_counter: AtomicU64::new(1),
+    });
     Router::new()
         .route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_delete))
         .route("/health", get(health))
@@ -78,7 +81,10 @@ fn check_bearer(state: &AppState, headers: &HeaderMap) -> Option<Response> {
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        });
     match presented {
         Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => None,
         _ => Some(
@@ -191,8 +197,10 @@ async fn handle_message(state: &AppState, msg: &Value) -> Option<Value> {
             let policy = &state.config.policy;
             let out = match name {
                 "run_command" => {
-                    let command =
-                        args.and_then(|a| a.get("command")).and_then(|c| c.as_str()).unwrap_or("");
+                    let command = args
+                        .and_then(|a| a.get("command"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
                     exec::run_command(policy, command).await
                 }
                 "run_script" => {
@@ -200,22 +208,24 @@ async fn handle_message(state: &AppState, msg: &Value) -> Option<Value> {
                         .and_then(|a| a.get("interpreter"))
                         .and_then(|c| c.as_str())
                         .unwrap_or("");
-                    let script =
-                        args.and_then(|a| a.get("script")).and_then(|c| c.as_str()).unwrap_or("");
+                    let script = args
+                        .and_then(|a| a.get("script"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
                     exec::run_script(policy, interpreter, script).await
                 }
                 "show_security_rules" => exec::show_security_rules(policy),
                 other => {
-                    return Some(err_result(
-                        id,
-                        -32602,
-                        &format!("unknown tool: {other}"),
-                    ));
+                    return Some(err_result(id, -32602, &format!("unknown tool: {other}")));
                 }
             };
             Some(ok_result(id, tool_result(out.text, out.is_error)))
         }
-        other => Some(err_result(id, -32601, &format!("method not found: {other}"))),
+        other => Some(err_result(
+            id,
+            -32601,
+            &format!("method not found: {other}"),
+        )),
     }
 }
 
@@ -250,8 +260,7 @@ async fn mcp_post(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
         return (StatusCode::OK, Json(Value::Array(responses))).into_response();
     }
 
-    let is_initialize =
-        value.get("method").and_then(|m| m.as_str()) == Some("initialize");
+    let is_initialize = value.get("method").and_then(|m| m.as_str()) == Some("initialize");
     match handle_message(&state, &value).await {
         None => StatusCode::ACCEPTED.into_response(),
         Some(resp) if is_initialize => {

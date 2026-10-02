@@ -223,8 +223,9 @@ impl ServerConfig {
             "" | "corp-dev" => DEFAULT_ALLOWED_COMMANDS.to_string(),
             "corp-dev-trusted" => format!("{DEFAULT_ALLOWED_COMMANDS},{TRUSTED_EXTRAS}"),
             other => {
-                profile_warning =
-                    Some(format!("unknown CW_PROFILE='{other}', falling back to default"));
+                profile_warning = Some(format!(
+                    "unknown CW_PROFILE='{other}', falling back to default"
+                ));
                 DEFAULT_ALLOWED_COMMANDS.to_string()
             }
         };
@@ -242,7 +243,9 @@ impl ServerConfig {
         let allowed_flags_csv = get("ALLOWED_FLAGS").unwrap_or(DEFAULT_ALLOWED_FLAGS);
         let allowed_flags_all = allowed_flags_csv.trim() == "all";
 
-        let allowed_dir = get("ALLOWED_DIR").unwrap_or(DEFAULT_ALLOWED_DIR).to_string();
+        let allowed_dir = get("ALLOWED_DIR")
+            .unwrap_or(DEFAULT_ALLOWED_DIR)
+            .to_string();
         let command_timeout = get("COMMAND_TIMEOUT")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_COMMAND_TIMEOUT);
@@ -317,12 +320,16 @@ impl Policy {
         // are currently loaded (read live, so this reflects the config as of
         // now). Values are NOT printed — they may be secrets.
         let env_path = host_exec_env_path();
-        let env_keys: Vec<String> =
-            load_host_exec_env().into_iter().map(|(k, _)| k).collect();
+        let env_keys: Vec<String> = load_host_exec_env().into_iter().map(|(k, _)| k).collect();
         let host_exec_env = if env_keys.is_empty() {
             format!("{} (none loaded)", env_path.display())
         } else {
-            format!("{} ({} keys: {})", env_path.display(), env_keys.len(), env_keys.join(", "))
+            format!(
+                "{} ({} keys: {})",
+                env_path.display(),
+                env_keys.len(),
+                env_keys.join(", ")
+            )
         };
         format!(
             "host-bash MCP server — effective security policy\n\

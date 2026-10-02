@@ -508,8 +508,11 @@ resume_prompt = "resume"
     /// where a wedged context-limit/429 banner covers the status bar and the
     /// parse misses, even though Claude Code is still running.
     pub fn set_status_unparseable(&self) {
-        fs::write(&self.mock_status_data, "not json — banner covering status bar\n")
-            .expect("write unparseable mock status data");
+        fs::write(
+            &self.mock_status_data,
+            "not json — banner covering status bar\n",
+        )
+        .expect("write unparseable mock status data");
     }
 
     /// Send text to the tmux pane to simulate pane content.
@@ -562,11 +565,7 @@ resume_prompt = "resume"
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
         loop {
-            if self
-                .capture_pane()
-                .lines()
-                .any(|l| l.trim_end() == needle)
-            {
+            if self.capture_pane().lines().any(|l| l.trim_end() == needle) {
                 return;
             }
             if std::time::Instant::now() >= deadline {

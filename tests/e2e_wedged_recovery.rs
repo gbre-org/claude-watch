@@ -57,9 +57,7 @@ fn wedged_context_limit_with_unparseable_status_runs_self_clear() {
     // The wedged_clear event should be in the JSONL log.
     let entries = env.read_log_entries();
     assert!(
-        entries
-            .iter()
-            .any(|e| e["event"] == "wedged_clear"),
+        entries.iter().any(|e| e["event"] == "wedged_clear"),
         "expected a wedged_clear JSONL event. Entries: {:?}",
         entries
     );

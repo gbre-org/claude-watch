@@ -215,3 +215,52 @@ fn inject_text_queued_proceeds_on_a_bare_idle_prompt() {
         after
     );
 }
+
+/// Claude Code's own prompt autosuggestion is drawn faint (SGR 2). It is not
+/// operator input and regenerates forever, so the guard must NOT treat it as
+/// someone mid-keystroke -- that stalled auto-update indefinitely.
+#[test]
+fn inject_text_queued_proceeds_over_faint_autosuggestion() {
+    let session_name = unique_session_name("queued-ghost");
+    let _guard = TmuxSession::new(&session_name);
+    new_session(&session_name);
+    render_idle_prompt(&session_name, r"\e[2mrun the tests again\e[0m");
+
+    let pane = format!("{}:0.0", session_name);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        inject_text_queued(&pane, "TEST-GHOST-OK").await;
+    });
+
+    std::thread::sleep(Duration::from_millis(300));
+    let after = capture_pane(&session_name);
+    assert!(
+        after.contains("TEST-GHOST-OK"),
+        "a faint autosuggestion must not block the inject. Pane:\n{}",
+        after
+    );
+}
+
+/// The inverse, which is the point of the guard: text drawn in ordinary
+/// weight, even with a colour attribute, is real input and must be honoured.
+#[test]
+fn inject_text_queued_still_skips_non_faint_styled_text() {
+    let session_name = unique_session_name("queued-styled-real");
+    let _guard = TmuxSession::new(&session_name);
+    new_session(&session_name);
+    render_idle_prompt(&session_name, r"\e[38;2;1;2;3mhalf typed\e[0m");
+
+    let pane = format!("{}:0.0", session_name);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        inject_text_queued(&pane, "TEST-MUST-NOT-TYPE").await;
+    });
+
+    std::thread::sleep(Duration::from_millis(300));
+    let after = capture_pane(&session_name);
+    assert!(
+        !after.contains("TEST-MUST-NOT-TYPE"),
+        "non-faint text is real input; the inject must be skipped. Pane:\n{}",
+        after
+    );
+}

@@ -78,7 +78,16 @@ async fn configured_pane_is_resolved_as_main_loop_target() {
 
     // The main-loop session (what the config points at) and a SEPARATE session
     // standing in for an operator-focused TUI agent-view subagent pane.
-    if !tmux(&["new-session", "-d", "-s", &main_session, "-x", "200", "-y", "50"]) {
+    if !tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        &main_session,
+        "-x",
+        "200",
+        "-y",
+        "50",
+    ]) {
         eprintln!("skipping: tmux not available");
         return;
     }
@@ -149,8 +158,8 @@ async fn agent_pane_active_still_resolves_to_main_pane() {
     // Make the agent pane unambiguously the active/selected one.
     assert!(tmux(&["select-pane", "-t", &format!("{}:0.1", session)]));
 
-    let active_id = pane_id_of(&format!("{}:0.1", session))
-        .expect("agent pane must resolve to a pane_id");
+    let active_id =
+        pane_id_of(&format!("{}:0.1", session)).expect("agent pane must resolve to a pane_id");
     assert_ne!(active_id, main_id, "test setup: panes must be distinct");
 
     let cfg = TmuxConfig {

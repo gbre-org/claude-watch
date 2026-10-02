@@ -220,6 +220,14 @@ pub async fn capture_pane(pane: &str) -> Option<String> {
     run_cmd(&["tmux", "capture-pane", "-t", pane, "-p"], 5).await
 }
 
+/// Capture the pane WITH its SGR escape sequences (`-e`). Needed only where
+/// the colour/weight a character was drawn in carries meaning -- e.g.
+/// telling Claude Code's faint prompt autosuggestion from typed input. Every
+/// other reader wants the plain `capture_pane`.
+pub async fn capture_pane_styled(pane: &str) -> Option<String> {
+    run_cmd(&["tmux", "capture-pane", "-t", pane, "-p", "-e"], 5).await
+}
+
 /// Capture pane with -J flag to join wrapped lines. Use for status bar parsing
 /// where text may be truncated at pane width (e.g. "275898 tokens" → "275898 toke…").
 pub async fn capture_pane_joined(pane: &str) -> Option<String> {
@@ -1832,20 +1840,39 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
 /// only safe move is to not send it at all. Skipping this cycle costs
 /// nothing; the daemon re-evaluates on the next tick.
 async fn operator_typing_in_progress(pane: &str) -> bool {
-    let prompt = capture_pane(pane)
-        .await
-        .and_then(|out| prompt_line_text(&out));
-    if prompt_has_unsubmitted_text(prompt.as_deref()) {
+    let styled = capture_pane_styled(pane).await;
+    let line = styled.as_deref().and_then(prompt_line_styled);
+    let Some(r) = line else {
+        return false;
+    };
+    if !prompt_has_unsubmitted_text(Some(r.text.as_str())) {
+        return false;
+    }
+    if r.all_faint {
+        // Claude Code's own prompt autosuggestion: ghost text drawn in the
+        // faint attribute (SGR 2), NOT input anyone typed. It regenerates
+        // from the conversation, so treating it as "operator typing" would
+        // block the inject indefinitely. Typing over it is safe -- the first
+        // real keystroke replaces it.
         info!(
             pane = %pane,
-            residue = ?prompt,
-            "inject: unsubmitted text already on the prompt line (operator likely \
-             mid-keystroke) -- skipping this inject rather than typing over it"
+            suggestion = ?r.text,
+            rendering = %r.rendering,
+            "inject: prompt line holds only faint ghost text (Claude Code's own prompt \
+             suggestion, not operator input) -- proceeding with the inject"
         );
-        true
-    } else {
-        false
+        return false;
     }
+    info!(
+        pane = %pane,
+        residue = ?r.text,
+        rendering = %r.rendering,
+        "inject: prompt line holds text drawn as ordinary (non-faint) input -- most \
+         likely an operator mid-keystroke, but it could be other UI chrome on the prompt \
+         row (a picker row, a hint); skipping this inject rather than typing over it. \
+         `rendering` is the raw row with ESC shown as \\e"
+    );
+    true
 }
 
 pub async fn inject_text(pane: &str, text: &str) {
@@ -2282,6 +2309,111 @@ pub(crate) fn prompt_line_text(pane_output: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// What follows the `❯` on the live prompt row, with how it was drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StyledPromptLine {
+    /// Same trimmed text `prompt_line_text` yields for the plain capture.
+    pub text: String,
+    /// True when `text` is non-empty and EVERY non-whitespace character in it
+    /// was drawn with the faint attribute (SGR 2). Observed live: Claude
+    /// Code paints its prompt autosuggestion as `\e[2m<text>\e[0m`, while
+    /// typed input carries no SGR at all. Conservative on purpose: one
+    /// non-faint character makes the whole line count as real input.
+    pub all_faint: bool,
+    /// The raw row (from the `❯` on) with ESC rendered as `\e`, for logs.
+    pub rendering: String,
+}
+
+/// Pure: parse a `capture-pane -p -e` capture into a [`StyledPromptLine`]
+/// for the LAST row containing `❯` (same row selection as
+/// `prompt_line_text`). Tracks only the faint attribute: SGR `2` sets it;
+/// `0`/empty/`22` clear it; extended-colour introducers (`38`/`48`/`58`
+/// followed by `;5;n` or `;2;r;g;b`) have their arguments skipped so a `2`
+/// inside them is not misread as "faint".
+pub(crate) fn prompt_line_styled(styled_pane: &str) -> Option<StyledPromptLine> {
+    for line in styled_pane.lines().rev() {
+        let mut faint = false;
+        let mut seen_prompt = false;
+        let mut text = String::new();
+        let mut any_non_faint = false;
+        let mut any_visible = false;
+        let mut raw = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                let mut seq = String::new();
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        seq.push(n);
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                    if seen_prompt {
+                        raw.push_str("\\e[");
+                        raw.push_str(&seq);
+                    }
+                    if seq.ends_with('m') {
+                        faint = apply_sgr_faint(faint, &seq[..seq.len() - 1]);
+                    }
+                }
+                continue;
+            }
+            if !seen_prompt {
+                if c == '\u{276f}' {
+                    seen_prompt = true;
+                    raw.push(c);
+                }
+                continue;
+            }
+            raw.push(c);
+            text.push(c);
+            if !c.is_whitespace() {
+                any_visible = true;
+                if !faint {
+                    any_non_faint = true;
+                }
+            }
+        }
+        if seen_prompt {
+            return Some(StyledPromptLine {
+                all_faint: any_visible && !any_non_faint,
+                text: text.trim().to_string(),
+                rendering: raw,
+            });
+        }
+    }
+    None
+}
+
+fn apply_sgr_faint(mut faint: bool, params: &str) -> bool {
+    if params.is_empty() {
+        return false;
+    }
+    let mut it = params.split(';');
+    while let Some(p) = it.next() {
+        match p {
+            "" | "0" | "22" => faint = false,
+            "2" => faint = true,
+            "38" | "48" | "58" => match it.next() {
+                Some("5") => {
+                    it.next();
+                }
+                Some("2") => {
+                    it.next();
+                    it.next();
+                    it.next();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    faint
 }
 
 /// Inject text into a Claude Code (vim-mode) pane and, unless `submit` is
@@ -4700,6 +4832,69 @@ mod tests {
         // An older `❯` in scrollback must not shadow the live input line.
         let output = "\u{276f} old typed text\nstuff\n\u{276f} new text";
         assert_eq!(prompt_line_text(output).as_deref(), Some("new text"));
+    }
+
+    // ---- prompt autosuggestion vs typed input (2026-10-02) ----
+    // Shapes are from a live `capture-pane -p -e`: the `❯` is followed by a
+    // NBSP; a suggestion is wrapped in SGR 2 (faint), typed input has no SGR.
+
+    #[test]
+    fn styled_prompt_faint_suggestion_is_all_faint() {
+        let cap = "x\n\u{1b}[39m\u{276f}\u{a0}\u{1b}[2mrun hello.py\u{1b}[0m\n";
+        let l = prompt_line_styled(cap).unwrap();
+        assert_eq!(l.text, "run hello.py");
+        assert!(l.all_faint);
+        assert!(l.rendering.contains("\\e[2m"));
+    }
+
+    #[test]
+    fn styled_prompt_typed_text_is_not_faint() {
+        let cap = "x\n\u{1b}[39m\u{276f}\u{a0}typed by human\n";
+        let l = prompt_line_styled(cap).unwrap();
+        assert_eq!(l.text, "typed by human");
+        assert!(!l.all_faint);
+    }
+
+    #[test]
+    fn styled_prompt_typed_text_before_ghost_tail_is_real_input() {
+        // Any non-faint character makes the line genuine input.
+        let cap = "\u{276f}\u{a0}half\u{1b}[2m rest\u{1b}[0m\n";
+        assert!(!prompt_line_styled(cap).unwrap().all_faint);
+    }
+
+    #[test]
+    fn styled_prompt_extended_colour_args_are_not_faint() {
+        // `38;2;r;g;b` contains a literal `2` that is NOT the faint attribute.
+        let cap = "\u{276f}\u{a0}\u{1b}[38;2;1;2;3mtext\u{1b}[0m\n";
+        assert!(!prompt_line_styled(cap).unwrap().all_faint);
+        let cap = "\u{276f}\u{a0}\u{1b}[38;5;2mtext\u{1b}[0m\n";
+        assert!(!prompt_line_styled(cap).unwrap().all_faint);
+    }
+
+    #[test]
+    fn styled_prompt_faint_reset_by_22_and_empty_params() {
+        let cap = "\u{276f}\u{a0}\u{1b}[2ma\u{1b}[22mb\n";
+        assert!(!prompt_line_styled(cap).unwrap().all_faint);
+        let cap = "\u{276f}\u{a0}\u{1b}[2ma\u{1b}[mb\n";
+        assert!(!prompt_line_styled(cap).unwrap().all_faint);
+    }
+
+    #[test]
+    fn styled_prompt_empty_and_missing() {
+        let l = prompt_line_styled("\u{276f}\u{a0}\n").unwrap();
+        assert_eq!(l.text, "");
+        assert!(!l.all_faint);
+        assert!(prompt_line_styled("no prompt\n").is_none());
+    }
+
+    #[test]
+    fn styled_prompt_text_matches_plain_extractor() {
+        let cap = "\u{1b}[39m\u{276f}\u{a0}\u{1b}[2mrun hello.py\u{1b}[0m";
+        let plain = "\u{276f}\u{a0}run hello.py";
+        assert_eq!(
+            prompt_line_styled(cap).unwrap().text,
+            prompt_line_text(plain).unwrap()
+        );
     }
 
     // ---- prompt-line exclusivity guards (the 2026-08-19 splice) ----

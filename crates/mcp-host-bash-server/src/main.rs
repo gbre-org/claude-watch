@@ -53,14 +53,20 @@ fn banner(cfg: &ServerConfig) {
                     "  WARNING:               binding non-loopback ({}) WITHOUT bearer auth exposes",
                     cfg.bind_host
                 );
-                eprintln!("                         the host shell-exec surface with no authentication.");
+                eprintln!(
+                    "                         the host shell-exec surface with no authentication."
+                );
             }
         }
     }
     if let Some(w) = &cfg.policy.profile_warning {
         eprintln!("  WARNING:               {w}");
     }
-    eprintln!("  config:                {} (present: {})", cfg.config_path.display(), cfg.config_present);
+    eprintln!(
+        "  config:                {} (present: {})",
+        cfg.config_path.display(),
+        cfg.config_present
+    );
     eprintln!();
     eprintln!("{}", cfg.policy.describe());
     eprintln!();
@@ -108,13 +114,26 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let config_path = args.config.unwrap_or_else(ServerConfig::default_config_path);
+    let config_path = args
+        .config
+        .unwrap_or_else(ServerConfig::default_config_path);
     let cfg = ServerConfig::load(config_path, args.port);
 
     if args.print_config {
         println!("listen: {}:{}", cfg.bind_host, cfg.port);
-        println!("bearer: {}", if cfg.bearer.is_some() { "enabled" } else { "disabled" });
-        println!("config: {} (present: {})", cfg.config_path.display(), cfg.config_present);
+        println!(
+            "bearer: {}",
+            if cfg.bearer.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        println!(
+            "config: {} (present: {})",
+            cfg.config_path.display(),
+            cfg.config_present
+        );
         println!();
         println!("{}", cfg.policy.describe());
         return;

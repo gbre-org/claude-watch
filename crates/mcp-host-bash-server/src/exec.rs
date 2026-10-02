@@ -22,10 +22,16 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     fn err(text: impl Into<String>) -> Self {
-        ToolOutput { text: text.into(), is_error: true }
+        ToolOutput {
+            text: text.into(),
+            is_error: true,
+        }
     }
     fn ok(text: impl Into<String>) -> Self {
-        ToolOutput { text: text.into(), is_error: false }
+        ToolOutput {
+            text: text.into(),
+            is_error: false,
+        }
     }
 }
 
@@ -104,9 +110,13 @@ async fn run_with_timeout(mut cmd: Command, timeout: u64, stdin_data: Option<&st
     for (k, v) in load_host_exec_env() {
         cmd.env(k, v);
     }
-    cmd.stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if stdin_data.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
