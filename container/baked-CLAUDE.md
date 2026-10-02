@@ -299,7 +299,7 @@ The five-step protocol (mirrors the host `## Resume Actions` workflow):
 1. `session-task queue add --scope <scope> --summary '<headline>' --desc-file - <<'EOF'`
    → JSON with id. **Exit 3 = scope overlap; DO NOT spawn.** Free text:
    quoted heredoc or single quotes, never double quotes (backticks/`$(...)`
-   would run).
+   run).
 2. Read `ready_now` from the JSON. If `false`, DO NOT FIRE — an
    overlapping-scope item is in flight; wait and re-check via
    `session-task queue spawn-check <id>`.
