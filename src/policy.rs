@@ -8100,6 +8100,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // operator's question. Suppress (delays the inject — recoverable)
         // rather than inject (destructive). Reset the fast-detection
         // counter so detection re-builds once the prompt clears.
+        // A Rewind picker left open after `/clear` is a modal nobody is going
+        // to answer (the self-clear that opened it gave up or died): cancel it
+        // with Escape so the resume can land, rather than skipping forever.
+        if !effective_pane.is_empty() && tmux::rewind_picker_on_pane(&effective_pane).await {
+            info!(
+                pane = %effective_pane,
+                "fresh /clear check: Rewind picker left open -- cancelling with Escape"
+            );
+            tmux::cancel_rewind_picker(&effective_pane).await;
+            state.consecutive_fast_detections = 0;
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        }
         if !effective_pane.is_empty() && tmux::is_interactive_prompt(&effective_pane).await {
             debug!(
                 "fresh /clear check: skipping — interactive prompt on screen (awaiting operator)"

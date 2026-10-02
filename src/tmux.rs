@@ -458,6 +458,14 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
         return true;
     }
 
+    // (9) The 2.1.283+ "Rewind" picker that `/clear` (self-clear) or an
+    // interrupt opens. Its `❯ (current)` row otherwise reads as an idle prompt
+    // carrying unsubmitted text, so every daemon inject skipped with
+    // `residue=Some("(current)")` and the picker sat forever (2026-10-02).
+    if rewind_picker_visible(pane_output) {
+        return true;
+    }
+
     false
 }
 
@@ -5591,6 +5599,20 @@ mod tests {
             output.push_str(&format!("\nscrollback line {i}"));
         }
         assert!(!rewind_picker_visible(&output));
+    }
+
+    #[test]
+    fn rewind_picker_is_an_interactive_prompt() {
+        // Must suppress injects (its `❯ (current)` row reads as idle residue).
+        assert!(interactive_prompt_visible(REWIND_PICKER_PANE));
+    }
+
+    #[test]
+    fn rewind_picker_matches_the_2026_10_02_wedge_capture() {
+        let pane = "\u{276f} /clear\n\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  Rewind\n  Restore and fork the conversation to the point before\u{2026}\n\n    /resume 95780a5a-8939-443a-88e3-8d1e5bfbede4 (previous session)\n\n    /clear\n\n  \u{276f} (current)\n\n  Enter to continue \u{b7} Esc to cancel\n";
+        assert!(rewind_picker_visible(pane));
+        assert!(interactive_prompt_visible(pane));
     }
 
     #[test]

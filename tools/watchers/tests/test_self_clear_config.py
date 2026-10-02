@@ -524,6 +524,65 @@ class PartialPickerRenderTest(unittest.TestCase):
         self.assertFalse(self.mod._rewind_picker_visible("── \n❯ \n── \n  0 tokens"))
 
 
+WEDGE_PANE = "\n".join([
+    "❯ /clear",
+    "",
+    "──────────────────────────────",
+    "  Rewind",
+    "  Restore and fork the conversation to the point before…",
+    "",
+    "    /resume 95780a5a-8939-443a-88e3-8d1e5bfbede4 (previous session)",
+    "",
+    "    /clear",
+    "",
+    "  ❯ (current)",
+    "",
+    "  Enter to continue · Esc to cancel",
+])
+
+
+class EchoedClearLineAbovePickerTest(unittest.TestCase):
+    """2026-10-02 wedge: the echoed `❯ /clear` input line sits ABOVE the
+    picker. The cursor check used the first `❯` in the whole pane, so it
+    always said "not on (current)" and never confirmed."""
+
+    def setUp(self):
+        self.mod = _import_self_clear()
+        self.calls = []
+        self.mod.log = lambda *a, **k: None
+        self.mod.capture_pane_text = lambda pane: ""
+
+    def _run_with(self, pane_text):
+        def fake_run(cmd, timeout=None):
+            self.calls.append(cmd)
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                return (pane_text, 0)
+            return ("", 0)
+        self.mod.run = fake_run
+
+    def _keys(self):
+        return [c[-1] for c in self.calls if c[:2] == ["tmux", "send-keys"]]
+
+    def test_cursor_is_current_despite_echoed_clear_line(self):
+        self.assertTrue(self.mod._rewind_picker_default_is_current(WEDGE_PANE))
+
+    def test_confirm_sends_enter_on_wedge_capture(self):
+        self._run_with(WEDGE_PANE)
+        self.assertEqual(
+            self.mod._rewind_picker_confirm_once("s:0.0", pane_text=WEDGE_PANE),
+            (True, True))
+        self.assertEqual(self._keys(), ["Enter"])
+
+    def test_cursor_on_previous_sends_escape_never_enter(self):
+        pane = WEDGE_PANE.replace("  ❯ (current)", "    (current)").replace(
+            "    /resume 95780a5a", "  ❯ /resume 95780a5a")
+        self._run_with(pane)
+        self.assertEqual(
+            self.mod._rewind_picker_confirm_once("s:0.0", pane_text=pane),
+            (True, False))
+        self.assertEqual(self._keys(), ["Escape"])
+
+
 class InjectCommandTest(unittest.TestCase):
     """The argv `inject()` hands to `claude-watch inject`.
 

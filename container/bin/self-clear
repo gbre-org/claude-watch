@@ -661,17 +661,42 @@ def _rewind_picker_partial_visible(pane_text):
     return False
 
 
+def _rewind_picker_region(pane_text):
+    """Pure: the lines belonging to the Rewind picker itself.
+
+    Starts at the `Rewind` title line when present (else at the first picker
+    entry row), so the echoed input line `❯ /clear` ABOVE the picker -- which
+    is on screen in every real /clear-opened picker -- is never mistaken for
+    the picker's cursor row.
+    """
+    lines = pane_text.splitlines()
+    start = None
+    for i, raw in enumerate(lines):
+        t = raw.strip()
+        if t == "Rewind" or t.startswith("Restore and fork the conversation"):
+            start = i
+    if start is None:
+        for i, raw in enumerate(lines):
+            t = raw.strip()
+            if t.startswith(_FLEETVIEW_CURSOR):
+                t = t[len(_FLEETVIEW_CURSOR):].strip()
+            if t.endswith("(current)") or (t.startswith("/resume") and
+                                           t.endswith("(previous)")):
+                start = i
+                break
+    return lines[start:] if start is not None else []
+
+
 def _rewind_picker_default_is_current(pane_text):
     """Pure: within a detected Rewind picker, is the cursor on `(current)`?
 
-    Guards against confirming into `/resume <id> (previous)`, which would
-    FORK the conversation instead of clearing it. The picker's documented
-    default selection is `(current)`, but this checks the cursor-marked
-    (`❯`) line explicitly rather than trusting that default blindly --
-    a future reorder of the picker's entries fails SAFE (no Enter sent)
-    instead of silently forking onto `(previous)`.
+    Only the picker's own region is examined (see `_rewind_picker_region`):
+    the 2026-10-02 wedge was this check returning on the FIRST `❯` line in the
+    whole pane -- the echoed `❯ /clear` input line above the picker -- so it
+    always answered "not on (current)", never confirmed, and the resume was
+    typed into the open picker.
     """
-    for raw in pane_text.splitlines():
+    for raw in _rewind_picker_region(pane_text):
         t = raw.strip()
         if t.startswith(_FLEETVIEW_CURSOR):
             rest = t[len(_FLEETVIEW_CURSOR):].strip()
@@ -716,17 +741,15 @@ def _rewind_picker_confirm_once(pane, pane_text=None):
         run(["tmux", "send-keys", "-t", pane, "Enter"])
         time.sleep(0.3)
         return True, True
-    log("  rewind_picker: WARNING Rewind picker detected but cursor NOT on "
-        "(current) -- refusing to blind-Enter (would risk landing on "
-        "/resume <previous> and forking the conversation); trying Down to "
-        f"reach (current). pane: {capture_pane_text(pane)}")
-    # (current) is documented as the picker's last/default entry, so a
-    # single Down is the least-surprising nudge toward it. Best-effort only
-    # -- we re-check on the NEXT poll iteration rather than trusting this
-    # blindly, and we still report picker_seen=True so the caller does not
-    # declare completion this iteration either way.
-    run(["tmux", "send-keys", "-t", pane, "Down"])
-    time.sleep(0.2)
+    # Cursor not provably on (current): never Enter (could fork onto
+    # /resume <previous>). Escape cancels the modal outright with no restore
+    # or fork, so it is safe wherever the highlight sits -- and unlike the old
+    # Down-nudge it actually CLOSES the picker, so the flow cannot spin on it.
+    log("  rewind_picker: Rewind picker detected but cursor NOT provably on "
+        "(current) -- sending Escape to cancel (no Enter: would risk forking "
+        f"onto /resume <previous>). pane: {capture_pane_text(pane)}")
+    run(["tmux", "send-keys", "-t", pane, "Escape"])
+    time.sleep(0.3)
     return True, False
 
 
