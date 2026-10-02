@@ -976,7 +976,50 @@ def cmd_index_done(args) -> int:
 # ----------------------------------------------------------------------
 
 
+def _resolve_send_text(args):
+    """Resolve the message body for `send`: inline positional XOR -F/--file.
+
+    Bash expands backticks / $(...) inside a double-quoted argument before this
+    CLI starts, so long or code-bearing text should be fed with a quoted
+    heredoc: ``agent-msg send <id> -F - <<'EOF' ... EOF``. Returns
+    (text, error_message); error_message is None on success.
+    """
+    file_arg = getattr(args, "file", None)
+    queue_id_arg = getattr(args, "queue_id", None)
+    if file_arg is None:
+        # `send --queue-id q-X "text"`: argparse hands the lone positional to
+        # agent_id (both are optional); shift it into text.
+        if queue_id_arg and args.text is None and args.agent_id:
+            args.text, args.agent_id = args.agent_id, None
+        if args.text is None:
+            return None, ("send requires <text> or -F/--file FILE|- "
+                          "(heredoc: -F - <<'EOF' ... EOF)")
+        return args.text, None
+    # File mode: no inline text allowed. With --queue-id a stray lone
+    # positional would have landed in agent_id, which is ambiguous -> reject.
+    if args.text is not None or (queue_id_arg and args.agent_id):
+        return None, "give the message as <text> OR -F/--file, not both"
+    try:
+        if file_arg == "-":
+            body = sys.stdin.read()
+        else:
+            with open(file_arg, "r") as fh:
+                body = fh.read()
+    except OSError as e:
+        return None, f"cannot read -F {file_arg!r}: {e}"
+    body = body.strip("\n")
+    if not body.strip():
+        return None, "message body from -F/--file is empty"
+    return body, None
+
+
 def cmd_send(args) -> int:
+    # Resolve the body FIRST so a bad file/stdin never touches any state.
+    _text, _err = _resolve_send_text(args)
+    if _err:
+        print(f"ERROR: {_err}", file=sys.stderr)
+        return 1
+    args.text = _text
     # Resolution path: if --queue-id is given (and no explicit agent id),
     # resolve it to the single live agent bound to that queue item. LOUD
     # failure on zero / multiple live agents -- never guess (a guess is
@@ -3999,7 +4042,13 @@ def build_parser():
              "(by agent id, or --queue-id <q-id> to resolve)")
     p_send.add_argument("agent_id", nargs="?", default=None,
                         help="target agent id (omit when using --queue-id)")
-    p_send.add_argument("text")
+    p_send.add_argument("text", nargs="?", default=None,
+                        help="message body (or use -F/--file; prefer a "
+                             "quoted heredoc for any text with backticks, "
+                             "$(...) or $VARS)")
+    p_send.add_argument("-F", "--file", default=None, metavar="FILE|-",
+                        help="read the message body from FILE, or stdin with "
+                             "'-': agent-msg send <id> -F - <<'EOF' ... EOF")
     p_send.add_argument("--queue-id", default=None,
                         help="resolve the target agent from this queue id "
                              "(errors loudly on zero / multiple live agents)")

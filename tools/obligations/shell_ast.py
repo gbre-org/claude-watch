@@ -1339,6 +1339,308 @@ def _neutralize_operator_chars(word: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Expanding command substitution inside the ARGUMENTS of chosen commands
+# ---------------------------------------------------------------------------
+#
+# ``tokenize`` strips quotes, so it cannot tell ``'`x`'`` (literal) from
+# ``"`x`"`` (bash RUNS it before the CLI starts). This separate scanner keeps
+# the quoting state so the free-text guard can answer exactly that question.
+
+
+class _Word:
+    __slots__ = ("text", "subst", "bodies")
+
+    def __init__(self):
+        self.text = ""
+        self.subst = False   # contains a backtick / $(...) bash will EXPAND
+        self.bodies = []     # inner command strings (recursed into)
+
+
+class _Seg:
+    __slots__ = ("words", "heredoc_subst")
+
+    def __init__(self):
+        self.words = []
+        self.heredoc_subst = False   # an UNQUOTED heredoc body expands
+
+
+def _find_backtick_end(s: str, start: int) -> int:
+    """Index of the closing (unescaped) backtick, scanning from ``start``;
+    -1 if none."""
+    j = start
+    n = len(s)
+    while j < n:
+        if s[j] == "\\":
+            j += 2
+            continue
+        if s[j] == "`":
+            return j
+        j += 1
+    return -1
+
+
+def _heredoc_body_expands(body: str) -> bool:
+    """True iff an UNQUOTED heredoc body contains an expanding ``$(`` (not
+    ``$((``) or backtick (a backslash-escaped one is literal)."""
+    i = 0
+    n = len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "`":
+            return True
+        if c == "$" and body.startswith("(", i + 1) and not body.startswith(
+                "((", i + 1):
+            return True
+        i += 1
+    return False
+
+
+def _scan_segments(cmd: str) -> List[_Seg]:
+    """Quote-preserving scan of ``cmd`` into segments of ``_Word``s. Raises
+    ``ShellParseError`` on anything it cannot resolve (caller fails open)."""
+    segs: List[_Seg] = []
+    seg = _Seg()
+    word: Optional[_Word] = None
+    skip_word = False      # next word is a redirection target: drop it
+    pending: List[tuple] = []   # (delim, strip_tabs, quoted, owner segment)
+    i = 0
+    n = len(cmd)
+
+    def end_word():
+        nonlocal word, skip_word
+        if word is not None:
+            if skip_word:
+                skip_word = False
+            else:
+                seg.words.append(word)
+            word = None
+
+    def end_seg():
+        nonlocal seg
+        end_word()
+        if seg.words or seg.heredoc_subst or any(
+                p[3] is seg for p in pending):
+            segs.append(seg)
+        seg = _Seg()
+
+    def w() -> _Word:
+        nonlocal word
+        if word is None:
+            word = _Word()
+        return word
+
+    def note_subst(idx: int) -> int:
+        """cmd[idx] is a backtick or the ``$`` of ``$(``: record the
+        expanding substitution on the current word; return index past it."""
+        cw = w()
+        if cmd[idx] == "`":
+            end = _find_backtick_end(cmd, idx + 1)
+            if end == -1:
+                raise ShellParseError("unbalanced backticks")
+            cw.subst = True
+            cw.bodies.append(cmd[idx + 1:end])
+            cw.text += cmd[idx:end + 1]
+            return end + 1
+        end = _match_paren(cmd, idx + 1)
+        if end == -1:
+            raise ShellParseError("unbalanced $( )")
+        cw.subst = True
+        cw.bodies.append(cmd[idx + 2:end])
+        cw.text += cmd[idx:end + 1]
+        return end + 1
+
+    def is_dollar_paren(idx: int) -> bool:
+        return (cmd[idx] == "$" and cmd.startswith("(", idx + 1)
+                and not cmd.startswith("((", idx + 1))
+
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            if i + 1 < n and cmd[i + 1] == "\n":
+                i += 2
+                continue
+            w().text += cmd[i + 1] if i + 1 < n else "\\"
+            i += 2
+            continue
+        if c == "'":
+            end = cmd.find("'", i + 1)
+            if end == -1:
+                raise ShellParseError("unterminated single quote")
+            w().text += cmd[i + 1:end]
+            i = end + 1
+            continue
+        if c == '"':
+            cw = w()
+            j = i + 1
+            closed = False
+            while j < n:
+                cj = cmd[j]
+                if cj == "\\" and j + 1 < n:
+                    cw.text += cmd[j + 1]
+                    j += 2
+                    continue
+                if cj == '"':
+                    closed = True
+                    j += 1
+                    break
+                if cj == "`" or is_dollar_paren(j):
+                    j = note_subst(j)
+                    continue
+                cw.text += cj
+                j += 1
+            if not closed:
+                raise ShellParseError("unterminated double quote")
+            i = j
+            continue
+        if c == "`" or is_dollar_paren(i):
+            i = note_subst(i)
+            continue
+        if c == "$" and cmd.startswith("((", i + 1):
+            end = _match_paren(cmd, i + 1)
+            if end == -1:
+                raise ShellParseError("unbalanced $(( ))")
+            w().text += cmd[i:end + 1]
+            i = end + 1
+            continue
+        if c == "#" and word is None:
+            while i < n and cmd[i] != "\n":
+                i += 1
+            continue
+        if c in ("<", ">") and i + 1 < n and cmd[i + 1] == "(":
+            end = _match_paren(cmd, i + 1)
+            if end == -1:
+                raise ShellParseError("unbalanced process substitution")
+            cw = w()
+            cw.bodies.append(cmd[i + 2:end])   # recursed, not "expanding"
+            cw.text += cmd[i:end + 1]
+            i = end + 1
+            continue
+        if cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+            k = i + 2
+            strip_tabs = False
+            if k < n and cmd[k] == "-":
+                strip_tabs = True
+                k += 1
+            while k < n and cmd[k] in (" ", "\t"):
+                k += 1
+            delim, k2 = _read_heredoc_delim(cmd, k)
+            if delim is None:
+                raise ShellParseError("heredoc with no delimiter")
+            raw = cmd[k:k2]
+            quoted = any(ch in raw for ch in ("'", '"', "\\"))
+            # a leading fd digit word (``0<<EOF``) is not an argument
+            if word is not None and word.text.isdigit() and not word.subst:
+                word = None
+            end_word()
+            pending.append((delim, strip_tabs, quoted, seg))
+            i = k2
+            continue
+        if c in ("<", ">") or (c == "&" and cmd.startswith("&>", i)):
+            # Redirection: a leading all-digit word is the fd, not an arg.
+            if word is not None and word.text.isdigit() and not word.subst:
+                word = None
+            end_word()
+            # >&2 / 2>&1: the & belongs to the redirection operator.
+            while i < n and cmd[i] in ("<", ">", "&"):
+                i += 1
+            skip_word = True
+            continue
+        if c == "\n":
+            end_word()
+            i += 1
+            if pending:
+                owners = []
+                for delim, strip_tabs, quoted, owner in pending:
+                    body = []
+                    while i <= n:
+                        eol = cmd.find("\n", i)
+                        line = cmd[i:] if eol == -1 else cmd[i:eol]
+                        i = n + 1 if eol == -1 else eol + 1
+                        chk = line.lstrip("\t") if strip_tabs else line
+                        if chk == delim:
+                            break
+                        body.append(line)
+                    if not quoted and _heredoc_body_expands("\n".join(body)):
+                        owners.append(owner)
+                for o in owners:
+                    o.heredoc_subst = True
+                pending = []
+                i = min(i, n)
+            end_seg()
+            continue
+        if c in (" ", "\t"):
+            end_word()
+            i += 1
+            continue
+        if c in ("|", "&", ";", "(", ")"):
+            end_seg()
+            i += 1
+            if i < n and cmd[i] == c and c in ("|", "&", ";"):
+                i += 1
+            continue
+        w().text += c
+        i += 1
+    end_seg()
+    return segs
+
+
+# (command basename, leading subcommand words) whose free-text arguments must
+# never reach the shell as an expanding double-quoted span.
+_FREE_TEXT_SPECS = (
+    ("session-task", ("queue", "add")),
+    ("session-task", ("queue", "block")),
+    ("session-task", ("queue", "abandon")),
+    ("session-task", ("set",)),
+    ("session-task", ("complete",)),
+    ("agent-msg", ("send",)),
+    ("event-ack", ("ack",)),
+    ("botchat" + "-send", ()),
+)
+
+
+def free_text_substitutions(cmd: str, _depth: int = 0) -> List[str]:
+    """Return human-readable hits: each a target free-text command (see
+    ``_FREE_TEXT_SPECS``) in ``cmd`` whose ARGUMENTS contain a backtick or
+    ``$(...)`` that bash will EXPAND before the CLI starts (outside single
+    quotes and outside a QUOTED heredoc body), or that carries an UNQUOTED
+    heredoc whose body expands. Looks in every command position (after
+    ``&&`` / ``;``, behind ``env`` wrappers, inside ``bash -c`` and inside
+    substitution bodies). Raises ``ShellParseError`` when ``cmd`` cannot be
+    scanned (caller fails OPEN)."""
+    if _depth > _MAX_INVOCATION_DEPTH:
+        raise ShellParseError("command nesting too deep")
+    hits: List[str] = []
+    for seg in _scan_segments(cmd):
+        texts = [x.text for x in seg.words]
+        stripped = _strip_command_prefix(texts)
+        off = len(texts) - len(stripped)
+        if stripped:
+            head = os.path.basename(stripped[0])
+            for name, subs in _FREE_TEXT_SPECS:
+                if head != name:
+                    continue
+                k = len(subs)
+                if tuple(stripped[1:1 + k]) != subs:
+                    continue
+                args = seg.words[off + 1 + k:]
+                if any(a.subst for a in args) or seg.heredoc_subst:
+                    what = " ".join((name,) + subs)
+                    hits.append(
+                        f"`{what}` has a backtick/$(...) in an argument "
+                        f"or an unquoted heredoc")
+                    break
+        for x in seg.words:
+            for inner in x.bodies:
+                hits.extend(free_text_substitutions(inner, _depth + 1))
+        for inner in _dash_c_bodies(texts):
+            hits.extend(free_text_substitutions(inner, _depth + 1))
+    return hits
+
+
 def _run_tests() -> int:
     cases = []
 

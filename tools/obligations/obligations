@@ -670,6 +670,35 @@ def _session_task_queue_banned_subcommand(command_string):
     return sorted(hits)[0] if hits else None
 
 
+def _free_text_substitution_hits(command_string):
+    """Hits from ``shell_ast.free_text_substitutions`` (see there), or ``[]``
+    when the AST module is unavailable or the command cannot be parsed.
+    FAILS OPEN by design: this is a mistake-catching guard, not a security
+    boundary, so an unparseable command must never be blocked by it."""
+    if not command_string or _shell_ast is None:
+        return []
+    try:
+        return _shell_ast.free_text_substitutions(command_string)
+    except _shell_ast.ShellParseError:
+        return []
+    except Exception:  # noqa: BLE001 -- a helper bug must never gate
+        return []
+
+
+SHELL_SUBST_HEREDOC_HINT = (
+    "Bash expands backticks and $(...) inside a double-quoted argument (and "
+    "inside an UNQUOTED heredoc) BEFORE the CLI starts, and RUNS the "
+    "substituted command. Pass free text through a QUOTED heredoc instead, "
+    "e.g.:  session-task queue add --scope repo:X --summary 'headline' "
+    "--desc-file - <<'EOF' ... EOF   |   agent-msg send <id> -F - <<'EOF' "
+    "... EOF   |   event-ack ack KEY --action-file - <<'EOF' ... EOF   |   "
+    "session-task queue block|abandon ID --reason-file - <<'EOF' ... EOF   |"
+    "   session-task set|complete --desc-file - <<'EOF' ... EOF   |   "
+    "botchat-send -F FILE. Or use single quotes / plain words with no "
+    "backticks."
+)
+
+
 # MUTATING `session-task queue` subcommands the MAIN loop must not run while a
 # mandatory-drain gate (see `drain_before_dispatch`, below) is FIRING. These
 # are the task-DISPATCH / lifecycle-MUTATION verbs -- "managing task work". The
@@ -790,6 +819,7 @@ VALID_PREDICATE_KINDS = {
     "force_started_unspawned",
     "subagent_queue_item_running",
     "subagent_queue_mutating_banned",
+    "shell_substitution_in_free_text",
     "no_backgrounded_watcher",
     "evaluator",
     "all_of",
@@ -2847,6 +2877,34 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
                     f"subagent_queue_mutating_banned default-open on "
                     f"error: {e}")
 
+    if kind == "shell_substitution_in_free_text":
+        # BAN-style predicate: DENY a Bash command where session-task
+        # (queue add / queue block / queue abandon / set / complete),
+        # agent-msg send, event-ack ack or botchat-send has an argument
+        # holding a backtick or $(...) that bash will EXPAND (outside single
+        # quotes, outside a QUOTED heredoc body), or carries an UNQUOTED
+        # heredoc that expands. The substituted command would otherwise RUN
+        # before the CLI even starts, and its output corrupts the stored text.
+        #
+        # Default-open: non-Bash tool, empty command, parse failure, any
+        # exception => ALLOW. It only inspects the free-text commands above,
+        # so read-only session-task queue subcommands, the obligations CLI and
+        # the other recovery CLIs are never targets (the row also exempts
+        # them by pattern; see obligations-init).
+        try:
+            if tool_name not in ("Bash",):
+                return (True, f"tool {tool_name} is not Bash (predicate N/A)")
+            cmd = command_string or ""
+            if not cmd.strip():
+                return (True, "empty command (allow)")
+            hits = _free_text_substitution_hits(cmd)
+            if not hits:
+                return (True, "no expanding substitution in free-text args")
+            return (False, "; ".join(hits[:3]) + ". " + SHELL_SUBST_HEREDOC_HINT)
+        except Exception as e:  # noqa: BLE001 -- default-open
+            return (True, f"shell_substitution_in_free_text default-open on "
+                          f"error: {e}")
+
     if kind == "no_backgrounded_watcher":
         # BAN-style predicate: satisfied (=allow) UNLESS the Bash command
         # backgrounds a watcher LAUNCH with a real top-level shell ``&``
@@ -3578,6 +3636,17 @@ def _universal_recovery_exempt_match(tool_name, command_string,
             )
             if ehit:
                 return (True, epat)
+    # FREE-TEXT SUBSTITUTION CARVE-OUT: `Bash:^session-task\\b` floors EVERY
+    # session-task command, which would let `session-task queue add "...`x`..."`
+    # straight past the shell_substitution_in_free_text row. When (and ONLY
+    # when) the command carries an expanding backtick/$(...) in a free-text
+    # argument, drop it from the floor so that row can DENY it. Clean commands
+    # (heredoc / single-quoted / no substitution) stay floored, so the recovery
+    # path is never gated and the fix (re-issue via a quoted heredoc) always
+    # works. Fails open: no hits on any parse error.
+    if matched and tool_name == "Bash" and _free_text_substitution_hits(
+            command_string):
+        return (False, None)
     if (matched and tool_name == "Bash"
             and _is_subagent_context(agent_id, agent_type)):
         # AST-aware: a mutating subcommand in ANY command position (after

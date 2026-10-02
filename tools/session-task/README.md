@@ -33,7 +33,9 @@ Before invoking `Agent`:
 # 1. Add to the queue. Always succeeds; if scope conflicts with a running peer
 #    the new item is soft-serialized behind it (ready_now=false,
 #    serialized_after records the peer) and the caller is told to wait.
-session-task queue add "do the thing" --scope repo:foo --summary "~10 word"
+session-task queue add --scope repo:foo --summary '~10 word' --desc-file - <<'EOF'
+do the thing
+EOF
 
 # 2. If add returned ready_now=true, atomically claim it as running. If
 #    ready_now=false, do NOT spawn an agent yet -- the main loop will pick
@@ -167,6 +169,38 @@ prose vs a whole agent prompt), in how they confirm a candidate (this one
 requires a real dir under the repos root and therefore also trusts a bare
 distinctive name; the gate trusts only prefixed forms and never touches the
 filesystem), and in consequence (advise vs deny).
+
+## Free text: use a quoted heredoc, never a double-quoted argument
+
+Bash expands a backtick or `$(...)` inside a double-quoted argument BEFORE the
+CLI starts, and RUNS the substituted command, so the stored text is mangled
+(or worse). Feed free text through a file or a QUOTED heredoc; it is stored
+byte-for-byte:
+
+```sh
+session-task queue add --scope repo:foo --summary 'headline' --desc-file - <<'EOF'
+Any text, including `cmd`, $(cmd) and $VARS, stored literally.
+EOF
+```
+
+File flags (each takes `FILE` or `-` for stdin; the inline form is still
+accepted, and giving both or neither is an error that never touches state):
+
+| Command | Flag |
+|---|---|
+| `queue add` | `--desc-file` (replaces the positional), `--summary-file` |
+| `queue update` | `--desc-file` |
+| `set`, `complete` | `--desc-file` (replaces the positional) |
+| `queue block`, `queue abandon` | `--reason-file` |
+| `agent-msg send` | `-F/--file` |
+| `event-ack ack` | `--action-file` |
+| the botchat send CLI | `-F` (already existed) |
+
+Use a heredoc on stdin, not a pipe from a subshell. The
+`shell_substitution_in_free_text` obligation (seeded by `obligations-init`)
+DENIES a Bash command that passes an expanding backtick / `$(...)` (or an
+UNQUOTED heredoc) to those commands, and shows the heredoc form. It fails open
+on unparseable commands; single-quoted text and quoted-heredoc bodies are fine.
 
 ## Files
 

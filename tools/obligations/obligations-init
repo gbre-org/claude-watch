@@ -125,6 +125,7 @@ ORPHANED_RUNNING_HARD_GATE_TAG = "[default-seed] orphaned_running_hard_gate"
 QUEUE_READY_UNSPAWNED_TAG = "[default-seed] queue_ready_unspawned"
 NO_BACKGROUNDED_WATCHER_TAG = "[default-seed] no_backgrounded_watcher"
 SUBAGENT_QUEUE_MUTATING_BANNED_TAG = "[default-seed] subagent_queue_mutating_banned"
+SHELL_SUBST_FREE_TEXT_TAG = "[default-seed] shell_substitution_in_free_text"
 NO_BG_HOSTBASH_RUN_COMMAND_TAG = "[default-seed] no_bg_hostbash:run_command"
 NO_BG_HOSTBASH_RUN_SCRIPT_TAG = "[default-seed] no_bg_hostbash:run_script"
 
@@ -998,6 +999,75 @@ def seed_subagent_queue_mutating_banned(cli: str, *, dry_run: bool = False,
     return 0
 
 
+def seed_shell_substitution_in_free_text(cli: str, *, dry_run: bool = False,
+                                         force: bool = False,
+                                         verbose: bool = False) -> int:
+    """Add the shell_substitution_in_free_text obligation (ALL contexts: main
+    loop and subagents). DENIES a Bash command where session-task (queue add /
+    block / abandon, set, complete), agent-msg send, event-ack ack or the
+    botchat send CLI has an argument containing a backtick or $(...) that bash
+    would expand before the CLI starts (outside single quotes and outside a
+    QUOTED heredoc), or an UNQUOTED heredoc. The deny message shows the
+    quoted-heredoc form. Fails OPEN on parse errors.
+
+    The predicate only ever inspects those free-text commands, so read-only
+    session-task queue subcommands and the recovery CLIs are never affected;
+    they are additionally listed as exempt patterns for self-documentation.
+    (The universal `Bash:^session-task` floor is carved out ONLY for a command
+    that carries an expanding substitution -- see
+    _universal_recovery_exempt_match.)
+    """
+    if not force and _row_already_present(cli, SHELL_SUBST_FREE_TEXT_TAG):
+        if verbose:
+            print("shell_substitution_in_free_text: already seeded -- "
+                  "skipping", file=sys.stderr)
+        return 0
+    cmd = [
+        cli, "add",
+        "--tool-pattern", "Bash",
+        "--predicate", "shell_substitution_in_free_text",
+        "--params", "{}",
+        "--ttl", "0",
+        "--enforcement", "gate",
+        "--deny-msg", SHELL_SUBST_FREE_TEXT_TAG
+        + " a backtick or $(...) in a free-text argument would be EXPANDED "
+          "(and RUN) by bash before the CLI starts. Use a QUOTED heredoc: "
+          "session-task queue add --scope repo:X --summary 'headline' "
+          "--desc-file - <<'EOF' ... EOF  (also: agent-msg send ID -F -, "
+          "event-ack ack KEY --action-file -, session-task queue "
+          "block|abandon ID --reason-file -, session-task set|complete "
+          "--desc-file -).",
+        "--created-by", "obligations-init",
+        "--json",
+    ]
+    for pat in (
+        r"Bash:^session-task\s+queue\s+"
+        r"(list|show|scope|groups|ready|spawn-check|banner|locks|status|"
+        r"register)\b",
+        r"Bash:^obligations\s+(list|show|status|check|override|satisfy)",
+    ):
+        cmd.extend(["--exempt-tool-pattern", pat])
+    if dry_run:
+        print("DRY-RUN: " + " ".join(cmd))
+        return 0
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print("obligations-init: obligations add failed "
+              f"rc={proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        return 1
+    if verbose:
+        print("shell_substitution_in_free_text: seeded", file=sys.stderr)
+    return 0
+
+
 def _existing_user_manifest_rows(cli: str) -> list[dict]:
     """Return the active obligation rows that were applied from a user
     manifest, identified by created_by carrying the user-manifest marker.
@@ -1351,6 +1421,7 @@ SEEDERS = {
     "orphaned_running_hard_gate": seed_orphaned_running_hard_gate,
     "no_backgrounded_watcher": seed_no_backgrounded_watcher,
     "subagent_queue_mutating_banned": seed_subagent_queue_mutating_banned,
+    "shell_substitution_in_free_text": seed_shell_substitution_in_free_text,
     "no_bg_hostbash": seed_no_bg_hostbash,
 }
 
@@ -1448,6 +1519,10 @@ def main() -> int:
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
 
+    rc_fts = seed_shell_substitution_in_free_text(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+
     rc_bg = seed_no_bg_hostbash(
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
@@ -1467,7 +1542,7 @@ def main() -> int:
     )
 
     # Return first non-zero exit code (if any)
-    return rc or rc2 or rc3 or rc4 or rc5 or rc_orphan or rc6 or rc7 or rc_bg or rc8
+    return rc or rc2 or rc3 or rc4 or rc5 or rc_orphan or rc6 or rc7 or rc_fts or rc_bg or rc8
 
 
 if __name__ == "__main__":

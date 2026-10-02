@@ -660,7 +660,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("ack", help="Ack (remove) a pending entry.")
     sp.add_argument("key")
-    sp.add_argument("--action", required=True)
+    sp.add_argument("--action", default=None,
+                    help="what you did (one line). For text with backticks, "
+                         "$(...) or $VARS use --action-file - with a QUOTED "
+                         "heredoc instead: event-ack ack KEY --action-file - "
+                         "<<'EOF' ... EOF")
+    sp.add_argument("--action-file", default=None, metavar="FILE|-",
+                    help="read the action text from FILE, or stdin with '-' "
+                         "(exclusive with --action)")
     sp.add_argument(
         "--verified-false-positive", action="store_true",
         help="For a queue-orphaned key: the caller has independently "
@@ -806,6 +813,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "ack":
+        if args.action is not None and args.action_file is not None:
+            print("ERROR: --action and --action-file are mutually exclusive",
+                  file=sys.stderr)
+            return 1
+        if args.action is None and args.action_file is None:
+            print("ERROR: give --action TEXT or --action-file FILE|-",
+                  file=sys.stderr)
+            return 1
+        if args.action_file is not None:
+            try:
+                if args.action_file == "-":
+                    args.action = sys.stdin.read()
+                else:
+                    with open(args.action_file, "r") as _fh:
+                        args.action = _fh.read()
+            except OSError as e:
+                print(f"ERROR: cannot read --action-file "
+                      f"{args.action_file!r}: {e}", file=sys.stderr)
+                return 1
         action = (args.action or "").strip()
         entry = _find_pending_entry(state_dir, args.key)
         # Queue-orphaned events: an ack does NOT resolve the orphan. Refuse the

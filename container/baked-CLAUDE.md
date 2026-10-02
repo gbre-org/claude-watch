@@ -296,10 +296,19 @@ default-opens only on TRULY unexpected internal errors, not "CLI missing".
 
 The five-step protocol (mirrors the host `## Resume Actions` workflow):
 
-1. `session-task queue add "<task description>" --scope <scope> --summary "~10 word headline"`
+1. Add the item, with the description on a QUOTED heredoc:
+   ```sh
+   session-task queue add --scope <scope> --summary '~10 word headline' --desc-file - <<'EOF'
+   <task description>
+   EOF
+   ```
    → returns JSON with a queue id (`q-YYYY-MM-DD-XXXX`). **Exit 3 =
    HARD REFUSED for scope overlap; DO NOT spawn.** Wait or pick a
-   different scope.
+   different scope. **Free-text rule: never put free text in a
+   double-quoted argument** — bash expands (and RUNS) backticks and `$(...)`
+   before the CLI starts. Use a quoted heredoc (`-F -` / `--desc-file -` /
+   `--reason-file -` / `--action-file -`), a file, or single quotes; the
+   `shell_substitution_in_free_text` obligation denies the double-quoted form.
 2. Read `ready_now` from the JSON. If `false`, DO NOT FIRE — an
    overlapping-scope item is in flight; wait and re-check via
    `session-task queue spawn-check <id>`.
@@ -405,7 +414,9 @@ compaction/clear. If the scope conflicts, add it with `--force-enqueue`
 and it serializes behind the running item automatically:
 
 ```
-session-task queue add "..." --scope <same-scope> --force-enqueue
+session-task queue add --scope <same-scope> --force-enqueue --desc-file - <<'EOF'
+...
+EOF
 ```
 
 **Restart-tasks are queueable too.** Redeploy / `cwsr` / restart are

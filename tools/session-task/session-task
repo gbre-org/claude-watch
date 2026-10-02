@@ -564,7 +564,53 @@ def save(data):
     TASK_FILE.write_text(json.dumps(data, indent=2) + "\n")
 
 
+def _resolve_free_text(positional, file_arg, *, pos_name, file_flag,
+                       required=True):
+    """Resolve free text given either inline or via FILE|- (stdin).
+
+    Bash expands backticks / $(...) inside a double-quoted argument before the
+    CLI starts, so long free text should come from a file or a QUOTED heredoc
+    on stdin (``--desc-file - <<'EOF'``). Mutually exclusive with the inline
+    form; the result is stripped and must be non-empty. Callers invoke this
+    BEFORE taking any lock so a failure never mutates state. Exits 1 on error.
+    Returns None only when ``required`` is False and neither form was given.
+    """
+    have_pos = positional is not None
+    have_file = file_arg is not None
+    if have_pos and have_file:
+        print(f"ERROR: {pos_name} and {file_flag} are mutually exclusive",
+              file=sys.stderr)
+        sys.exit(1)
+    if not have_pos and not have_file:
+        if not required:
+            return None
+        print(f"ERROR: give {pos_name} or {file_flag} FILE|- "
+              f"(heredoc: {file_flag} - <<'EOF' ... EOF)", file=sys.stderr)
+        sys.exit(1)
+    if have_pos:
+        text = positional
+    else:
+        try:
+            if file_arg == "-":
+                text = sys.stdin.read()
+            else:
+                with open(file_arg, "r") as fh:
+                    text = fh.read()
+        except OSError as e:
+            print(f"ERROR: cannot read {file_flag} {file_arg!r}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+    text = text.strip()
+    if not text:
+        print(f"ERROR: {pos_name} / {file_flag} is empty", file=sys.stderr)
+        sys.exit(1)
+    return text
+
+
 def cmd_set(args):
+    args.description = _resolve_free_text(
+        args.description, getattr(args, "desc_file", None),
+        pos_name="description", file_flag="--desc-file")
     data = {
         "task": args.description,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -654,6 +700,9 @@ def log_completed(description, extra=None):
 
 
 def cmd_complete(args):
+    args.description = _resolve_free_text(
+        args.description, getattr(args, "desc_file", None),
+        pos_name="description", file_flag="--desc-file")
     log_completed(args.description)
     print(f"Logged completed task: {args.description}")
 
@@ -3605,6 +3654,14 @@ def _write_force_start_bundle(target_id, target_summary, raw_reason,
 
 
 def cmd_queue_add(args):
+    # Resolve free text FIRST (before validation/lock) so a bad file/stdin
+    # never mutates the queue. See _resolve_free_text.
+    args.description = _resolve_free_text(
+        args.description, getattr(args, "desc_file", None),
+        pos_name="description", file_flag="--desc-file")
+    args.summary = _resolve_free_text(
+        args.summary, getattr(args, "summary_file", None),
+        pos_name="--summary", file_flag="--summary-file", required=False)
     scope_raw = args.scope or []
     if not scope_raw:
         print("ERROR: at least one --scope required (e.g. --scope '*')", file=sys.stderr)
@@ -4652,6 +4709,10 @@ def cmd_queue_abandon(args):
     `--force` overrides that refusal. Note the asymmetry is deliberate:
     the absence of an agent record authorizes nothing.
     """
+    if getattr(args, "reason_file", None) is not None:
+        args.reason = _resolve_free_text(
+            args.reason, args.reason_file,
+            pos_name="--reason", file_flag="--reason-file", required=False)
     confirmed_dead = bool(getattr(args, "confirmed_dead", False))
     force = bool(getattr(args, "force", False))
 
@@ -6907,6 +6968,10 @@ def cmd_queue_block(args):
         surface the block prominently.
       * Pingme notification fires by default; --silent suppresses it.
     """
+    if getattr(args, "reason_file", None) is not None:
+        args.reason = _resolve_free_text(
+            args.reason, args.reason_file,
+            pos_name="--reason", file_flag="--reason-file", required=False)
     raw_reason = (args.reason or "").strip()
     if not raw_reason:
         print(
@@ -8877,7 +8942,11 @@ def build_parser():
 
     # Layer 1 (single-slot resume action)
     p_set = sub.add_parser("set", help="Set a resume action")
-    p_set.add_argument("description", help="What to do on resume")
+    p_set.add_argument("description", nargs="?",
+                       help="What to do on resume (or use --desc-file)")
+    p_set.add_argument("--desc-file", metavar="FILE|-",
+                       help="Read the text from FILE, or stdin with '-' "
+                            "(use a QUOTED heredoc: --desc-file - <<'EOF')")
     p_set.add_argument("--context", "-c", help="JSON context/state")
 
     p_append = sub.add_parser("append", help="Append to existing action")
@@ -8889,7 +8958,11 @@ def build_parser():
     sub.add_parser("banner", help="Output for session-resume (internal)")
 
     p_complete = sub.add_parser("complete", help="Log a completed task")
-    p_complete.add_argument("description", help="What was completed")
+    p_complete.add_argument("description", nargs="?",
+                            help="What was completed (or use --desc-file)")
+    p_complete.add_argument("--desc-file", metavar="FILE|-",
+                            help="Read the text from FILE, or stdin with '-' "
+                                 "(use a QUOTED heredoc: --desc-file - <<'EOF')")
 
     p_history = sub.add_parser("history", help="Show last N completed tasks")
     p_history.add_argument("-n", "--count", type=int, default=10)
@@ -8927,8 +9000,34 @@ def build_parser():
     p_queue = sub.add_parser("queue", help="Task queue with scope-based groups")
     qsub = p_queue.add_subparsers(dest="qcmd")
 
-    q_add = qsub.add_parser("add", help="Add item")
-    q_add.add_argument("description")
+    q_add = qsub.add_parser(
+        "add", help="Add item",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "PREFERRED form for any free text (safe against backticks, "
+            "$(...), $VARS):\n\n"
+            "  session-task queue add --scope repo:X --summary 'short headline' "
+            "--desc-file - <<'EOF'\n"
+            "  Any text, including `cmd` and $(cmd) and $VARS, stored literally.\n"
+            "  EOF\n\n"
+            "Never put free text in a double-quoted argument: bash expands "
+            "backticks and $(...) BEFORE this CLI starts (and RUNS them). "
+            "Use a quoted heredoc ('EOF'), a single-quoted string, or a file."
+        ),
+    )
+    q_add.add_argument(
+        "description", nargs="?",
+        help="Inline description (or use --desc-file; exactly one required)",
+    )
+    q_add.add_argument(
+        "--desc-file", metavar="FILE|-",
+        help="Read the description from FILE, or stdin with '-' (heredoc)",
+    )
+    q_add.add_argument(
+        "--summary-file", metavar="FILE|-",
+        help="Read the summary from FILE, or stdin with '-' "
+             "(exclusive with --summary; only one of the file flags may be '-')",
+    )
     q_add.add_argument(
         "--scope",
         action="append",
@@ -9086,6 +9185,10 @@ def build_parser():
     )
     q_abandon.add_argument("id")
     q_abandon.add_argument("--reason")
+    q_abandon.add_argument(
+        "--reason-file", metavar="FILE|-",
+        help="Read the reason from FILE, or stdin with '-' (quoted heredoc)",
+    )
     q_abandon.add_argument(
         "--confirmed-dead", action="store_true",
         help=(
@@ -9372,8 +9475,11 @@ def build_parser():
     )
     q_block.add_argument("id")
     q_block.add_argument(
+        "--reason-file", metavar="FILE|-",
+        help="Read the reason from FILE, or stdin with '-' (quoted heredoc)",
+    )
+    q_block.add_argument(
         "--reason",
-        required=True,
         help=(
             "Why is the agent blocked? Common values: 'awaiting human "
             "greenlight', 'awaiting branch-protection toggle', "
