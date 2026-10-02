@@ -306,5 +306,44 @@ class DoReconnectNonCancellingTest(unittest.TestCase):
         self.assertTrue(kwargs.get("slash_command", False))
 
 
+class RealPickerFixtureTest(unittest.TestCase):
+    """Captured from a scratch tmux pane under Claude Code v2.1.287."""
+
+    FX = Path(__file__).resolve().parent / "fixtures"
+
+    def setUp(self):
+        self.mod = _import_self_mcp_reconnect()
+        self.top = (self.FX / "mcp_picker_v2.1.287_top.txt").read_text()
+        self.detail = (self.FX / "mcp_picker_v2.1.287_detail.txt").read_text()
+        self.result = (self.FX / "mcp_picker_v2.1.287_result.txt").read_text()
+
+    def test_top_rows_parse(self):
+        rows = self.mod.parse_server_rows(self.top)
+        self.assertEqual([r[0] for r in rows],
+                         ["chrome-devtools", "host-bash", "mcp-adaptor", "slack"])
+        self.assertTrue(rows[0][2])
+        self.assertFalse(any(r[2] for r in rows[1:]))
+        self.assertIn("tools fetch failed", rows[2][1])
+        self.assertIn("needs authentication", rows[3][1])
+        self.assertTrue(self.mod.top_menu_visible(self.top))
+
+    def test_detail_actions(self):
+        self.assertTrue(self.mod.detail_menu_visible(self.detail))
+        acts = self.mod.parse_action_rows(self.detail)
+        self.assertEqual([(n, l) for n, l, _ in acts], [(1, "Reconnect"), (2, "Disable")])
+
+    def test_partial_result(self):
+        r = self.mod.find_last_result(self.result)
+        self.assertEqual(r[0], "partial")
+        self.assertEqual(r[1], "mcp-adaptor")
+        self.assertIn("no active session", r[2])
+
+    def test_legacy_layout_still_parses(self):
+        rows = self.mod.parse_server_rows(
+            "  Manage MCP servers\n ❯ a-srv \xb7 ✔ connected \xb7 2 tools\n"
+            "   b-srv \xb7 ✘ failed\n  Enter to confirm\n")
+        self.assertEqual([r[0] for r in rows], ["a-srv", "b-srv"])
+
+
 if __name__ == "__main__":
     unittest.main()

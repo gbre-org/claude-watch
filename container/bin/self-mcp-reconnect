@@ -240,13 +240,27 @@ TOP_MENU_TITLE = "manage mcp servers"
 TOP_MENU_FOOTER = "enter to confirm"          # "... · Enter to confirm · Esc to cancel"
 DETAIL_MENU_FOOTER = "enter to select"        # "... · Enter to select · Esc to back"
 
-# A server row in the top-level list, e.g.:
-#   "   host-bash · ✔ connected · 3 tools"
-#   " ❯ mcp-adaptor · ✘ failed"
-_SERVER_ROW_RE = re.compile(
-    r"^\s*(?P<cursor>\W\s+)?(?P<name>[A-Za-z0-9_.\-]+)\s*\xb7\s*(?P<status>.+?)\s*$"
+# A server row in the top-level list. Two layouts are supported:
+#
+#   v2.1.287+ (grouped by scope, glyph BEFORE the name, column-aligned status,
+#   NO middot separator):
+#     "     Built-in MCPs (always available)"
+#     "   ❯ ✔ chrome-devtools   29 tools"
+#     "     ⚠ mcp-adaptor       tools fetch failed · connected"
+#     "     ⚠ slack             needs authentication"
+#   legacy (2026-08-31):
+#     "   host-bash · ✔ connected · 3 tools"
+#     " ❯ mcp-adaptor · ✘ failed"
+_CURSOR_CHARS = "❯›▸>→"
+_NEW_ROW_RE = re.compile(
+    r"^\s*(?:(?P<cursor>[" + _CURSOR_CHARS + r"])\s+)?(?P<glyph>[^\w\s])\s+"
+    r"(?P<name>[A-Za-z0-9_][A-Za-z0-9_.\-]*)(?:\s{2,}(?P<status>\S.*?))?\s*$"
 )
-_STATUS_GLYPHS = ("✔", "✘", "△")  # ✔ ✘ △
+_OLD_ROW_RE = re.compile(
+    r"^\s*(?:(?P<cursor>[" + _CURSOR_CHARS + r"])\s+)?"
+    r"(?P<name>[A-Za-z0-9_][A-Za-z0-9_.\-]*)\s*\xb7\s*(?P<status>.+?)\s*$"
+)
+_STATUS_GLYPHS = ("✔", "✘", "△", "⚠", "✓", "✗", "○", "●", "◐")
 
 # A numbered action row in a server's detail screen, e.g.:
 #   " ❯ 1. View tools"
@@ -255,6 +269,7 @@ _ACTION_ROW_RE = re.compile(r"^\s*(?P<cursor>\W\s+)?(?P<num>\d+)\.\s+(?P<label>.
 
 _RESULT_RE = re.compile(
     r"(Reconnected to (?P<ok_name>[A-Za-z0-9_.\-]+)\.)"
+    r"|(Reconnected to (?P<partial_name>[A-Za-z0-9_.\-]+),\s*but fetching tools failed:\s*(?P<partial_reason>.+))"
     r"|(Failed to reconnect to (?P<fail_name>[A-Za-z0-9_.\-]+):\s*(?P<reason>.+))"
 )
 
@@ -281,20 +296,33 @@ def any_mcp_menu_visible(text: str) -> bool:
 
 
 def parse_server_rows(text: str):
-    """Return [(name, status_text, is_cursor), ...] in on-screen order."""
+    """Return [(name, status_text, is_cursor), ...] in on-screen order.
+
+    Tolerates both the v2.1.287+ grouped layout (glyph, name, aligned status)
+    and the legacy `name · glyph status` layout. Only lines after the
+    "Manage MCP servers" title and before the footer are considered, so the
+    detail-screen `Status:` lines and chat text cannot be mistaken for rows.
+    """
+    lines = text.splitlines()
+    start = 0
+    for i, raw in enumerate(lines):
+        if TOP_MENU_TITLE in raw.lower():
+            start = i + 1
     rows = []
-    for raw in text.splitlines():
-        if "\xb7" not in raw or not any(g in raw for g in _STATUS_GLYPHS):
+    for raw in lines[start:]:
+        low = raw.lower()
+        if TOP_MENU_FOOTER in low or "for help" in low:
+            break
+        m = _NEW_ROW_RE.match(raw)
+        if m and (m.group("glyph") in _STATUS_GLYPHS or m.group("cursor")):
+            rows.append((m.group("name"), (m.group("status") or "").strip(),
+                         bool(m.group("cursor"))))
             continue
-        m = _SERVER_ROW_RE.match(raw)
-        if not m:
-            continue
-        is_cursor = bool(m.group("cursor")) and m.group("cursor").strip() not in ("", ".")
-        # A cursor glyph is a non-word char captured before the name; a plain
-        # multi-space indent captures as None from the optional group.
-        cursor_char = (m.group("cursor") or "").strip()
-        is_cursor = cursor_char != "" and not cursor_char[0].isalnum()
-        rows.append((m.group("name"), m.group("status").strip(), is_cursor))
+        if "\xb7" in raw and any(g in raw for g in _STATUS_GLYPHS):
+            m = _OLD_ROW_RE.match(raw)
+            if m:
+                rows.append((m.group("name"), m.group("status").strip(),
+                             bool(m.group("cursor"))))
     return rows
 
 
@@ -314,7 +342,7 @@ def parse_action_rows(text: str):
 def find_last_result(text: str):
     """Return the LAST (status, name, reason) result line in the pane, or None.
 
-    status is "ok" or "fail". Scanning for the last match (not the first)
+    status is "ok", "partial" (reconnected but tools fetch failed) or "fail". Scanning for the last match (not the first)
     matters because a pane can carry an earlier /mcp attempt's result above
     ours in scrollback-adjacent visible text.
     """
@@ -322,6 +350,8 @@ def find_last_result(text: str):
     for m in _RESULT_RE.finditer(text):
         if m.group("ok_name"):
             last = ("ok", m.group("ok_name"), None)
+        elif m.group("partial_name"):
+            last = ("partial", m.group("partial_name"), m.group("partial_reason"))
         else:
             last = ("fail", m.group("fail_name"), m.group("reason"))
     return last
@@ -391,7 +421,12 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
     log("  injecting /mcp (non-cancelling: no interrupt, no --escape)")
     sc.inject(pane, "/mcp", label="mcp-open", slash_command=True, escape=False)
 
-    text = _poll_until(pane, top_menu_visible, timeout=menu_timeout)
+    # Poll until the title AND at least one parseable server row are on
+    # screen: the title paints before the rows, and parsing a half-rendered
+    # picker is what used to yield "server list: []".
+    text = _poll_until(
+        pane, lambda t: top_menu_visible(t) and bool(parse_server_rows(t)),
+        timeout=menu_timeout)
     if not top_menu_visible(text):
         log(f"  FAIL: top-level MCP menu never rendered. pane: {sc.capture_pane_text(pane)}")
         close_any_menu(pane)
@@ -400,6 +435,8 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
     rows = parse_server_rows(text)
     names = [r[0] for r in rows]
     log(f"  server list: {names}")
+    if not rows:
+        log(f"  WARNING: top menu visible but no rows parsed; raw pane: {text!r}")
     if server not in names:
         log(f"  FAIL: server {server!r} not in /mcp list {names!r}")
         close_any_menu(pane)
@@ -413,6 +450,9 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
     tools_before = rows[target_idx][1]
     cursor_idx = next((i for i, r in enumerate(rows) if r[2]), 0)
     downs = target_idx - cursor_idx
+    if "fetch failed" in tools_before.lower() or "no active session" in tools_before.lower():
+        log(f"  NOTE: {server} shows {tools_before!r} (connected but tool discovery failed); "
+            "attempting Reconnect anyway")
     log(f"  target row {target_idx} ({tools_before!r}), cursor at {cursor_idx}, sending {downs} Down")
     for _ in range(max(0, downs)):
         _send_key(pane, "Down")
@@ -472,6 +512,11 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
             "reason": f"reconnect result named a different server ({name!r}); navigation likely misfired",
             "code": 4,
         }
+    if status == "partial":
+        log(f"  PARTIAL: reconnected to {server} but tools fetch failed: {reason}")
+        return {"ok": False, "server": server, "code": 5, "tools_before": tools_before,
+                "reason": f"reconnected but tools fetch failed: {reason} "
+                          "(server-side session is dead; re-auth/restart the host adapter)"}
     if status == "ok":
         log(f"  SUCCESS: Reconnected to {server}.")
         return {"ok": True, "server": server, "reason": None, "code": 0, "tools_before": tools_before}

@@ -36,6 +36,20 @@ Down x M (to "Reconnect"), Enter
 
 So a correct reconnect needs real menu navigation with text-based lookups at each step — a blind `/mcp` + Enter (the older [`mcp-reconnect`](https://github.com/gbre-org/claude-watch/blob/main/container/bin/mcp-reconnect) script's approach) only opens the list and leaves it sitting there; it never drives a server's own Reconnect action. `mcp-reconnect` still exists for callers that only need to force the list open (e.g. to eyeball transport status); `self-mcp-reconnect` is the tool for an actual, confirmed reconnect.
 
+**Claude Code v2.1.287+ layout (re-verified 2026-10-02; this is what broke the old parser, which returned an empty server list):** the list is grouped by scope and has NO middot separator; the status glyph comes BEFORE the name and the status text is column-aligned after it:
+
+```
+  Manage MCP servers
+  4 servers
+    Built-in MCPs (always available)
+  ❯ ✔ chrome-devtools   29 tools
+    ✔ host-bash         3 tools
+    ⚠ mcp-adaptor       tools fetch failed · connected
+    ⚠ slack             needs authentication
+```
+
+The cursor starts on the first row, the detail screen is "Reconnect / Disable" for a server in this state, and the result line can be `Reconnected to <name>, but fetching tools failed: <error>` (reported by the tool as exit 5: the transport reconnected but the server-side session is dead, so re-auth/restart the host adapter). Real captures live in `tools/watchers/tests/fixtures/mcp_picker_v2.1.287_*.txt`. The parser also still accepts the legacy `name · glyph status` layout, and waits until at least one server row has rendered before parsing.
+
 **Uncertainty flag:** the row-status glyphs, footer text, and action-menu wording above were captured from one live session on one Claude Code version. If a future Claude Code release changes the `/mcp` UI's copy or layout, `self-mcp-reconnect` fails LOUD (see exit codes below) rather than silently reporting success — treat a `menu-did-not-open` / `no Reconnect action` failure as "the UI shape moved, go re-verify in a scratch pane" rather than a transient error to retry blindly.
 
 ## Steps
@@ -53,6 +67,7 @@ So a correct reconnect needs real menu navigation with text-based lookups at eac
    - `1` — usage error / no Claude Code pane found / internal error.
    - `4` — the server wasn't in the `/mcp` list, no "Reconnect" action was found on its detail screen, or a menu never rendered — a UI-shape mismatch, not a transient failure. Re-verify the picker's current layout in a scratch pane before retrying.
    - `5` — the reconnect was attempted and Claude Code itself reported failure (`Failed to reconnect to <name>: <error>`) — a real MCP-server-side problem (check the server / its auth on the host), not a scripting bug.
+   - `5` also covers `Reconnected to <name>, but fetching tools failed: ...` (connected, but tool discovery still failing; the server shows `Connected · tools fetch failed — no active session` in `claude mcp list`). The tool still attempts Reconnect in that state.
    - `6` — no result line appeared within the poll window (ambiguous — the tool sends a best-effort Escape to close any menu left open before exiting).
 
 4. **Variant flags** (rarely needed):

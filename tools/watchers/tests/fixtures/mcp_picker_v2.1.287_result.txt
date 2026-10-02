@@ -1,0 +1,1 @@
+  ⎿  Reconnected to mcp-adaptor, but fetching tools failed: no active session: connection lost

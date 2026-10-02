@@ -1,0 +1,9 @@
+   Manage MCP servers
+   4 servers
+     Built-in MCPs (always available)
+   ❯ ✔ chrome-devtools   29 tools
+     ✔ host-bash         3 tools
+     ⚠ mcp-adaptor       tools fetch failed · connected
+     ⚠ slack             needs authentication
+   https://code.claude.com/docs/en/mcp for help
+   ↑/↓ to navigate · Enter to confirm · Esc to cancel

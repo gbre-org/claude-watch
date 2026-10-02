@@ -1,0 +1,11 @@
+   Mcp-adaptor MCP Server
+   Status:           ⚠ connected · tools fetch failed
+   Auth:             ✘ not authenticated
+   URL:              http://host.docker.internal:8765
+   Config location:  Dynamically configured
+   Capabilities: none
+   Issue:
+   request failed after reconnection
+   ❯ 1. Reconnect
+     2. Disable
+   ↑/↓ to navigate · Enter to select · Esc to back
