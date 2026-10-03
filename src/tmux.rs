@@ -722,6 +722,126 @@ pub async fn cancel_rewind_picker(pane: &str) {
     send_keys(pane, &[REWIND_PICKER_CANCEL_KEY]).await;
 }
 
+/// Pure: is the pane showing a FleetView agent-view (an agent other than the
+/// main conversation is being viewed or selected)?
+///
+/// Two signatures, both specific to the agent-view itself:
+///   * a `❯`-cursored agent row: the cursor followed by a status bullet
+///     (`❯ ● main`, `❯ ◯ general-purpose …`). Same as signature (5) of
+///     `interactive_prompt_visible`;
+///   * the viewer footer `↑/↓ to select · Enter to view`.
+///
+/// Deliberately NOT a signature: the `← for agents` hint. Claude Code draws
+/// it on the MAIN-loop status bar whenever any subagent exists, followed by an
+/// uncursored roster (`● main` / `◯ general-purpose …`), while focus is on the
+/// main prompt:
+///
+/// ```text
+/// ❯ scale up the training pod
+/// ──────────────────────────────
+///   -- INSERT -- ⏵⏵ bypass permissions on · 2 monitors · ← for agents
+///
+///   ● main
+///   ◯ general-purpose  Decoding ensure_main_loop… 18m 3s · ↓ 153.1k tokens
+/// ```
+///
+/// The retired Python check in `self-clear` treated that hint as an
+/// agent-view, so with any subagent listed it could never confirm main-loop
+/// focus and sent an Escape per attempt into the main prompt. On 2026-09-29
+/// those Escapes, sent right after a confirmed `/clear`, opened the Rewind
+/// picker and the resume prompt was typed into it.
+///
+/// Also not a signature: a generic `to select · Enter to confirm` footer.
+/// That is a question menu, and the Escape this detector leads to would
+/// cancel it.
+pub(crate) fn fleetview_agent_view_visible(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = lines.len().saturating_sub(25);
+    for line in &lines[start..] {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.contains("to select") && lower.contains("to view") {
+            return true;
+        }
+        if let Some(rest) = trimmed.strip_prefix('\u{276f}') {
+            let c = rest.trim_start().chars().next();
+            if c == Some('\u{25cf}') || c == Some('\u{25ef}') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Result of `ensure_main_loop_focus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusOutcome {
+    /// No agent-view on the pane after `attempts` navigation passes.
+    Confirmed { attempts: u32 },
+    /// An agent-view was still visible after every attempt.
+    Unconfirmed { attempts: u32 },
+    /// No capture succeeded, so nothing could be confirmed either way.
+    CaptureFailed,
+}
+
+/// Return keyboard focus to the main loop and verify it from a pane capture.
+///
+/// Each pass reselects the main-loop tmux pane, sends the configured
+/// `[tmux].focus_main_keys`, and captures. When no agent-view is visible the
+/// focus is confirmed. Otherwise one Escape is sent to collapse the overlay
+/// and the pass repeats.
+///
+/// The Escape is only sent on a positive agent-view detection, never on the
+/// main prompt: on Claude Code 2.1.283+ Escapes at an idle prompt open the
+/// Rewind picker. If a picker shows up anyway after our Escape, it is
+/// cancelled (Escape again) before the next pass, so this routine never leaves
+/// a picker behind for the caller's next inject to type into.
+pub async fn ensure_main_loop_focus(pane: &str, max_attempts: u32) -> FocusOutcome {
+    let max_attempts = max_attempts.max(1);
+    let mut captured_any = false;
+    for attempt in 1..=max_attempts {
+        reselect_main_loop_pane(pane).await;
+        send_focus_main_keys(pane).await;
+        sleep(Duration::from_millis(300)).await;
+        let Some(out) = capture_pane(pane).await.filter(|o| !o.is_empty()) else {
+            info!(pane = %pane, attempt, max_attempts, "ensure_main_loop_focus: capture failed");
+            continue;
+        };
+        captured_any = true;
+        if !fleetview_agent_view_visible(&out) {
+            info!(pane = %pane, attempt, max_attempts, "ensure_main_loop_focus: main-loop focus confirmed");
+            return FocusOutcome::Confirmed { attempts: attempt };
+        }
+        info!(
+            pane = %pane,
+            attempt,
+            max_attempts,
+            "ensure_main_loop_focus: FleetView agent-view visible; sending Escape to collapse"
+        );
+        send_keys(pane, &["Escape"]).await;
+        sleep(Duration::from_millis(300)).await;
+        if rewind_picker_on_pane(pane).await {
+            info!(
+                pane = %pane,
+                "ensure_main_loop_focus: Escape opened the Rewind picker; cancelling it"
+            );
+            cancel_rewind_picker(pane).await;
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+    if !captured_any {
+        return FocusOutcome::CaptureFailed;
+    }
+    warn!(
+        pane = %pane,
+        max_attempts,
+        "ensure_main_loop_focus: could NOT confirm main-loop focus; a FleetView agent-view is still visible"
+    );
+    FocusOutcome::Unconfirmed {
+        attempts: max_attempts,
+    }
+}
+
 /// Keys that move the Bypass-Permissions launch dialog's selection from its
 /// default ("No, exit") onto the confirm option ("Yes, I accept") and submit.
 ///
@@ -5808,6 +5928,72 @@ mod tests {
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  Rewind\n  Restore and fork the conversation to the point before\u{2026}\n\n    /resume 95780a5a-8939-443a-88e3-8d1e5bfbede4 (previous session)\n\n    /clear\n\n  \u{276f} (current)\n\n  Enter to continue \u{b7} Esc to cancel\n";
         assert!(rewind_picker_visible(pane));
         assert!(interactive_prompt_visible(pane));
+    }
+
+    /// Main-loop pane with subagents listed (live capture, 2026-10-03): the
+    /// `← for agents` hint and an uncursored roster, focus on the main prompt.
+    const MAIN_LOOP_WITH_ROSTER: &str = "\u{273b} Waiting for 2 background agents to finish\n\
+        \x20                                                          851146 tokens\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+        \u{276f} scale up the training pod\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+        \x20 -- INSERT -- \u{23f5}\u{23f5} bypass permissions on \u{b7} 2 monitors \u{b7} \u{2190} for agents\n\
+        \n\
+        \x20 \u{25cf} main\n\
+        \x20 \u{25ef} general-purpose  Decoding ensure_main_loop\u{2026} 18m 3s \u{b7} \u{2193} 153.1k tokens\n\
+        \x20 \u{25ef} general-purpose  Checking NodePool labels \u{2026} 14m 9s \u{b7} \u{2193} 196.5k tokens\n";
+
+    #[test]
+    fn agent_view_not_fired_by_for_agents_hint_on_main_loop() {
+        // The root cause of the repeated ensure_main_loop_focus failures: this
+        // pane is the MAIN loop, and must confirm.
+        assert!(!fleetview_agent_view_visible(MAIN_LOOP_WITH_ROSTER));
+    }
+
+    #[test]
+    fn agent_view_not_fired_by_truncated_for_agents_hint() {
+        // The status bar truncates the hint while a turn runs (2026-10-02 log:
+        // `esc to interrupt · ← for agen…`). Still the main loop.
+        let pane = "\u{276f} \n\
+            \x20 \u{23f5}\u{23f5} bypass permissions on \u{b7} 2 monitors \u{b7} esc to interrupt \u{b7} \u{2190} for agen\u{2026}\n\
+            \n\
+            \x20 \u{25cf} main\n\
+            \x20 \u{25ef} general-purpose  Reading q-2026-09-24-3685\u{2026} 1m 47s \u{b7} \u{2193} 112.4k tokens\n";
+        assert!(!fleetview_agent_view_visible(pane));
+    }
+
+    #[test]
+    fn agent_view_fired_by_cursored_agent_row() {
+        let pane = "\u{2191}/\u{2193} to select \u{b7} Enter to view \u{b7} Esc to close\n\
+            \u{276f} \u{25ef} general-purpose  running a search\n\
+            \x20 \u{25cf} main\n";
+        assert!(fleetview_agent_view_visible(pane));
+        // Cursor on `main` inside the viewer is still the viewer, not the prompt.
+        assert!(fleetview_agent_view_visible(
+            "\u{276f} \u{25cf} main\n  \u{25ef} general-purpose  x\n"
+        ));
+    }
+
+    #[test]
+    fn agent_view_fired_by_viewer_footer_alone() {
+        let pane = "some agent output\n\u{2191}/\u{2193} to select \u{b7} Enter to view\n";
+        assert!(fleetview_agent_view_visible(pane));
+    }
+
+    #[test]
+    fn agent_view_not_fired_by_question_menu() {
+        // Escaping a question menu would cancel it.
+        let pane = "Which approach?\n\u{276f} 1. Refactor\n  2. Rewrite\n\
+            \u{2191}/\u{2193} to select \u{b7} Enter to confirm \u{b7} Esc to cancel\n";
+        assert!(!fleetview_agent_view_visible(pane));
+    }
+
+    #[test]
+    fn agent_view_not_fired_by_rewind_picker_or_bare_prompt() {
+        assert!(!fleetview_agent_view_visible(REWIND_PICKER_PANE));
+        assert!(!fleetview_agent_view_visible(
+            "\u{23fa} done\n\u{276f} \n  bypass permissions on\n"
+        ));
     }
 
     #[test]

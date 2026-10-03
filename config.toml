@@ -120,6 +120,11 @@ cooldown = 120
 # the daemon actually observed plus pane idleness, and ignores the
 # background-shell count. 0 disables it.
 post_clear_window_secs = 300
+# Seconds after a /clear at which the daemon checks the pane once for a Rewind
+# picker (Claude Code 2.1.283+) left open, and cancels it with Escape. A picker
+# screen has no token line, so the fresh-/clear check above never sees it.
+# 0 disables it.
+post_clear_picker_recheck_secs = 20
 
 [ack]
 # Minutes without ANY claude-event ack before the main loop is considered

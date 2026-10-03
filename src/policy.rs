@@ -533,6 +533,103 @@ pub(crate) fn post_clear_resume_due(
     idle_checks >= checks_required
 }
 
+/// How long after a clear the post-clear Rewind-picker recheck may still run.
+/// Past this the clear is stale (e.g. the daemon was down through it) and a
+/// picker on screen is no longer attributable to it.
+pub(crate) const POST_CLEAR_PICKER_RECHECK_MAX_AGE_SECS: f64 = 600.0;
+
+/// Epoch seconds of the most recent clear the daemon knows about: the later of
+/// `last_context_clear` (RFC3339, stamped when the daemon observes a clear) and
+/// the `self-clear` handoff marker's mtime (stamped when a self-clear delivers
+/// its resume prompt, which is exactly when a stranded picker would swallow
+/// it).
+pub(crate) fn latest_clear_epoch(
+    last_context_clear: Option<&str>,
+    handoff_mtime: Option<f64>,
+) -> Option<f64> {
+    let observed = last_context_clear
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis() as f64 / 1000.0);
+    match (observed, handoff_mtime) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Pure gate for the post-clear Rewind-picker recheck.
+///
+/// Due once per clear, at least `recheck_secs` after it and no later than
+/// `POST_CLEAR_PICKER_RECHECK_MAX_AGE_SECS` past that, and never while a
+/// `self-clear` holds its lock (it is driving the picker itself and an Escape
+/// from us would race its Enter). `recheck_secs == 0` disables it.
+pub(crate) fn post_clear_picker_recheck_due(
+    clear_epoch: Option<f64>,
+    now_epoch: f64,
+    recheck_secs: u64,
+    checked_for: Option<f64>,
+    self_clear_running: bool,
+) -> bool {
+    if recheck_secs == 0 || self_clear_running {
+        return false;
+    }
+    let Some(cleared) = clear_epoch else {
+        return false;
+    };
+    if checked_for == Some(cleared) {
+        return false;
+    }
+    let age = now_epoch - cleared;
+    age >= recheck_secs as f64 && age < recheck_secs as f64 + POST_CLEAR_PICKER_RECHECK_MAX_AGE_SECS
+}
+
+/// Post-clear safety net: once per clear, `recheck_secs` after it, cancel a
+/// Rewind picker still open on the pane.
+///
+/// The fresh-/clear check's own cancel (#838) only runs for a pane reading
+/// `[min_tokens, max_tokens)` with `bashes == 0`. A picker screen has no token
+/// line, so it reads 0 (or the carried-forward pre-clear total), and the
+/// dead-process block returns first. This runs ahead of that block. Returns
+/// whether an Escape was sent.
+async fn recheck_post_clear_picker(config: &Config, state: &mut State, pane: &str) -> bool {
+    if pane.is_empty() {
+        return false;
+    }
+    let clear_epoch = latest_clear_epoch(
+        state.last_context_clear.as_deref(),
+        tmux::self_clear_handoff_mtime(),
+    );
+    let now_epoch = Utc::now().timestamp_millis() as f64 / 1000.0;
+    if !post_clear_picker_recheck_due(
+        clear_epoch,
+        now_epoch,
+        config.fresh_clear.post_clear_picker_recheck_secs,
+        state.post_clear_picker_checked_for,
+        tmux::self_clear_in_progress(),
+    ) {
+        return false;
+    }
+    state.post_clear_picker_checked_for = clear_epoch;
+    if !tmux::rewind_picker_on_pane(pane).await {
+        debug!(pane = %pane, "post-clear picker recheck: no Rewind picker on the pane");
+        return false;
+    }
+    info!(
+        pane = %pane,
+        "post-clear picker recheck: Rewind picker still open after /clear -- cancelling with Escape"
+    );
+    write_jsonl_log(
+        &config.general.log_file,
+        "post_clear_picker_cancelled",
+        serde_json::json!({
+            "pane": pane,
+            "clear_epoch": clear_epoch,
+            "recheck_secs": config.fresh_clear.post_clear_picker_recheck_secs,
+        }),
+    );
+    tmux::cancel_rewind_picker(pane).await;
+    true
+}
+
 /// Watcher-down active-turn verdict, with the two cases where the premise of
 /// the suppression is false folded in.
 ///
@@ -7553,6 +7650,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         .await
         .is_some();
 
+    // --- Post-clear Rewind-picker recheck ---
+    // Must run before the dead-process block: a picker screen has no token
+    // line, so it reads tokens=0 and that block returns. See
+    // `recheck_post_clear_picker`.
+    recheck_post_clear_picker(config, state, &effective_pane).await;
+
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
         state.consecutive_dead_checks += 1;
@@ -10003,6 +10106,67 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 mod tests {
     use super::*;
     use crate::credentials::{AccessTokenState, CredentialExpiry};
+
+    #[test]
+    fn post_clear_picker_recheck_fires_once_after_the_delay() {
+        let cleared = Some(1_000.0);
+        // Too early.
+        assert!(!post_clear_picker_recheck_due(
+            cleared, 1_010.0, 20, None, false
+        ));
+        // Due.
+        assert!(post_clear_picker_recheck_due(
+            cleared, 1_020.0, 20, None, false
+        ));
+        assert!(post_clear_picker_recheck_due(
+            cleared, 1_300.0, 20, None, false
+        ));
+        // Already ran for this clear.
+        assert!(!post_clear_picker_recheck_due(
+            cleared,
+            1_030.0,
+            20,
+            Some(1_000.0),
+            false
+        ));
+        // A newer clear re-arms it.
+        assert!(post_clear_picker_recheck_due(
+            Some(2_000.0),
+            2_030.0,
+            20,
+            Some(1_000.0),
+            false
+        ));
+    }
+
+    #[test]
+    fn post_clear_picker_recheck_skips_stale_disabled_or_busy() {
+        let cleared = Some(1_000.0);
+        let stale = 1_000.0 + 20.0 + POST_CLEAR_PICKER_RECHECK_MAX_AGE_SECS;
+        assert!(!post_clear_picker_recheck_due(
+            cleared, stale, 20, None, false
+        ));
+        assert!(!post_clear_picker_recheck_due(
+            cleared, 1_030.0, 0, None, false
+        ));
+        assert!(!post_clear_picker_recheck_due(
+            cleared, 1_030.0, 20, None, true
+        ));
+        assert!(!post_clear_picker_recheck_due(
+            None, 1_030.0, 20, None, false
+        ));
+    }
+
+    #[test]
+    fn latest_clear_epoch_takes_the_newer_source() {
+        let rfc = "1970-01-01T00:16:40+00:00"; // 1000s
+        assert_eq!(latest_clear_epoch(Some(rfc), None), Some(1_000.0));
+        assert_eq!(latest_clear_epoch(None, Some(1_500.5)), Some(1_500.5));
+        assert_eq!(latest_clear_epoch(Some(rfc), Some(900.0)), Some(1_000.0));
+        assert_eq!(latest_clear_epoch(Some(rfc), Some(1_200.0)), Some(1_200.0));
+        assert_eq!(latest_clear_epoch(Some("garbage"), None), None);
+        assert_eq!(latest_clear_epoch(None, None), None);
+    }
 
     // ---- auto-update: which modal is fronting the injected /exit ----
 

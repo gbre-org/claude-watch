@@ -355,6 +355,22 @@ pub struct FreshClearConfig {
     /// bridge the bootstrap gap. `0` disables it. Default: 120s.
     #[serde(default = "default_self_clear_handoff_grace_secs")]
     pub self_clear_handoff_grace_secs: u64,
+    /// Seconds after a `/clear` at which the daemon re-captures the pane once
+    /// and, if the 2.1.283+ Rewind picker is still open, cancels it with
+    /// Escape.
+    ///
+    /// The fresh-/clear check already cancels a stranded picker, but only for
+    /// a pane reading `[min_tokens, max_tokens)` with no background shells. A
+    /// picker screen has no token line, so it reads 0 (or a carried-forward
+    /// pre-clear total), and that check never runs. Nothing else cancels the
+    /// picker, and every inject is suppressed while it is up. `0` disables
+    /// the recheck. Default: 20.
+    #[serde(default = "default_post_clear_picker_recheck_secs")]
+    pub post_clear_picker_recheck_secs: u64,
+}
+
+fn default_post_clear_picker_recheck_secs() -> u64 {
+    20
 }
 
 fn default_suppress_when_active() -> bool {

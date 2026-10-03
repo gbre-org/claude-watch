@@ -423,6 +423,28 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Return keyboard focus to the main loop and verify it.
+    ///
+    /// Reselects the main-loop tmux pane, sends `[tmux].focus_main_keys`, and
+    /// confirms from a capture that no FleetView agent-view is on screen,
+    /// sending one Escape per attempt only when one is. The `← for agents`
+    /// status-bar hint shown whenever subagents exist is NOT an agent-view.
+    ///
+    /// Exit codes: 0 = focus confirmed. 6 = an agent-view was still visible
+    /// after every attempt. 7 = the pane could not be captured.
+    FocusMain {
+        /// Target tmux pane. Same resolution order as `inject`.
+        #[arg(long, value_name = "PANE")]
+        pane: Option<String>,
+
+        /// Navigation passes before giving up.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
+        attempts: u32,
+
+        /// Emit machine-readable JSON outcome on stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1933,6 +1955,36 @@ fn multicall_rewrite_args() -> Vec<String> {
 /// `[tmux] dashboard_pane` config (when non-empty) > auto-detection via the
 /// claude-pane scan > the `claude-container:0.0` fallback the shell callers
 /// historically defaulted to.
+/// Exit code and status label for a `focus-main` outcome.
+fn focus_main_exit(outcome: tmux::FocusOutcome) -> (i32, &'static str, u32) {
+    match outcome {
+        tmux::FocusOutcome::Confirmed { attempts } => (0, "confirmed", attempts),
+        tmux::FocusOutcome::Unconfirmed { attempts } => (6, "unconfirmed", attempts),
+        tmux::FocusOutcome::CaptureFailed => (7, "capture_failed", 0),
+    }
+}
+
+/// `claude-watch focus-main`: see the subcommand doc.
+async fn run_focus_main(pane_flag: Option<&str>, attempts: u32, json: bool) -> i32 {
+    if let Ok(cfg) = config::try_load_config() {
+        tmux::set_focus_main_keys(cfg.tmux.focus_main_keys.clone());
+    }
+    let pane = resolve_inject_pane(pane_flag).await;
+    // Serialize with injectors: our Escape must not land mid-payload.
+    let _inject_guard = inject_lock::InjectLock::acquire("focus-main").await;
+    let outcome = tmux::ensure_main_loop_focus(&pane, attempts).await;
+    let (code, status, used) = focus_main_exit(outcome);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "pane": pane, "status": status, "attempts": used, "exit_code": code })
+        );
+    } else {
+        eprintln!("focus-main: {status} (pane={pane}, attempts={used})");
+    }
+    code
+}
+
 async fn resolve_inject_pane(flag: Option<&str>) -> String {
     if let Some(p) = flag {
         if !p.is_empty() {
@@ -2401,6 +2453,16 @@ async fn main() {
                 std::process::exit(code);
             }
         }
+        Some(Commands::FocusMain {
+            pane,
+            attempts,
+            json,
+        }) => {
+            let code = run_focus_main(pane.as_deref(), attempts, json).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Some(Commands::Inject {
             submit,
             pane,
@@ -2461,6 +2523,44 @@ mod tests {
             claude_watch_version: "0.1.0",
             daemon_active: Some(true),
         }
+    }
+
+    #[test]
+    fn focus_main_parses_and_maps_exit_codes() {
+        let cli = Cli::parse_from([
+            "claude-watch",
+            "focus-main",
+            "--pane",
+            "x:0.0",
+            "--attempts",
+            "2",
+        ]);
+        match cli.command {
+            Some(Commands::FocusMain {
+                pane,
+                attempts,
+                json,
+            }) => {
+                assert_eq!(pane.as_deref(), Some("x:0.0"));
+                assert_eq!(attempts, 2);
+                assert!(!json);
+            }
+            _ => panic!("expected FocusMain"),
+        }
+        let default = Cli::parse_from(["claude-watch", "focus-main"]);
+        assert!(matches!(
+            default.command,
+            Some(Commands::FocusMain { attempts: 3, .. })
+        ));
+        assert_eq!(
+            focus_main_exit(tmux::FocusOutcome::Confirmed { attempts: 1 }).0,
+            0
+        );
+        assert_eq!(
+            focus_main_exit(tmux::FocusOutcome::Unconfirmed { attempts: 3 }).0,
+            6
+        );
+        assert_eq!(focus_main_exit(tmux::FocusOutcome::CaptureFailed).0, 7);
     }
 
     /// Pull the `Inject` variant's flags out of a parsed argv, or panic.

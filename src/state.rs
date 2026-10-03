@@ -161,6 +161,10 @@ pub struct State {
     /// `consecutive_fast_detections` debounces the fresh-/clear gate.
     #[serde(default)]
     pub post_clear_idle_checks: u32,
+    /// Epoch seconds of the clear that the post-clear Rewind-picker recheck
+    /// last ran for. Latches the recheck to one run per clear.
+    #[serde(default)]
+    pub post_clear_picker_checked_for: Option<f64>,
     /// Number of consecutive check cycles where the pane has shown a "wedged"
     /// pattern (context limit reached / persistent rate limit). When this
     /// reaches `context_monitor.wedged_consecutive`, claude-watch runs
