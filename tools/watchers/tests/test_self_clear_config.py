@@ -140,66 +140,44 @@ class HelpTest(unittest.TestCase):
         self.assertIn("--resume-prompt", proc.stdout)
 
 
-class FleetViewDetectionTest(unittest.TestCase):
-    """Pure-function tests for the FleetView-awareness helpers added with the
-    FleetView-aware navigation fix. No live tmux needed."""
+class FocusMainDelegationTest(unittest.TestCase):
+    """Focus logic lives in Rust (`claude-watch focus-main`); self-clear only
+    shells out and maps the exit code."""
 
     def setUp(self):
         self.mod = _import_self_clear()
 
-    def test_agent_view_selected_agent_row(self):
-        pane = "\n".join([
-            "  ● main",
-            "❯ ◯ general-purpose  running a search",
-            "  ↑/↓ to select · Enter to view",
-        ])
-        self.assertTrue(self.mod._fleetview_agent_view_visible(pane))
-        self.assertFalse(self.mod._main_loop_prompt_visible(pane))
+    def test_no_python_focus_logic_left(self):
+        for name in ("_read_focus_main_keys", "_fleetview_agent_view_visible",
+                     "_main_loop_prompt_visible", "_return_focus_to_main"):
+            self.assertFalse(hasattr(self.mod, name), name)
 
-    def test_agent_view_footer_hint(self):
-        pane = "some output\n  ← for agents\n"
-        self.assertTrue(self.mod._fleetview_agent_view_visible(pane))
+    def _call(self, rc):
+        calls = []
+        self.mod.run = lambda cmd, timeout=10: (calls.append(cmd), ("", rc))[1]
+        self.mod.log = lambda m: None
+        return self.mod.ensure_main_loop_focus("%3", 2), calls
 
-    def test_main_loop_prompt_detected(self):
-        pane = "\n".join([
-            "⏺ done",
-            "❯ ",
-            "  bypass permissions on · 123k tokens",
-        ])
-        self.assertTrue(self.mod._main_loop_prompt_visible(pane))
-        self.assertFalse(self.mod._fleetview_agent_view_visible(pane))
+    def test_confirmed(self):
+        ok, calls = self._call(0)
+        self.assertTrue(ok)
+        self.assertEqual(calls, [["claude-watch", "focus-main", "--pane", "%3",
+                                  "--attempts", "2"]])
 
-    def test_numbered_option_is_not_main_prompt(self):
-        pane = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n"
-        self.assertFalse(self.mod._main_loop_prompt_visible(pane))
+    def test_unconfirmed_codes_return_false(self):
+        for rc in (6, 7, -1):
+            ok, _ = self._call(rc)
+            self.assertFalse(ok, rc)
 
-    def test_read_focus_main_keys_from_config(self):
-        with tempfile.TemporaryDirectory() as td:
-            cfg = Path(td) / "config.toml"
-            cfg.write_text('[tmux]\nfocus_main_keys = ["Right", "Left"]\n')
-            saved = os.environ.get("CLAUDE_WATCH_CONFIG")
-            os.environ["CLAUDE_WATCH_CONFIG"] = str(cfg)
-            try:
-                self.assertEqual(self.mod._read_focus_main_keys(), ["Right", "Left"])
-            finally:
-                if saved is None:
-                    os.environ.pop("CLAUDE_WATCH_CONFIG", None)
-                else:
-                    os.environ["CLAUDE_WATCH_CONFIG"] = saved
-
-    def test_read_focus_main_keys_default_empty(self):
-        with tempfile.TemporaryDirectory() as td:
-            cfg = Path(td) / "config.toml"
-            cfg.write_text('[tmux]\nfocus_main_keys = []\n')
-            saved = os.environ.get("CLAUDE_WATCH_CONFIG")
-            os.environ["CLAUDE_WATCH_CONFIG"] = str(cfg)
-            try:
-                self.assertEqual(self.mod._read_focus_main_keys(), [])
-            finally:
-                if saved is None:
-                    os.environ.pop("CLAUDE_WATCH_CONFIG", None)
-                else:
-                    os.environ["CLAUDE_WATCH_CONFIG"] = saved
+    def test_interrupt_uses_focus_main_not_raw_keys(self):
+        calls = []
+        self.mod.run = lambda cmd, timeout=10: (calls.append(cmd), ("", 0))[1]
+        self.mod.log = lambda m: None
+        self.mod.is_idle = lambda pane: True
+        self.mod.time.sleep = lambda s: None
+        self.assertTrue(self.mod.interrupt_and_wait("%3", timeout=5))
+        self.assertEqual(calls[0][:3], ["claude-watch", "focus-main", "--pane"])
+        self.assertFalse(any(c[:2] == ["tmux", "send-keys"] for c in calls))
 
 
 class RewindPickerTest(unittest.TestCase):
