@@ -1481,7 +1481,7 @@ class MultitailTest(unittest.TestCase):
         src = (HERE / "static" / "multitail.js").read_text()
         m = re.search(r"MAX_LIVE_STREAMS\s*=\s*(\d+)", src)
         self.assertIsNotNone(m, "MAX_LIVE_STREAMS not declared")
-        self.assertLessEqual(int(m.group(1)), 4)
+        self.assertGreaterEqual(int(m.group(1)), 10)
         # Panes are selected by the server-derived attribute, never by
         # re-deriving eligibility in the front-end.
         self.assertIn("data-live-log-mode", src)
@@ -1895,7 +1895,7 @@ class MultitailTest(unittest.TestCase):
             "can take every connection and starve the other running tasks",
         )
         # The cap itself is untouched: autoshow must not buy itself sockets.
-        self.assertIn("const MAX_LIVE_STREAMS = 4;", src)
+        self.assertIn("const MAX_LIVE_STREAMS = 12;", src)
 
     def test_options_dialog_styles_shipped(self):
         """The dialog is class-driven; without the CSS it is a plain list.

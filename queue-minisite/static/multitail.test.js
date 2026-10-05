@@ -181,6 +181,11 @@ function streamCountFor(qid) {
 window.eval(ansiSrc);
 window.eval(src);
 const mt = window.__multitail;
+// The slot-queueing scenarios below are written around five cards, so they run
+// at a small cap (4) via the test seam; the SHIPPED cap is asserted separately
+// (>= 10) and exercised at full size in the section at the end of this file.
+const CAP = 4;
+mt.setMaxLiveStreams(CAP);
 
 let failures = 0;
 function assert(label, cond, detail) {
@@ -265,13 +270,13 @@ assert('empty-state note is hidden while panes exist',
 console.log('\n-- connection cap: never more than MAX_LIVE_STREAMS at once');
 // ==========================================================================
 assert(
-  'cap is small enough to leave the queue poll a connection',
-  mt.MAX_LIVE_STREAMS <= 4,
+  'the shipped cap covers a ten-pane stack (HTTP/2: no 6-connection limit)',
+  mt.MAX_LIVE_STREAMS >= 10,
   'MAX_LIVE_STREAMS=' + mt.MAX_LIVE_STREAMS,
 );
 assert(
   'exactly MAX_LIVE_STREAMS streams opened',
-  openStreams().length === mt.MAX_LIVE_STREAMS,
+  openStreams().length === CAP,
   'open=' + openStreams().length,
 );
 assert(
@@ -390,7 +395,7 @@ console.log('\n-- a job that finishes keeps its pane and frees its slot');
     'q-e stream: ' + String(streamFor('q-e') && streamFor('q-e').url),
   );
   assert('still at the cap, not over it',
-    openStreams().length === mt.MAX_LIVE_STREAMS, 'open=' + openStreams().length);
+    openStreams().length === CAP, 'open=' + openStreams().length);
 }
 
 // ==========================================================================
@@ -1274,14 +1279,14 @@ console.log('\n-- retries lose to `ended`, and do not fight the slot cap');
   ]);
   mt.openMode();
   assert('five panes, four streams', paneEls().length === 5 &&
-    openStreams().length === mt.MAX_LIVE_STREAMS, 'open=' + openStreams().length);
+    openStreams().length === CAP, 'open=' + openStreams().length);
   assert('the fifth is waiting for a SLOT (a distinct state from a backoff)',
     /waiting for a stream slot/.test(statusOf('q-5')), statusOf('q-5'));
   latestStreamFor('q-1').emit({ type: 'error', kind: 'open-failed', error: 'nope' });
   assert('the backing-off pane handed its slot to the waiter',
     streamFor('q-5') !== undefined);
   assert('still exactly at the cap',
-    openStreams().length === mt.MAX_LIVE_STREAMS, 'open=' + openStreams().length);
+    openStreams().length === CAP, 'open=' + openStreams().length);
   assert('and the backing-off pane is labelled as such, not as slot-starved',
     /waiting for log/.test(statusOf('q-1')), statusOf('q-1'));
   mt.closeMode();
@@ -1999,7 +2004,7 @@ function clickEl(node) {
     mt.streamUrl(paneRecord('q-tree')) === '/api/queue/q-tree/stream',
     mt.streamUrl(paneRecord('q-tree')));
   assert('the cap still holds across both kinds of pane',
-    openStreams().length === mt.MAX_LIVE_STREAMS,
+    openStreams().length === CAP,
     'open=' + openStreams().length);
   // DISPLAY order is the order panes are ON SCREEN, not the order they were
   // created: a nested pane is inserted beside its parent, so map order and
@@ -2206,7 +2211,7 @@ console.log('\n-- subagents: auto-showing never exceeds the connection cap');
     subPaneFor(SID_A) !== null && subPaneFor(SID_B) !== null &&
     subPaneFor(SID_C) !== null);
   assert('but the cap is unchanged — no fifth connection for them',
-    openStreams().length === mt.MAX_LIVE_STREAMS,
+    openStreams().length === CAP,
     'open=' + openStreams().length);
   assert('and each one SAYS it is waiting rather than looking broken',
     [SID_A, SID_B, SID_C].every((s2) =>
@@ -2315,6 +2320,53 @@ console.log('\n-- the options dialog: one entry point for every setting');
   mt.closeMode();
   assert('closing the mode closes the sheet with it',
     mt.isOptionsOpen() === false && modal.hidden === true);
+}
+
+// ==========================================================================
+console.log('\n-- the SHIPPED cap: a ten-plus pane stack streams, and no slot leaks');
+// ==========================================================================
+{
+  mt.setMaxLiveStreams(0); // 0 restores the shipped MAX_LIVE_STREAMS
+  const N = mt.MAX_LIVE_STREAMS + 2;
+  const ids = [];
+  for (let i = 1; i <= N; i++) ids.push('q-big' + i);
+  resetQueue(ids.map((id) => card(id, 'live', 'agent ' + id)));
+  mt.openMode();
+  assert('every card has a pane', paneEls().length === N, 'panes=' + paneEls().length);
+  assert('the first ten panes are all streaming (none "waiting for a stream slot")',
+    ids.slice(0, 10).every((id) => !/waiting for a stream slot/.test(statusOf(id))),
+    ids.slice(0, 10).map(statusOf).join(' | '));
+  assert('exactly the shipped cap is open', openStreams().length === mt.MAX_LIVE_STREAMS,
+    'open=' + openStreams().length);
+  assert('only the overflow waits',
+    /waiting for a stream slot/.test(statusOf(ids[N - 1])), statusOf(ids[N - 1]));
+
+  // LEAK GUARD. A CLOSED EventSource (readyState 2: the response was an HTTP
+  // error) never reconnects and never fires onerror again. It must hand its
+  // slot back, or the pane holds it forever while a waiter starves.
+  const dead = streamFor(ids[0]);
+  dead.readyState = 2;
+  dead.onerror({});
+  assert('a browser-CLOSED stream releases its slot', dead.closed === true);
+  assert('so the overflow pane is promoted',
+    streamFor(ids[N - 1]) !== undefined || streamFor(ids[N - 2]) !== undefined);
+  assert('the cap still holds after the swap',
+    openStreams().length === mt.MAX_LIVE_STREAMS, 'open=' + openStreams().length);
+  assert('the dead pane says it is retrying, with a record',
+    /waiting for log/.test(statusOf(ids[0])) &&
+    /retrying/.test(paneFor(ids[0]).textContent), statusOf(ids[0]));
+  const before = streamCountFor(ids[1]);
+
+  // A stream the browser is still reconnecting (readyState 0) is healthy: it
+  // keeps its slot and is NOT torn down.
+  const live = streamFor(ids[1]);
+  live.readyState = 0;
+  live.onerror({});
+  assert('a CONNECTING (auto-reconnecting) stream keeps its slot',
+    live.closed === false && streamCountFor(ids[1]) === before);
+  assert('and says it is reconnecting', /reconnecting/.test(statusOf(ids[1])),
+    statusOf(ids[1]));
+  mt.setMaxLiveStreams(CAP);
 }
 
 console.log(
