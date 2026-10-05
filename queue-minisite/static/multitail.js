@@ -108,11 +108,12 @@
 // ---------------------------------------------------------------------------
 // WHY THE CONCURRENT-STREAM CAP EXISTS (MAX_LIVE_STREAMS)
 // ---------------------------------------------------------------------------
-// Every pane tails via EventSource, i.e. a long-lived HTTP connection, and a
-// browser allows only ~6 concurrent connections per origin on HTTP/1.1. Open
-// six tails and the site's OWN 5s /api/queue poll can no longer get a
-// connection: the page silently freezes, which looks exactly like a server
-// fault. So at most MAX_LIVE_STREAMS panes hold a connection at a time; the
+// Every pane tails via EventSource, i.e. a long-lived HTTP connection. On
+// HTTP/1.1 a browser allows only ~6 per origin, and six tails would starve the
+// site's OWN 5s /api/queue poll (the page silently freezes, which looks like
+// a server fault); over HTTP/2, which the site now uses, the limit is ~100
+// multiplexed streams, and what is scarce is the server's worker threads (one
+// per open tail). Either way a ceiling is needed, so at most MAX_LIVE_STREAMS panes hold a connection at a time; the
 // rest are built, visible and labelled "waiting for a stream slot", and get
 // promoted the moment an earlier pane is closed or its job ends. Every
 // eligible item still gets a pane — what is rationed is the socket, not the
@@ -538,10 +539,18 @@
   // pane width on its own left margin. Past this the panes stay at the same
   // offset and the tree order carries the hierarchy.
   const MAX_SUB_INDENT_DEPTH = 4;
-  // Max simultaneous EventSource connections — see the header comment. Four
-  // leaves two of the browser's ~6 per-origin HTTP/1.1 connections for the
-  // queue poll and any action POST.
-  const MAX_LIVE_STREAMS = 4;
+  // Max simultaneous EventSource connections — see the header comment. It was
+  // 4, sized for HTTP/1.1's ~6 connections per origin; the site is served over
+  // HTTP/2 (multiplexed, ~100 concurrent streams), so that ceiling no longer
+  // applies and 4 left panes past the fourth blank. 12 covers a full stack
+  // (10+ panes) with a little headroom. The REAL budget is now server-side:
+  // each tail holds one gunicorn thread, so the Dockerfile's --threads must
+  // stay comfortably above this number times the number of open tabs.
+  const MAX_LIVE_STREAMS = 12;
+  // The cap actually enforced. Equal to MAX_LIVE_STREAMS in the product; the
+  // only writer is setMaxLiveStreams(), a seam so the slot-queueing mechanics
+  // can be tested with a handful of panes instead of thirteen.
+  let maxLiveStreams = MAX_LIVE_STREAMS;
   // Lines retained per pane. A tail is a window on the recent past; keeping
   // an unbounded transcript in N panes is how a long-lived tab runs out of
   // memory. Unchanged by wrap on purpose — see the header comment.
@@ -1835,6 +1844,18 @@
         releaseSlot(pane);
         return;
       }
+      // SLOT LEAK GUARD. A browser only auto-reconnects while readyState is
+      // CONNECTING. If the response was a non-200 (an expired auth session, a
+      // 502 from the proxy during a restart) or not text/event-stream, the
+      // EventSource is CLOSED for good and onerror will never fire again, yet
+      // the pane still counts as `streaming`: it would hold its slot forever
+      // showing "reconnecting" while a waiting pane starves. Treat a CLOSED
+      // stream like "no log yet": release the slot, retry on the backoff.
+      if (es.readyState === 2) {
+        scheduleStreamRetry(pane, 'stream-closed',
+          'stream closed by the browser (HTTP error)');
+        return;
+      }
       setPaneStatus(pane, 'reconnecting', 'mt-idle');
     };
   }
@@ -1977,7 +1998,7 @@
       if (pane.streaming) live += 1;
     }
     for (const pane of ordered) {
-      if (live >= MAX_LIVE_STREAMS) break;
+      if (live >= maxLiveStreams) break;
       if (!wantsSlot(pane)) continue;
       connectPane(pane);
       live += 1;
@@ -2035,7 +2056,7 @@
     // should be able to see how much of the stack is the tree.
     if (nested) bits.push(nested + (nested === 1 ? ' subagent' : ' subagents'));
     if (live < total - ended) {
-      bits.push(live + ' streaming (cap ' + MAX_LIVE_STREAMS + ')');
+      bits.push(live + ' streaming (cap ' + maxLiveStreams + ')');
     }
     if (retrying) bits.push(retrying + ' waiting for a log');
     if (ended) bits.push(ended + ' ended');
@@ -2672,6 +2693,7 @@
     slotOrder,
     SUB_NODE_SELECTOR,
     MAX_SUB_INDENT_DEPTH,
+    setMaxLiveStreams: (n) => { maxLiveStreams = n > 0 ? n : MAX_LIVE_STREAMS; pumpSlots(); },
     isOpen: () => open,
     setWrap,
     setTimestamps,

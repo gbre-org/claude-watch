@@ -74,5 +74,8 @@ EXPOSE 8000
 # in-handler idle/lifetime caps (SSE_TAIL_MAX_IDLE_SECONDS,
 # SSE_TAIL_MAX_LIFETIME_SECONDS) that bound thread leaks. Threads bumped
 # from 4 -> 8 to absorb a couple of long-lived SSE connections without
-# starving the regular request path.
-CMD ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "2", "--threads", "8", "--timeout", "0", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+# starving the regular request path, then 8 -> 32: the multitail window now
+# opens up to 12 concurrent tails PER TAB (MAX_LIVE_STREAMS in multitail.js),
+# each holding a thread for its whole life, so 2 x 8 = 16 would be consumed by
+# a single tab.
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "2", "--threads", "32", "--timeout", "0", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
