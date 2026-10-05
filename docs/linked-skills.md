@@ -77,6 +77,16 @@ scripts/install-linked-skills.sh --src <dir> [--dest <dir>] [-n] [--prune]
   `installed_at`, `installed_by`) so every skill in the central dir is traceable
   and stale installs are visible. `--prune` drops installs whose source path is
   gone.
+- **Always records the MAIN clone.** `source_repo` / `source_path` are the main
+  working tree (first entry of `git worktree list`), even when `--src` is a
+  linked git worktree, so provenance never dangles when a worktree is removed.
+  `source_commit` stays the commit actually installed. Install from the
+  up-to-date main clone (`git fetch && git merge --ff-only origin/main`,
+  then `make install-linked-skills SRC=$HOME/repos/<repo>`).
+- **Warns loudly on stderr** (exit stays 0) when `--src` is a worktree, when the
+  main clone is behind `origin/main`, has uncommitted changes under the skills
+  dir, when the content being copied differs from the main clone's, or when the
+  source commit is not on `origin/main`.
 - **Seeds** `<dest>/.claude-plugin/plugin.json` on first run.
 - `DEST` defaults to `$CLAUDE_LINKED_SKILLS_DIR`, else
   `~/.config/claude-container/linked-skills`.
