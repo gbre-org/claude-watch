@@ -18,7 +18,9 @@ Contract pinned here:
   6. --dry-run touches nothing.
   7. --prune removes an install whose source path is gone, and keeps live ones.
   8. The reserved 'synced' skill name is skipped.
-  9. Makefile: install-linked-skills invokes the script.
+  9. --src inside a git worktree: provenance records the MAIN clone (repo and
+     path), warns on stderr, and warns if content differs from the main clone.
+ 10. Makefile: install-linked-skills invokes the script.
 """
 from __future__ import annotations
 import json, os, subprocess, sys, tempfile
@@ -154,6 +156,50 @@ def test_synced_reserved_name_skipped() -> None:
                "reserved 'synced' name should be skipped")
         expect((dest / "skills" / "real").exists(), "real skill missing")
 
+def git(cwd, *a):
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                   cwd=cwd, check=True, capture_output=True)
+
+def test_worktree_src_records_main_clone() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td).resolve()
+        main = td / "main"; main.mkdir()
+        make_src_repo(main, ["alpha"])
+        wt = td / "wt"
+        git(main, "worktree", "add", "-q", "-b", "feat", str(wt))
+        dest = td / "central"
+        r = run("--src", str(wt), "--dest", str(dest))
+        expect(r.returncode == 0, f"worktree install rc={r.returncode}: {r.stderr}")
+        expect("WORKTREE" in r.stderr, f"no worktree warning: {r.stderr!r}")
+        p = json.loads((dest / "skills" / "alpha" / ".provenance.json").read_text())
+        expect(p["source_repo"] == str(main), f"source_repo={p['source_repo']} want {main}")
+        expect(p["source_path"].startswith(str(main)) and str(wt) not in p["source_path"],
+               f"source_path not under main clone: {p['source_path']}")
+        expect(p["source_commit"] not in ("", "unknown"), "source_commit missing")
+
+def test_main_clone_no_worktree_warning() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td).resolve()
+        main = td / "main"; main.mkdir()
+        make_src_repo(main, ["alpha"])
+        dest = td / "central"
+        r = run("--src", str(main), "--dest", str(dest))
+        expect("WORKTREE" not in r.stderr, f"spurious worktree warning: {r.stderr!r}")
+        p = json.loads((dest / "skills" / "alpha" / ".provenance.json").read_text())
+        expect(p["source_repo"] == str(main), f"source_repo={p['source_repo']}")
+
+def test_warns_when_content_differs_from_main() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td).resolve()
+        main = td / "main"; main.mkdir()
+        make_src_repo(main, ["alpha"])
+        wt = td / "wt"
+        git(main, "worktree", "add", "-q", "-b", "feat", str(wt))
+        (wt / ".claude" / "skills" / "alpha" / "SKILL.md").write_text(
+            "---\nname: alpha\ndescription: changed\n---\nnew\n")
+        r = run("--src", str(wt), "--dest", str(td / "central"))
+        expect("DIFFERS" in r.stderr, f"no differs warning: {r.stderr!r}")
+
 def test_makefile_wiring() -> None:
     r = subprocess.run(["make", "-n", "install-linked-skills",
                         "SRC=/tmp/x", "DEST=/tmp/y"],
@@ -170,6 +216,9 @@ TESTS = [
     test_dry_run_touches_nothing,
     test_prune,
     test_synced_reserved_name_skipped,
+    test_worktree_src_records_main_clone,
+    test_main_clone_no_worktree_warning,
+    test_warns_when_content_differs_from_main,
     test_makefile_wiring,
 ]
 

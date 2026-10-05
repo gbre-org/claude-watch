@@ -38,6 +38,13 @@
 #   recording source repo + source path + git commit + install timestamp, so
 #   everything in the central dir is traceable and stale installs are visible.
 #
+# MAIN CLONE ONLY: source_repo/source_path always point at the main working
+#   tree even if --src is a linked git worktree (which dangles when removed).
+#   The installer warns on stderr when --src is a worktree, when the main
+#   clone is behind origin/main, has local changes under the skills dir, or
+#   its skills content differs from what is being copied. Install from the
+#   up-to-date main clone.
+#
 # Idempotent: re-running refreshes the copy + provenance in place.
 #
 # Usage:
@@ -99,13 +106,55 @@ fi
 
 # Source repo root + commit for provenance (best-effort; skills need not be
 # in a git repo).
-SRC_REPO=""; SRC_COMMIT="unknown"
+#
+# source_repo ALWAYS records the MAIN working tree, never a linked worktree: a
+# worktree path dangles once the worktree is removed, and the installed content
+# is supposed to correspond to what lives in the main clone. When --src is
+# inside a worktree we resolve the main tree (first entry of
+# `git worktree list --porcelain`) and warn loudly on stderr. source_commit is
+# still the commit actually installed from --src.
+warn() { echo "install-linked-skills: WARNING: $*" >&2; }
+
+SRC_REPO=""; SRC_COMMIT="unknown"; SRC_PATH_BASE=""; SRC_TOP=""
 if git -C "$SKILLS_SRC" rev-parse --show-toplevel >/dev/null 2>&1; then
-    SRC_REPO="$(git -C "$SKILLS_SRC" rev-parse --show-toplevel 2>/dev/null || true)"
+    SRC_TOP="$(git -C "$SKILLS_SRC" rev-parse --show-toplevel 2>/dev/null || true)"
+    SRC_TOP="$(cd "$SRC_TOP" && pwd -P)"
     SRC_COMMIT="$(git -C "$SKILLS_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
     # append -dirty if the skill tree has uncommitted changes
     if ! git -C "$SKILLS_SRC" diff --quiet -- "$SKILLS_SRC" 2>/dev/null; then
         SRC_COMMIT="${SRC_COMMIT}-dirty"
+    fi
+    MAIN_TOP="$(git -C "$SKILLS_SRC" worktree list --porcelain 2>/dev/null \
+        | sed -n '1s/^worktree //p')"
+    [ -n "$MAIN_TOP" ] && MAIN_TOP="$(cd "$MAIN_TOP" 2>/dev/null && pwd -P || true)"
+    [ -n "$MAIN_TOP" ] || MAIN_TOP="$SRC_TOP"
+    SRC_REPO="$MAIN_TOP"
+    SRC_PATH_BASE="$MAIN_TOP"   # source_path is rewritten under the main tree
+    REL="${SKILLS_SRC#"$SRC_TOP"}"
+    MAIN_SKILLS="${MAIN_TOP}${REL}"
+    if [ "$SRC_TOP" != "$MAIN_TOP" ]; then
+        warn "--src is inside a git WORKTREE ($SRC_TOP); provenance will record the main clone ($MAIN_TOP) instead."
+        warn "installed content must correspond to the main clone: merge the worktree branch into the main branch, update the main clone, and re-install from it."
+    fi
+    # Content must match what the main clone holds.
+    if [ "$SRC_TOP" != "$MAIN_TOP" ] || [ -n "$(git -C "$MAIN_TOP" status --porcelain -- ".${REL}" 2>/dev/null)" ]; then
+        if [ ! -d "$MAIN_SKILLS" ] || ! diff -rq "$SKILLS_SRC" "$MAIN_SKILLS" >/dev/null 2>&1; then
+            warn "content being installed DIFFERS from the main clone's $MAIN_SKILLS."
+        fi
+    fi
+    if [ -n "$(git -C "$MAIN_TOP" status --porcelain -- ".${REL}" 2>/dev/null)" ]; then
+        warn "main clone has uncommitted changes under its skills dir ($MAIN_SKILLS)."
+    fi
+    # Behind origin/main? (local remote-tracking ref; no network fetch here)
+    MAIN_BRANCH="$(git -C "$MAIN_TOP" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    if git -C "$MAIN_TOP" rev-parse --verify -q origin/main >/dev/null 2>&1; then
+        behind="$(git -C "$MAIN_TOP" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+        if [ "${behind:-0}" -gt 0 ]; then
+            warn "main clone ($MAIN_TOP, branch $MAIN_BRANCH) is $behind commit(s) BEHIND origin/main; update it (git fetch && git merge --ff-only origin/main) before installing."
+        fi
+        if ! git -C "$SKILLS_SRC" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+            warn "source commit ${SRC_COMMIT%-dirty} is not on origin/main (unmerged/unpushed work)."
+        fi
     fi
 fi
 [ -n "$SRC_REPO" ] || SRC_REPO="$SRC"
@@ -150,6 +199,10 @@ for skill_md in "$SKILLS_SRC"/*/SKILL.md; do
 
     # stamp provenance alongside SKILL.md
     src_abs="$(cd "$skill_dir" && pwd -P)"
+    # record the path under the MAIN clone, not a worktree
+    if [ -n "$SRC_TOP" ] && [ "$SRC_TOP" != "$SRC_PATH_BASE" ]; then
+        src_abs="${SRC_PATH_BASE}${src_abs#"$SRC_TOP"}"
+    fi
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "  [dry-run] write $target/.provenance.json (repo=$SRC_REPO commit=$SRC_COMMIT)"
     else
