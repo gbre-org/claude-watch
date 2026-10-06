@@ -588,6 +588,14 @@ def _resolve_free_text(positional, file_arg, *, pos_name, file_flag,
               f"(heredoc: {file_flag} - <<'EOF' ... EOF)", file=sys.stderr)
         sys.exit(1)
     if have_pos:
+        if positional.strip() == "-":
+            # A lone "-" looks like the stdin convention but the positional
+            # form never reads stdin; storing the literal "-" silently wipes
+            # the real text (e.g. the resume note). Fail loudly instead.
+            print(f"ERROR: {pos_name} is a lone '-' (the positional form does "
+                  f"not read stdin); use {file_flag} - <<'EOF' ... EOF",
+                  file=sys.stderr)
+            sys.exit(1)
         text = positional
     else:
         try:
