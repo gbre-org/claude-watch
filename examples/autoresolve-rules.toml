@@ -1,0 +1,45 @@
+# Rules for claude-watch `[autoresolve]` (default-deny).
+#
+# Only a Bash-command permission dialog whose WHOLE command parses cleanly,
+# whose every segment is covered by a rule below, and whose every resolved
+# path lands inside a root below is ever answered (always with option 1,
+# Yes). Everything else is left alone and falls through to the normal
+# permission_prompt_monitor alert/decline ladder.
+#
+# List BOTH spellings of a root if the same directory is visible under two
+# prefixes (for example a host path and a container mount): the match is on
+# the path text the command uses.
+
+# `min_depth` = path components required BELOW the root. Worktrees live at
+# <root>/<repo>/<slug>/..., so 3 means "a file inside a worktree", never the
+# worktree directory or the repo directory itself.
+[[root]]
+path = "~/repos/.worktrees"
+min_depth = 3
+
+[[root]]
+path = "/tmp"
+min_depth = 1
+
+[[root]]
+path = "~/.cache"
+min_depth = 2
+
+# Removal of individual FILES. Directories are refused at match time (and
+# -r/-R/-d/--recursive can never be enabled: the loader rejects them).
+[[rule]]
+id = "rm-file-in-roots"
+description = "rm / rm -f of single regular files inside an allowed root"
+answer = 1
+programs = ["rm"]
+flags = ["-f"]
+require_subagent = true
+
+# The small file-editing commands agents chain around temp files.
+[[rule]]
+id = "scratch-edit-in-roots"
+description = "cd, cat, touch, mkdir -p, echo, printf, true, ls and plain sed s///g -i on files inside an allowed root"
+answer = 1
+programs = ["cd", "cat", "touch", "mkdir", "echo", "printf", "true", "ls", "sed"]
+flags = ["-p", "-i"]
+require_subagent = true

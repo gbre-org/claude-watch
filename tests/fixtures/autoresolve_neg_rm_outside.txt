@@ -1,0 +1,12 @@
+● Bash(...)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Bash command from general-purpose agent                                                          │
+│                                                                                                  │
+│   rm -f /home/user/repos/important/notes.txt                                                     │
+│                                                                                                  │
+│ Dangerous rm operation on critical path: /notes.txt                                              │
+│                                                                                                  │
+│ Do you want to proceed?                                                                          │
+│ ❯ 1. Yes                                                                                         │
+│   2. No                                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -1,0 +1,14 @@
+● Bash(...)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Bash command from general-purpose agent                                                          │
+│                                                                                                  │
+│   cd /home/user/repos/.worktrees/myrepo/fix-thing/tools/slack-reader/tests && sed -i 's/old_name │
+│   /new_name/g' test_reader.py && cat >> ../../../.gitignore.tmp </dev/null; rm -f ../../../.giti │
+│   gnore.tmp                                                                                      │
+│                                                                                                  │
+│ Dangerous rm operation on critical path: /.gitignore.tmp                                         │
+│                                                                                                  │
+│ Do you want to proceed?                                                                          │
+│ ❯ 1. Yes                                                                                         │
+│   2. No                                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

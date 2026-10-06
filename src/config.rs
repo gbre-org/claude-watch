@@ -83,6 +83,10 @@ pub struct Config {
     /// `crate::idle_autocompact::IdleAutocompactConfig`.
     #[serde(default)]
     pub idle_autocompact: crate::idle_autocompact::IdleAutocompactConfig,
+    /// Policy-driven auto-ANSWER ("Yes") of a narrow class of harmless Bash
+    /// permission prompts. Default OFF. See `crate::autoresolve`.
+    #[serde(default)]
+    pub autoresolve: crate::autoresolve::AutoResolveConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]

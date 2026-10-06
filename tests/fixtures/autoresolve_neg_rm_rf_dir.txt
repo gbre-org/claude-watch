@@ -1,0 +1,12 @@
+● Bash(...)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Bash command from general-purpose agent                                                          │
+│                                                                                                  │
+│   rm -rf /home/user/repos/.worktrees/myrepo/fix-thing/target                                     │
+│                                                                                                  │
+│ Dangerous rm operation on critical path: /target                                                 │
+│                                                                                                  │
+│ Do you want to proceed?                                                                          │
+│ ❯ 1. Yes                                                                                         │
+│   2. No                                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
