@@ -35,29 +35,29 @@ Wiring (in container settings.json via generate-hooks-shim-settings)::
 Detection contract
 ------------------
 
-A prompt is treated as a claude-watch alert iff it CONTAINS the literal
-substring `[CLAUDE-WATCH]` anywhere in the body. We match anywhere (not
-just at the start) because claude-watch's inject pipeline (`tmux::
-inject_text`) sometimes prepends an `i` (insert-mode entry) or other
-escape-sequence noise; the literal banner marker is the stable signal.
+A prompt is treated as a claude-watch alert iff the FIRST non-blank line
+of the prompt begins with the literal `[CLAUDE-WATCH]` banner, allowing at
+most MAX_NOISE_PREFIX characters of leading noise (claude-watch's inject
+pipeline (`tmux::inject_text`) sometimes prepends an `i` (insert-mode
+entry) or escape-sequence residue) and never a `<` (tag opener).
 
-Detected prompts:
-  - `[CLAUDE-WATCH] Prolonged thinking detected...`
-  - `[CLAUDE-WATCH] CONTEXT CRITICALLY LOW...`
-  - `[CLAUDE-WATCH] WATCHER(S) DOWN...`
-  - `[CLAUDE-WATCH] AUTO-RESPAWN: dashboard relaunched...`
-  - `[CLAUDE-WATCH] watcher-down (inject suppressed: main loop active)...`
+Consequences:
+  - `[CLAUDE-WATCH] Prolonged thinking detected...`            -> alert
+  - `i[CLAUDE-WATCH] CONTEXT CRITICALLY LOW...`                -> alert
+  - `<task-notification>...[CLAUDE-WATCH] Context at 90%...`   -> NO alert
+    (Monitor/system notification wrappers quote event text; the quoted
+    banner is not a daemon inject.)
+  - `[SYSTEM NOTIFICATION ...] ... [CLAUDE-WATCH] ...`         -> NO alert
+  - a genuine bare banner on its own FIRST line followed by a notification
+    wrapper                                                    -> alert
+  - a wrapper first, genuine banner on a later line            -> NO alert
+    (indistinguishable from a quoted line; the daemon injects its banner
+    as the start of the prompt, so the wrapper-first shape is never a
+    real inject).
+  - banner mentioned mid-sentence ("the alert said [CLAUDE-WATCH]")
+                                                               -> NO alert
 
-All these strings live in `claude-watch/src/policy.rs` + `src/respawn.rs`.
-
-False-positive safety
----------------------
-
-Operators copy-pasting a quoted alert (e.g. "the alert said `[CLAUDE-
-WATCH] ...`") will trip the hook. That's acceptable: an extra alert
-clears with one `claude-watch-ack ack <id>` call. The cost of a false
-record is tiny; the cost of a missed real alert (the v58 failure mode)
-is large.
+All genuine strings live in `claude-watch/src/policy.rs` + `src/respawn.rs`.
 
 Default-open contract
 ---------------------
@@ -84,6 +84,20 @@ ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 ERR_LOG_PATH = ERR_LOG_DIR / "claude-watch-alert-hook-errors.log"
 
 ALERT_MARKER = "[CLAUDE-WATCH]"
+MAX_NOISE_PREFIX = 3
+
+
+def _is_genuine_inject(prompt: str) -> bool:
+    """True iff the first non-blank line starts with the banner (modulo a
+    tiny non-tag noise prefix). See "Detection contract"."""
+    stripped = prompt.lstrip()
+    if not stripped:
+        return False
+    first = stripped.split("\n", 1)[0]
+    idx = first.find(ALERT_MARKER)
+    if idx < 0 or idx > MAX_NOISE_PREFIX:
+        return False
+    return "<" not in first[:idx]
 
 
 def _log(payload: dict) -> None:
@@ -145,7 +159,7 @@ def main() -> int:
     prompt = payload.get("prompt", "")
     if not isinstance(prompt, str) or not prompt:
         return 0
-    if ALERT_MARKER not in prompt:
+    if not _is_genuine_inject(prompt):
         return 0
 
     _record_alert(prompt)

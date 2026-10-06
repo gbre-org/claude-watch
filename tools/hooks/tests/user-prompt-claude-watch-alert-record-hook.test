@@ -4,7 +4,8 @@
 Covers:
   - Prompt without `[CLAUDE-WATCH]`: no-op, no state changes, exit 0
   - Prompt with `[CLAUDE-WATCH]` prefix: state gets a new alert
-  - Prompt with `[CLAUDE-WATCH]` mid-string: detected (anywhere match)
+  - Prompt with `[CLAUDE-WATCH]` mid-string: NOT an alert; task-notification
+    wrappers quoting the banner: NOT an alert
   - Empty prompt: no-op
   - Malformed JSON on stdin: no-op
   - Multiple consecutive prompts with the marker: stack
@@ -115,6 +116,55 @@ def test_marker_anywhere():
         h.cleanup()
 
 
+def _count(h):
+    return len(h.load_state()["alerts"])
+
+
+def test_task_notification_wrapper_no_alert():
+    h = Harness()
+    try:
+        p = ("<task-notification>\n<task-id>abc</task-id>\n<summary>Monitor "
+             "event</summary>\n<event>EVENT[claude-watch/alert] [CLAUDE-WATCH] "
+             "Context at 90% - save state</event>\n</task-notification>")
+        rc, _, _ = h.run_hook({"prompt": p})
+        check(rc == 0, "wrapper: exit 0")
+        check(_count(h) == 0, "wrapper w/ embedded banner: no alert")
+        p2 = "<task-notification>[CLAUDE-WATCH] quoted</task-notification>"
+        h.run_hook({"prompt": p2})
+        check(_count(h) == 0, "wrapper one-line: no alert")
+        h.run_hook({"prompt": "[SYSTEM NOTIFICATION x]\nUserPromptSubmit hook "
+                    "success\n[CLAUDE-WATCH] Context at 90%"})
+        check(_count(h) == 0, "SYSTEM NOTIFICATION wrapper: no alert")
+        h.run_hook({"prompt": "the alert said [CLAUDE-WATCH] blah"})
+        check(_count(h) == 0, "mid-sentence quote: no alert")
+    finally:
+        h.cleanup()
+
+
+def test_bare_line_then_wrapper_alerts():
+    h = Harness()
+    try:
+        p = ("[CLAUDE-WATCH] Context at 90%\n<task-notification>x"
+             "</task-notification>")
+        h.run_hook({"prompt": p})
+        check(_count(h) == 1, "bare first line + wrapper: alert")
+        h.run_hook({"prompt": "\n  [CLAUDE-WATCH] leading blank ok"})
+        check(_count(h) == 2, "leading blank lines tolerated")
+    finally:
+        h.cleanup()
+
+
+def test_wrapper_then_bare_line_no_alert():
+    h = Harness()
+    try:
+        p = ("<task-notification>x</task-notification>\n"
+             "[CLAUDE-WATCH] Context at 90%")
+        h.run_hook({"prompt": p})
+        check(_count(h) == 0, "wrapper first then bare line: no alert")
+    finally:
+        h.cleanup()
+
+
 def test_empty_prompt():
     h = Harness()
     try:
@@ -188,6 +238,9 @@ def main() -> int:
         test_no_marker_no_op,
         test_marker_records,
         test_marker_anywhere,
+        test_task_notification_wrapper_no_alert,
+        test_bare_line_then_wrapper_alerts,
+        test_wrapper_then_bare_line_no_alert,
         test_empty_prompt,
         test_malformed_stdin,
         test_multiple_prompts_stack,
