@@ -194,3 +194,37 @@ def test_help_shows_heredoc_form_first():
     assert r.returncode == 0
     assert "--desc-file - <<'EOF'" in r.stdout
     assert r.stdout.index("<<'EOF'") < r.stdout.index("positional arguments")
+
+
+def test_lone_dash_positional_rejected_and_state_untouched():
+    """`set - <<EOF` must not store the literal "-" (use --desc-file -)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env(tmp)
+        r = _run(env, "set", "keep me")
+        assert r.returncode == 0, r.stderr
+        task = Path(tmp, ".config/session/task.json")
+        before = task.read_bytes() if task.exists() else None
+        for argv in (("set", "-"), ("set", " - "), ("complete", "-")):
+            r = _run(env, *argv, stdin="real text\n")
+            assert r.returncode == 1, (argv, r.stdout, r.stderr)
+            assert "--desc-file" in r.stderr
+        after = task.read_bytes() if task.exists() else None
+        assert before == after
+
+
+def test_empty_description_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env(tmp)
+        for argv in (("set", ""), ("set", "   ")):
+            r = _run(env, *argv)
+            assert r.returncode == 1 and "empty" in r.stderr, (argv, r.stderr)
+        r = _run(env, "set", "--desc-file", "-", stdin="  \n")
+        assert r.returncode == 1 and "empty" in r.stderr
+
+
+def test_desc_file_dash_still_reads_stdin():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env(tmp)
+        r = _run(env, "set", "--desc-file", "-", stdin="from stdin\n")
+        assert r.returncode == 0, r.stderr
+        assert "from stdin" in r.stdout
