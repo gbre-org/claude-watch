@@ -194,6 +194,8 @@ pub struct Root {
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub id: String,
+    /// Human-readable rule summary, kept for config round-tripping and debugging.
+    #[allow(dead_code)]
     pub description: String,
     pub programs: Vec<String>,
     pub flags: Vec<String>,
