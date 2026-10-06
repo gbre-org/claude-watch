@@ -132,6 +132,26 @@ def test_stdout_captured_to_log() -> None:
     expect("hi" in out, f"poll: expected log tail to contain 'hi', got {out!r}")
 
 
+def test_log_lines_timestamped() -> None:
+    """Each log line is prefixed with an RFC3339 timestamp; poll/wait still work."""
+    import re
+    _, out, _, _ = run_hostjob(["run", "--label", "t_ts", "--", "sh", "-c",
+                                "echo one; sleep 1; echo two"])
+    wout, _ = wait_done("t_ts")
+    expect("done rc=0" in wout, f"wait: expected done rc=0, got {wout!r}")
+    log = Path(TMP_HOME) / ".cache" / "hostjob" / "t_ts" / "log"
+    lines = log.read_text().splitlines()
+    pat = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})([+-]\d{2}:\d{2}|Z) (.*)$")
+    ms = [pat.match(l) for l in lines]
+    expect(len(lines) == 2 and all(ms), f"log: expected 2 stamped lines, got {lines!r}")
+    if len(lines) == 2 and all(ms):
+        expect([m.group(3) for m in ms] == ["one", "two"], f"log bodies: {lines!r}")
+        expect(ms[0].group(1) < ms[1].group(1), f"log: timestamps not increasing: {lines!r}")
+    _, pout, _, _ = run_hostjob(["poll", "t_ts", "--tail", "5"])
+    expect("done rc=0" in pout and "| " in pout and " two" in pout,
+           f"poll: unexpected output {pout!r}")
+
+
 def test_list_shows_job() -> None:
     """list shows a known job after a run."""
     run_hostjob(["run", "--label", "t_list", "--", "true"])
@@ -197,6 +217,7 @@ TESTS = [
     test_poll_shows_done,
     test_failing_command_rc1,
     test_stdout_captured_to_log,
+    test_log_lines_timestamped,
     test_list_shows_job,
     test_clean_label_removes_finished,
     test_clean_refuses_running,
