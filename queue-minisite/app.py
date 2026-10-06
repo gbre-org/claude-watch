@@ -4609,8 +4609,8 @@ def _pending_transient_frame(pending: str) -> str | None:
 # from one parser instead of three regexes.
 #
 # BACK-COMPAT IS THE POINT. Every log file written before stamping existed —
-# and every hostjob log, whose writer lives on the host side and stamps
-# nothing — has no prefix, and those lines must render exactly as they always
+# and any hostjob log written before the runner began stamping its own lines
+# (it now prefixes each line at write time, same shape) — has no prefix, and those lines must render exactly as they always
 # did. So a line with no recognisable stamp keeps its text verbatim and gets
 # NO ``source_ts`` key at all, which is the same thing the front end has always
 # received. The two shapes mix freely inside one pane: a stamped line shows a
