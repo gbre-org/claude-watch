@@ -1,0 +1,10 @@
+● Bash(...)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Bash command from general-purpose agent                                                          │
+│                                                                                                  │
+│   cd /home/user/repos/.worktrees/myrepo/fix-thing && git push --force origin HEAD                │
+│                                                                                                  │
+│ Do you want to proceed?                                                                          │
+│ ❯ 1. Yes                                                                                         │
+│   2. No                                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

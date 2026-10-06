@@ -1101,3 +1101,31 @@ max_deny_attempts = 2
 # Lines of pane context captured ABOVE the question line (tool name and
 # command preview) for the alert payload. Default 16.
 context_lines = 16
+
+[autoresolve]
+# Auto-ANSWER ("Yes") a narrow class of harmless Bash permission prompts, for
+# example a sub-agent removing its own temp file inside its worktree when
+# Claude Code's rm safety check mis-resolves a relative path. DEFAULT OFF.
+#
+#   mode = "off"      nothing happens (default; any unknown value is "off")
+#   mode = "dry-run"  log + emit "would answer" events, press NOTHING
+#   mode = "enforce"  press Enter on option 1 when a rule matches
+#
+# Default-deny: a prompt is answered only if its strict shape parses, the
+# WHOLE command is covered by rules in `rules_file`, and every resolved path
+# is inside an allowed root. See docs/autoresolve.md and
+# examples/autoresolve-rules.toml. Kill switches: `touch
+# <state_dir>/autoresolve.disable` or CLAUDE_WATCH_AUTORESOLVE_DISABLE=1.
+mode = "off"
+# rules_file = "~/.config/claude-watch/autoresolve-rules.toml"  (absolute path required)
+rules_file = ""
+# Audit log + kill-switch dir. Empty = directory of [general] state_file.
+state_dir = ""
+# Max auto-answers per trailing minute before the feature pauses itself.
+max_per_minute = 6
+trip_cooldown_secs = 900
+# Seconds the identical dialog must stay on screen before it is considered.
+settle_secs = 3
+# Start relative paths from the pane's cwd (off: relative paths without a
+# `cd` to an absolute directory in the command are refused).
+use_pane_cwd = false

@@ -8423,6 +8423,40 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // and looks exactly like a dead agent from outside. Runs BEFORE the
     // AskUserQuestion monitor and tells it to stand down when it owns the
     // dialog, so one block never pages twice.
+    //
+    // Auto-resolve runs first and is default OFF. It only ever answers a
+    // strictly-shaped Bash dialog whose whole command matches an allow rule
+    // (see `crate::autoresolve`); anything else falls through untouched to
+    // the alert/decline ladder below.
+    match crate::autoresolve::step(
+        &config.autoresolve,
+        &config.general.state_file,
+        &effective_pane,
+    )
+    .await
+    {
+        crate::autoresolve::StepOutcome::Tripped => {
+            let msg = format!(
+                "claude-watch: autoresolve answered more than {} permission prompts in a \
+                 minute and has paused itself for {}s. Something is looping; review the \
+                 autoresolve audit log before re-enabling.",
+                config.autoresolve.max_per_minute, config.autoresolve.trip_cooldown_secs
+            );
+            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "autoresolve-tripped",
+                stuck_reason: "autoresolve rate limit exceeded",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &msg,
+            });
+            alert::send_pingme_with_priority(&msg, "high").await;
+        }
+        crate::autoresolve::StepOutcome::AnswerFailed { reason } => {
+            warn!(reason = %reason, "autoresolve: answer did not complete");
+        }
+        _ => {}
+    }
     let permission_prompt_active =
         check_permission_prompt(config, state, &effective_pane, &now).await;
 
