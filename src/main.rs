@@ -2087,7 +2087,7 @@ async fn run_inject(
     // Record BEFORE submitting, so the daemon cannot miss a dialog that
     // appears the instant the command runs.
     if let Some(dir) = &intent_dir {
-        let intent = inject_intent::Intent::model_switch(&pane, inject_intent::now_epoch());
+        let intent = inject_intent::Intent::model_switch(&pane, text, inject_intent::now_epoch());
         if let Err(e) = inject_intent::record(dir, &intent) {
             eprintln!("[claude-watch inject] could not record the deferred-menu intent: {e}");
         }
@@ -2115,24 +2115,26 @@ async fn run_inject(
     } else {
         inject_menu::MenuOutcome::None
     };
-    // Settle the intent. Keep it only when the synchronous watch could not
-    // finish the job: the command is queued behind a busy turn (no menu yet,
-    // pane not idle) or an answer was attempted and failed. Everything else
-    // is resolved here and must not leave the daemon a live permission.
+    // Settle the intent. "The pane looks idle and shows no menu yet" proves
+    // nothing: at a turn boundary the confirmation can still be drawn after
+    // this process exits (the input box is always visible, so idle fires
+    // early). Clear only on positive evidence the job is finished: the menu
+    // was answered here, the pane shows this command's own "Set model to"
+    // line (no dialog was needed), or nothing was submitted. Otherwise the
+    // intent stays and the daemon sweep clears it (answer, evidence, or TTL).
     if let Some(dir) = &intent_dir {
-        let queued = matches!(menu, inject_menu::MenuOutcome::None)
-            && matches!(
-                outcome,
-                tmux::InjectOutcome::Submitted | tmux::InjectOutcome::SubmitUnverified
-            )
-            && match tmux::capture_pane(&pane).await {
-                Some(f) => {
-                    !tmux::check_lines_for_idle_prompt(&f) && !tmux::model_switch_applied(&f)
-                }
-                None => false,
-            };
-        let failed = matches!(menu, inject_menu::MenuOutcome::AnswerFailed { .. });
-        if !(queued || failed) {
+        let submitted = matches!(
+            outcome,
+            tmux::InjectOutcome::Submitted | tmux::InjectOutcome::SubmitUnverified
+        );
+        let frame = tmux::capture_pane(&pane).await;
+        if !inject_intent::keep_after_inject(
+            submitted,
+            matches!(menu, inject_menu::MenuOutcome::None),
+            matches!(menu, inject_menu::MenuOutcome::AnswerFailed { .. }),
+            frame.as_deref(),
+            text,
+        ) {
             inject_intent::clear(dir, &pane);
         }
     }
