@@ -115,6 +115,42 @@ pub struct InjectLock {
 }
 
 impl InjectLock {
+    /// Take the lock only if it is free RIGHT NOW. `None` = a peer injector
+    /// holds it (the caller should skip this pass and try again later).
+    /// Locking disabled or unopenable yields an inert guard, like `acquire`.
+    pub fn try_acquire(reason: &str) -> Option<Self> {
+        let Some(path) = lock_path() else {
+            return Some(Self { _file: None });
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(reason, error = %e, "inject lock: cannot open lock file; proceeding unserialized");
+                return Some(Self { _file: None });
+            }
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            Some(Self { _file: Some(file) })
+        } else if matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK) | Some(libc::EINTR)
+        ) {
+            None
+        } else {
+            Some(Self { _file: None })
+        }
+    }
+
     /// Acquire the shared inject lock, waiting up to [`ACQUIRE_TIMEOUT`].
     ///
     /// `reason` is a short label for the log line (e.g. `"cli"`, `"daemon"`),

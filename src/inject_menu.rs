@@ -257,6 +257,13 @@ pub fn is_slash_payload(payload: &str) -> bool {
     payload.trim_start().starts_with('/')
 }
 
+/// Is this inject a slash-command submit? Either the caller said so with
+/// `--slash-command`, or the payload simply starts with `/`. Auto-detecting
+/// means a forgotten flag cannot silently disable the menu watch.
+pub fn effective_slash_command(flag: bool, payload: &str) -> bool {
+    flag || is_slash_payload(payload)
+}
+
 /// Pure function: which option to press on this menu WITHOUT an explicit
 /// `--answer`, or `None` to leave it alone and report it.
 ///
@@ -618,6 +625,22 @@ mod tests {
         assert_eq!(next_key(&m, 0), None);
         let on_two = Menu { selected: 2, ..m };
         assert_eq!(next_key(&on_two, 1), Some("Up"));
+    }
+
+    #[test]
+    fn leading_slash_payload_is_a_slash_command_without_the_flag() {
+        assert!(effective_slash_command(false, "/model opus[1m]"));
+        assert!(effective_slash_command(false, "  /model opus"));
+        assert!(effective_slash_command(true, "plain text"));
+        assert!(!effective_slash_command(false, "plain text"));
+        // And that arms the menu watch with the default policy.
+        let policy = MenuPolicy {
+            answer: None,
+            wait_secs: None,
+            auto_answer: true,
+        };
+        assert!(should_watch("/model opus[1m]", &policy));
+        assert!(!should_watch("hello", &policy));
     }
 
     #[test]
