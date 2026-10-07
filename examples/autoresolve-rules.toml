@@ -1,10 +1,10 @@
 # Rules for claude-watch `[autoresolve]` (default-deny).
 #
-# Only a Bash-command permission dialog whose WHOLE command parses cleanly,
+# Always-decide: only a Bash-command permission dialog whose WHOLE command parses cleanly,
 # whose every segment is covered by a rule below, and whose every resolved
 # path lands inside a root below is ever answered (always with option 1,
-# Yes). Everything else is left alone and falls through to the normal
-# permission_prompt_monitor alert/decline ladder.
+# Yes). Every other recognizable permission dialog is answered No (default-no); an
+# unreadable screen raises an alert instead.
 #
 # List BOTH spellings of a root if the same directory is visible under two
 # prefixes (for example a host path and a container mount): the match is on

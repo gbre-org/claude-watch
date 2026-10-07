@@ -7,7 +7,11 @@ answers. `[permission_prompt_monitor]` can only decline such a prompt after a
 grace period. `[autoresolve]` can answer **Yes** to a narrow, explicitly
 allow-listed class of them, immediately.
 
-It is **default OFF**, default-deny, and audited.
+It is **default OFF**, audited, and **always decides**: a recognizable
+permission dialog is never left hanging. A command matched by an allow rule
+gets **Yes**; every other recognizable dialog (unknown command, hard-deny
+class, parse failure, unrecognized dialog kind, unreadable rules) gets **No**.
+There is no configuration that produces a default Yes.
 
 ## Preferred fix: avoid the prompt at the source
 
@@ -43,6 +47,10 @@ max_per_minute = 6
 trip_cooldown_secs = 900
 settle_secs = 3
 use_pane_cwd = false
+default_answer = "no"        # only "no" is accepted; "yes" fails config load
+undecided_alert_after = 6    # unreadable dialog-looking screen: alert after N cycles
+no_after_secs = 20           # how long a dialog waits before a default-No is pressed
+notify_agent_on_no = true    # also drop a note in the blocked agent's inbox
 ```
 
 Rollout: copy `examples/autoresolve-rules.toml`, edit the roots, set
@@ -107,5 +115,31 @@ More than `max_per_minute` answers trips the feature off for
 `trip_cooldown_secs` and raises a high-severity `autoresolve-tripped` alert.
 A dialog is never answered twice without the screen changing.
 
-Anything not answered falls through to `[permission_prompt_monitor]`
-(alert, then decline), unchanged.
+## Default No, undecided screens, agent notes
+
+- **Recognizable dialog**: boxed title, a `Do you want ...?` question,
+  consecutively numbered options with both an affirmative option and a bare
+  `No`, exactly one cursor row, nothing live below it. Plan pickers and other
+  menus do not qualify and are left alone.
+- **Yes** needs the strict Bash shape plus a full rule match (all checks above).
+  Anything else is **No**: the digit of the bare `No` option is pressed after
+  `no_after_secs`; if the dialog survives, `Escape` is tried once. Audit kind
+  `answered-no`, rule id `default-no`, with the reason and full command.
+- **Variables**: commands containing `$VAR`, globs or substitutions (for
+  example the "possibly-empty variable path" warning) are not expanded and
+  therefore get No. Rewrite with absolute literal paths.
+- **Undecided**: a screen that looks like a dialog but is partial or changing
+  (box without a question, unreadable options, ambiguous cursor) causes no
+  keystroke. After `undecided_alert_after` consecutive cycles a
+  high-severity `autoresolve-undecided` alert is raised, and again every that
+  many cycles while it persists.
+- **Agent note**: after a No, if the dialog names an agent id (`a` + hex),
+  `agent-msg send <id> <note>` delivers the reason and the command so the
+  agent can rewrite it. With only an agent type label there is no id, so the
+  command is carried in the audit event (`autoresolve-no`). Disable with
+  `notify_agent_on_no = false`.
+- In `dry-run`, No decisions are logged (`would-answer-no`) and emitted but
+  nothing is pressed.
+
+Kill switch and rate limit apply to every decision. With the feature off, the
+old behavior (`[permission_prompt_monitor]` alert, then decline) is unchanged.

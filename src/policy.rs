@@ -8455,6 +8455,23 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         crate::autoresolve::StepOutcome::AnswerFailed { reason } => {
             warn!(reason = %reason, "autoresolve: answer did not complete");
         }
+        crate::autoresolve::StepOutcome::UndecidedAlert { cycles, reason } => {
+            let msg = format!(
+                "claude-watch: a permission dialog has looked unreadable for {} consecutive \
+                 cycles ({}); autoresolve cannot decide and has not pressed anything. A \
+                 session may be blocked: look at the pane.",
+                cycles, reason
+            );
+            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "autoresolve-undecided",
+                stuck_reason: "permission dialog unreadable",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &msg,
+            });
+            alert::send_pingme_with_priority(&msg, "high").await;
+        }
         _ => {}
     }
     let permission_prompt_active =
