@@ -52,10 +52,15 @@ pub struct Intent {
     pub expires_epoch: u64,
     #[serde(default)]
     pub attempts: u32,
+    /// The submitted command, used to tell THIS switch's confirmation line
+    /// from an older one in scrollback. Empty on intents from older writers
+    /// (then no applied-evidence clearing; the TTL still bounds them).
+    #[serde(default)]
+    pub payload: String,
 }
 
 impl Intent {
-    pub fn model_switch(pane: &str, now: u64) -> Self {
+    pub fn model_switch(pane: &str, payload: &str, now: u64) -> Self {
         Intent {
             pane: pane.to_string(),
             kind: KIND_MODEL_SWITCH.to_string(),
@@ -63,6 +68,7 @@ impl Intent {
             created_epoch: now,
             expires_epoch: now + INTENT_TTL_SECS,
             attempts: 0,
+            payload: payload.trim().to_string(),
         }
     }
 
@@ -142,11 +148,39 @@ pub fn live_intents(dir: &Path, now: u64) -> Vec<Intent> {
     out
 }
 
+/// Should the intent outlive the inject process that recorded it?
+///
+/// Keep it when the command was submitted and either the synchronous watch
+/// saw no menu AND the pane carries no positive evidence this command applied
+/// (an idle-looking pane proves nothing: the dialog can still be drawn at a
+/// turn boundary), or an answer was attempted and failed. A command that was
+/// never submitted, an answered or otherwise-handled menu, or this command's
+/// own confirmation line all end the intent.
+pub fn keep_after_inject(
+    submitted: bool,
+    no_menu: bool,
+    answer_failed: bool,
+    frame: Option<&str>,
+    payload: &str,
+) -> bool {
+    if !submitted {
+        return false;
+    }
+    if answer_failed {
+        return true;
+    }
+    no_menu && !frame.is_some_and(|f| tmux::model_switch_applied_after_command(f, payload))
+}
+
 /// What one sweep did for one intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SweepAction {
-    /// No dialog on the pane yet; intent kept.
+    /// No dialog on the pane yet; intent kept. An idle-looking pane with no
+    /// menu is NOT a reason to drop it: the dialog may still be drawn.
     Waiting,
+    /// No dialog needed: the pane shows this command's own confirmation line
+    /// below the command; intent cleared, nothing pressed.
+    Applied,
     /// Dialog up but the cursor row is unreadable; nothing pressed.
     Unreadable,
     /// Keys sent and the dialog went away; intent cleared.
@@ -187,6 +221,10 @@ where
                 // (it was just slow to repaint): the job is done.
                 clear(dir, &intent.pane);
                 results.push((intent, SweepAction::Answered));
+            } else if tmux::model_switch_applied_after_command(&frame, &intent.payload) {
+                // Positive evidence the switch completed without a dialog.
+                clear(dir, &intent.pane);
+                results.push((intent, SweepAction::Applied));
             } else {
                 results.push((intent, SweepAction::Waiting));
             }
@@ -231,6 +269,10 @@ mod tests {
         1. Yes, switch to Opus 5\n❯ 2. No, go back\n";
     const BUSY: &str = "● Working on things...\n✻ Thinking… (12s)\n";
     const IDLE: &str = "  Model set to opus\n❯ \n";
+    const IDLE_NO_MENU: &str = "● Done.\n  Stop hook running…\n❯ \n";
+    const INSTANT: &str = "❯ /model opus\n  ⎿  Set model to Opus 5 (1M context)\n❯ \n";
+    const STALE: &str = "  ⎿  Set model to Opus 5 (1M context)\n● later work\n\
+        ❯ /model opus\n  Stop hook running…\n❯ \n";
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -280,7 +322,11 @@ mod tests {
     #[tokio::test]
     async fn deferred_menu_is_answered_when_it_appears() {
         let d = tmpdir();
-        record(d.path(), &Intent::model_switch("dashboard:0.0", 1000)).unwrap();
+        record(
+            d.path(),
+            &Intent::model_switch("dashboard:0.0", "/model opus", 1000),
+        )
+        .unwrap();
         // First sweep: turn still running, no dialog. Intent survives.
         let busy = Fake::new(&[BUSY]);
         let r = run(d.path(), 1010, &busy).await;
@@ -298,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn decline_row_gets_up_then_enter() {
         let d = tmpdir();
-        record(d.path(), &Intent::model_switch("p:0.0", 0)).unwrap();
+        record(d.path(), &Intent::model_switch("p:0.0", "/model opus", 0)).unwrap();
         let fake = Fake::new(&[DIALOG_DECLINE_SELECTED, IDLE]);
         run(d.path(), 5, &fake).await;
         assert_eq!(*fake.sent.lock().unwrap(), vec![vec!["Up", "Enter"]]);
@@ -316,7 +362,11 @@ mod tests {
     #[tokio::test]
     async fn expired_intent_leaves_the_menu_alone_and_is_deleted() {
         let d = tmpdir();
-        record(d.path(), &Intent::model_switch("dashboard:0.0", 1000)).unwrap();
+        record(
+            d.path(),
+            &Intent::model_switch("dashboard:0.0", "/model opus", 1000),
+        )
+        .unwrap();
         let fake = Fake::new(&[DIALOG]);
         let r = run(d.path(), 1000 + INTENT_TTL_SECS, &fake).await;
         assert!(r.is_empty());
@@ -327,7 +377,11 @@ mod tests {
     #[tokio::test]
     async fn only_the_intents_own_pane_is_inspected() {
         let d = tmpdir();
-        record(d.path(), &Intent::model_switch("other:0.0", 0)).unwrap();
+        record(
+            d.path(),
+            &Intent::model_switch("other:0.0", "/model opus", 0),
+        )
+        .unwrap();
         let seen = Mutex::new(vec![]);
         sweep(
             d.path(),
@@ -345,7 +399,7 @@ mod tests {
     #[tokio::test]
     async fn attempts_are_bounded() {
         let d = tmpdir();
-        record(d.path(), &Intent::model_switch("p:0.0", 0)).unwrap();
+        record(d.path(), &Intent::model_switch("p:0.0", "/model opus", 0)).unwrap();
         let fake = Fake::new(&[DIALOG]); // never closes
         for _ in 0..MAX_ATTEMPTS {
             let r = run(d.path(), 1, &fake).await;
@@ -360,8 +414,8 @@ mod tests {
     #[test]
     fn record_replaces_and_clear_removes() {
         let d = tmpdir();
-        record(d.path(), &Intent::model_switch("p:0.0", 10)).unwrap();
-        record(d.path(), &Intent::model_switch("p:0.0", 20)).unwrap();
+        record(d.path(), &Intent::model_switch("p:0.0", "/model opus", 10)).unwrap();
+        record(d.path(), &Intent::model_switch("p:0.0", "/model opus", 20)).unwrap();
         assert_eq!(live_intents(d.path(), 21).len(), 1);
         clear(d.path(), "p:0.0");
         assert!(live_intents(d.path(), 21).is_empty());
@@ -374,5 +428,106 @@ mod tests {
             PathBuf::from("/var/lib/cw/inject-intents")
         );
         assert!(intent_dir_for("state.json").is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_boundary_race_idle_pane_then_dialog_is_answered() {
+        let d = tmpdir();
+        record(d.path(), &Intent::model_switch("p:0.0", "/model opus", 100)).unwrap();
+        // Idle-looking pane, no menu yet: the intent must survive.
+        let idle = Fake::new(&[IDLE_NO_MENU]);
+        let r = run(d.path(), 101, &idle).await;
+        assert_eq!(r[0].1, SweepAction::Waiting);
+        assert!(has_live(d.path(), "p:0.0", 101));
+        // The dialog is drawn afterwards: the sweep answers it.
+        let fake = Fake::new(&[DIALOG, IDLE]);
+        let r = run(d.path(), 110, &fake).await;
+        assert_eq!(r[0].1, SweepAction::Answered);
+        assert_eq!(*fake.sent.lock().unwrap(), vec![vec!["Enter"]]);
+    }
+
+    #[tokio::test]
+    async fn instant_switch_evidence_clears_without_pressing() {
+        let d = tmpdir();
+        record(d.path(), &Intent::model_switch("p:0.0", "/model opus", 100)).unwrap();
+        let fake = Fake::new(&[INSTANT]);
+        let r = run(d.path(), 101, &fake).await;
+        assert_eq!(r[0].1, SweepAction::Applied);
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!has_live(d.path(), "p:0.0", 101));
+    }
+
+    #[tokio::test]
+    async fn stale_scrollback_confirmation_does_not_clear() {
+        let d = tmpdir();
+        record(d.path(), &Intent::model_switch("p:0.0", "/model opus", 100)).unwrap();
+        let fake = Fake::new(&[STALE]);
+        let r = run(d.path(), 101, &fake).await;
+        assert_eq!(r[0].1, SweepAction::Waiting);
+        assert!(has_live(d.path(), "p:0.0", 101));
+    }
+
+    #[tokio::test]
+    async fn confirmation_for_a_different_model_does_not_clear() {
+        let d = tmpdir();
+        record(
+            d.path(),
+            &Intent::model_switch("p:0.0", "/model sonnet", 100),
+        )
+        .unwrap();
+        let fake = Fake::new(&[INSTANT]); // says Opus
+        let r = run(d.path(), 101, &fake).await;
+        assert_eq!(r[0].1, SweepAction::Waiting);
+    }
+
+    #[test]
+    fn inject_keeps_the_intent_on_an_idle_pane_with_no_menu() {
+        // The turn-boundary race: idle-looking, no menu yet, no evidence.
+        assert!(keep_after_inject(
+            true,
+            true,
+            false,
+            Some(IDLE_NO_MENU),
+            "/model opus"
+        ));
+        assert!(keep_after_inject(true, true, false, None, "/model opus"));
+        // Stale confirmation above the command is not evidence.
+        assert!(keep_after_inject(
+            true,
+            true,
+            false,
+            Some(STALE),
+            "/model opus"
+        ));
+        // Own confirmation, answered/handled menu, or nothing submitted: done.
+        assert!(!keep_after_inject(
+            true,
+            true,
+            false,
+            Some(INSTANT),
+            "/model opus"
+        ));
+        assert!(!keep_after_inject(
+            true,
+            false,
+            false,
+            Some(IDLE_NO_MENU),
+            "/model opus"
+        ));
+        assert!(!keep_after_inject(
+            false,
+            true,
+            false,
+            Some(IDLE_NO_MENU),
+            "/model opus"
+        ));
+        // A failed answer is retried by the daemon.
+        assert!(keep_after_inject(
+            true,
+            false,
+            true,
+            Some(IDLE_NO_MENU),
+            "/model opus"
+        ));
     }
 }

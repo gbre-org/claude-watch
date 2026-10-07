@@ -3517,6 +3517,49 @@ pub fn model_switch_applied(pane_output: &str) -> bool {
     })
 }
 
+/// Pure function: did THIS `/model` command apply without a dialog?
+///
+/// Stricter than [`model_switch_applied`], which matches a confirmation line
+/// anywhere in the recent tail and so also matches one left over from an
+/// earlier switch. Here the confirmation must sit BELOW the last line that
+/// echoes `payload` (the submitted command) and must name the requested
+/// model, so scrollback above the command can never satisfy it. No echoed
+/// command on the capture means no evidence.
+pub fn model_switch_applied_after_command(pane_output: &str, payload: &str) -> bool {
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let payload = norm(payload);
+    let Some(arg) = payload.strip_prefix("/model") else {
+        return false;
+    };
+    let arg = arg.trim().to_lowercase();
+    if arg.is_empty() {
+        return false;
+    }
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let Some(cmd_idx) = lines.iter().rposition(|l| norm(l).contains(&payload)) else {
+        return false;
+    };
+    // Family/word tokens of the requested model ("sonnet", "opus", "fable");
+    // the display name ("Sonnet 5.5") rarely repeats a full model id.
+    let tokens: Vec<&str> = arg
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|t| t.len() >= 3 && *t != "claude")
+        .collect();
+    let squashed = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+    };
+    lines[cmd_idx + 1..].iter().any(|line| {
+        let lower = line.to_lowercase();
+        MODEL_SWITCH_APPLIED_MARKERS
+            .iter()
+            .any(|m| lower.contains(m))
+            && (tokens.iter().any(|t| lower.contains(t))
+                || squashed(&lower).contains(&squashed(&arg)))
+    })
+}
+
 /// The last `n` lines of a pane capture — the "is this live or is it
 /// scrollback" scope every dialog detector here shares.
 fn recent_tail(pane_output: &str, n: usize) -> impl Iterator<Item = &str> {

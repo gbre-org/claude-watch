@@ -389,7 +389,9 @@ pub async fn settle_menu(pane: &str, payload: &str, policy: &MenuPolicy) -> Menu
                 break (frame, menu);
             }
             // `/model` that applied straight away: nothing will appear.
-            if is_model_command(payload) && tmux::model_switch_applied(&frame) {
+            if is_model_command(payload)
+                && tmux::model_switch_applied_after_command(&frame, payload)
+            {
                 return MenuOutcome::None;
             }
         }
