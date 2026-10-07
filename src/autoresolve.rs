@@ -8,9 +8,16 @@
 //! answers. `permission_prompt_monitor` can only DECLINE such a prompt; this
 //! module can answer "Yes" to a narrow, explicitly allow-listed class of them.
 //!
+//! # Always decide
+//!
+//! A recognizable permission dialog is never left hanging: an allow-rule match
+//! is answered Yes, everything else No (`default_answer`, only "no" is
+//! accepted). A screen that looks like a dialog but cannot be read causes no
+//! keystroke and a high-severity alert after `undecided_alert_after` cycles.
+//!
 //! # Safety model
 //!
-//! This is a way to APPROVE tool calls, so everything is default-deny:
+//! Yes is the only risky answer, so it stays default-deny:
 //!
 //! 1. **Feature gate.** `mode` is `off` (default), `dry-run` (log what would
 //!    be answered, press nothing) or `enforce`. A kill-switch file in the
@@ -77,6 +84,49 @@ pub struct AutoResolveConfig {
     /// the pane's cwd is the main loop's, not necessarily the agent's.
     #[serde(default)]
     pub use_pane_cwd: bool,
+    /// What happens to a recognizable permission dialog no allow rule covers.
+    /// Only `"no"` is accepted; the loader rejects anything else (there is no
+    /// way to configure a default Yes).
+    #[serde(
+        default = "default_default_answer",
+        deserialize_with = "de_default_answer"
+    )]
+    pub default_answer: String,
+    /// Consecutive cycles a dialog-looking but unreadable (partial or
+    /// changing) screen may stay undecided before a high-severity alert is
+    /// raised (and again every this-many cycles while it persists).
+    #[serde(default = "default_undecided_alert_after")]
+    pub undecided_alert_after: u32,
+    /// After answering No for an agent, also drop a note into that agent's
+    /// inbox (`agent-msg send`) when its id is identifiable on screen.
+    #[serde(default = "yes")]
+    pub notify_agent_on_no: bool,
+    /// Seconds an identical dialog must stay on screen before a default-No is
+    /// pressed (longer than `settle_secs`: gives a human a window).
+    #[serde(default = "default_no_after")]
+    pub no_after_secs: u64,
+}
+
+fn default_default_answer() -> String {
+    "no".to_string()
+}
+fn default_undecided_alert_after() -> u32 {
+    6
+}
+fn default_no_after() -> u64 {
+    20
+}
+
+fn de_default_answer<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let s = String::deserialize(d)?;
+    if s.trim().eq_ignore_ascii_case("no") {
+        Ok("no".to_string())
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "autoresolve.default_answer must be \"no\" (got {:?}); a default Yes is not supported",
+            s
+        )))
+    }
 }
 
 fn default_mode() -> String {
@@ -102,6 +152,10 @@ impl Default for AutoResolveConfig {
             trip_cooldown_secs: default_trip_cooldown(),
             settle_secs: default_settle(),
             use_pane_cwd: false,
+            default_answer: default_default_answer(),
+            undecided_alert_after: default_undecided_alert_after(),
+            notify_agent_on_no: true,
+            no_after_secs: default_no_after(),
         }
     }
 }
@@ -963,7 +1017,10 @@ fn option_row(line: &str) -> Option<(u32, String, bool)> {
 }
 
 /// Warnings the Bash safety check prints that this feature knows how to read.
-const ACCEPTED_WARNING_PREFIXES: &[&str] = &["dangerous rm operation on critical path:"];
+const ACCEPTED_WARNING_PREFIXES: &[&str] = &[
+    "dangerous rm operation on critical path:",
+    "dangerous rm operation on possibly-empty variable path",
+];
 
 fn looks_like_description(line: &str) -> bool {
     let first = line.chars().next();
@@ -1163,6 +1220,249 @@ impl RateLimiter {
 }
 
 // ---------------------------------------------------------------------------
+// Generic dialog classification (always-decide)
+// ---------------------------------------------------------------------------
+
+/// A permission dialog whose shape is unambiguous: a boxed title, a
+/// `Do you want ...?` question, consecutively numbered options directly below
+/// it, and exactly one cursor row. Not necessarily a Bash dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dialog {
+    pub title: String,
+    pub question: String,
+    /// `(number, lowercase label, cursor)`.
+    pub options: Vec<(u32, String, bool)>,
+    /// Raw text between the title and the question, one stripped line each.
+    pub body: String,
+    pub signature: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Screen {
+    /// No dialog (or only a stale one that is no longer live).
+    Nothing,
+    /// Looks like a dialog but is partial / changing / unreadable. Do nothing
+    /// this cycle; the caller counts consecutive undecided cycles.
+    Undecided(String),
+    Dialog(Box<Dialog>),
+}
+
+impl Dialog {
+    /// Digit of the option that declines, only when the label is a bare "No"
+    /// (a "No, and tell Claude..." variant opens a text box, so it is not
+    /// used).
+    pub fn no_digit(&self) -> Option<u32> {
+        self.options
+            .iter()
+            .find(|(_, l, _)| l == "no")
+            .map(|(n, _, _)| *n)
+    }
+}
+
+pub fn classify_screen(frame: &str) -> Screen {
+    let lines: Vec<&str> = frame.lines().collect();
+    let start = lines.len().saturating_sub(40);
+    let tail = &lines[start..];
+
+    let title_marker = tail.iter().any(|l| {
+        strip_chrome(l)
+            .to_ascii_lowercase()
+            .starts_with("bash command")
+    });
+    let q = tail.iter().rposition(|l| {
+        let s = strip_chrome(l);
+        s.starts_with("Do you want") && s.ends_with('?')
+    });
+    let Some(q) = q else {
+        return if title_marker {
+            Screen::Undecided("Bash command box without a question yet".into())
+        } else {
+            Screen::Nothing
+        };
+    };
+
+    let mut opts: Vec<(u32, String, bool)> = Vec::new();
+    for l in &tail[q + 1..] {
+        let s = strip_chrome(l);
+        if s.is_empty() {
+            continue;
+        }
+        if let Some(o) = option_row(l) {
+            opts.push(o);
+            continue;
+        }
+        let lower = s.to_ascii_lowercase();
+        if lower.contains("esc to cancel")
+            || lower.contains("tab to amend")
+            || lower.starts_with("esc")
+        {
+            continue;
+        }
+        // Live content below the "options": the dialog is scrollback.
+        return Screen::Nothing;
+    }
+    if opts.len() < 2 || opts.iter().enumerate().any(|(i, o)| o.0 != i as u32 + 1) {
+        return Screen::Undecided("options not yet readable".into());
+    }
+    // Permission-shaped only: an affirmative option and a bare "No" option.
+    // Anything else (plan pickers, menus) is not ours to answer.
+    let has_yes = opts.iter().any(|o| o.1 == "yes" || o.1.starts_with("yes,"));
+    let has_no = opts.iter().any(|o| o.1 == "no");
+    if !(has_yes && has_no) {
+        return Screen::Nothing;
+    }
+    if opts.iter().filter(|o| o.2).count() != 1 {
+        return Screen::Undecided("cursor not on exactly one option".into());
+    }
+
+    let lo = q.saturating_sub(25);
+    let Some(top) = (lo..q)
+        .rev()
+        .find(|&i| tail[i].trim_start().starts_with('\u{256d}'))
+    else {
+        return Screen::Undecided("no box top above the question".into());
+    };
+    let Some(t) = (top + 1..q).find(|&i| !strip_chrome(tail[i]).is_empty()) else {
+        return Screen::Undecided("no title line".into());
+    };
+    let body = tail[t + 1..q]
+        .iter()
+        .map(|l| strip_chrome(l))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Screen::Dialog(Box::new(Dialog {
+        title: strip_chrome(tail[t]).to_string(),
+        question: strip_chrome(tail[q]).to_string(),
+        options: opts,
+        body,
+        signature: prompt_signature(&tail[t..].join("\n")),
+    }))
+}
+
+/// What to do with a live dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Yes {
+        rule_ids: Vec<String>,
+        resolved: Vec<PathBuf>,
+        prompt: Box<BashPrompt>,
+    },
+    No {
+        /// `default-no` plus the reason (denial class, parse failure...).
+        reason: String,
+        command: String,
+        agent: Option<String>,
+    },
+}
+
+/// The single decision point. A recognizable dialog ALWAYS gets a verdict:
+/// Yes only when the strict Bash shape parses AND a rule allows the whole
+/// command; every other path is No.
+pub fn decide_dialog(
+    policy: Result<&Policy, &str>,
+    frame: &str,
+    dialog: &Dialog,
+    start_cwd: Option<&Path>,
+) -> Verdict {
+    let no = |reason: String, command: String, agent: Option<String>| Verdict::No {
+        reason,
+        command,
+        agent,
+    };
+    let raw_cmd = dialog.body.clone();
+    let agent_of = |t: &str| {
+        t.to_ascii_lowercase()
+            .find(" from ")
+            .map(|i| t[i + 6..].trim().to_string())
+    };
+    if !dialog
+        .title
+        .to_ascii_lowercase()
+        .starts_with("bash command")
+    {
+        return no(
+            format!("unrecognized-dialog:{}", dialog.title),
+            raw_cmd,
+            agent_of(&dialog.title),
+        );
+    }
+    let prompt = match parse_bash_prompt(frame) {
+        Ok(p) => p,
+        Err(e) => {
+            return no(
+                format!("unparsed-bash-dialog:{}", e),
+                raw_cmd,
+                agent_of(&dialog.title),
+            )
+        }
+    };
+    let policy = match policy {
+        Ok(p) => p,
+        Err(e) => {
+            return no(
+                format!("rules unavailable: {}", e),
+                prompt.command.clone(),
+                prompt.agent.clone(),
+            )
+        }
+    };
+    match evaluate_prompt(policy, &prompt, start_cwd) {
+        Decision::Allow { rule_ids, resolved } => Verdict::Yes {
+            rule_ids,
+            resolved,
+            prompt: Box::new(prompt),
+        },
+        Decision::Deny { reason } => no(reason, prompt.command.clone(), prompt.agent.clone()),
+    }
+}
+
+/// Counts consecutive cycles on which the screen looked like a dialog but was
+/// unreadable.
+#[derive(Debug, Default)]
+pub struct UndecidedTracker {
+    pub cycles: u32,
+}
+
+impl UndecidedTracker {
+    /// Returns true when an alert is due (at `after` cycles, then every
+    /// `after` more while it persists).
+    pub fn observe(&mut self, undecided: bool, after: u32) -> bool {
+        if !undecided {
+            self.cycles = 0;
+            return false;
+        }
+        self.cycles = self.cycles.saturating_add(1);
+        let n = after.max(1);
+        self.cycles % n == 0
+    }
+}
+
+/// An agent id as `agent-msg` knows it (`a` + hex, optionally `agent-` prefixed),
+/// if the dialog's agent label is one. A type label such as
+/// `general-purpose` is not an id.
+pub fn agent_id_from_label(label: &str) -> Option<String> {
+    let t = label.trim().trim_start_matches("agent-");
+    let hex = t.strip_prefix('a')?;
+    if hex.len() >= 8 && hex.len() <= 40 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+/// Short note delivered to a refused agent.
+pub fn refusal_note(command: &str, reason: &str) -> String {
+    let cmd: String = command.chars().take(300).collect();
+    format!(
+        "claude-watch autoresolve answered No to your permission dialog (reason: {reason}). \
+         Command was: {cmd} -- Rewrite it with absolute literal paths inside your worktree or \
+         /tmp (no unresolved variables, no recursive or destructive operations), or ask the \
+         main loop to run it."
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Runtime driver
 // ---------------------------------------------------------------------------
 
@@ -1172,6 +1472,9 @@ struct RuntimeState {
     candidate: Option<(u64, Instant)>,
     last_answered: Option<u64>,
     last_refused: Option<u64>,
+    /// `(signature, keystrokes already tried)` for default-No.
+    no_attempts: Option<(u64, u32)>,
+    undecided: UndecidedTracker,
     limiter: RateLimiter,
     tripped_until: Option<Instant>,
     trip_alerted: bool,
@@ -1185,16 +1488,23 @@ pub enum StepOutcome {
     Nothing,
     /// A dialog is on screen and is being considered; do not treat as idle.
     Considering,
-    Refused {
-        reason: String,
-    },
     WouldAnswer {
         rule_ids: Vec<String>,
     },
     Answered {
         rule_ids: Vec<String>,
     },
+    /// Answered (or, in dry-run, would answer) No.
+    AnsweredNo {
+        reason: String,
+        dry_run: bool,
+    },
     AnswerFailed {
+        reason: String,
+    },
+    /// A dialog-looking screen stayed unreadable for `cycles` cycles.
+    UndecidedAlert {
+        cycles: u32,
         reason: String,
     },
     /// Rate limit tripped; caller should page the operator once.
@@ -1251,6 +1561,14 @@ async fn pane_query(pane: &str, fmt: &str) -> Option<String> {
     crate::cmd::run_cmd(&["tmux", "display-message", "-p", "-t", pane, fmt], 5).await
 }
 
+fn mode_str(mode: Mode) -> &'static str {
+    if mode == Mode::Enforce {
+        "enforce"
+    } else {
+        "dry-run"
+    }
+}
+
 /// One daemon cycle. Safe to call every cycle; does nothing unless enabled.
 pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> StepOutcome {
     let mode = cfg.parsed_mode();
@@ -1258,27 +1576,55 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
     if mode == Mode::Off || pane.is_empty() || kill_switch_active(&state_dir) {
         return StepOutcome::Nothing;
     }
+    // Defense in depth: the loader already rejects anything but "no".
+    if !cfg.default_answer.eq_ignore_ascii_case("no") {
+        return StepOutcome::Nothing;
+    }
     let Some(frame) = tmux::capture_pane(pane).await else {
         return StepOutcome::Nothing;
     };
-    let prompt = match parse_bash_prompt(&frame) {
-        Ok(p) => p,
-        Err(_) => {
-            // Not our dialog shape (or none at all): forget any candidate.
+    let dialog = match classify_screen(&frame) {
+        Screen::Nothing => {
             if let Some(s) = RUNTIME.lock().unwrap().as_mut() {
                 s.candidate = None;
                 s.last_answered = None;
                 s.last_refused = None;
+                s.no_attempts = None;
+                s.undecided.observe(false, cfg.undecided_alert_after);
             }
             return StepOutcome::Nothing;
         }
+        Screen::Undecided(reason) => {
+            let mut g = RUNTIME.lock().unwrap();
+            let s = g.get_or_insert_with(RuntimeState::default);
+            s.candidate = None;
+            let due = s.undecided.observe(true, cfg.undecided_alert_after);
+            let cycles = s.undecided.cycles;
+            drop(g);
+            if due {
+                audit(
+                    &state_dir,
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "kind": "undecided-alert",
+                        "pane": pane,
+                        "cycles": cycles,
+                        "reason": reason,
+                        "mode": mode_str(mode),
+                    }),
+                );
+                return StepOutcome::UndecidedAlert { cycles, reason };
+            }
+            return StepOutcome::Considering;
+        }
+        Screen::Dialog(d) => *d,
     };
     let now = Instant::now();
 
-    // Tripped cooldown.
     {
         let mut g = RUNTIME.lock().unwrap();
         let s = g.get_or_insert_with(RuntimeState::default);
+        s.undecided.observe(false, cfg.undecided_alert_after);
         if let Some(until) = s.tripped_until {
             if now < until {
                 return StepOutcome::Considering;
@@ -1286,39 +1632,26 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
             s.tripped_until = None;
             s.trip_alerted = false;
         }
-        if s.last_answered == Some(prompt.signature) {
-            // Same screen after we answered: never answer twice.
-            return StepOutcome::Considering;
-        }
-        if s.last_refused == Some(prompt.signature) {
+        if s.last_answered == Some(dialog.signature) || s.last_refused == Some(dialog.signature) {
             return StepOutcome::Considering;
         }
         match s.candidate {
-            Some((sig, first)) if sig == prompt.signature => {
+            Some((sig, first)) if sig == dialog.signature => {
+                // Yes candidates settle quickly; the conservative No waits
+                // longer so a human has a window. The verdict is computed
+                // below; here use the shorter wait and re-check for No.
                 if now.duration_since(first) < Duration::from_secs(cfg.settle_secs) {
                     return StepOutcome::Considering;
                 }
             }
             _ => {
-                s.candidate = Some((prompt.signature, now));
+                s.candidate = Some((dialog.signature, now));
                 return StepOutcome::Considering;
             }
         }
     }
 
-    // Decide.
-    let policy = match Policy::load(&cfg.rules_file) {
-        Ok(p) => p,
-        Err(e) => {
-            return refuse(
-                &state_dir,
-                pane,
-                &prompt,
-                &format!("rules unavailable: {}", e),
-                mode,
-            );
-        }
-    };
+    let policy = Policy::load(&cfg.rules_file);
     let cwd: Option<PathBuf> = if cfg.use_pane_cwd {
         pane_query(pane, "#{pane_current_path}")
             .await
@@ -1327,11 +1660,68 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
     } else {
         None
     };
-    let (rule_ids, resolved) = match evaluate_prompt(&policy, &prompt, cwd.as_deref()) {
-        Decision::Allow { rule_ids, resolved } => (rule_ids, resolved),
-        Decision::Deny { reason } => return refuse(&state_dir, pane, &prompt, &reason, mode),
-    };
+    let verdict = decide_dialog(
+        policy.as_ref().map_err(|e| e.as_str()),
+        &frame,
+        &dialog,
+        cwd.as_deref(),
+    );
 
+    match verdict {
+        Verdict::Yes {
+            rule_ids,
+            resolved,
+            prompt,
+        } => {
+            answer_yes(
+                cfg, &state_dir, pane, mode, now, &prompt, rule_ids, resolved, cwd,
+            )
+            .await
+        }
+        Verdict::No {
+            reason,
+            command,
+            agent,
+        } => {
+            // The conservative answer waits `no_after_secs` in total.
+            let first = RUNTIME
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|s| s.candidate)
+                .map(|(_, t)| t);
+            if let Some(first) = first {
+                if now.duration_since(first) < Duration::from_secs(cfg.no_after_secs) {
+                    return StepOutcome::Considering;
+                }
+            }
+            answer_no(
+                cfg,
+                &state_dir,
+                pane,
+                mode,
+                &dialog,
+                &reason,
+                &command,
+                agent.as_deref(),
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn answer_yes(
+    cfg: &AutoResolveConfig,
+    state_dir: &Path,
+    pane: &str,
+    mode: Mode,
+    now: Instant,
+    prompt: &BashPrompt,
+    rule_ids: Vec<String>,
+    resolved: Vec<PathBuf>,
+    cwd: Option<PathBuf>,
+) -> StepOutcome {
     let entry = |kind: &str, answer: &str| {
         serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339(),
@@ -1344,12 +1734,12 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
             "resolved_paths": resolved.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "rule_ids": rule_ids,
             "answer": answer,
-            "mode": if mode == Mode::Enforce { "enforce" } else { "dry-run" },
+            "mode": mode_str(mode),
         })
     };
 
     if mode == Mode::DryRun {
-        audit(&state_dir, entry("would-answer", "1"));
+        audit(state_dir, entry("would-answer", "1"));
         emit_audit_event(
             "autoresolve-dry-run",
             &format!(
@@ -1371,7 +1761,7 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
             let first = !s.trip_alerted;
             s.trip_alerted = true;
             drop(g);
-            audit(&state_dir, entry("tripped", "none"));
+            audit(state_dir, entry("tripped", "none"));
             return if first {
                 StepOutcome::Tripped
             } else {
@@ -1379,7 +1769,7 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
             };
         }
     }
-    if !audit(&state_dir, entry("answering", "1")) {
+    if !audit(state_dir, entry("answering", "1")) {
         // No audit trail, no keystroke.
         return StepOutcome::AnswerFailed {
             reason: "audit log not writable".into(),
@@ -1390,7 +1780,7 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
         .await
         .and_then(|f| parse_bash_prompt(&f).ok());
     if again.as_ref().map(|p| p.signature) != Some(prompt.signature) {
-        audit(&state_dir, entry("aborted-screen-changed", "none"));
+        audit(state_dir, entry("aborted-screen-changed", "none"));
         return StepOutcome::AnswerFailed {
             reason: "screen changed before keystroke".into(),
         };
@@ -1409,7 +1799,7 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
         s.candidate = None;
     }
     audit(
-        &state_dir,
+        state_dir,
         entry(
             if cleared {
                 "answered"
@@ -1435,29 +1825,157 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
     }
 }
 
-fn refuse(
+#[allow(clippy::too_many_arguments)]
+async fn answer_no(
+    cfg: &AutoResolveConfig,
     state_dir: &Path,
     pane: &str,
-    prompt: &BashPrompt,
-    reason: &str,
     mode: Mode,
+    dialog: &Dialog,
+    reason: &str,
+    command: &str,
+    agent: Option<&str>,
 ) -> StepOutcome {
-    audit(
-        state_dir,
+    let agent_id = agent.and_then(agent_id_from_label);
+    let entry = |kind: &str, key: &str, notified: bool| {
         serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339(),
-            "kind": "refused",
+            "kind": kind,
             "pane": pane,
-            "agent": prompt.agent,
-            "command": prompt.command,
+            "title": dialog.title,
+            "agent": agent,
+            "agent_id": agent_id,
+            "command": command,
+            "rule_ids": ["default-no"],
             "reason": reason,
-            "mode": if mode == Mode::Enforce { "enforce" } else { "dry-run" },
-        }),
+            "answer": "no",
+            "key": key,
+            "notified_agent": notified,
+            "mode": mode_str(mode),
+        })
+    };
+    if mode == Mode::DryRun {
+        audit(state_dir, entry("would-answer-no", "none", false));
+        emit_audit_event(
+            "autoresolve-dry-run",
+            &format!(
+                "autoresolve DRY-RUN: would answer No (default-no: {}) for {:?}: {}",
+                reason, agent, command
+            ),
+        );
+        let mut g = RUNTIME.lock().unwrap();
+        g.get_or_insert_with(RuntimeState::default).last_refused = Some(dialog.signature);
+        return StepOutcome::AnsweredNo {
+            reason: reason.to_string(),
+            dry_run: true,
+        };
+    }
+
+    // First try the digit of the bare "No" option; if the dialog survives
+    // that, fall back to Escape (also a decline) on the next attempt.
+    let attempt = {
+        let mut g = RUNTIME.lock().unwrap();
+        let s = g.get_or_insert_with(RuntimeState::default);
+        let n = match s.no_attempts {
+            Some((sig, n)) if sig == dialog.signature => n,
+            _ => 0,
+        };
+        if n >= 2 {
+            s.last_refused = Some(dialog.signature);
+            drop(g);
+            audit(state_dir, entry("no-gave-up", "none", false));
+            return StepOutcome::AnswerFailed {
+                reason: "dialog survived both No keystrokes".into(),
+            };
+        }
+        s.no_attempts = Some((dialog.signature, n + 1));
+        n
+    };
+    let digit = dialog.no_digit().map(|d| d.to_string());
+    let key: String = match (&digit, attempt) {
+        (Some(d), 0) => d.clone(),
+        _ => "Escape".to_string(),
+    };
+    if !audit(state_dir, entry("answering-no", &key, false)) {
+        return StepOutcome::AnswerFailed {
+            reason: "audit log not writable".into(),
+        };
+    }
+    // Fresh capture: still this very dialog.
+    let still = tmux::capture_pane(pane)
+        .await
+        .map(|f| classify_screen(&f))
+        .map(|sc| matches!(sc, Screen::Dialog(d) if d.signature == dialog.signature))
+        .unwrap_or(false);
+    if !still {
+        audit(state_dir, entry("aborted-screen-changed", "none", false));
+        return StepOutcome::AnswerFailed {
+            reason: "screen changed before keystroke".into(),
+        };
+    }
+    tmux::send_keys(pane, &[key.as_str()]).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let cleared = tmux::capture_pane(pane)
+        .await
+        .map(|f| classify_screen(&f))
+        .map(|sc| !matches!(sc, Screen::Dialog(d) if d.signature == dialog.signature))
+        .unwrap_or(true);
+    let mut notified = false;
+    if cleared {
+        {
+            let mut g = RUNTIME.lock().unwrap();
+            let s = g.get_or_insert_with(RuntimeState::default);
+            s.last_answered = Some(dialog.signature);
+            s.candidate = None;
+        }
+        if cfg.notify_agent_on_no {
+            if let Some(id) = &agent_id {
+                let note = refusal_note(command, reason);
+                notified = crate::cmd::run_cmd_any(&["agent-msg", "send", id, &note], 10)
+                    .await
+                    .1;
+            }
+        }
+    }
+    audit(
+        state_dir,
+        entry(
+            if cleared {
+                "answered-no"
+            } else {
+                "answered-no-not-cleared"
+            },
+            &key,
+            notified,
+        ),
     );
-    let mut g = RUNTIME.lock().unwrap();
-    g.get_or_insert_with(RuntimeState::default).last_refused = Some(prompt.signature);
-    StepOutcome::Refused {
-        reason: reason.to_string(),
+    emit_audit_event(
+        "autoresolve-no",
+        &format!(
+            "autoresolve: answered No (default-no: {}) for agent {:?}{}: {}",
+            reason,
+            agent,
+            if agent_id.is_some() {
+                if notified {
+                    " [agent notified]"
+                } else {
+                    " [agent notify failed]"
+                }
+            } else {
+                " [agent id not on screen; no inbox note]"
+            },
+            command
+        ),
+    );
+    if cleared {
+        StepOutcome::AnsweredNo {
+            reason: reason.to_string(),
+            dry_run: false,
+        }
+    } else {
+        StepOutcome::AnswerFailed {
+            reason: "No keystroke sent but dialog still on screen".into(),
+        }
     }
 }
 
@@ -1622,7 +2140,7 @@ mod tests {
         // Unrecognized warning kind.
         let w = SHOT.replace(
             "Dangerous rm operation on critical path",
-            "Dangerous rm operation on possibly-empty variable path",
+            "Dangerous mv operation",
         );
         assert!(parse_bash_prompt(&w).is_err());
     }
@@ -1791,6 +2309,160 @@ mod tests {
         assert!(audit(td.path(), serde_json::json!({"a": 2})));
         let t = std::fs::read_to_string(td.path().join(AUDIT_FILE)).unwrap();
         assert_eq!(t.lines().count(), 2);
+    }
+
+    const VAR_RM: &str = include_str!("../tests/fixtures/autoresolve_possibly_empty_var.txt");
+    const UNKNOWN_CMD: &str = include_str!("../tests/fixtures/autoresolve_unknown_command.txt");
+    const ALLOW_RM: &str = include_str!("../tests/fixtures/autoresolve_allow_rm_worktree_file.txt");
+
+    fn verdict(fx: &str) -> Verdict {
+        let Screen::Dialog(d) = classify_screen(fx) else {
+            panic!("fixture must classify as a dialog:\n{}", fx)
+        };
+        let p = policy();
+        decide_dialog(Ok(&p), fx, &d, None)
+    }
+
+    fn assert_no(fx: &str, reason_prefix: &str) {
+        match verdict(fx) {
+            Verdict::No { reason, .. } => {
+                assert!(reason.starts_with(reason_prefix), "{reason}")
+            }
+            Verdict::Yes { .. } => panic!("must be No:\n{}", fx),
+        }
+    }
+
+    #[test]
+    fn possibly_empty_variable_rm_is_no() {
+        // Variables are not expanded: the command cannot be proven safe.
+        assert_no(VAR_RM, "unparseable:");
+    }
+
+    #[test]
+    fn unknown_command_is_no_not_hanging() {
+        assert_no(UNKNOWN_CMD, "program not allowed:");
+    }
+
+    #[test]
+    fn force_push_is_no() {
+        assert_no(NEG_PUSH, "hard-deny:");
+    }
+
+    #[test]
+    fn hard_deny_classes_are_always_no() {
+        assert_no(NEG_KUBECTL, "hard-deny:");
+        assert_no(NEG_SECRET, "hard-deny:");
+        assert_no(NEG_OUTSIDE, "outside-roots:");
+        assert_no(NEG_RM_RF, "flag not allowed");
+    }
+
+    #[test]
+    fn allow_rule_rm_of_worktree_file_is_yes() {
+        match verdict(ALLOW_RM) {
+            Verdict::Yes { rule_ids, .. } => {
+                assert!(rule_ids.contains(&"rm-file-in-roots".to_string()))
+            }
+            v => panic!("must be Yes: {v:?}"),
+        }
+        assert!(matches!(verdict(SHOT), Verdict::Yes { .. }));
+    }
+
+    #[test]
+    fn unreadable_rules_mean_no_never_yes() {
+        let Screen::Dialog(d) = classify_screen(ALLOW_RM) else {
+            panic!()
+        };
+        match decide_dialog(Err("missing"), ALLOW_RM, &d, None) {
+            Verdict::No { reason, .. } => assert!(reason.contains("rules unavailable")),
+            v => panic!("{v:?}"),
+        }
+    }
+
+    #[test]
+    fn non_bash_dialog_is_no() {
+        let fx = "\u{256d}\u{2500}\u{2500}\u{256e}\n\u{2502} Edit file from general-purpose agent \u{2502}\n\u{2502}  src/main.rs \u{2502}\n\u{2502} Do you want to make this edit to main.rs? \u{2502}\n\u{2502} \u{276f} 1. Yes \u{2502}\n\u{2502}   2. Yes, and don't ask again \u{2502}\n\u{2502}   3. No \u{2502}\n\u{2570}\u{2500}\u{2500}\u{256f}\n";
+        match classify_screen(fx) {
+            Screen::Dialog(d) => {
+                assert_eq!(d.no_digit(), Some(3));
+                match decide_dialog(Ok(&policy()), fx, &d, None) {
+                    Verdict::No { reason, .. } => {
+                        assert!(reason.starts_with("unrecognized-dialog:"))
+                    }
+                    v => panic!("{v:?}"),
+                }
+            }
+            s => panic!("{s:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_screen_is_undecided_then_alerts_after_n() {
+        assert!(matches!(classify_screen(NEG_PARTIAL), Screen::Undecided(_)));
+        let mut t = UndecidedTracker::default();
+        assert!(!t.observe(true, 3));
+        assert!(!t.observe(true, 3));
+        assert!(t.observe(true, 3), "alert on the Nth consecutive cycle");
+        assert!(!t.observe(true, 3));
+        // A readable screen resets the count.
+        assert!(!t.observe(false, 3));
+        assert_eq!(t.cycles, 0);
+        assert!(!t.observe(true, 3));
+    }
+
+    #[test]
+    fn non_dialog_screens_are_nothing() {
+        assert_eq!(classify_screen(""), Screen::Nothing);
+        assert_eq!(classify_screen("$ ls\nfoo\n"), Screen::Nothing);
+        // Live prompt below the dialog = scrollback.
+        let sb = format!("{}\n\u{276f} next thing", SHOT);
+        assert_eq!(classify_screen(&sb), Screen::Nothing);
+        // Not permission-shaped (no bare No).
+        let menu = SHOT.replace("2. No", "2. Maybe");
+        assert_eq!(classify_screen(&menu), Screen::Nothing);
+    }
+
+    #[test]
+    fn default_answer_yes_is_rejected_by_config_loader() {
+        let ok: AutoResolveConfig = toml::from_str("default_answer = \"no\"").unwrap();
+        assert_eq!(ok.default_answer, "no");
+        assert_eq!(
+            toml::from_str::<AutoResolveConfig>("")
+                .unwrap()
+                .default_answer,
+            "no"
+        );
+        for bad in ["yes", "Yes", "", "1", "ask"] {
+            let r = toml::from_str::<AutoResolveConfig>(&format!("default_answer = \"{bad}\""));
+            assert!(r.is_err(), "{bad:?} must be rejected");
+        }
+        let d = AutoResolveConfig::default();
+        assert!(d.notify_agent_on_no);
+        assert_eq!(d.parsed_mode(), Mode::Off);
+        assert!(d.undecided_alert_after > 0);
+    }
+
+    #[test]
+    fn agent_notification_targets_only_real_ids() {
+        assert_eq!(agent_id_from_label("general-purpose"), None);
+        assert_eq!(agent_id_from_label("the Explore"), None);
+        assert_eq!(
+            agent_id_from_label("a1b2c3d4e5f6a7b8c").as_deref(),
+            Some("a1b2c3d4e5f6a7b8c")
+        );
+        assert_eq!(
+            agent_id_from_label("agent-a1b2c3d4e5f6a7b8c").as_deref(),
+            Some("a1b2c3d4e5f6a7b8c")
+        );
+        let n = refusal_note("rm -f $Q/*.json", "unparseable:x");
+        assert!(n.contains("rm -f $Q/*.json") && n.contains("unparseable"));
+    }
+
+    #[test]
+    fn no_digit_picks_bare_no_only() {
+        let Screen::Dialog(d) = classify_screen(SHOT) else {
+            panic!()
+        };
+        assert_eq!(d.no_digit(), Some(2));
     }
 
     #[test]

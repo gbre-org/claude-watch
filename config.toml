@@ -1111,12 +1111,23 @@ context_lines = 16
 #   mode = "dry-run"  log + emit "would answer" events, press NOTHING
 #   mode = "enforce"  press Enter on option 1 when a rule matches
 #
-# Default-deny: a prompt is answered only if its strict shape parses, the
-# WHOLE command is covered by rules in `rules_file`, and every resolved path
-# is inside an allowed root. See docs/autoresolve.md and
+# Always decides: a recognizable permission dialog is never left hanging.
+# Yes only if the strict Bash shape parses, the WHOLE command is covered by
+# rules in `rules_file`, and every resolved path is inside an allowed root;
+# every other recognizable dialog gets No (option "No", then Escape). See docs/autoresolve.md and
 # examples/autoresolve-rules.toml. Kill switches: `touch
 # <state_dir>/autoresolve.disable` or CLAUDE_WATCH_AUTORESOLVE_DISABLE=1.
 mode = "off"
+# Only "no" is accepted (a default Yes is rejected at load).
+default_answer = "no"
+# Consecutive cycles an unreadable dialog-looking screen may persist before a
+# high-severity alert (then repeated every N cycles).
+undecided_alert_after = 6
+# Seconds a dialog must sit unanswered before a default-No is pressed.
+no_after_secs = 20
+# After a No, drop a note in the blocked agent's inbox (agent-msg) when its id
+# is shown on the dialog.
+notify_agent_on_no = true
 # rules_file = "~/.config/claude-watch/autoresolve-rules.toml"  (absolute path required)
 rules_file = ""
 # Audit log + kill-switch dir. Empty = directory of [general] state_file.

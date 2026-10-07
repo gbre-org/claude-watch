@@ -1,0 +1,12 @@
+● Bash(...)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Bash command from general-purpose agent                                                          │
+│                                                                                                  │
+│   Q=/home/user/repos/.worktrees/myrepo/fix-thing/q; rm -f $Q/*.json                              │
+│                                                                                                  │
+│ Dangerous rm operation on possibly-empty variable path: $Q/*.json                                │
+│                                                                                                  │
+│ Do you want to proceed?                                                                          │
+│ ❯ 1. Yes                                                                                         │
+│   2. No                                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
