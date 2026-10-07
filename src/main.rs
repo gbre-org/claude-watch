@@ -32,6 +32,7 @@ mod event_bus;
 mod hook_fire;
 mod idle_autocompact;
 mod inject_dispatch;
+mod inject_intent;
 mod inject_lock;
 mod inject_menu;
 mod inject_probe;
@@ -1593,6 +1594,11 @@ async fn run_daemon() {
             }
         }
 
+        // Answer a `/model` confirmation that an `inject` queued behind a busy
+        // turn (see `inject_intent`). No-op unless an unexpired intent file
+        // exists.
+        service_inject_intents(&current_config).await;
+
         // Full check cycle at general.check_interval
         if now.duration_since(last_full_check) >= general_interval {
             policy::check_cycle(&current_config, &mut state).await;
@@ -1968,6 +1974,55 @@ async fn resolve_inject_pane(flag: Option<&str>) -> String {
     "claude-container:0.0".to_string()
 }
 
+/// Daemon-side half of the deferred-menu fix: answer the `/model` confirmation
+/// an `inject` expected, if one is live and the dialog is on its pane. Cheap
+/// when idle (one directory read). Skipped while another injector holds the
+/// inject lock, so it never types over an inject's own menu handling.
+async fn service_inject_intents(config: &config::Config) {
+    let Some(dir) = inject_intent::intent_dir_for(&config.general.state_file) else {
+        return;
+    };
+    if !dir.is_dir() {
+        return;
+    }
+    let Some(_guard) = inject_lock::InjectLock::try_acquire("daemon-intent") else {
+        return;
+    };
+    let results = inject_intent::sweep(
+        &dir,
+        inject_intent::now_epoch(),
+        |pane| async move { tmux::capture_pane(&pane).await },
+        |pane, keys| async move {
+            tmux::send_model_switch_answer(&pane, keys).await;
+            sleep(Duration::from_secs(1)).await;
+        },
+    )
+    .await;
+    for (intent, action) in results {
+        match action {
+            inject_intent::SweepAction::Waiting => {}
+            inject_intent::SweepAction::Unreadable => tracing::warn!(
+                pane = %intent.pane,
+                "deferred /model confirmation is up but its selection is unreadable; \
+                 NOT guessing a keystroke"
+            ),
+            other => {
+                info!(pane = %intent.pane, action = ?other, "deferred /model confirmation handled");
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "inject_intent_menu",
+                    serde_json::json!({
+                        "pane": intent.pane,
+                        "kind": intent.kind,
+                        "attempts": intent.attempts,
+                        "action": format!("{other:?}"),
+                    }),
+                );
+            }
+        }
+    }
+}
+
 /// Handler for `claude-watch inject`. Returns a process exit code:
 ///   0 = typed (no-submit) OR submission verified
 ///   3 = submit keystrokes sent but the payload was still on the prompt line
@@ -1997,6 +2052,27 @@ async fn run_inject(
     }
     let pane = resolve_inject_pane(pane_flag).await;
     let submit = !no_submit;
+    // A payload that starts with `/` IS a slash command. Requiring a separate
+    // flag meant a forgotten `--slash-command` silently skipped both the
+    // bare-Enter submit and the post-submit menu watch (a `/model` dialog
+    // then sat open until a human pressed Enter). The explicit flag still
+    // works; it is now redundant for a leading-slash payload.
+    let slash_command = inject_menu::effective_slash_command(slash_command, text);
+
+    // Where a deferred-menu intent is recorded for the daemon (see
+    // `inject_intent`). Only for an allowlisted auto-answer: an explicit
+    // `--answer`, or `--no-auto-answer`, means the caller is driving.
+    let intent_dir = if submit
+        && menu_policy.answer.is_none()
+        && menu_policy.auto_answer
+        && inject_menu::is_model_command(text)
+    {
+        config::try_load_config()
+            .ok()
+            .and_then(|c| inject_intent::intent_dir_for(&c.general.state_file))
+    } else {
+        None
+    };
 
     // SERIALIZE against every other injector — the daemon's own in-process
     // alerts and any other `claude-watch inject` process. Without this, two
@@ -2007,6 +2083,15 @@ async fn run_inject(
     // both injects still reported success. Held across type+submit+verify, and
     // released when the guard drops. See `inject_lock` for the full autopsy.
     let _inject_guard = inject_lock::InjectLock::acquire("cli").await;
+
+    // Record BEFORE submitting, so the daemon cannot miss a dialog that
+    // appears the instant the command runs.
+    if let Some(dir) = &intent_dir {
+        let intent = inject_intent::Intent::model_switch(&pane, inject_intent::now_epoch());
+        if let Err(e) = inject_intent::record(dir, &intent) {
+            eprintln!("[claude-watch inject] could not record the deferred-menu intent: {e}");
+        }
+    }
 
     let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command, escape).await;
 
@@ -2030,6 +2115,27 @@ async fn run_inject(
     } else {
         inject_menu::MenuOutcome::None
     };
+    // Settle the intent. Keep it only when the synchronous watch could not
+    // finish the job: the command is queued behind a busy turn (no menu yet,
+    // pane not idle) or an answer was attempted and failed. Everything else
+    // is resolved here and must not leave the daemon a live permission.
+    if let Some(dir) = &intent_dir {
+        let queued = matches!(menu, inject_menu::MenuOutcome::None)
+            && matches!(
+                outcome,
+                tmux::InjectOutcome::Submitted | tmux::InjectOutcome::SubmitUnverified
+            )
+            && match tmux::capture_pane(&pane).await {
+                Some(f) => {
+                    !tmux::check_lines_for_idle_prompt(&f) && !tmux::model_switch_applied(&f)
+                }
+                None => false,
+            };
+        let failed = matches!(menu, inject_menu::MenuOutcome::AnswerFailed { .. });
+        if !(queued || failed) {
+            inject_intent::clear(dir, &pane);
+        }
+    }
     match &menu {
         inject_menu::MenuOutcome::Answered { .. } if code == 3 => {
             // The menu closing on our answer proves the submit landed.
