@@ -169,7 +169,15 @@ pub fn build_event_json(alert: &ClaudeWatchAlert<'_>) -> serde_json::Value {
     // context. (Its phone notification does not depend on this: the demotion
     // push is sent directly and verified, precisely so that no routing or
     // suppression decision downstream can swallow it.)
-    if alert.alert_type == "watcher-down" || alert.alert_type == "credits-exhausted" {
+    //
+    // `autoresolve-no` is stamped because an auto-denied permission prompt is
+    // a decision the main loop must make (retry with a rewritten command, or
+    // ask the operator for permission). Left unstamped it classifies ambient
+    // and the denial is silently lost.
+    if matches!(
+        alert.alert_type,
+        "watcher-down" | "credits-exhausted" | "autoresolve-no"
+    ) {
         event["data"]["tier"] = serde_json::Value::from("actionable");
     }
     event
@@ -883,6 +891,22 @@ mod tests {
         assert_eq!(v["data"]["alert_type"], "credits-exhausted");
         assert_eq!(v["data"]["tier"], "actionable");
         assert_eq!(v["priority"], "high");
+    }
+
+    /// An auto-denied permission prompt must reach the main loop.
+    #[test]
+    fn build_event_json_stamps_autoresolve_no_actionable() {
+        let alert = ClaudeWatchAlert {
+            alert_type: "autoresolve-no",
+            stuck_reason: "permission prompt auto-denied",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: Severity::High,
+            message: "auto-resolved a permission prompt with No",
+        };
+        let v = build_event_json(&alert);
+        assert_eq!(v["data"]["alert_type"], "autoresolve-no");
+        assert_eq!(v["data"]["tier"], "actionable");
     }
 
     #[test]
