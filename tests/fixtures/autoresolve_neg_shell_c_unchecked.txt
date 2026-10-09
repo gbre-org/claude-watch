@@ -1,0 +1,13 @@
+● Agent(...)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Bash command from the general-purpose agent                                                      │
+│                                                                                                  │
+│   sudo bash -c 'cd /var/apps/prometheus; for d in 01*; do du -s $d; done' | sort -rn | head -12   │
+│   Run shell command                                                                              │
+│                                                                                                  │
+│ This shell -c script runs rm and could not be checked                                            │
+│                                                                                                  │
+│ Do you want to proceed?                                                                          │
+│ ❯ 1. Yes                                                                                         │
+│   2. No                                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
