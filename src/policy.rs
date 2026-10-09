@@ -7275,6 +7275,54 @@ async fn check_ask_question_stale(
     }
 }
 
+/// One auto-resolve cycle: answer (or decline) a recognizable permission
+/// dialog and page on the loop-trip / unreadable outcomes. Called from BOTH
+/// the alive path and the dead-process branch: an open dialog hides the
+/// status line, so a blocked session reads tokens=0/bashes=0 and the dead
+/// branch returns before the alive path is reached.
+async fn run_autoresolve_step(config: &Config, pane: &str) {
+    match crate::autoresolve::step(&config.autoresolve, &config.general.state_file, pane).await {
+        crate::autoresolve::StepOutcome::Tripped => {
+            let msg = format!(
+                "claude-watch: autoresolve answered more than {} permission prompts in a \
+                 minute and has paused itself for {}s. Something is looping; review the \
+                 autoresolve audit log before re-enabling.",
+                config.autoresolve.max_per_minute, config.autoresolve.trip_cooldown_secs
+            );
+            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "autoresolve-tripped",
+                stuck_reason: "autoresolve rate limit exceeded",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &msg,
+            });
+            alert::send_pingme_with_priority(&msg, "high").await;
+        }
+        crate::autoresolve::StepOutcome::AnswerFailed { reason } => {
+            warn!(reason = %reason, "autoresolve: answer did not complete");
+        }
+        crate::autoresolve::StepOutcome::UndecidedAlert { cycles, reason } => {
+            let msg = format!(
+                "claude-watch: a permission dialog has looked unreadable for {} consecutive \
+                 cycles ({}); autoresolve cannot decide and has not pressed anything. A \
+                 session may be blocked: look at the pane.",
+                cycles, reason
+            );
+            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "autoresolve-undecided",
+                stuck_reason: "permission dialog unreadable",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &msg,
+            });
+            alert::send_pingme_with_priority(&msg, "high").await;
+        }
+        _ => {}
+    }
+}
+
 pub async fn check_cycle(config: &Config, state: &mut State) {
     let now = Local::now().to_rfc3339();
 
@@ -7558,6 +7606,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.consecutive_dead_checks += 1;
         let dead_checks = state.consecutive_dead_checks;
         info!(dead_checks, "dead process detected: tokens=0, bashes=0");
+
+        // An open permission dialog hides the status line, which reads as
+        // tokens=0/bashes=0 and sends every cycle down this branch (which
+        // returns early). Run auto-resolve here too or the dialog is never seen.
+        run_autoresolve_step(config, &effective_pane).await;
 
         // --- Self-heal: once we reach the alert threshold, retry status
         // discovery from scratch before committing to any dead-check actions.
@@ -8428,52 +8481,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // strictly-shaped Bash dialog whose whole command matches an allow rule
     // (see `crate::autoresolve`); anything else falls through untouched to
     // the alert/decline ladder below.
-    match crate::autoresolve::step(
-        &config.autoresolve,
-        &config.general.state_file,
-        &effective_pane,
-    )
-    .await
-    {
-        crate::autoresolve::StepOutcome::Tripped => {
-            let msg = format!(
-                "claude-watch: autoresolve answered more than {} permission prompts in a \
-                 minute and has paused itself for {}s. Something is looping; review the \
-                 autoresolve audit log before re-enabling.",
-                config.autoresolve.max_per_minute, config.autoresolve.trip_cooldown_secs
-            );
-            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
-                alert_type: "autoresolve-tripped",
-                stuck_reason: "autoresolve rate limit exceeded",
-                stale_minutes: None,
-                affected_watchers: vec![],
-                severity: crate::event_bus::Severity::High,
-                message: &msg,
-            });
-            alert::send_pingme_with_priority(&msg, "high").await;
-        }
-        crate::autoresolve::StepOutcome::AnswerFailed { reason } => {
-            warn!(reason = %reason, "autoresolve: answer did not complete");
-        }
-        crate::autoresolve::StepOutcome::UndecidedAlert { cycles, reason } => {
-            let msg = format!(
-                "claude-watch: a permission dialog has looked unreadable for {} consecutive \
-                 cycles ({}); autoresolve cannot decide and has not pressed anything. A \
-                 session may be blocked: look at the pane.",
-                cycles, reason
-            );
-            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
-                alert_type: "autoresolve-undecided",
-                stuck_reason: "permission dialog unreadable",
-                stale_minutes: None,
-                affected_watchers: vec![],
-                severity: crate::event_bus::Severity::High,
-                message: &msg,
-            });
-            alert::send_pingme_with_priority(&msg, "high").await;
-        }
-        _ => {}
-    }
+    run_autoresolve_step(config, &effective_pane).await;
     let permission_prompt_active =
         check_permission_prompt(config, state, &effective_pane, &now).await;
 

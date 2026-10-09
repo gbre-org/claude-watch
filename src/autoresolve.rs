@@ -1340,6 +1340,41 @@ pub fn classify_screen(frame: &str) -> Screen {
     }))
 }
 
+/// True when an unreadable screen still carries a `Do you want ...?` question
+/// with at least one numbered option below it, i.e. a permission-shaped
+/// dialog that is safe to decline with Escape.
+pub fn undecided_fallback_applies(frame: &str) -> bool {
+    let lines: Vec<&str> = frame.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(40)..];
+    let Some(q) = tail.iter().rposition(|l| {
+        let s = strip_chrome(l);
+        s.starts_with("Do you want") && s.ends_with('?')
+    }) else {
+        return false;
+    };
+    tail[q + 1..].iter().any(|l| option_row(l).is_some())
+}
+
+/// Compact one-line summary of the dialog body for the event text.
+fn undecided_summary(frame: &str) -> String {
+    let lines: Vec<&str> = frame.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(40)..];
+    let q = tail
+        .iter()
+        .rposition(|l| strip_chrome(l).starts_with("Do you want"))
+        .unwrap_or(tail.len());
+    let body: Vec<&str> = tail[..q]
+        .iter()
+        .rev()
+        .map(|l| strip_chrome(l))
+        .take_while(|s| !s.to_ascii_lowercase().starts_with("bash command"))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut v: Vec<&str> = body.into_iter().rev().collect();
+    v.truncate(8);
+    v.join(" | ").chars().take(400).collect()
+}
+
 /// What to do with a live dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -1557,6 +1592,61 @@ fn emit_audit_event(kind: &'static str, msg: &str) {
     });
 }
 
+/// The safety-check line Claude Code prints in the dialog ("Dangerous rm
+/// operation ...", "This shell -c script runs rm and could not be checked").
+pub fn dialog_reason_line(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|l| {
+            let lo = l.to_ascii_lowercase();
+            lo.starts_with("dangerous ") || lo.contains("could not be checked")
+        })
+        .map(str::to_string)
+}
+
+/// Message for the auto-No event: who was denied, the full command, the
+/// dialog's own reason line and the resolver's reason.
+pub fn denial_message(
+    agent: Option<&str>,
+    agent_id: Option<&str>,
+    notified: bool,
+    dialog_reason: Option<&str>,
+    reason: &str,
+    command: &str,
+) -> String {
+    format!(
+        "autoresolve DENIED a permission prompt (answered No). agent: {} (id: {}; inbox note: {}). \
+         dialog said: {}. resolver reason: {}. command: {}",
+        agent.unwrap_or("unknown"),
+        agent_id.unwrap_or("not on screen"),
+        if notified { "sent" } else { "not sent" },
+        dialog_reason.unwrap_or("(no reason line)"),
+        reason,
+        command
+    )
+}
+
+/// An auto-No is information the main loop must see (it may need to ask the
+/// operator for permission), so it is raised at HIGH priority.
+fn emit_denial_event(
+    agent: Option<&str>,
+    agent_id: Option<&str>,
+    notified: bool,
+    dialog_reason: Option<&str>,
+    reason: &str,
+    command: &str,
+) {
+    let msg = denial_message(agent, agent_id, notified, dialog_reason, reason, command);
+    crate::event_bus::emit(&crate::event_bus::ClaudeWatchAlert {
+        alert_type: "autoresolve-no",
+        stuck_reason: "permission prompt denied by autoresolve",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::High,
+        message: &msg,
+    });
+}
+
 async fn pane_query(pane: &str, fmt: &str) -> Option<String> {
     crate::cmd::run_cmd(&["tmux", "display-message", "-p", "-t", pane, fmt], 5).await
 }
@@ -1602,6 +1692,38 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
             let cycles = s.undecided.cycles;
             drop(g);
             if due {
+                // Never leave an unrecognised permission-shaped dialog
+                // blocking: after the grace period, decline it with Escape
+                // (a decline in every Claude Code dialog) and say so.
+                if undecided_fallback_applies(&frame) {
+                    let command = undecided_summary(&frame);
+                    let entry = serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "kind": if mode == Mode::Enforce { "undecided-escape" } else { "would-undecided-escape" },
+                        "pane": pane,
+                        "cycles": cycles,
+                        "reason": reason,
+                        "answer": "no",
+                        "key": "Escape",
+                        "command": command,
+                        "mode": mode_str(mode),
+                    });
+                    audit(&state_dir, entry);
+                    if mode == Mode::Enforce {
+                        tmux::send_keys(pane, &["Escape"]).await;
+                        emit_denial_event(
+                            None,
+                            None,
+                            false,
+                            None,
+                            &format!(
+                                "unrecognised dialog ({}), declined with Escape after {} cycles",
+                                reason, cycles
+                            ),
+                            &command,
+                        );
+                    }
+                }
                 audit(
                     &state_dir,
                     serde_json::json!({
@@ -1949,23 +2071,13 @@ async fn answer_no(
             notified,
         ),
     );
-    emit_audit_event(
-        "autoresolve-no",
-        &format!(
-            "autoresolve: answered No (default-no: {}) for agent {:?}{}: {}",
-            reason,
-            agent,
-            if agent_id.is_some() {
-                if notified {
-                    " [agent notified]"
-                } else {
-                    " [agent notify failed]"
-                }
-            } else {
-                " [agent id not on screen; no inbox note]"
-            },
-            command
-        ),
+    emit_denial_event(
+        agent,
+        agent_id.as_deref(),
+        notified,
+        dialog_reason_line(&dialog.body).as_deref(),
+        reason,
+        command,
     );
     if cleared {
         StepOutcome::AnsweredNo {
@@ -2336,6 +2448,67 @@ mod tests {
     fn possibly_empty_variable_rm_is_no() {
         // Variables are not expanded: the command cannot be proven safe.
         assert_no(VAR_RM, "unparseable:");
+    }
+
+    #[test]
+    fn unknown_shape_falls_back_to_decline() {
+        // Cursor on neither/both options: classify_screen cannot decide, but
+        // the fallback must still recognise a permission-shaped dialog.
+        let fx = "\u{256d}\u{2500}\u{256e}\n\u{2502} Frobnicate request from the x agent \u{2502}\n\u{2502} Do you want to proceed? \u{2502}\n\u{2502}   1. Yes \u{2502}\n\u{2502}   2. No \u{2502}\n\u{2570}\u{2500}\u{256f}\n";
+        assert!(matches!(classify_screen(fx), Screen::Undecided(_)));
+        assert!(undecided_fallback_applies(fx));
+        assert!(!undecided_fallback_applies("just some prose\nno dialog"));
+    }
+
+    #[test]
+    fn denial_message_carries_agent_reason_and_full_command() {
+        let fx = include_str!("../tests/fixtures/autoresolve_neg_shell_c_unchecked.txt");
+        let Screen::Dialog(d) = classify_screen(fx) else {
+            panic!("dialog")
+        };
+        let line = dialog_reason_line(&d.body).expect("reason line");
+        assert_eq!(
+            line,
+            "This shell -c script runs rm and could not be checked"
+        );
+        let m = denial_message(
+            Some("the general-purpose agent"),
+            Some("a1b2c3"),
+            true,
+            Some(&line),
+            "default-no",
+            "sudo bash -c 'x'",
+        );
+        for needle in [
+            "general-purpose",
+            "a1b2c3",
+            "could not be checked",
+            "sudo bash -c 'x'",
+        ] {
+            assert!(m.contains(needle), "{m}");
+        }
+    }
+
+    #[test]
+    fn unchecked_shell_c_script_is_never_yes() {
+        // Claude Code's "could not check a shell -c script" guard is a
+        // person-only approval: it must classify as a dialog and get No.
+        let fx = include_str!("../tests/fixtures/autoresolve_neg_shell_c_unchecked.txt");
+        match verdict(fx) {
+            Verdict::No { .. } => {}
+            Verdict::Yes { .. } => panic!("must never auto-approve"),
+        }
+    }
+
+    #[test]
+    fn dead_process_branch_runs_autoresolve() {
+        // An open dialog hides the status line (tokens=0), so the dead-process
+        // branch -- which returns early -- must also run the auto-resolver.
+        let src = include_str!("policy.rs");
+        let i = src
+            .find("\"dead process detected: tokens=0, bashes=0\");")
+            .expect("dead branch");
+        assert!(src[i..i + 1200].contains("run_autoresolve_step("));
     }
 
     #[test]

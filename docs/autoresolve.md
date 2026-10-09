@@ -143,3 +143,17 @@ A dialog is never answered twice without the screen changing.
 
 Kill switch and rate limit apply to every decision. With the feature off, the
 old behavior (`[permission_prompt_monitor]` alert, then decline) is unchanged.
+
+## Denial events (`autoresolve-no`)
+
+Every automatic No raises a HIGH-priority claude-event tagged `autoresolve-no`
+so the main loop sees it as information, not a blocker. The message names the
+denied agent (label and id when the dialog shows one), the dialog's own reason
+line (for example "This shell -c script runs rm and could not be checked"),
+the resolver's reason, and the full command. The main loop decides whether to
+ask the operator for permission. Claude Code's removal guards are never
+answered Yes unless an explicit allow rule matches the whole command.
+
+An unrecognised permission-shaped dialog (question plus numbered options) that
+stays unreadable past the grace period (`undecided_alert_after` cycles) is
+declined with Escape and reported with the same event tag.
