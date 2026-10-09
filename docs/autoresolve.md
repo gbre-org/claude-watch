@@ -147,7 +147,8 @@ old behavior (`[permission_prompt_monitor]` alert, then decline) is unchanged.
 ## Denial events (`autoresolve-no`)
 
 Every automatic No raises a HIGH-priority claude-event tagged `autoresolve-no`
-so the main loop sees it as information, not a blocker. The message names the
+stamped `data.tier = "actionable"` so it routes to the main loop's actionable
+list rather than ambient context. The message names the
 denied agent (label and id when the dialog shows one), the dialog's own reason
 line (for example "This shell -c script runs rm and could not be checked"),
 the resolver's reason, and the full command. The main loop decides whether to
