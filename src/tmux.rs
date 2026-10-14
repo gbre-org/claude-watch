@@ -477,6 +477,22 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
     false
 }
 
+/// Does the slice start (within a few lines) with a dialog's numbered choice
+/// rows: a `1.` row then a `2.` row, each optionally cursored with the
+/// prompt glyph?
+fn followed_by_numbered_options(rest: &[&str]) -> bool {
+    let mut saw_one = false;
+    for line in rest.iter().take(6) {
+        let t = line.trim().trim_start_matches('\u{276f}').trim_start();
+        if t.starts_with("1.") {
+            saw_one = true;
+        } else if t.starts_with("2.") && saw_one {
+            return true;
+        }
+    }
+    false
+}
+
 /// Pure function: does the pane show a BLOCKING interactive question that is
 /// truly awaiting a human answer — an `AskUserQuestion` menu or a
 /// tool-permission confirmation — as opposed to a PASSIVE selector/viewer
@@ -514,14 +530,21 @@ pub(crate) fn blocking_question_visible(pane_output: &str) -> bool {
     } else {
         0
     };
-    for line in &lines[start..] {
+    for (offset, line) in lines[start..].iter().enumerate() {
         let trimmed = line.trim();
         let lower = trimmed.to_lowercase();
 
-        // (1) Permission / confirmation question text.
-        if lower.contains("do you want to")
+        // (1) Permission / confirmation question text -- but ONLY when it is
+        // followed by the dialog's own numbered option rows. The phrase alone
+        // also appears in ordinary assistant prose left in the scrollback
+        // ("Do you want X paused, or ...?"), which on an idle pane stays in
+        // the 25-line window for hours and fired a spurious alarm every
+        // cooldown. Real dialogs always render `1.` / `2.` choices right
+        // under the question.
+        if (lower.contains("do you want to")
             || lower.contains("would you like to")
-            || lower.contains("do you trust")
+            || lower.contains("do you trust"))
+            && followed_by_numbered_options(&lines[start + offset + 1..])
         {
             return true;
         }
@@ -5312,6 +5335,36 @@ mod tests {
             !blocking_question_visible(output),
             "passive viewer overlay must NOT be treated as a blocking question"
         );
+    }
+
+    #[test]
+    fn blocking_question_not_fired_on_assistant_prose_with_question_phrase() {
+        // Regression: ordinary assistant prose ("Do you want ... ?") left in
+        // the scrollback of an idle pane, above a finished-agent footer, is
+        // NOT a dialog. It stayed in the 25-line window for hours and fired
+        // `ask-question-stale` every cooldown.
+        let output = "  Waiting on you:\n\
+                      \x20 - Free space: 229G. Do you want to pause item 7, or\n\
+                      \x20   something cleared?\n\
+                      \x20 - Login: run /login before tonight.\n\
+                      \n\
+                      \u{273b} Worked for 10s \u{00b7} 1 shell, 4 monitors still running\n\
+                      \n\
+                      \u{25cf} Monitor event: \"watcher\"\n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      \u{276f} \n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      \x20 -- INSERT -- \u{23f5}\u{23f5} bypass permissions on \u{00b7} 1 shell, 4 monitors\n\
+                      \n\
+                      \x20 \u{25cf} main\n\
+                      \x20 \u{25ef} general-purpose  Counting finished\u{2026} 11m 18s \u{00b7} \u{2193} 99.5k tokens";
+        assert!(!blocking_question_visible(output));
+    }
+
+    #[test]
+    fn blocking_question_fires_on_question_text_with_uncursored_numbered_rows() {
+        let output = "Do you want to proceed?\n  1. Yes\n  2. No";
+        assert!(blocking_question_visible(output));
     }
 
     #[test]
