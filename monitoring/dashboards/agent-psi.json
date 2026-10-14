@@ -71,7 +71,7 @@
     },
     {
       "id": 2,
-      "title": "Inference — productive vs stalled (60s)",
+      "title": "Inference 60s",
       "type": "stat",
       "gridPos": {
         "h": 5,
@@ -216,7 +216,7 @@
     },
     {
       "id": 3,
-      "title": "Inference — productive vs stalled (300s)",
+      "title": "Inference 300s",
       "type": "stat",
       "gridPos": {
         "h": 5,
