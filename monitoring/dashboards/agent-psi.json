@@ -74,7 +74,7 @@
       "title": "Inference — productive vs stalled (60s)",
       "type": "stat",
       "gridPos": {
-        "h": 6,
+        "h": 5,
         "w": 10,
         "x": 4,
         "y": 0
@@ -219,7 +219,7 @@
       "title": "Inference — productive vs stalled (300s)",
       "type": "stat",
       "gridPos": {
-        "h": 6,
+        "h": 5,
         "w": 10,
         "x": 14,
         "y": 0
@@ -367,7 +367,7 @@
         "h": 5,
         "w": 12,
         "x": 0,
-        "y": 6
+        "y": 5
       },
       "datasource": {
         "type": "prometheus",
@@ -441,7 +441,7 @@
         "h": 5,
         "w": 12,
         "x": 12,
-        "y": 6
+        "y": 5
       },
       "datasource": {
         "type": "prometheus",
@@ -515,7 +515,7 @@
         "h": 5,
         "w": 24,
         "x": 0,
-        "y": 11
+        "y": 10
       },
       "datasource": {
         "type": "prometheus",
@@ -660,7 +660,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 16
+        "y": 15
       },
       "datasource": {
         "type": "prometheus",
@@ -851,7 +851,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 23
       },
       "datasource": {
         "type": "prometheus",
@@ -1019,7 +1019,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 32
+        "y": 31
       },
       "datasource": {
         "type": "prometheus",
@@ -1073,7 +1073,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 40
       },
       "datasource": {
         "type": "prometheus",
@@ -1132,7 +1132,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 49
+        "y": 48
       },
       "datasource": {
         "type": "prometheus",
@@ -1188,69 +1188,6 @@
         }
       },
       "description": "How many agents of each MODEL were stalled at once (mean concurrent agents, 60s window) — the time-in-state companion to the error-count panel above, and the series that answers 'how much did that capacity episode actually cost us, per model'. Legends come from the metric's own model label ({{model}}), so a new family appears without a dashboard edit, and the main loop's model is plotted alongside the workers instead of being aggregated away. Stacked, in agents: unlike agent_psi_inference_stalled_full this is not divided by an active-agent count, so a lone stalled worker reads 1.0 rather than 'the whole fleet is rate-limited', and a fleet split across models still sums honestly."
-    },
-    {
-      "id": 16,
-      "title": "Lost sight of",
-      "type": "stat",
-      "gridPos": {
-        "h": 3,
-        "w": 4,
-        "x": 0,
-        "y": 3
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "agent_psi_stale_agents{scope=\"fleet\",model=\"all\"}",
-          "legendFormat": "fleet"
-        },
-        {
-          "refId": "B",
-          "expr": "agent_psi_stale_agents{scope=\"main\",model=\"all\"}",
-          "legendFormat": "main"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "decimals": 0,
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#cb4b16",
-                "value": 1
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "value_and_name",
-        "colorMode": "value",
-        "graphMode": "area"
-      },
-      "description": "Agents whose CURRENT state is unobservable: no transcript write for AGENT_PSI_STALE_AFTER_SECONDS while the last thing we saw them do was work. Nonzero means a host went away mid-run (a closed laptop lid, a suspended VM, a killed client) OR a tool has been blocking for longer than the threshold — indistinguishable from a transcript, which is why this is its own number rather than being counted as busy or idle. Note the horizon: past AGENT_PSI_LIVE_WINDOW_SECONDS the transcript leaves the live set entirely and stops being counted anywhere, so a long suspension shows here first and then simply drops out."
     }
   ]
 }
