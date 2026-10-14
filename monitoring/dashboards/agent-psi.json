@@ -1194,10 +1194,10 @@
       "title": "Agents we have lost sight of (unobservable)",
       "type": "stat",
       "gridPos": {
-        "h": 5,
+        "h": 2,
         "w": 4,
         "x": 0,
-        "y": 56
+        "y": 3
       },
       "datasource": {
         "type": "prometheus",
