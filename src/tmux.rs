@@ -2331,12 +2331,26 @@ async fn retract_typed_payload(pane: &str, text: &str) {
 /// char is present. Mirrors `container/bin/self-clear`'s
 /// `get_prompt_line_text`, the battle-tested verification primitive.
 pub(crate) fn prompt_line_text(pane_output: &str) -> Option<String> {
-    for line in pane_output.lines().rev() {
-        if let Some(idx) = line.find('\u{276f}') {
-            // Byte index is valid: `❯` is a known char, `find` returns its
-            // start. Slice from just past it (the char is 3 bytes in UTF-8).
-            let after = &line[idx + '\u{276f}'.len_utf8()..];
-            return Some(after.trim().to_string());
+    // Two passes. The input box draws its `❯` in column 0; the slash-command
+    // autocomplete dropdown that opens as soon as a `/` is typed draws its
+    // highlighted row as `  ❯ /login   Sign in with your Anthropic account`,
+    // INDENTED, and it sits BELOW the input box. Taking the last `❯` row
+    // unconditionally therefore reads the menu row once a slash command is
+    // typed, so the typed-payload exclusivity check saw
+    // `/login   Sign in with...` instead of `/login` and refused every
+    // non-cancelling slash-command inject (exit 4). Prefer the column-0 row;
+    // fall back to any `❯` row for layouts that do not draw one.
+    for strict in [true, false] {
+        for line in pane_output.lines().rev() {
+            if let Some(idx) = line.find('\u{276f}') {
+                if strict && idx != 0 {
+                    continue;
+                }
+                // Byte index is valid: the glyph is a known char, `find`
+                // returns its start. Slice from just past it.
+                let after = &line[idx + '\u{276f}'.len_utf8()..];
+                return Some(after.trim().to_string());
+            }
         }
     }
     None
@@ -2364,7 +2378,14 @@ pub(crate) struct StyledPromptLine {
 /// followed by `;5;n` or `;2;r;g;b`) have their arguments skipped so a `2`
 /// inside them is not misread as "faint".
 pub(crate) fn prompt_line_styled(styled_pane: &str) -> Option<StyledPromptLine> {
-    for line in styled_pane.lines().rev() {
+    // Same two-pass row choice as `prompt_line_text`: the column-0 input row
+    // beats an indented autocomplete-menu row.
+    prompt_line_styled_pass(styled_pane, true)
+        .or_else(|| prompt_line_styled_pass(styled_pane, false))
+}
+
+fn prompt_line_styled_pass(styled_pane: &str, strict: bool) -> Option<StyledPromptLine> {
+    'lines: for line in styled_pane.lines().rev() {
         let mut faint = false;
         let mut seen_prompt = false;
         let mut text = String::new();
@@ -2398,6 +2419,13 @@ pub(crate) fn prompt_line_styled(styled_pane: &str) -> Option<StyledPromptLine> 
                 if c == '\u{276f}' {
                     seen_prompt = true;
                     raw.push(c);
+                } else if strict {
+                    // Anything drawn before the glyph (indent included) means
+                    // this is not the column-0 input row.
+                    if line.contains('\u{276f}') {
+                        continue 'lines;
+                    }
+                    break;
                 }
                 continue;
             }
@@ -4899,6 +4927,32 @@ mod tests {
     fn prompt_line_text_none_without_prompt() {
         let output = "no prompt char here\njust text";
         assert_eq!(prompt_line_text(output), None);
+    }
+
+    #[test]
+    fn prompt_line_text_ignores_indented_autocomplete_menu_row() {
+        // Shape of a live pane after typing `/login` (Claude Code 2.1.300):
+        // the input row is column 0, the dropdown below it draws an indented
+        // row with the command description.
+        let output = "\u{276f} /login\n------\n  \u{276f} /login                    Sign in with your Anthropic\n    /design-login             Authorize design-system access";
+        assert_eq!(prompt_line_text(output).as_deref(), Some("/login"));
+        assert!(typed_line_is_exclusively_payload(
+            prompt_line_text(output).as_deref(),
+            "/login"
+        ));
+    }
+
+    #[test]
+    fn prompt_line_text_falls_back_to_indented_row() {
+        let output = "stuff\n  \u{276f} only indented";
+        assert_eq!(prompt_line_text(output).as_deref(), Some("only indented"));
+    }
+
+    #[test]
+    fn styled_prompt_ignores_indented_autocomplete_menu_row() {
+        let cap = "\u{1b}[39m\u{276f}\u{a0}\u{1b}[38;5;153m/login\u{1b}[39m\n\u{1b}[39m  \u{1b}[38;5;153m\u{276f} /login      Sign in\u{1b}[39m\n";
+        let l = prompt_line_styled(cap).unwrap();
+        assert_eq!(l.text, "/login");
     }
 
     #[test]
