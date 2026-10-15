@@ -544,13 +544,25 @@ expiry_auto_self_login = true
 # session on.
 expiry_auto_days = 1
 
+# Renew a hard-capped refresh token EARLY, from the credential store alone
+# (no on-screen warning needed). Fires once refreshTokenExpiresAt is within
+# expiry_lead_hours, preferring an idle pane; once it is within
+# expiry_force_hours (keep above 24) it fires regardless. Only an expiry that
+# has not moved for expiry_hardcap_stable_hours counts: a rolling short-lived
+# token re-stamps itself constantly and would otherwise look "close" forever.
+# 0 lead disables. The operator-facing half (push, chat code entry, 15 min
+# timeout) lives in `self-login`; see docs/watchers.md.
+expiry_lead_hours = 48
+expiry_force_hours = 26
+expiry_hardcap_stable_hours = 12
+
 # Minimum gap between auto-fire attempts (seconds). The warning persists for
 # days, so without this a ten-second poll re-fires the flow all day.
 self_login_retry_seconds = 3600
 
 # Attempts allowed in one expiry window, reset when the credentials are
 # actually renewed. Failing loudly is right; failing every hour forever is not.
-self_login_max_attempts = 3
+self_login_max_attempts = 6
 
 # Escape out of an unconsumed login dialog after this many seconds, handing
 # the pane back. This is the answer to "auto-fire ran at 3am and nobody

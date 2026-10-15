@@ -40,6 +40,13 @@ def _import_self_login(env_overrides=None):
         "CLAUDE_SELF_LOGIN_LOCK",
         "CLAUDE_SELF_LOGIN_STATE",
         "CLAUDE_SELF_LOGIN_NOTIFY_CMD",
+        "CLAUDE_SELF_LOGIN_PUSH_CMD",
+        "CLAUDE_SELF_LOGIN_CHAT_SEND_CMD",
+        "CLAUDE_SELF_LOGIN_CHAT_POLL_CMD",
+        "CLAUDE_SELF_LOGIN_CHAT_SENDER",
+        "CLAUDE_SELF_LOGIN_CODE_TIMEOUT",
+        "CLAUDE_WATCH_NOTIFY_CMD",
+        "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
         "XDG_RUNTIME_DIR",
     ):

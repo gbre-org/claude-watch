@@ -940,6 +940,28 @@ pub struct ReauthConfig {
     #[serde(default = "default_expiry_auto_days")]
     pub expiry_auto_days: u32,
 
+    /// Hard-cap lead time, in hours (default: 48; 0 disables). Fire the
+    /// login flow once the credential store's `refreshTokenExpiresAt` is this
+    /// close, instead of waiting for Claude Code's own on-screen warning (which
+    /// only nags inside the last day, leaving no room for the operator to be
+    /// asleep). Only a refresh token whose expiry has NOT moved for
+    /// `expiry_hardcap_stable_hours` qualifies: a short-lived rolling token
+    /// re-stamps its expiry constantly and would otherwise look "close" forever.
+    #[serde(default = "default_expiry_lead_hours")]
+    pub expiry_lead_hours: u32,
+
+    /// Inside the lead window, wait for the main pane to be idle (a quiet
+    /// moment) before opening the modal. Once the expiry is this many hours
+    /// away or closer (default: 26, i.e. still more than a day of margin) fire
+    /// regardless of idleness. Must stay above 24 to honour the minimum lead.
+    #[serde(default = "default_expiry_force_hours")]
+    pub expiry_force_hours: u32,
+
+    /// How long `refreshTokenExpiresAt` must sit unchanged before it is
+    /// believed to be a hard cap rather than a rolling expiry (default: 12).
+    #[serde(default = "default_expiry_hardcap_stable_hours")]
+    pub expiry_hardcap_stable_hours: u32,
+
     /// Minimum gap between auto-fire attempts (default: 3600 = 1 hour). The
     /// warning persists for days, so without this a poller re-fires every
     /// cycle.
@@ -947,7 +969,7 @@ pub struct ReauthConfig {
     pub self_login_retry_seconds: u64,
 
     /// Give up after this many auto-fire attempts in one expiry window
-    /// (default: 3). Resets when the credentials are renewed. Failing loudly
+    /// (default: 6). Resets when the credentials are renewed. Failing loudly
     /// is right; failing every hour forever is not.
     #[serde(default = "default_self_login_max_attempts")]
     pub self_login_max_attempts: u32,
@@ -1000,6 +1022,9 @@ impl Default for ReauthConfig {
             expiry_watch_enabled: default_expiry_watch_enabled(),
             expiry_auto_self_login: default_expiry_auto_self_login(),
             expiry_auto_days: default_expiry_auto_days(),
+            expiry_lead_hours: default_expiry_lead_hours(),
+            expiry_force_hours: default_expiry_force_hours(),
+            expiry_hardcap_stable_hours: default_expiry_hardcap_stable_hours(),
             self_login_retry_seconds: default_self_login_retry_seconds(),
             self_login_max_attempts: default_self_login_max_attempts(),
             self_login_abandon_seconds: default_self_login_abandon_seconds(),
@@ -1193,12 +1218,24 @@ fn default_expiry_auto_days() -> u32 {
     1
 }
 
+fn default_expiry_lead_hours() -> u32 {
+    48
+}
+
+fn default_expiry_force_hours() -> u32 {
+    26
+}
+
+fn default_expiry_hardcap_stable_hours() -> u32 {
+    12
+}
+
 fn default_self_login_retry_seconds() -> u64 {
     3600 // 1 hour
 }
 
 fn default_self_login_max_attempts() -> u32 {
-    3
+    6
 }
 
 fn default_self_login_abandon_seconds() -> u64 {
@@ -2882,7 +2919,10 @@ cooldown = 300
         assert!(config.reauth.auth_error_auto_self_login);
         assert_eq!(config.reauth.expiry_auto_days, 1);
         assert_eq!(config.reauth.self_login_retry_seconds, 3600);
-        assert_eq!(config.reauth.self_login_max_attempts, 3);
+        assert_eq!(config.reauth.self_login_max_attempts, 6);
+        assert_eq!(config.reauth.expiry_lead_hours, 48);
+        assert_eq!(config.reauth.expiry_force_hours, 26);
+        assert_eq!(config.reauth.expiry_hardcap_stable_hours, 12);
         assert_eq!(config.reauth.self_login_abandon_seconds, 1800);
         assert!(!config.reauth.expiry_from_credentials);
         assert_eq!(config.reauth.credentials_file, "");

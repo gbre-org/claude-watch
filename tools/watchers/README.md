@@ -288,11 +288,20 @@ self-login [--pane PANE] [--log-file PATH] [--state-file PATH]
            start [--foreground] [--url-timeout SECS] [--timeout SECS]
                  [--login-method claudeai|console|platform]
                  [--menu-attempts N] [--force]
+                 [--code-timeout SECS] [--no-watch]
+         | watch [--started-at EPOCH] [--timeout SECS]
          | code CODE [--verify-timeout SECS] [--force]
          | cancel
          | url
          | status
 ```
+
+Out-of-band operation: `start` pushes the OAuth URL straight to the operator
+(it does not wait for the session to relay it), and leaves a detached `watch`
+process that accepts a strict `login code <CODE>` chat message from one
+configured sender and auto-cancels the dialog after `--code-timeout` (default
+900s). Settings, precedence and the full rationale are in `docs/watchers.md`
+("Out-of-band delivery, code entry and the timeout").
 
 The `/login` counterpart to `self-clear`. When Claude Code's credentials lapse
 the session cannot recover on its own — the login screen is a modal that

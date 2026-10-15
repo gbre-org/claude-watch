@@ -414,6 +414,11 @@ pub struct State {
     /// warning window and therefore never "resolves" by position alone.
     #[serde(default)]
     pub last_seen_refresh_expiry_ms: Option<i64>,
+    /// RFC3339 time `last_seen_refresh_expiry_ms` last CHANGED (first sight
+    /// counts). How long it has sat still is what separates a hard-capped
+    /// refresh token from a rolling one that is re-stamped constantly.
+    #[serde(default)]
+    pub refresh_expiry_changed_at: Option<String>,
     /// Tracks whether we've already injected "resume" for a fresh external session
     /// (tokens=0 with Claude idle prompt visible). Reset when tokens become non-zero.
     #[serde(default)]

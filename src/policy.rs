@@ -3534,6 +3534,53 @@ pub(crate) struct BannerEvidence {
     pub login_pending: bool,
 }
 
+/// Inputs to `hardcap_lead_due`, bundled so the call site and the tests read
+/// the same way.
+pub(crate) struct HardcapTiming {
+    /// `refreshTokenExpiresAt - now`, in ms, if the store was readable.
+    pub remaining_ms: Option<i64>,
+    /// Seconds the stored expiry has sat unchanged, if known.
+    pub stable_secs: Option<f64>,
+    /// The main pane is at an idle prompt (a quiet moment).
+    pub pane_idle: bool,
+    /// 0 disables the whole mechanism.
+    pub lead_hours: u32,
+    pub force_hours: u32,
+    pub stable_hours: u32,
+}
+
+/// Is it time to renew a HARD-CAPPED refresh token, with a day or more to spare?
+///
+/// The access token refreshes itself silently; the refresh token is what has a
+/// fixed deadline, and when it lapses the session dies wherever it stands,
+/// usually at the worst moment. So the login is started a day or two EARLY,
+/// while the operator can still be asked. Three conditions, all required:
+///
+///   * inside `lead_hours` of the deadline (and not already past it, which is
+///     the reactive path's territory);
+///   * the stored expiry has been still for `stable_hours`. A short-lived
+///     rolling token re-stamps its expiry on every refresh and is always
+///     "close"; firing for it would re-open the modal forever on a healthy
+///     session. A real cap does not move until a login renews it;
+///   * the pane is idle, OR the deadline is within `force_hours` (kept above
+///     24h so the minimum lead is honoured even when the loop is never quiet).
+pub(crate) fn hardcap_lead_due(t: &HardcapTiming) -> bool {
+    if t.lead_hours == 0 {
+        return false;
+    }
+    let Some(remaining_ms) = t.remaining_ms else {
+        return false;
+    };
+    if remaining_ms <= 0 || remaining_ms > i64::from(t.lead_hours) * 3_600_000 {
+        return false;
+    }
+    match t.stable_secs {
+        Some(s) if s >= f64::from(t.stable_hours) * 3600.0 => {}
+        _ => return false,
+    }
+    t.pane_idle || remaining_ms <= i64::from(t.force_hours) * 3_600_000
+}
+
 /// Decide what the reactive 401-banner path should do, given this cycle's
 /// evidence. Pure, for the same reason `decide_expiry_action` is.
 ///
@@ -4723,6 +4770,11 @@ pub(crate) struct ExpiryEvidence {
     pub max_attempts: u32,
     /// An auto-fired login is already up and waiting for a code.
     pub login_pending: bool,
+    /// The hard-cap lead window is open (see `hardcap_lead_due`): the stored
+    /// refresh expiry is close, has not been moving, and either the pane is
+    /// quiet or the deadline is near enough that waiting is no longer safe.
+    /// Acts like `credentials_may_trigger` and lifts the `auto_days` gate.
+    pub hardcap_due: bool,
 }
 
 /// Decide what the proactive expiry path should do, given this cycle's evidence.
@@ -4762,7 +4814,9 @@ pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
             (pane.min(days_left), true)
         }
         (Some(pane), CredentialExpiry::Unknown) => (pane, false),
-        (None, CredentialExpiry::Expiring { days_left }) if ev.credentials_may_trigger => {
+        (None, CredentialExpiry::Expiring { days_left })
+            if ev.credentials_may_trigger || ev.hardcap_due =>
+        {
             (days_left, true)
         }
         (None, _) => return ExpiryAction::Idle,
@@ -4773,7 +4827,7 @@ pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
         corroborated,
     };
 
-    if !ev.auto_enabled || days_left > ev.auto_days {
+    if !ev.auto_enabled || (days_left > ev.auto_days && !ev.hardcap_due) {
         return alert_only;
     }
     // A login dialog we already opened is still waiting for its code. Firing
@@ -4875,8 +4929,23 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
     }
     if state.last_seen_refresh_expiry_ms != refresh_expiry {
         state.last_seen_refresh_expiry_ms = refresh_expiry;
+        state.refresh_expiry_changed_at = Some(Local::now().to_rfc3339());
         crate::state::save_state(&config.general.state_file, state);
     }
+    let hardcap_due = hardcap_lead_due(&HardcapTiming {
+        remaining_ms: refresh_expiry.map(|e| e - Local::now().timestamp_millis()),
+        stable_secs: state
+            .refresh_expiry_changed_at
+            .as_deref()
+            .and_then(elapsed_since),
+        pane_idle: pane_frame
+            .as_deref()
+            .map(tmux::check_lines_for_idle_prompt)
+            .unwrap_or(false),
+        lead_hours: config.reauth.expiry_lead_hours,
+        force_hours: config.reauth.expiry_force_hours,
+        stable_hours: config.reauth.expiry_hardcap_stable_hours,
+    });
 
     let action = decide_expiry_action(&ExpiryEvidence {
         pane_days_left,
@@ -4892,6 +4961,7 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
         attempts: state.self_login_attempts_this_window,
         max_attempts: config.reauth.self_login_max_attempts,
         login_pending: state.self_login_dialog_opened_at.is_some(),
+        hardcap_due,
     });
 
     // Hand the pane back if an auto-fired login has been sitting unconsumed.
@@ -10132,7 +10202,135 @@ mod tests {
             attempts: 0,
             max_attempts: 3,
             login_pending: false,
+            hardcap_due: false,
         }
+    }
+
+    fn timing() -> HardcapTiming {
+        HardcapTiming {
+            remaining_ms: Some(40 * 3_600_000),
+            stable_secs: Some(48.0 * 3600.0),
+            pane_idle: true,
+            lead_hours: 48,
+            force_hours: 26,
+            stable_hours: 12,
+        }
+    }
+
+    /// Inside the lead window, deadline un-moving, pane quiet: due.
+    #[test]
+    fn hardcap_is_due_inside_the_lead_window_when_quiet() {
+        assert!(hardcap_lead_due(&timing()));
+    }
+
+    #[test]
+    fn hardcap_is_not_due_before_the_lead_window_opens() {
+        let t = HardcapTiming {
+            remaining_ms: Some(49 * 3_600_000),
+            ..timing()
+        };
+        assert!(!hardcap_lead_due(&t));
+    }
+
+    /// The false-positive guard: a rolling short-lived token re-stamps its
+    /// expiry constantly, so it is always "close" and must never qualify.
+    #[test]
+    fn hardcap_ignores_an_expiry_that_keeps_moving() {
+        let t = HardcapTiming {
+            stable_secs: Some(60.0),
+            ..timing()
+        };
+        assert!(!hardcap_lead_due(&t));
+        let unknown = HardcapTiming {
+            stable_secs: None,
+            ..timing()
+        };
+        assert!(!hardcap_lead_due(&unknown));
+    }
+
+    /// A busy pane defers the login, but only while a day of margin remains.
+    #[test]
+    fn hardcap_waits_for_a_quiet_moment_until_the_force_point() {
+        let busy = HardcapTiming {
+            pane_idle: false,
+            ..timing()
+        };
+        assert!(!hardcap_lead_due(&busy), "40h left, busy: wait");
+        let forced = HardcapTiming {
+            pane_idle: false,
+            remaining_ms: Some(25 * 3_600_000),
+            ..timing()
+        };
+        assert!(hardcap_lead_due(&forced), "25h left: fire even if busy");
+    }
+
+    #[test]
+    fn hardcap_never_fires_when_disabled_expired_or_unreadable() {
+        let off = HardcapTiming {
+            lead_hours: 0,
+            ..timing()
+        };
+        assert!(!hardcap_lead_due(&off));
+        let past = HardcapTiming {
+            remaining_ms: Some(-1),
+            ..timing()
+        };
+        assert!(!hardcap_lead_due(&past));
+        let unreadable = HardcapTiming {
+            remaining_ms: None,
+            ..timing()
+        };
+        assert!(!hardcap_lead_due(&unreadable));
+    }
+
+    /// The decision: a due hard cap fires with 2 days left (above the 1-day
+    /// `auto_days` gate) and needs neither a pane warning nor the opt-in
+    /// `expiry_from_credentials`.
+    #[test]
+    fn a_due_hardcap_auto_fires_ahead_of_the_pane_warning() {
+        let ev = ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Expiring { days_left: 2 },
+            credentials_may_trigger: false,
+            hardcap_due: true,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AutoLogin { days_left: 2 }
+        );
+        let not_due = ExpiryEvidence {
+            hardcap_due: false,
+            ..ev
+        };
+        assert_eq!(decide_expiry_action(&not_due), ExpiryAction::Idle);
+    }
+
+    /// The one-dialog latch and the attempt budget still bind a due hard cap.
+    #[test]
+    fn a_due_hardcap_still_respects_the_latch_and_the_budget() {
+        let base = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 2 },
+            credentials_may_trigger: false,
+            hardcap_due: true,
+            ..evidence()
+        };
+        let pending = ExpiryEvidence {
+            login_pending: true,
+            ..base
+        };
+        assert!(matches!(
+            decide_expiry_action(&pending),
+            ExpiryAction::AlertOnly { .. }
+        ));
+        let spent = ExpiryEvidence {
+            attempts: 3,
+            ..base
+        };
+        assert!(matches!(
+            decide_expiry_action(&spent),
+            ExpiryAction::AlertOnly { .. }
+        ));
     }
 
     /// Nothing on the pane and nothing on disk: the daemon stays out of it.

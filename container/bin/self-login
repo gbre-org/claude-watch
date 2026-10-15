@@ -40,6 +40,36 @@ authenticated, the dialog never rendered, or the pane is wedged. All three are
 things the operator must see, so a missing URL is a non-zero exit AND a
 high-priority event — never a quiet success.
 
+Out-of-band operation (the operator never has to go through the session)
+------------------------------------------------------------------------
+The session being re-authenticated may BE the process that would otherwise
+relay the URL: `/login` is a modal that swallows its keystrokes, so a loop
+asked to forward the link is stuck behind the very dialog it is forwarding.
+That wedged a real deployment for hours. So everything the operator needs
+travels around the session, and nothing waits on it:
+
+  * the URL is pushed straight to the operator (push notification and,
+    when configured, a chat message) by this process, not by an event the
+    session must read;
+  * `start` leaves a detached `watch` process behind. It polls the operator
+    chat channel for a strict `login code <CODE>` message from the configured
+    sender, types the code in, and reports the outcome;
+  * if no code arrives within the timeout (default 900s) the same process
+    runs `cancel`, handing the pane back, and tells the operator.
+
+Operator-channel settings (env var wins over the optional TOML file at
+`$XDG_CONFIG_HOME/claude-watch/self-login.toml`; all optional):
+
+  push_cmd          env CLAUDE_SELF_LOGIN_PUSH_CMD, else CLAUDE_WATCH_NOTIFY_CMD,
+                    else `pingme` if on PATH. Invoked `<cmd> -p high <message>`.
+  chat_send_cmd     env CLAUDE_SELF_LOGIN_CHAT_SEND_CMD. Invoked `<cmd> <message>`.
+  chat_poll_cmd     env CLAUDE_SELF_LOGIN_CHAT_POLL_CMD. Must print a JSON list
+                    of messages with `id`, `sender`, `body`, `ts` (epoch secs).
+  chat_sender       env CLAUDE_SELF_LOGIN_CHAT_SENDER. Only this sender's
+                    messages are ever honoured. Code entry is DISABLED unless
+                    it is set (no default: the channel must be named).
+  code_timeout_seconds  env CLAUDE_SELF_LOGIN_CODE_TIMEOUT (default 900).
+
 Configuration (defaults portable; override via CLI flag or env var):
   --log-file PATH    (env $CLAUDE_SELF_LOGIN_LOG)
   --lock-file PATH   (env $CLAUDE_SELF_LOGIN_LOCK)
@@ -77,6 +107,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -381,12 +412,28 @@ def run_notify_cmd(url: str) -> None:
 
 
 def publish_url(pane: str, url: str) -> None:
-    """Fan the fresh OAuth URL out to every sink."""
+    """Fan the fresh OAuth URL out to every sink, operator FIRST.
+
+    The operator push goes before the claude-event on purpose: the event is
+    read by the session, and the session is the thing sitting behind the
+    login modal.
+    """
     write_state({
         "status": "awaiting-code",
         "pane": pane,
         "url": url,
     })
+    cfg = load_settings()
+    if cfg.get("chat_sender") and cfg.get("chat_poll_cmd"):
+        how = "Reply to this chat with:  login code <CODE>"
+    else:
+        how = "Then run on the host:  self-login code <CODE>"
+    tell_operator(
+        cfg,
+        f"Claude Code needs a login. Open this link, authorize, copy the code. "
+        f"{how}\n{url}\n(The dialog auto-cancels after "
+        f"{code_timeout(cfg) // 60} min without a code.)",
+    )
     emit_event(
         f"Claude Code login URL ready. Open it, authorize, then run: "
         f"self-login code <CODE>. URL: {url}",
@@ -397,14 +444,268 @@ def publish_url(pane: str, url: str) -> None:
     run_notify_cmd(url)
 
 
-def publish_failure(pane: str, reason: str, tag: str = "self-login-failed") -> None:
+def publish_failure(pane: str, reason: str, tag: str = "self-login-failed",
+                    notify: bool = True) -> None:
     write_state({"status": "failed", "pane": pane, "reason": reason})
+    if notify:
+        # Out-of-band first, for the same reason publish_url does it.
+        tell_operator(load_settings(), f"self-login FAILED: {reason}")
     emit_event(
         f"self-login FAILED: {reason}",
         tag=tag,
         priority="high",
         data={"pane": pane, "reason": reason},
     )
+
+
+# ---------------------------------------------------------------------------
+# Operator channel: settings, out-of-band messages, chat-delivered code
+# ---------------------------------------------------------------------------
+
+DEFAULT_CODE_TIMEOUT = 900
+POLL_INTERVAL = 5.0
+
+# Exactly `login code <CODE>` and nothing else. Anchored at both ends so a
+# message that merely CONTAINS the phrase (quoted, forwarded, mid-sentence, or
+# an instruction block that includes the example) can never feed a code.
+_CODE_MESSAGE = re.compile(r"^\s*login\s+code\s+(\S+)\s*$", re.IGNORECASE)
+
+
+def _settings_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else Path(_HOME) / ".config"
+    return base / "claude-watch" / "self-login.toml"
+
+
+def load_settings() -> dict:
+    """Operator-channel settings: TOML file first, env vars override."""
+    cfg: dict = {}
+    try:
+        with open(_settings_path(), "rb") as f:
+            cfg = dict(tomllib.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"  WARNING: could not read {_settings_path()}: {exc}")
+    env_map = {
+        "push_cmd": "CLAUDE_SELF_LOGIN_PUSH_CMD",
+        "chat_send_cmd": "CLAUDE_SELF_LOGIN_CHAT_SEND_CMD",
+        "chat_poll_cmd": "CLAUDE_SELF_LOGIN_CHAT_POLL_CMD",
+        "chat_sender": "CLAUDE_SELF_LOGIN_CHAT_SENDER",
+        "code_timeout_seconds": "CLAUDE_SELF_LOGIN_CODE_TIMEOUT",
+    }
+    for key, env in env_map.items():
+        val = os.environ.get(env, "").strip()
+        if val:
+            cfg[key] = val
+    if not cfg.get("push_cmd"):
+        cfg["push_cmd"] = (os.environ.get("CLAUDE_WATCH_NOTIFY_CMD", "").strip()
+                           or ("pingme" if shutil.which("pingme") else ""))
+    return cfg
+
+
+def code_timeout(cfg: dict, override=None) -> int:
+    for raw in (override, cfg.get("code_timeout_seconds")):
+        try:
+            if raw is not None and int(raw) > 0:
+                return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_CODE_TIMEOUT
+
+
+def push_operator(cfg: dict, message: str, priority: str = "high") -> bool:
+    """Push a notification straight to the operator. Never raises."""
+    cmd = (cfg.get("push_cmd") or "").split()
+    if not cmd:
+        log("  push: no push command configured; skipped")
+        return False
+    out, rc = sc.run(cmd + ["-p", priority, message], timeout=30)
+    if rc != 0:
+        log(f"  WARNING: push failed (rc={rc}): {out!r}")
+    else:
+        log("  push delivered")
+    return rc == 0
+
+
+def chat_operator(cfg: dict, message: str) -> bool:
+    """Post to the operator chat channel, if one is configured. Never raises."""
+    cmd = (cfg.get("chat_send_cmd") or "").split()
+    if not cmd:
+        return False
+    out, rc = sc.run(cmd + [message], timeout=30)
+    if rc != 0:
+        log(f"  WARNING: chat send failed (rc={rc}): {out!r}")
+    else:
+        log("  chat message sent")
+    return rc == 0
+
+
+def tell_operator(cfg: dict, message: str, priority: str = "high") -> None:
+    """Every out-of-band channel; one failing never skips the others."""
+    push_operator(cfg, message, priority)
+    chat_operator(cfg, message)
+
+
+def parse_code_message(body) -> str:
+    """Return the code from a strict `login code <CODE>` body, else ''."""
+    if not isinstance(body, str):
+        return ""
+    m = _CODE_MESSAGE.match(body)
+    if not m:
+        return ""
+    code = m.group(1)
+    return "" if validate_code(code) else code
+
+
+def pick_code_message(messages, sender: str, since_ts: float, seen_ids) -> tuple:
+    """Pick the oldest honourable code message: (id, code) or (None, '').
+
+    Honoured means ALL of: the configured sender (exact, case-insensitive; an
+    empty sender honours nobody), sent after this login began (a stale code
+    from an earlier flow is dead and must not be typed), not already consumed,
+    and a body that is exactly `login code <CODE>`.
+    """
+    if not sender or not isinstance(messages, list):
+        return (None, "")
+    best = None
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        mid = msg.get("id")
+        if mid is None or mid in seen_ids:
+            continue
+        if str(msg.get("sender", "")).strip().lower() != sender.strip().lower():
+            continue
+        try:
+            ts = float(msg.get("ts", 0))
+        except (TypeError, ValueError):
+            continue
+        if ts < since_ts:
+            continue
+        code = parse_code_message(msg.get("body"))
+        if not code:
+            continue
+        if best is None or ts < best[0]:
+            best = (ts, mid, code)
+    return (best[1], best[2]) if best else (None, "")
+
+
+def poll_chat(cfg: dict) -> list:
+    """Run the configured poll command; [] on any failure (logged)."""
+    cmd = (cfg.get("chat_poll_cmd") or "").split()
+    if not cmd:
+        return []
+    out, rc = sc.run(cmd, timeout=30)
+    if rc != 0:
+        log(f"  WARNING: chat poll failed (rc={rc}): {out!r}")
+        return []
+    try:
+        data = json.loads(out)
+    except ValueError:
+        log("  WARNING: chat poll output was not JSON")
+        return []
+    return data if isinstance(data, list) else []
+
+
+def spawn_watcher(pane: str, timeout, started_at: float) -> None:
+    """Leave a detached `watch` process behind. Never raises.
+
+    stdio is closed so a supervisor that captures our stdout (the daemon runs
+    `start --foreground --json` and reads until EOF) is not held open by it.
+    """
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--pane", pane,
+           "--log-file", LOG_FILE, "--state-file", STATE_FILE,
+           "--lock-file", LOCKFILE, "watch", "--started-at", repr(started_at)]
+    if timeout:
+        cmd += ["--timeout", str(timeout)]
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True,
+                         close_fds=True)
+        log("  watcher spawned")
+    except Exception as exc:
+        log(f"  WARNING: could not spawn the watcher: {exc}")
+        tell_operator(load_settings(),
+                      "self-login: could not start the timeout watcher; the "
+                      "login dialog will NOT auto-cancel. Run `self-login cancel`.")
+
+
+def run_watch(pane: str, started_at: float, timeout_override=None) -> int:
+    """Wait for a chat-delivered code, or time out and hand the pane back.
+
+    Holds the lock only around the pane-touching actions, never while idle, so
+    a daemon-side `cancel` is not blocked by us sleeping.
+    """
+    cfg = load_settings()
+    timeout = code_timeout(cfg, timeout_override)
+    sender = (cfg.get("chat_sender") or "").strip()
+    chat_on = bool(sender and cfg.get("chat_poll_cmd"))
+    deadline = started_at + timeout
+    seen: set = set()
+    log(f"WATCH: pane={pane} timeout={timeout}s chat_code_entry="
+        f"{'on' if chat_on else 'off'}")
+
+    while time.time() < deadline:
+        text = capture(pane)
+        if text and not login_dialog_visible(text):
+            log("WATCH: login dialog is gone (completed or cancelled elsewhere)")
+            return 0
+        if chat_on:
+            mid, code = pick_code_message(poll_chat(cfg), sender, started_at, seen)
+            if mid is not None:
+                seen.add(mid)
+                lock_fd = acquire_lock()
+                if lock_fd is None:
+                    log("WATCH: lock busy; will retry the code next poll")
+                    seen.discard(mid)
+                else:
+                    try:
+                        ns = argparse.Namespace(force=False, verify_timeout=60)
+                        result = do_code(pane, code, ns)
+                    finally:
+                        os.close(lock_fd)
+                    if result.get("ok"):
+                        write_state({"status": "logged-in", "pane": pane})
+                        emit_event("Claude Code login completed via self-login.",
+                                   tag="self-login-complete", priority="normal",
+                                   data={"pane": pane})
+                        tell_operator(cfg, "Claude Code login completed. Thanks.",
+                                      "normal")
+                        return 0
+                    reason = result.get("reason", "unknown")
+                    publish_failure(pane, reason, tag="self-login-code-failed",
+                                    notify=False)
+                    tell_operator(cfg, f"Login code was not accepted: {reason}. "
+                                       "Send a fresh `login code <CODE>` before "
+                                       "the timeout, or the dialog will cancel.")
+        time.sleep(POLL_INTERVAL)
+
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        log("WATCH: timeout reached but lock busy; leaving it to the daemon watchdog")
+        return 1
+    try:
+        result = do_cancel(pane)
+    finally:
+        os.close(lock_fd)
+    if result.get("ok"):
+        if result.get("cancelled"):
+            write_state({"status": "cancelled", "pane": pane,
+                         "reason": f"no login code within {timeout}s"})
+            emit_event("Claude Code self-login timed out and was cancelled.",
+                       tag="self-login-cancelled", priority="high",
+                       data={"pane": pane})
+            tell_operator(cfg, f"Claude Code login timed out after {timeout}s with "
+                               "no code. The dialog was cancelled and the session "
+                               "has its pane back. A fresh link will be sent on "
+                               "the next attempt.")
+        return 0
+    publish_failure(pane, result.get("reason", "unknown"),
+                    tag="self-login-cancel-failed", notify=False)
+    tell_operator(cfg, "Login timed out and the dialog would NOT close. The "
+                       "session may be stuck behind it: run `self-login cancel`.")
+    return 4
 
 
 def emit_result(json_mode: bool, payload: dict) -> None:
@@ -823,6 +1124,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: 2)")
     s.add_argument("--force", action="store_true",
                    help="Inject /login even if a login dialog is already showing")
+    s.add_argument("--code-timeout", type=int, default=None,
+                   help="Seconds to wait for a code before auto-cancelling "
+                        "(default 900; env CLAUDE_SELF_LOGIN_CODE_TIMEOUT)")
+    s.add_argument("--no-watch", action="store_true",
+                   help="Do not leave the timeout/chat-code watcher behind "
+                        "(test/debug knob: the dialog then stays up until "
+                        "someone cancels it)")
+
+    w = sub.add_parser("watch", help="(internal) wait for a chat-delivered code, "
+                                     "else cancel the dialog after the timeout")
+    w.add_argument("--started-at", type=float, default=None,
+                   help="Epoch seconds the login began (default: now)")
+    w.add_argument("--timeout", type=int, default=None)
 
     c = sub.add_parser("code", help="Type the authorization code into the dialog")
     c.add_argument("code", help="The authorization code pasted back by the operator")
@@ -874,6 +1188,9 @@ def main() -> int:
         print(url)
         return 0
 
+    if subcommand == "watch":
+        return run_watch(pane, args.started_at or time.time(), args.timeout)
+
     if subcommand == "cancel":
         lock_fd = acquire_lock()
         if lock_fd is None:
@@ -898,6 +1215,9 @@ def main() -> int:
                     tag="self-login-cancelled", priority="high",
                     data={"pane": pane},
                 )
+                tell_operator(load_settings(),
+                              "Claude Code login dialog was cancelled; the "
+                              "session has its pane back.", "normal")
             emit_result(args.json, result)
             return 0
         publish_failure(pane, result.get("reason", "unknown"),
@@ -955,7 +1275,10 @@ def main() -> int:
             pass
 
     if result.get("ok"):
+        started_at = time.time()
         publish_url(pane, result["url"])
+        if not args.no_watch:
+            spawn_watcher(pane, args.code_timeout, started_at)
         log("SUCCESS: OAuth URL published")
         if foreground:
             emit_result(args.json, result)

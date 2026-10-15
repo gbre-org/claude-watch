@@ -351,6 +351,7 @@ test-self-clear: ## self-clear config-only smoke tests
 # self-login pure predicates + config paths. No terminal needed.
 test-self-login: ## self-login unit tests (pane predicates, code validation, config)
 	python3 tools/watchers/tests/test_self_login.py
+	python3 tools/watchers/tests/test_self_login_oob.py
 
 # self-login end-to-end against a THROWAWAY tmux session running a fake login
 # screen — never a real Claude Code pane. Split from test-self-login because it

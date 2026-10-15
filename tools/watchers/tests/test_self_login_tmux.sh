@@ -51,6 +51,14 @@ export CLAUDE_SELF_LOGIN_LOG="$WORK/self-login.log"
 export CLAUDE_SELF_LOGIN_STATE="$WORK/self-login.json"
 export CLAUDE_SELF_LOGIN_LOCK="$WORK/self-login.lock"
 unset CLAUDE_SELF_LOGIN_NOTIFY_CMD
+# Operator-channel isolation, same reasoning as the event queue below: with
+# the real push/chat tools on PATH a test run would page the operator for
+# real. Pin the push command to a no-op, drop any chat wiring, point the
+# optional settings file at an empty dir, and keep any leftover watcher short.
+export CLAUDE_SELF_LOGIN_PUSH_CMD=true
+unset CLAUDE_SELF_LOGIN_CHAT_SEND_CMD CLAUDE_SELF_LOGIN_CHAT_POLL_CMD CLAUDE_SELF_LOGIN_CHAT_SENDER
+export XDG_CONFIG_HOME="$WORK/cfg"
+export CLAUDE_SELF_LOGIN_CODE_TIMEOUT=20
 # Event isolation, and it is load bearing. `self-login` emits through whatever
 # `claude-event` is on PATH, and PATH here PREPENDS to the caller's rather than
 # replacing it — so on a host that has the real binary, a test run drops
@@ -447,6 +455,30 @@ if printf '%s' "$OUT" | grep -q '"cancelled": false'; then
   ok "self-login cancel is a no-op on a pane with no login dialog"
 else
   bad "self-login cancel did not report cancelled:false (got: $OUT)"
+fi
+
+tmux kill-session -t "$SESSION" 2>/dev/null
+
+# --- 7. the timeout watcher cancels a dialog nobody answers ---
+#
+# This is the "never wedge" guarantee end to end: with no code coming, the
+# detached watcher must hand the pane back by itself, with nobody calling
+# `cancel`. A fresh fake dialog, a 4s timeout, and the watcher run in the
+# foreground so the test can wait on it.
+tmux new-session -d -s "$SESSION" -x 80 -y 24 "$WORK/fake-cancellable-login.sh"
+sleep 1.5
+"$SELF_LOGIN" --pane "$PANE" watch --timeout 4 >"$WORK/watch.out" 2>"$WORK/watch.err"
+check_eq "self-login watch exits 0 after timing out and cancelling" "0" "$?"
+sleep 0.5
+if tmux capture-pane -t "$PANE" -p | grep -qF "Paste code here"; then
+  bad "the login dialog is STILL on the pane after the watcher timed out"
+else
+  ok "the watcher timed out and the pane is back at the prompt"
+fi
+if grep -q '"status": "cancelled"' "$CLAUDE_SELF_LOGIN_STATE" 2>/dev/null; then
+  ok "watcher recorded status=cancelled"
+else
+  bad "watcher did not record status=cancelled (got: $(cat "$CLAUDE_SELF_LOGIN_STATE" 2>/dev/null))"
 fi
 
 tmux kill-session -t "$SESSION" 2>/dev/null

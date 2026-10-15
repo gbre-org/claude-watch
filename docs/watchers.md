@@ -340,6 +340,47 @@ self-login url                   # print the URL on the pane (no injection)
 self-login status                # print the state file
 ```
 
+### Out-of-band delivery, code entry and the timeout
+
+The session being re-authenticated can be the very process that would relay
+the URL: the `/login` modal swallows its keystrokes, so a loop asked to forward
+the link is stuck behind the dialog it is forwarding. Nothing the operator
+needs therefore routes through the session:
+
+- **URL delivery.** `start` pushes the URL itself (push command, then chat),
+  before emitting the `claude-event`. The push command is
+  `CLAUDE_SELF_LOGIN_PUSH_CMD`, else `CLAUDE_WATCH_NOTIFY_CMD`, else `pingme`
+  if it is on PATH, invoked `<cmd> -p high <message>`. Chat is optional:
+  `CLAUDE_SELF_LOGIN_CHAT_SEND_CMD`, invoked `<cmd> <message>`.
+- **Code entry.** With `CLAUDE_SELF_LOGIN_CHAT_POLL_CMD` (prints a JSON list of
+  `{id, sender, body, ts}`) and `CLAUDE_SELF_LOGIN_CHAT_SENDER` both set, a
+  detached `self-login watch` polls for a message that is EXACTLY
+  `login code <CODE>` from that sender, sent after the login began, and types it
+  in. Each message is consumed once; anything else is ignored. With no sender
+  configured chat code entry is off (there is no default sender).
+- **Never wedge.** `start` always leaves that watcher behind. If no code lands
+  within `code_timeout_seconds` (default 900) it runs `cancel`, handing the pane
+  back, and tells the operator. The daemon's `self_login_abandon_seconds`
+  watchdog remains a second, independent backstop.
+
+All five settings may instead live in
+`$XDG_CONFIG_HOME/claude-watch/self-login.toml` (keys `push_cmd`,
+`chat_send_cmd`, `chat_poll_cmd`, `chat_sender`, `code_timeout_seconds`);
+environment variables win. This is what lets the systemd-run daemon and a
+shell-run `self-login` behave identically without editing the unit.
+
+### Renewing before the hard cap
+
+`refreshTokenExpiresAt` is the deadline that actually kills a session. The
+daemon opens the login flow once it is within `expiry_lead_hours` (default 48),
+preferring a quiet moment (idle pane) and firing regardless once it is within
+`expiry_force_hours` (default 26, so there is always more than a day of margin).
+It only trusts an expiry that has sat unchanged for
+`expiry_hardcap_stable_hours` (default 12): a short-lived rolling token
+re-stamps its expiry constantly and would otherwise look "close" forever. The
+usual attempt/retry bounds (`self_login_max_attempts`, `self_login_retry_seconds`)
+and the one-dialog latch apply.
+
 `start` forks and returns immediately, exactly as `self-clear` does — when the
 caller is the session itself, the TUI is busy running that very command, and
 the turn has to end before the pane reaches an idle prompt. The result lands in
