@@ -4999,7 +4999,7 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
             pass
 
 
-def _hostjob_item_terminal(label: str) -> bool:
+def _hostjob_item_terminal(label: str, qid: str | None = None) -> bool:
     """Return True once the hostjob-bound queue item has left a running
     state (done / abandoned / blocked / vanished).
 
@@ -5009,24 +5009,38 @@ def _hostjob_item_terminal(label: str) -> bool:
     signal. We re-read the queue (uncached) so a just-flipped status is
     observed promptly. Fail-soft: any read error returns False so the
     tail keeps following rather than cutting off a live log.
+
+    A label can be re-run, leaving several queue rows with the same
+    ``hostjob:<label>`` scope (older finished runs plus the live one).
+    When ``qid`` names one of those rows, that row's own status decides.
+    Otherwise the label is terminal only if no matching row is still
+    running / pending, so a stale finished row never ends a live stream.
     """
     data, err = _read_queue()
     if err is not None or not isinstance(data, dict):
         return False
+    matched = False
     for it in data.get("items", []) or []:
         if not isinstance(it, dict):
             continue
         if _extract_hostjob_label(it.get("scope") or []) != label:
             continue
         status = it.get("status")
-        # running / starting (a running item with no content yet) keep
-        # the stream open; anything else is terminal for streaming.
-        return status not in ("running", "pending")
+        live = status in ("running", "pending")
+        if qid and it.get("id") == qid:
+            return not live
+        matched = True
+        if live and not qid:
+            return False
+    if qid and matched:
+        # The requested row vanished but other runs of the label exist:
+        # fall back to the label-wide view.
+        return _hostjob_item_terminal(label)
     # No matching item in the queue (pruned / archived) -> terminal.
     return True
 
 
-def _tail_hostjob_output(label: str) -> Iterator[bytes]:
+def _tail_hostjob_output(label: str, qid: str | None = None) -> Iterator[bytes]:
     """Generator yielding SSE events for a tailed hostjob output file.
 
     Mirrors ``_tail_workload_output`` (same line-oriented plain-text wire
@@ -5172,7 +5186,7 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                     # we subscribed still closes the stream promptly. The
                     # final bytes live in the (coherent-on-close) file, so we
                     # drain the file tail, not the broker, at end-of-stream.
-                    if _hostjob_item_terminal(label):
+                    if _hostjob_item_terminal(label, qid):
                         yield from _drain_pending_terminal()
                         return
                     raw = resp.readline()
@@ -5206,7 +5220,7 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                     # while the item is still genuinely running is treated as
                     # a broker error worth falling back to the file for.
                     for _ in range(20):  # ~2s grace
-                        if _hostjob_item_terminal(label):
+                        if _hostjob_item_terminal(label, qid):
                             yield from _drain_pending_terminal()
                             return
                         time.sleep(0.1)
@@ -5269,7 +5283,7 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
             except OSError:
                 pass
             # Check if the bound queue item has gone terminal.
-            if _hostjob_item_terminal(label):
+            if _hostjob_item_terminal(label, qid):
                 yield from _drain_pending_terminal()
                 return
             # No chunk and not yet terminal: speculatively surface the
@@ -5445,7 +5459,7 @@ def api_queue_stream(qid: str) -> Any:
     # falling through to the agent lookup + `_no_agent` placeholder.
     if hostjob_label:
         return Response(
-            stream_with_context(_tail_hostjob_output(hostjob_label)),
+            stream_with_context(_tail_hostjob_output(hostjob_label, qid)),
             headers=headers,
             direct_passthrough=True,
         )

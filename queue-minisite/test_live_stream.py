@@ -633,6 +633,41 @@ class LiveStreamEndpointTest(unittest.TestCase):
 
     # ---------- format guards ----------
 
+    # ---------- hostjob re-run: stale terminal row must not end a live stream ----------
+
+    def _write_queue(self, items):
+        self.queue_actual.write_text(json.dumps({"items": items}))
+        self.appmod._cache.fetched_at = 0.0
+
+    def test_hostjob_terminal_ignores_older_done_row_for_rerun_label(self):
+        """Older done row + newer running row sharing hostjob:<label>:
+        the label must NOT read as terminal (regression: the first
+        matching row, the stale done one, used to decide)."""
+        self._write_queue([
+            {"id": "q-2026-01-01-aaaa", "status": "done",
+             "scope": ["hostjob:rerun-job"]},
+            {"id": "q-2026-01-02-bbbb", "status": "running",
+             "scope": ["hostjob:rerun-job"]},
+        ])
+        self.assertFalse(self.appmod._hostjob_item_terminal("rerun-job"))
+        # Keyed by the live row's own id: still live.
+        self.assertFalse(
+            self.appmod._hostjob_item_terminal("rerun-job", "q-2026-01-02-bbbb"))
+        # Keyed by the stale row's id: that run really is finished.
+        self.assertTrue(
+            self.appmod._hostjob_item_terminal("rerun-job", "q-2026-01-01-aaaa"))
+
+    def test_hostjob_terminal_when_all_rows_finished_or_absent(self):
+        self._write_queue([
+            {"id": "q-2026-01-01-aaaa", "status": "done",
+             "scope": ["hostjob:rerun-job"]},
+            {"id": "q-2026-01-02-bbbb", "status": "abandoned",
+             "scope": ["hostjob:rerun-job"]},
+        ])
+        self.assertTrue(self.appmod._hostjob_item_terminal("rerun-job"))
+        self.assertTrue(self.appmod._hostjob_item_terminal("no-such-label"))
+
+
     def test_stream_400_on_bad_qid_format(self):
         """Malformed queue id (not matching the q-XXXX regex) -> 400."""
         r = self.client.get("/api/queue/not-a-real-id/stream")
