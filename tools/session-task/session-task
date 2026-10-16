@@ -4182,8 +4182,22 @@ def _hostjob_effective_terminal(label, running_age_seconds):
         # reached terminal), or we're inside the launch race. Gate on the
         # window to exclude the race. rc is unrecoverable => present as a
         # plain `done` (no evidence of failure to justify abandoned).
+        #
+        # Only infer "cleaned" when the runner's state directory is actually
+        # VISIBLE and non-empty. Where the CLI runs in a different filesystem
+        # view than the host runner (e.g. inside a container) the directory
+        # is absent or empty, so a missing status.json says nothing about the
+        # job; flipping would mark LIVE jobs finished. Mirrors the minisite's
+        # `surface_visible` guard.
+        surface_visible = False
+        try:
+            with os.scandir(HOSTJOB_LOG_DIR) as _entries:
+                surface_visible = any(True for _ in _entries)
+        except OSError:
+            surface_visible = False
         if (
-            running_age_seconds is not None
+            surface_visible
+            and running_age_seconds is not None
             and running_age_seconds > HOSTJOB_STARTING_WINDOW_SECONDS
         ):
             return {"status": "done", "reason": None}

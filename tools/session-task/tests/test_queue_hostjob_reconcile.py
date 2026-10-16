@@ -169,11 +169,40 @@ def test_missing_state_dir_past_window_reconciles_to_done():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         _write_queue(env, [_running_hostjob_row("q-c", "gonejob", age_seconds=3600)])
-        # No status.json written at all.
+        # No status.json for this label, but the state dir is visible and
+        # holds another label (proof the surface is readable).
+        _write_status(env, "otherjob", {"status": "running", "rc": None})
         r = _run(env, "queue", "reconcile-hostjobs", "--json")
         assert r.returncode == 0, r.stderr
         it = _read_item(env, "q-c")
         assert it["status"] == "done", it
+
+
+# ---------------------------------------------------------------------------
+# state dir INVISIBLE (absent / empty, e.g. CLI in a different filesystem view
+# than the runner) + old row -> keep running; a missing status.json is no
+# evidence the job finished.
+# ---------------------------------------------------------------------------
+def test_invisible_state_dir_past_window_keeps_running():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        assert not Path(env["HOSTJOB_LOG_DIR"]).exists()
+        _write_queue(env, [_running_hostjob_row("q-iv", "livejob", age_seconds=3600)])
+        r = _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == []
+        assert _read_item(env, "q-iv")["status"] == "running"
+
+
+def test_empty_state_dir_past_window_keeps_running():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        Path(env["HOSTJOB_LOG_DIR"]).mkdir(parents=True)
+        _write_queue(env, [_running_hostjob_row("q-ev", "livejob", age_seconds=3600)])
+        r = _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == []
+        assert _read_item(env, "q-ev")["status"] == "running"
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +313,24 @@ def test_quarantine_missing_state_dir_past_window_reaped():
         _write_queue(
             env, [_quarantined_hostjob_row("q-qm", "cleanedjob", age_seconds=3600)]
         )
-        # No status.json at all.
+        # No status.json for this label; state dir visible via another label.
+        _write_status(env, "otherjob", {"status": "running", "rc": None})
         r = _run(env, "queue", "reconcile-hostjobs", "--json")
         assert r.returncode == 0, r.stderr
         assert _read_item(env, "q-qm")["status"] == "abandoned"
+
+
+# An INVISIBLE state dir proves nothing: leave the quarantine alone.
+def test_quarantine_invisible_state_dir_left_alone():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        _write_queue(
+            env, [_quarantined_hostjob_row("q-qi", "livejob", age_seconds=3600)]
+        )
+        r = _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == []
+        assert _read_item(env, "q-qi")["status"] == "quarantined"
 
 
 # SAFETY: a quarantine whose runner still reports `running` is a LIVE
