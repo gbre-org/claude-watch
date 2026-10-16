@@ -283,6 +283,7 @@ test-hooks: ## obligations + PreToolUse/PostToolUse hook suites
 	python3 tools/obligations/shell_ast.py --test
 	tools/hooks/tests/pre-tool-obligations-gate-hook.test
 	tools/hooks/tests/pre-agent-queue-gate-hook.test
+	tools/hooks/tests/pre-agent-queue-gate-hook-branch-scope.test
 	tools/hooks/tests/pre-tool-claude-watch-alert-gate-hook.test
 	tools/hooks/tests/user-prompt-claude-watch-alert-record-hook.test
 	tools/hooks/tests/pre-tool-dispatch-gate-hook.test

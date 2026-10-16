@@ -1272,6 +1272,14 @@ def _new_group_id():
 # --- scope tokens --------------------------------------------------------
 
 _TYPED_TOKEN_RE = re.compile(r"^(repo|resource|book|agent-proto):")
+# `branch:<repo>@<branch>` scope tokens (worktree-derived scope, phase 0).
+# A branch-qualified claim is strictly narrower than `repo:<repo>`. The split
+# is on the FIRST `@` (repo dir names never contain `@`; branch names may
+# contain `/`). Overlap: same repo+branch overlaps itself, different
+# branches/repos are disjoint, and `repo:R` / `path:R/..` overlap every
+# `branch:R@*` (a whole-repo or path claim does not say which branch).
+# Phase 0 ships the token type only: nothing in the CLI emits it yet.
+_BRANCH_TOKEN_PREFIX = "branch:"
 # `path:<repo>/<subdir>` scope tokens (added 2026-05-11 to fix
 # over-serialization within large repos -- e.g. an example-monorepo's
 # monitoring/ vs queue-minisite/ subtrees both tagging `repo:example-monorepo`
@@ -1304,6 +1312,30 @@ def _task_token_target(tok):
     if not _is_task_token(tok):
         return None
     return tok[len(_TASK_TOKEN_PREFIX):]
+
+
+_BRANCH_BAD_CHARS_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+
+
+def _parse_branch_token(tok):
+    """Return (repo, branch) for a valid `branch:<repo>@<branch>`, else None."""
+    if not isinstance(tok, str) or not tok.startswith(_BRANCH_TOKEN_PREFIX):
+        return None
+    body = tok[len(_BRANCH_TOKEN_PREFIX):]
+    repo, sep, branch = body.partition("@")
+    if not sep or not repo or not branch:
+        return None
+    if "/" in repo or _BRANCH_BAD_CHARS_RE.search(repo):
+        return None
+    if (_BRANCH_BAD_CHARS_RE.search(branch) or "@{" in branch
+            or ".." in branch or branch.startswith(("/", "-"))
+            or branch.endswith(("/", ".", ".lock")) or "//" in branch):
+        return None
+    return (repo, branch)
+
+
+def _is_branch_token(tok):
+    return _parse_branch_token(tok) is not None
 
 
 def _normalize_token(tok):
@@ -1353,6 +1385,15 @@ def _normalize_token(tok):
                 f"(use repo:<name> for the whole repo): {tok!r}"
             )
         return f"{_PATH_TOKEN_PREFIX}{'/'.join(segments)}"
+    if tok.startswith(_BRANCH_TOKEN_PREFIX):
+        parsed = _parse_branch_token(tok)
+        if parsed is None:
+            raise ValueError(
+                f"branch: tokens must look like branch:<repo>@<branch> with a "
+                f"non-empty repo (no '/' or '@') and a git-valid branch "
+                f"(no spaces, control chars, '@{{', '..', '~^:?*[\\'): {tok!r}"
+            )
+        return tok
     if _TYPED_TOKEN_RE.match(tok):
         return tok
     if _is_task_token(tok):
@@ -1613,6 +1654,8 @@ def _repo_scope_names(scope):
             n = _path_token_repo(tok)
             if n:
                 names.add(n)
+        elif _is_branch_token(tok):
+            names.add(_parse_branch_token(tok)[0])
     return names
 
 
@@ -1802,6 +1845,8 @@ def _tokens_overlap(a, b):
       (and '*'). They never overlap regular scope tokens. Lock machinery
       uses this so `queue lock task:q-XXXX` parks any pending item that
       lists `task:q-XXXX` in its scope.
+    - `branch:R@B` overlaps only the identical token, `repo:R`, and
+      `path:R/...`; other branches/repos are disjoint.
     - Typed/other tokens overlap only if equal.
 
     NOTE: `task:` tokens are EXEMPT from group-merge and running-scope
@@ -1847,6 +1892,21 @@ def _tokens_overlap(a, b):
         if len(ra) <= len(rb):
             return rb[: len(ra)] == ra
         return ra[: len(rb)] == rb
+    # `branch:R@B`: same token overlaps itself; `repo:R` and `path:R/..`
+    # overlap every branch of R; everything else (other branch, other repo,
+    # other namespace) is disjoint. A malformed branch token falls through to
+    # exact-match below.
+    pa_b = _parse_branch_token(a)
+    pb_b = _parse_branch_token(b)
+    if pa_b or pb_b:
+        if pa_b and pb_b:
+            return pa_b == pb_b
+        br, other = (pa_b, b) if pa_b else (pb_b, a)
+        if other.startswith("repo:"):
+            return other[len("repo:"):] == br[0]
+        if _is_path_token(other):
+            return _path_token_repo(other) == br[0]
+        return False
     # `repo:X` overlaps any `path:X/...`: the broad whole-repo claim wins.
     a_is_repo = a.startswith("repo:")
     b_is_repo = b.startswith("repo:")
