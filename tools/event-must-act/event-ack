@@ -375,6 +375,40 @@ def _resolve_session_task_cli() -> str | None:
     return None
 
 
+QUEUE_QUARANTINED_SOURCE_EVENTS = (
+    "queue/queue-quarantined", "claude-watch/queue-quarantined")
+
+
+def quarantine_reminder(entry: dict | None, key: str) -> str:
+    """One-line reminder when the acked key is a still-QUARANTINED queue row.
+
+    Acking a queue-quarantined event does not release the row; it keeps
+    holding its scope. Best-effort and silent on any lookup problem."""
+    if ((entry or {}).get("source_event", "") or "") \
+            not in QUEUE_QUARANTINED_SOURCE_EVENTS:
+        return ""
+    m = _QID_RE.search(key or "")
+    cli = _resolve_session_task_cli()
+    if not m or not cli:
+        return ""
+    qid = m.group(0)
+    try:
+        proc = subprocess.run([cli, "queue", "show", qid],
+                              capture_output=True, text=True, timeout=10,
+                              check=False)
+        if proc.returncode != 0:
+            return ""
+        status = json.loads(proc.stdout).get("status")
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        return ""
+    if status != "quarantined":
+        return ""
+    return (f"REMINDER: {qid} is still QUARANTINED and holding its scope; "
+            f"ack did not release it. Run `session-task queue release {qid} "
+            f"--reason '<why>'` (dead/finished) or `session-task queue "
+            f"resurrect {qid}` (should still run).")
+
+
 def verify_orphan_resolved(
     entry: dict | None, key: str, *, verified_false_positive: bool = False,
 ) -> tuple[bool, str]:
@@ -604,7 +638,8 @@ def _classify_inline(source: str, tag: str, message: str,
 
 
 def ingest(state_dir: Path, source: str, tag: str,
-           message: str, shipped_tier: str | None = None) -> dict:
+           message: str, shipped_tier: str | None = None,
+           action_hint: str | None = None) -> dict:
     """Classify event and route to pending or ambient. Excluded
     events are no-op (Signal stays on its own gate). ``shipped_tier`` is the
     producer-shipped tier (event ``data.tier``); it takes precedence over the
@@ -613,6 +648,12 @@ def ingest(state_dir: Path, source: str, tag: str,
     tier = cls.get("tier", "ambient")
     reason = cls.get("reason", "")
     unclassified = bool(cls.get("unclassified"))
+    if action_hint and tier == "actionable":
+        # Producer-shipped instruction (event data.action): surface it as the
+        # pending entry's reason, which is what `event-ack list` and the gate
+        # banner show, so the required action is visible where it is read.
+        reason = f"{action_hint.strip()} [{reason}]" if reason else \
+            action_hint.strip()
     if tier == "excluded":
         return {"routed": "excluded", "tier": tier, "reason": reason,
                 "unclassified": unclassified}
@@ -653,6 +694,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Producer-SHIPPED tier (actionable|ambient|excluded) "
                          "from the event's data.tier; takes precedence over "
                          "the consumer-side classifier table.")
+
+    sp.add_argument("--action-hint", default=None,
+                    help="Producer-shipped instruction (event data.action); "
+                         "stored as the pending entry's reason.")
 
     sp = sub.add_parser("add", help="Add a pending actionable entry.")
     sp.add_argument("key")
@@ -802,7 +847,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "ingest":
         res = ingest(state_dir, args.source, args.tag, args.message,
-                     shipped_tier=args.tier)
+                     shipped_tier=args.tier,
+                     action_hint=args.action_hint)
         print(json.dumps(res))
         return 0
 
@@ -862,6 +908,9 @@ def main(argv: list[str] | None = None) -> int:
         res = ack_pending(state_dir, args.key, args.action)
         if res["removed"]:
             print(f"Acked: {args.key} (action: {args.action})")
+            reminder = quarantine_reminder(entry, args.key)
+            if reminder:
+                print(reminder)
         else:
             print(f"Warning: \"{args.key}\" was not pending "
                   f"(idempotent no-op)")
