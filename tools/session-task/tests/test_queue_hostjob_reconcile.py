@@ -381,3 +381,51 @@ def test_queue_list_auto_reaps_quarantine():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# revive: a reconcile-closed row whose worker is verifiably alive is reopened
+# ---------------------------------------------------------------------------
+def _closed_by_reconcile(row, status="done"):
+    row = dict(row)
+    row["status"] = status
+    row["reconciled_hostjob"] = True
+    row["completed_at"] = row["created_at"]
+    return row
+
+
+def test_reconciled_done_row_with_live_worker_is_revived():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        row = _closed_by_reconcile(_running_hostjob_row("q-r", "livejob", age_seconds=900))
+        _write_queue(env, [row])
+        _write_status(env, "livejob", {"status": "running", "rc": None, "queue_id": "q-r"})
+        r = _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == [{"id": "q-r", "status": "running"}]
+        it = _read_item(env, "q-r")
+        assert it["status"] == "running"
+        assert it["revived_from_status"] == "done"
+        assert "completed_at" not in it
+
+
+def test_revive_requires_runner_to_name_this_queue_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        row = _closed_by_reconcile(_running_hostjob_row("q-old", "reused", age_seconds=900))
+        _write_queue(env, [row])
+        _write_status(env, "reused", {"status": "running", "queue_id": "q-new"})
+        r = _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert r.returncode == 0, r.stderr
+        assert _read_item(env, "q-old")["status"] == "done"
+
+
+def test_non_reconciled_done_row_is_not_revived():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        row = _closed_by_reconcile(_running_hostjob_row("q-n", "normal", age_seconds=900))
+        row.pop("reconciled_hostjob")
+        _write_queue(env, [row])
+        _write_status(env, "normal", {"status": "running", "queue_id": "q-n"})
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-n")["status"] == "done"
