@@ -237,6 +237,9 @@ jobs:
       - name: Run make-help index gate
         run: make test-make-help
 
+      - name: Run Build Info open-PR tile gate
+        run: make test-dashboard-build-info
+
       # The bounded/retrying apt wrapper THIS workflow's package-install
       # steps run through. Deliberately placed before the step that uses it
       # so a broken wrapper is reported as a wrapper failure rather than as

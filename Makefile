@@ -83,7 +83,7 @@
 # Tests — repo-wide gates + installers
 .PHONY: test-doc-links test-claude-md-size test-install-hooks
 .PHONY: test-install-host-skills test-install-linked-skills test-install-host-cron test-install-links
-.PHONY: test-ci-apt-install test-make-help test-prometheus-rules
+.PHONY: test-ci-apt-install test-make-help test-prometheus-rules test-dashboard-build-info
 # Build + install / deploy — Linux host
 .PHONY: build install install-skills install-cron deploy-systemd deploy
 # Container image + compose stack (workbot)
@@ -718,6 +718,11 @@ test-ci-apt-install: ## Tests for the bounded/retrying CI apt installer
 # two deprecated aliases on an explicit allowlist. Read-only; builds nothing.
 test-make-help: ## Gate: `make help` indexes every public target
 	scripts/tests/make-help.test
+
+# Gate: the Build Info "open PRs" tile (drafts + non-drafts, one number) stays
+# wired -- target, column and field filter. Offline JSON inspection only.
+test-dashboard-build-info: ## Gate: Build Info open-PR-count tile is wired
+	scripts/tests/dashboard-build-info.test
 
 # Gate: monitoring/prometheus/claude-watch.rules.yml is checked BY THE REPO
 # THAT OWNS IT. Runs `promtool check rules` (syntax + a positive rule count)

@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Gate: Build Info keeps its "open PRs" tile wired end to end.
+
+The tile counts every open PR on the repo (drafts and non-drafts together)
+via an Infinity target against GitHub's issue-search endpoint. It only
+renders if four things agree, so assert all of them offline:
+  1. a target queries is:pr + is:open for gbre-org/claude-watch and does
+     NOT filter on draft state;
+  2. that target selects total_count under the column name "open PRs";
+  3. the panel's reduceOptions field regex lets "open PRs" through;
+  4. no other target in the panel shares its refId.
+Pure JSON inspection: no network, no Grafana, deterministic.
+"""
+import json
+import re
+import sys
+from pathlib import Path
+
+DASH = Path(__file__).resolve().parents[2] / "monitoring/dashboards/claude-watch.json"
+TILE = "open PRs"
+
+
+def main() -> int:
+    data = json.loads(DASH.read_text())
+    panels = [p for p in data["panels"] if p.get("title") == "Build Info"]
+    errs = []
+    if len(panels) != 1:
+        print(f"FAIL: expected exactly one Build Info panel, got {len(panels)}")
+        return 1
+    panel = panels[0]
+    targets = panel["targets"]
+    ref_ids = [t["refId"] for t in targets]
+    if len(ref_ids) != len(set(ref_ids)):
+        errs.append(f"duplicate refIds: {ref_ids}")
+
+    hits = [t for t in targets if any(c.get("text") == TILE for c in t.get("columns", []))]
+    if len(hits) != 1:
+        errs.append(f"expected one target with column {TILE!r}, got {len(hits)}")
+    else:
+        t = hits[0]
+        url = t.get("url", "")
+        for needle in ("repo:gbre-org/claude-watch", "is:pr", "is:open"):
+            if needle not in url:
+                errs.append(f"url missing {needle!r}: {url}")
+        if "draft" in url:
+            errs.append(f"url must not split on draft state: {url}")
+        col = [c for c in t["columns"] if c["text"] == TILE][0]
+        if col["selector"] != "total_count" or col["type"] != "number":
+            errs.append(f"column must be total_count/number, got {col}")
+
+    fields = panel["options"]["reduceOptions"]["fields"]
+    if not re.search(fields.strip("/"), TILE):
+        errs.append(f"reduceOptions.fields {fields!r} filters out {TILE!r}")
+
+    if errs:
+        print("FAIL:\n  " + "\n  ".join(errs))
+        return 1
+    print("ok: Build Info 'open PRs' tile wired")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
