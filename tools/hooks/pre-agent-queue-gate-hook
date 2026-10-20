@@ -553,7 +553,7 @@ def _prompt_names_repo(prompt: str, repo: str) -> bool:
 
 
 def _scope_repo_names(scope: list[str]) -> set[str]:
-    """Repo names claimed by `repo:` / `path:` tokens in a scope list."""
+    """Repo names claimed by `repo:` / `path:` / `branch:` tokens in a scope list."""
     names: set[str] = set()
     for tok in scope or []:
         if not isinstance(tok, str):
@@ -567,6 +567,13 @@ def _scope_repo_names(scope: list[str]) -> set[str]:
             first = body.split("/", 1)[0].strip() if body else ""
             if first:
                 names.add(first)
+        elif tok.startswith("branch:"):
+            # `branch:<repo>@<branch>` (worktree-derived scope): the repo part
+            # is the claimed repo. Malformed tokens contribute nothing.
+            repo, sep, branch = tok[len("branch:"):].partition("@")
+            repo = repo.strip()
+            if sep and branch and repo and "/" not in repo:
+                names.add(repo)
     return names
 
 

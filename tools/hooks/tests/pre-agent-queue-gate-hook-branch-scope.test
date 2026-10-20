@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Unit tests: pre-agent-queue-gate-hook understands `branch:<repo>@<branch>`
+scope tokens (worktree-derived scope, phase 0). Pure in-process; touches no
+queue state. Also pins the pre-existing repo:/path: behaviour.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+os.environ["CLAUDE_REPO_ORGS"] = "acme-sf"
+HOOK = Path(__file__).resolve().parent.parent / "pre-agent-queue-gate-hook"
+loader = importlib.machinery.SourceFileLoader("qgate_hook", str(HOOK))
+spec = importlib.util.spec_from_loader("qgate_hook", loader)
+hook = importlib.util.module_from_spec(spec)
+loader.exec_module(hook)
+
+fails = []
+
+
+def check(name, cond):
+    print(("  PASS  " if cond else "  FAIL  ") + name)
+    if not cond:
+        fails.append(name)
+
+
+names = hook._scope_repo_names
+check("branch token yields repo", names(["branch:alpha@main"]) == {"alpha"})
+check("branch with slashes in branch", names(["branch:alpha@user/feat"]) == {"alpha"})
+check("malformed branch tokens ignored",
+      names(["branch:alpha", "branch:@x", "branch:a/b@c", "branch:alpha@"]) == set())
+check("mixed with repo/path", names(["repo:a", "path:b/x", "branch:c@d", "hostjob:z"]) == {"a", "b", "c"})
+check("regression repo/path only", names(["repo:a", "path:b/x/y", "resource:r", "*"]) == {"a", "b"})
+check("regression empty", names([]) == set() and names(None) == set())
+
+mm = hook._scope_target_mismatch
+prompt_other = "Fix rendering in acme-sf/beta-svc.\n"
+check("branch scope on other repo, prompt targets beta-svc -> deny",
+      mm(prompt_other, ["branch:alpha@main"]) is not None)
+check("branch scope matching prompt target -> allow",
+      mm("Fix rendering in acme-sf/alpha.\n", ["branch:alpha@main"]) is None)
+check("branch scope, no clear target -> allow (default-open)",
+      mm("do the thing", ["branch:alpha@main"]) is None)
+check("regression: repo scope mismatch still denies",
+      mm(prompt_other, ["repo:alpha"]) is not None)
+check("regression: star allows", mm(prompt_other, ["*"]) is None)
+check("regression: non-repo scope allows", mm(prompt_other, ["resource:x"]) is None)
+
+print(f"RESULT: {'FAIL' if fails else 'ok'} ({len(fails)} failures)")
+sys.exit(1 if fails else 0)
