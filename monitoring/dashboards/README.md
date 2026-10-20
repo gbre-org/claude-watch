@@ -183,6 +183,10 @@ decides the answer is redone in the selector.
   build. No dashboard tile since 2026-08-23 (the Build Info panel is about
   the daemon, not the exporter); read it with `curl -s localhost:9099/metrics
   | grep build_info`. See `monitoring/prometheus/README.md`.
+- "open PRs" (Build Info's fourth tile, drafts + non-drafts together) → no
+  metric at all: Infinity reads `total_count` from
+  `api.github.com/search/issues?q=repo:gbre-org/claude-watch+is:pr+is:open`
+  at render time, same datasource as "latest merged".
 - "latest merged" (Build Info's third tile) → no metric at all: Infinity
   fetches `api.github.com/repos/gbre-org/claude-watch/pulls` at render time
 

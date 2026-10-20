@@ -358,7 +358,7 @@
       "id": 47,
       "title": "Build Info",
       "type": "stat",
-      "description": "Identity of the RUNNING daemon binary (commit, PR) alongside the repo's most recently MERGED pull request on GitHub -- a gap between the PR shown here and the \"latest merged\" tile is un-deployed work.\n\nMIXED AGAIN, ON PURPOSE (2026-08-26, Andrew #5629). This panel was split single-datasource in #716/#5548 because an UNAUTHENTICATED Infinity/GitHub target (60 req/hr/IP) batched into one /api/ds/query request could fail the WHOLE panel -- including the healthy Prometheus tiles -- the moment GitHub rate-limited it. That risk is now much lower: the Infinity datasource (uid `infinity`) is authenticated with a GitHub token (andrew-sf-tools b19defc, 5,000 req/hr), so re-mixing the commit/PR Prometheus tiles with the latest-merged GitHub tile back into one panel is acceptable again. The standalone \"Latest Merged PR\" panel (#717) is retired -- its Infinity target and \"#NNN\" formatting move here verbatim as the third tile, and its panel-header link to the merged-PR list moves to this panel's links array. commit/PR still come from the claude_watch_build_info gauge (src/metrics.rs, stamped at build time by build.rs) and only move on a deploy; \"latest merged\" moves the moment a PR merges on GitHub.\n\nTILE PLUMBING. The gauge's VALUE is a constant 1 and everything interesting is in its labels, so a labelsToFields transformation -- scoped to refId A, so it cannot touch the GitHub frame (refId C) -- promotes commit/pr to fields; filterFieldsByName (also scoped to A) drops the scrape-added labels (instance/job/source/version); pr is converted to a number so the `prefix:#` unit renders #714 instead of \"714\"; organize renames pr -> PR. The GitHub frame (C) keeps its merged_at TIME field -- Infinity only hangs the pr/title columns on the value field as labels when the frame has a time field -- so a byType override renames it to \"merged at\" and the panel's field selector (/^(commit|PR|latest merged)$/) leaves it out; a byFrameRefID override on C renames its value field to \"latest merged\" and carries the same color/unit/decimals/noValue the standalone panel used to render \"#NNN\".\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first -- PR number order inverts merged order routinely, so `max(number)` would show the wrong PR every time that happens.\n\nGEOMETRY IS LOAD-BEARING. A stat tile only stacks its name above its value while the tile is at most ~2.5x wider than it is tall; past that ratio Grafana switches to the wide layout and puts the name to the LEFT of the value. Three tiles in a full-width 24-column panel would need h=9 to stack -- half width (w=12) with h=5 puts each tile at roughly 310x155 and stacks, the same shape as the Session Timers tiles at the top of the board. This panel keeps that half-width/h=5 geometry and its existing gridPos -- the standalone panel's freed grid slot to its left is simply no longer allocated, not backfilled, so widening or shortening this panel would flip the tiles back onto one line; move w and h together if that ever changes.\n\nVALUE SIZE IS BOUNDED BY THE PHONE, not the desktop: options.text.valueSize is 24, chosen at 390px width where 26px grazes and 28px collides with the neighbouring tile. Check any change to it at phone width, not desktop.",
+      "description": "Identity of the RUNNING daemon binary (commit, PR) alongside the repo's most recently MERGED pull request on GitHub -- a gap between the PR shown here and the \"latest merged\" tile is un-deployed work.\n\nMIXED AGAIN, ON PURPOSE (2026-08-26, Andrew #5629). This panel was split single-datasource in #716/#5548 because an UNAUTHENTICATED Infinity/GitHub target (60 req/hr/IP) batched into one /api/ds/query request could fail the WHOLE panel -- including the healthy Prometheus tiles -- the moment GitHub rate-limited it. That risk is now much lower: the Infinity datasource (uid `infinity`) is authenticated with a GitHub token (andrew-sf-tools b19defc, 5,000 req/hr), so re-mixing the commit/PR Prometheus tiles with the latest-merged GitHub tile back into one panel is acceptable again. The standalone \"Latest Merged PR\" panel (#717) is retired -- its Infinity target and \"#NNN\" formatting move here verbatim as the third tile, and its panel-header link to the merged-PR list moves to this panel's links array. commit/PR still come from the claude_watch_build_info gauge (src/metrics.rs, stamped at build time by build.rs) and only move on a deploy; \"latest merged\" moves the moment a PR merges on GitHub.\n\nTILE PLUMBING. The gauge's VALUE is a constant 1 and everything interesting is in its labels, so a labelsToFields transformation -- scoped to refId A, so it cannot touch the GitHub frame (refId C) -- promotes commit/pr to fields; filterFieldsByName (also scoped to A) drops the scrape-added labels (instance/job/source/version); pr is converted to a number so the `prefix:#` unit renders #714 instead of \"714\"; organize renames pr -> PR. The GitHub frame (C) keeps its merged_at TIME field -- Infinity only hangs the pr/title columns on the value field as labels when the frame has a time field -- so a byType override renames it to \"merged at\" and the panel's field selector (/^(commit|PR|latest merged)$/) leaves it out; a byFrameRefID override on C renames its value field to \"latest merged\" and carries the same color/unit/decimals/noValue the standalone panel used to render \"#NNN\".\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first -- PR number order inverts merged order routinely, so `max(number)` would show the wrong PR every time that happens.\n\nGEOMETRY IS LOAD-BEARING. A stat tile only stacks its name above its value while the tile is at most ~2.5x wider than it is tall; past that ratio Grafana switches to the wide layout and puts the name to the LEFT of the value. Three tiles in a full-width 24-column panel would need h=9 to stack -- half width (w=12) with h=5 puts each tile at roughly 310x155 and stacks, the same shape as the Session Timers tiles at the top of the board. This panel keeps that half-width/h=5 geometry and its existing gridPos -- the standalone panel's freed grid slot to its left is simply no longer allocated, not backfilled, so widening or shortening this panel would flip the tiles back onto one line; move w and h together if that ever changes.\n\nVALUE SIZE IS BOUNDED BY THE PHONE, not the desktop: options.text.valueSize is 20 (titleSize 13) with four tiles, chosen at 390px width where wider text collides with the neighbouring tile. Check any change to it at phone width, not desktop.\n\nOPEN PRS TILE. A fourth tile, \"open PRs\", counts every open pull request on the repo, drafts and non-drafts together, with no split. Like \"latest merged\" it has no exporter and no metric: Infinity (target D) reads total_count from GitHub's issue-search endpoint (is:pr is:open, per_page=1 so only the count is transferred) at render time. It reuses the same authenticated Infinity datasource and carries the same shared-failure caveat described above.",
       "gridPos": {
         "h": 5,
         "w": 12,
@@ -421,6 +421,29 @@
             {
               "selector": "number",
               "text": "value",
+              "type": "number"
+            }
+          ]
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "infinity"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "https://api.github.com/search/issues?q=repo:gbre-org/claude-watch+is:pr+is:open&per_page=1",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "$",
+          "columns": [
+            {
+              "selector": "total_count",
+              "text": "open PRs",
               "type": "number"
             }
           ]
@@ -531,6 +554,29 @@
                 "value": "merged at"
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "open PRs"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#cb4b16"
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "noValue",
+                "value": "n/a"
+              }
+            ]
           }
         ]
       },
@@ -544,12 +590,12 @@
           "calcs": [
             "lastNotNull"
           ],
-          "fields": "/^(commit|PR|latest merged)$/",
+          "fields": "/^(commit|PR|latest merged|open PRs)$/",
           "values": false
         },
         "text": {
-          "valueSize": 24,
-          "titleSize": 16
+          "valueSize": 20,
+          "titleSize": 13
         }
       },
       "transformations": [
