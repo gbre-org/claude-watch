@@ -117,3 +117,31 @@ class HostjobPromoteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class HostjobReviveClosedRowTest(HostjobPromoteTest):
+    """A done/abandoned row whose worker is still running under that queue id
+    renders RUNNING (visible) and records the stored status."""
+
+    def _closed(self, label, status="done"):
+        it = self._pending_item(label)
+        it["status"] = status
+        it["completed_at"] = "2026-06-01T00:05:00+00:00"
+        return it
+
+    def test_done_row_with_live_worker_renders_running(self):
+        self._write_status("zlive", {"status": "running", "queue_id": "q-zlive"})
+        for st in ("done", "abandoned", "quarantined"):
+            s = self._shape(self._closed("zlive", st))
+            self.assertEqual(s["status"], "running")
+            self.assertEqual(s["hostjob_queue_status"], st)
+
+    def test_done_row_owned_by_other_queue_id_stays_done(self):
+        self._write_status("zold", {"status": "running", "queue_id": "q-other"})
+        s = self._shape(self._closed("zold"))
+        self.assertEqual(s["status"], "done")
+        self.assertEqual(s["hostjob_queue_status"], "")
+
+    def test_done_row_with_terminal_worker_stays_done(self):
+        self._write_status("zdead", {"status": "done", "rc": 0, "queue_id": "q-zdead"})
+        self.assertEqual(self._shape(self._closed("zdead"))["status"], "done")

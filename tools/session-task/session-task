@@ -4226,6 +4226,24 @@ def _hostjob_effective_terminal(label, running_age_seconds):
     }
 
 
+def _hostjob_runner_owns_live(label, qid):
+    """True iff the runner's status.json explicitly says ``running`` and names
+    ``qid`` as its queue item. Fail-soft: any problem returns False."""
+    if not label or not qid:
+        return False
+    try:
+        with open(HOSTJOB_LOG_DIR / label / "status.json", "r",
+                  encoding="utf-8", errors="replace") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(st, dict)
+        and st.get("status") == "running"
+        and st.get("queue_id") == qid
+    )
+
+
 def _reconcile_hostjob_rows(items):
     """Heal leaked hostjob rows whose runner reports the worker is dead.
 
@@ -4283,6 +4301,34 @@ def _reconcile_hostjob_rows(items):
     for it in items:
         try:
             status = it.get("status")
+            if status in ("done", "abandoned") and it.get("reconciled_hostjob"):
+                # REVIVE: this sweep itself closed the row, but the runner's
+                # status.json now (or still) EXPLICITLY reports the worker
+                # running under THIS queue id -- the earlier inference was
+                # wrong (e.g. the runner state dir was not visible from here).
+                # Reopen it so a live hostjob is never left without a live
+                # queue item. Skipped when another open row already owns the
+                # same hostjob scope.
+                label = _extract_hostjob_label(it.get("scope") or [])
+                if label and _hostjob_runner_owns_live(label, it.get("id")):
+                    scope_key = "hostjob:" + label
+                    taken = any(
+                        o is not it
+                        and o.get("status") in ("running", "wedged", "quarantined")
+                        and scope_key in (o.get("scope") or [])
+                        for o in items
+                    )
+                    if not taken:
+                        now_iso = _fmt_ts()
+                        it["revived_from_status"] = status
+                        it["status"] = "running"
+                        it.pop("completed_at", None)
+                        it.pop("abandoned_at", None)
+                        it.pop("abandon_reason", None)
+                        it["revived_hostjob_at"] = now_iso
+                        it["last_heartbeat_at"] = now_iso
+                        reconciled.append((it.get("id"), "running"))
+                continue
             if status not in ("running", "quarantined"):
                 continue
             label = _extract_hostjob_label(it.get("scope") or [])

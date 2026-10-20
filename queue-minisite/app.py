@@ -1848,6 +1848,33 @@ def _shape(
                     _promoted_started_iso = datetime.fromtimestamp(
                         _ts, timezone.utc
                     ).isoformat()
+    # Hostjob REVIVE. A hostjob whose queue row was closed (done / abandoned /
+    # quarantined) while its worker is still alive -- e.g. a reconcile sweep
+    # that could not see the runner state dir and inferred "finished" -- would
+    # otherwise drop into the time-capped terminal sections and vanish while the
+    # process keeps running. When the runner's status.json EXPLICITLY reports
+    # ``running`` AND names THIS queue item as its owner (so an older row of a
+    # re-used label is never revived), render the row as RUNNING and expose the
+    # stored queue status in ``hostjob_queue_status`` so the UI can flag it.
+    hostjob_queue_status = ""
+    if status in ("done", "abandoned", "quarantined"):
+        _hj_label = _extract_hostjob_label(item.get("scope") or [])
+        if _hj_label:
+            _hj_st = _read_hostjob_status(_hj_label)
+            if (
+                _hj_st is not None
+                and _hj_st.get("status") == "running"
+                and item.get("id")
+                and _hj_st.get("queue_id") == item.get("id")
+            ):
+                hostjob_queue_status = status
+                status = "running"
+                is_reconciled_hostjob = True
+                _ts = _hj_st.get("started_at")
+                if isinstance(_ts, (int, float)):
+                    _promoted_started_iso = datetime.fromtimestamp(
+                        _ts, timezone.utc
+                    ).isoformat()
     created = _parse_iso(item.get("created_at"))
     started = _parse_iso(
         item.get("registered_at") or item.get("started_at") or _promoted_started_iso
@@ -2179,6 +2206,9 @@ def _shape(
     # Surface whether the status shown was reconciled from the hostjob's own
     # status.json (i.e. the queue said `running` but the job had finished).
     shaped["is_reconciled_hostjob"] = is_reconciled_hostjob
+    # Non-empty when the stored queue status was overridden because the worker
+    # is still alive (see "Hostjob REVIVE" above).
+    shaped["hostjob_queue_status"] = hostjob_queue_status
     if status == "abandoned" and shaped["hostjob_label"]:
         m = _HOSTJOB_EXIT_RE.match((shaped["abandon_reason"] or "").strip())
         if m and m.group(1) != "0":
