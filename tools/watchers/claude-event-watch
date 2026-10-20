@@ -1292,7 +1292,11 @@ if cli:
     # the log bytes above, so re-read the tier straight from the event dict.
     _ev_data = ev.get("data")
     _shipped_tier = None
+    _action_hint = None
     if isinstance(_ev_data, dict):
+        _a = _ev_data.get("action")
+        if isinstance(_a, str) and _a.strip():
+            _action_hint = _a.strip()
         _t = _ev_data.get("tier")
         if isinstance(_t, str) and _t.strip():
             _shipped_tier = _t.strip()
@@ -1301,6 +1305,8 @@ if cli:
                        "--message", full_message]
         if _shipped_tier:
             _ingest_cmd += ["--tier", _shipped_tier]
+        if _action_hint:
+            _ingest_cmd += ["--action-hint", _action_hint]
         subprocess.run(
             _ingest_cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

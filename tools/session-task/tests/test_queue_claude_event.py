@@ -343,6 +343,12 @@ def test_abandon_without_evidence_emits_queue_quarantined_event():
         # attention. #782 (756c927) wrongly stamped this ambient; corrected
         # here to match the other actionable-tier producer stamps.
         assert parsed["data"]["tier"] == "actionable"
+        qid = d1["id"]
+        # The event text itself must say how to clear the row (ack does not).
+        assert "acking does NOT clear it" in parsed["message"]
+        assert f"session-task queue release {qid} --reason" in parsed["message"]
+        assert f"session-task queue resurrect {qid}" in parsed["message"]
+        assert f"session-task queue release {qid}" in parsed["data"]["action"]
 
         # Releasing it then emits the ordinary terminal event, so anything
         # downstream that only knows `queue-abandoned` still sees the scope

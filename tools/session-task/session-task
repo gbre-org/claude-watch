@@ -4980,6 +4980,19 @@ def cmd_queue_abandon(args):
     print(f"abandoned: {args.id}")
 
 
+
+def _quarantine_action_text(qid: str) -> str:
+    """Operator-facing instruction carried by the queue-quarantined event.
+
+    Acking the event does NOT clear the quarantine: the row keeps holding its
+    scope until it is explicitly released or resurrected."""
+    return (
+        "ACTION REQUIRED: acking does NOT clear it. If the job is dead or "
+        f"finished: `session-task queue release {qid} --reason '<why>'`; "
+        f"if it should still run: `session-task queue resurrect {qid}`."
+    )
+
+
 def _emit_quarantine_notifications(target, args, *, started_at, prior_status):
     """Log / pingme / claude-event for an abandon that landed in quarantine.
 
@@ -5035,9 +5048,11 @@ def _emit_quarantine_notifications(target, args, *, started_at, prior_status):
         tag="queue-quarantined",
         message=(
             f"queue QUARANTINED: {qid} ({_item_summary(target)}) "
-            f"-- scope still held, reason: {reason_str}"
+            f"-- scope still held, reason: {reason_str}. "
+            f"{_quarantine_action_text(qid)}"
         ),
         data={
+            "action": _quarantine_action_text(qid),
             "queue_id": qid,
             "group_id": target.get("group_id"),
             "scope": target.get("scope", []),
