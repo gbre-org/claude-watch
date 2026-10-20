@@ -106,6 +106,16 @@ pub const DEFAULT_ORPHAN_AUTO_ABANDON_SECS: u64 = 0;
 /// Max number of ids to list inline in the human-readable `message`.
 pub const TOP_N: usize = 3;
 
+/// A transcript parked on an un-answered `tool_use` is excluded from the
+/// SOFT `queue-orphaned` event only while it has been quiet for less than
+/// this long. A subagent killed mid-tool-call (e.g. by a restart of the
+/// host session) also ends on a pending `tool_use`, so without a cap it
+/// would stay "in flight" forever and never alert. The HARD gate keeps its
+/// unconditional in-flight exclusion (it blocks the main loop, so it stays
+/// default-open); the soft event is non-blocking and corroborated across
+/// two ticks, so a cap is safe there.
+pub const IN_FLIGHT_SOFT_ORPHAN_SECS: u64 = 1800;
+
 /// Tag for an emitted orphaned-item event.
 pub const EVENT_TAG_ORPHANED: &str = "queue-orphaned";
 /// Tag for an emitted stuck-item event.
@@ -476,7 +486,11 @@ where
                 // stuck check (like the `Alive` arm) — a live agent needn't
                 // pat the queue heartbeat, so the stale-heartbeat stuck path
                 // would false-positive here too.
-                if in_flight_tool_use {
+                let in_flight_within_cap = in_flight_tool_use
+                    && age_secs
+                        .map(|a| a < IN_FLIGHT_SOFT_ORPHAN_SECS)
+                        .unwrap_or(true);
+                if in_flight_within_cap {
                     continue;
                 }
                 // Grace for a JUST-registered / just-resumed item: a `Dead`
@@ -1799,6 +1813,38 @@ mod tests {
             all_agents_alive,
         );
         assert!(q.is_empty(), "{:?}", q);
+    }
+
+    #[test]
+    fn in_flight_quiet_past_cap_is_soft_orphaned() {
+        // A subagent killed mid-tool-call keeps a pending tool_use forever;
+        // past the cap it must alert instead of staying silent.
+        let it = running_reg("q-killed", 60, &[]);
+        let now = Utc::now().timestamp();
+        let lookup = |_q: &str| AgentLiveness::Dead {
+            agent_id: "agent-k".to_string(),
+            age_secs: Some(IN_FLIGHT_SOFT_ORPHAN_SECS + 1),
+            in_flight_tool_use: true,
+        };
+        let q = compute_qualifying(&[it], &State::new(), now, 15 * 60, GRACE, all_alive, lookup);
+        assert_eq!(q.len(), 1, "{:?}", q);
+        assert_eq!(q[0].condition, Condition::Orphaned);
+    }
+
+    #[test]
+    fn in_flight_within_cap_or_unknown_age_stays_silent() {
+        let now = Utc::now().timestamp();
+        for age in [Some(IN_FLIGHT_SOFT_ORPHAN_SECS - 1), None] {
+            let it = running_reg("q-wait", 60, &[]);
+            let lookup = move |_q: &str| AgentLiveness::Dead {
+                agent_id: "agent-w".to_string(),
+                age_secs: age,
+                in_flight_tool_use: true,
+            };
+            let q =
+                compute_qualifying(&[it], &State::new(), now, 15 * 60, GRACE, all_alive, lookup);
+            assert!(q.is_empty(), "{:?}", q);
+        }
     }
 
     #[test]
