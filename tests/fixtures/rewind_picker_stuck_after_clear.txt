@@ -1,0 +1,10 @@
+  [Monitor expired after 30m with 3 events delivered. Re-arm it if you still
+  need the watch.]
+  ⎿  Interrupted · What should Claude do instead?
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  Rewind
+  Restore and fork the conversation to the point before…
+    ↑ 2 more
+    You have ALREADY been restarted — this message was injected by claude…
+  ❯ (current)
+  Enter to continue · Esc to cancel
