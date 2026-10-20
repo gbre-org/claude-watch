@@ -2839,6 +2839,17 @@ async fn handle_wedged_pane(
     true
 }
 
+/// Pure: should the daemon press Escape on a Rewind picker it found parked on
+/// the pane? Yes when a picker is visible and no `self-clear` owns the pane
+/// (self-clear confirms/cancels its own picker; an Escape from here would race
+/// its `/clear` sequence).
+pub(crate) fn stray_rewind_picker_should_be_cancelled(
+    picker_visible: bool,
+    self_clear_busy: bool,
+) -> bool {
+    picker_visible && !self_clear_busy
+}
+
 /// Spawn a deferred self-clear child process.
 /// The child sleeps for the grace period, then checks if tokens are still high.
 /// If so, it runs `self-clear` to force a context clear.
@@ -7682,6 +7693,37 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // returns early). Run auto-resolve here too or the dialog is never seen.
         run_autoresolve_step(config, &effective_pane).await;
 
+        // A Rewind picker parked on the pane hides the status bar, so the pane
+        // reads tokens=0/bashes=0 and lands HERE -- a branch that previously
+        // never looked for the picker (the fresh-/clear branch that does needs
+        // tokens >= min_tokens). Incident 2026-10-19/20: the daemon's own
+        // context-warning interrupt opened the picker, and it then sat for
+        // ~20h logging "dead process detected" every 6s. Cancel it with Escape
+        // (never Enter) unless a self-clear is driving the pane.
+        if stray_rewind_picker_should_be_cancelled(
+            tmux::rewind_picker_on_pane(&effective_pane).await,
+            tmux::self_clear_in_progress()
+                || tmux::self_clear_handoff_recent(
+                    config.fresh_clear.self_clear_handoff_grace_secs,
+                ),
+        ) {
+            warn!(
+                pane = %effective_pane,
+                dead_checks,
+                "dead-process check: Rewind picker parked on the pane (status bar hidden, tokens=0) -- cancelling with Escape"
+            );
+            tmux::cancel_rewind_picker(&effective_pane).await;
+            write_jsonl_log(
+                &config.general.log_file,
+                "rewind_picker_cancelled",
+                serde_json::json!({ "site": "dead_process", "dead_checks": dead_checks }),
+            );
+            state.consecutive_dead_checks = 0;
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        }
+
         // --- Self-heal: once we reach the alert threshold, retry status
         // discovery from scratch before committing to any dead-check actions.
         // Addresses a stale-latch bug where the daemon read tokens=0 for 45+
@@ -10132,6 +10174,26 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 mod tests {
     use super::*;
     use crate::credentials::{AccessTokenState, CredentialExpiry};
+
+    /// The pane captured when the picker sat for ~20h on 2026-10-19/20.
+    const STUCK_PICKER_PANE: &str =
+        include_str!("../tests/fixtures/rewind_picker_stuck_after_clear.txt");
+
+    #[test]
+    fn stuck_incident_pane_is_a_rewind_picker_with_no_status_bar() {
+        assert!(tmux::rewind_picker_visible(STUCK_PICKER_PANE));
+        // The picker hides the status bar: this is exactly why the daemon read
+        // tokens=0 and took the dead-process branch.
+        let (parsed, saw_bar) = status::parse_status_bar_with_diag(STUCK_PICKER_PANE);
+        assert!(parsed.tokens.is_none() && parsed.bashes.is_none() && !saw_bar);
+    }
+
+    #[test]
+    fn stray_picker_is_cancelled_unless_self_clear_owns_the_pane() {
+        assert!(stray_rewind_picker_should_be_cancelled(true, false));
+        assert!(!stray_rewind_picker_should_be_cancelled(true, true));
+        assert!(!stray_rewind_picker_should_be_cancelled(false, false));
+    }
 
     // ---- auto-update: which modal is fronting the injected /exit ----
 

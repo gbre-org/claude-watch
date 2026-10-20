@@ -1056,7 +1056,14 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
 
     // Short-mode shortcuts: skip the agent/watcher fan-out (cheap-path).
     if tokens_only && !json {
-        if cs.tokens > 0 || !cs.pane.is_empty() {
+        // A Rewind picker hides the status bar, so the count parses as 0. The
+        // deferred-clear child reads 0 as "Claude cleared on its own" and
+        // exits -- the 2026-10-19 wedge. Report unknown instead.
+        let picker_up =
+            cs.tokens == 0 && !cs.pane.is_empty() && tmux::rewind_picker_on_pane(&cs.pane).await;
+        if picker_up {
+            println!("?");
+        } else if cs.tokens > 0 || !cs.pane.is_empty() {
             println!("{}", cs.tokens);
         } else {
             println!("?");

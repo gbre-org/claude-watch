@@ -981,6 +981,24 @@ def plan_argv(pane, args):
     return lines
 
 
+def cancel_stray_rewind_picker(pane, max_tries=5, settle=0.4):
+    """Escape a Rewind picker that is ALREADY open before we start driving.
+
+    Returns True iff a picker was seen (and an Escape sent). Escape cancels with
+    no restore/fork; Enter would risk committing a fork.
+    """
+    sent = False
+    for _ in range(max_tries):
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        if rc != 0 or not out or not _rewind_picker_visible(out):
+            return sent
+        log("  pre-interrupt: stray Rewind picker open -- sending Escape")
+        run(["tmux", "send-keys", "-t", pane, "Escape"])
+        sent = True
+        time.sleep(settle)
+    return sent
+
+
 def child_main(pane, args):
     """Main logic for the forked child process.
 
@@ -996,6 +1014,13 @@ def child_main(pane, args):
     # main conversation and never on a background agent selected in FleetView.
     if not ensure_main_loop_focus(pane):
         log("  proceeding despite unconfirmed main-loop focus (see WARNING above)")
+
+    # A Rewind picker already parked on the pane (opened by an earlier
+    # interrupt, e.g. the daemon's context warning) shows a `❯ (current)` row
+    # that reads as an idle prompt, so the interrupt below would "confirm idle"
+    # and `/clear` would be typed into the modal. Cancel it first (Escape,
+    # never Enter). Incident 2026-10-19/20.
+    cancel_stray_rewind_picker(pane)
 
     # Actively interrupt thinking by sending Escape and verifying via tmux.
     idle_ok = interrupt_and_wait(pane, timeout=args.timeout)
