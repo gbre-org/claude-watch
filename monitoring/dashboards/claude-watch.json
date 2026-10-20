@@ -557,8 +557,8 @@
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "open PRs"
+              "id": "byFrameRefID",
+              "options": "D"
             },
             "properties": [
               {
@@ -575,6 +575,10 @@
               {
                 "id": "noValue",
                 "value": "n/a"
+              },
+              {
+                "id": "displayName",
+                "value": "open PRs"
               }
             ]
           }
