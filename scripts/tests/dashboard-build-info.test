@@ -48,9 +48,41 @@ def main() -> int:
         if col["selector"] != "total_count" or col["type"] != "number":
             errs.append(f"column must be total_count/number, got {col}")
 
+    # Grafana matches reduceOptions.fields against the field's DISPLAY name,
+    # not the column text. With several queries in one panel a multi-query
+    # frame's value field is shown as "<refId> <column text>" (e.g. "D open PRs"),
+    # which the anchored regex rejects, so the tile silently disappears. The
+    # column text alone is therefore not enough: a displayName override scoped
+    # to the target's frame must pin the shown name to TILE.
     fields = panel["options"]["reduceOptions"]["fields"]
     if not re.search(fields.strip("/"), TILE):
         errs.append(f"reduceOptions.fields {fields!r} filters out {TILE!r}")
+    if len(hits) == 1:
+        ref = hits[0]["refId"]
+        named = [
+            o
+            for o in panel["fieldConfig"]["overrides"]
+            if o["matcher"] == {"id": "byFrameRefID", "options": ref}
+            and any(
+                p["id"] == "displayName" and p["value"] == TILE
+                for p in o["properties"]
+            )
+        ]
+        if len(named) != 1:
+            errs.append(
+                f"need exactly one byFrameRefID={ref!r} override setting "
+                f"displayName={TILE!r} (Grafana otherwise names the field "
+                f"'{ref} {TILE}', which reduceOptions.fields filters out); "
+                f"got {len(named)}"
+            )
+        # Style overrides must target the same frame, not a name that never exists.
+        stray = [
+            o
+            for o in panel["fieldConfig"]["overrides"]
+            if o["matcher"] == {"id": "byName", "options": TILE}
+        ]
+        if stray:
+            errs.append(f"byName={TILE!r} override never matches; use byFrameRefID={ref!r}")
 
     if errs:
         print("FAIL:\n  " + "\n  ".join(errs))
