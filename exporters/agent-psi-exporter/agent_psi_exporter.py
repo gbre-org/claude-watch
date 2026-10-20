@@ -21,6 +21,17 @@ sibling exporters in ../work-queue-exporter and ../claude-events-exporter:
 stdlib HTTP server, one ``CollectorRegistry``, gauges re-cleared and refilled
 per scrape.
 
+Scrape cost
+-----------
+Transcripts are parsed incrementally (``agent_psi.TranscriptCache``): each
+scrape reads only the bytes appended since the last one, and a file that
+leaves the live window is evicted. ``AGENT_PSI_INCREMENTAL=0`` restores the
+full re-parse per scrape. The rendered body is shared for
+``AGENT_PSI_CACHE_TTL_SECONDS`` (default 5; 0 disables), so concurrent
+scrapers compute once. The server is threaded, and ``/livez`` / ``/healthz``
+answer 200 without touching transcripts, so a liveness probe never waits on a
+scrape.
+
 Metrics
 -------
   - agent_psi_inference_some{scope,window,model}   gauge  [HEADLINE]
@@ -115,8 +126,9 @@ Metrics
 
 import logging
 import os
+import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prometheus_client import (
     CollectorRegistry,
@@ -190,11 +202,19 @@ STALE_AFTER_SECONDS = float(
     )
 )
 
+# How long one rendered /metrics body is served to every scraper before the
+# next request recomputes it. 0 recomputes on every request.
+CACHE_TTL_SECONDS = float(os.environ.get("AGENT_PSI_CACHE_TTL_SECONDS", "5"))
+INCREMENTAL = os.environ.get("AGENT_PSI_INCREMENTAL", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
 EXPORTER_COMMIT = os.environ.get("AGENT_PSI_EXPORTER_COMMIT", "").strip() or "unknown"
 EXPORTER_VERSION = os.environ.get("AGENT_PSI_EXPORTER_VERSION", "").strip() or "0.0.0"
 EXPORTER_SOURCE = os.environ.get("AGENT_PSI_EXPORTER_SOURCE", "").strip() or "host"
 
 REG = CollectorRegistry()
+TRANSCRIPT_CACHE = agent_psi.TranscriptCache() if INCREMENTAL else None
 
 # What an agent in each pressure category is DOING, for the HELP text. The two
 # stall categories are a block on something outside the loop; overhead is the
@@ -389,6 +409,22 @@ def _emit_scope(scope, transcripts, now, model="all"):
     )
 
 
+def clip_to_windows(transcripts, now):
+    """Drop intervals that end before the largest window.
+
+    Every windowed function skips an interval ending at or before its window
+    start, so this is exact; it keeps the per-window sweeps from rescanning
+    hours of history. The current-state tail ends at ``now`` and survives.
+    """
+    if not WINDOWS or max(WINDOWS) <= 0:
+        return transcripts
+    cutoff = now - max(WINDOWS)
+    return [
+        t._replace(intervals=[iv for iv in t.intervals if iv.end > cutoff])
+        for t in transcripts
+    ]
+
+
 def collect():
     """Re-scan transcripts and refresh all metrics."""
     now = time.time()
@@ -401,6 +437,7 @@ def collect():
             api_stall_tail=API_STALL_TAIL_SECONDS,
             api_stall_max=API_STALL_MAX_SECONDS,
             stale_after=STALE_AFTER_SECONDS,
+            cache=TRANSCRIPT_CACHE,
         )
     except Exception as e:  # pragma: no cover - defensive
         log.error("Failed to read %s: %s", PROJECTS_DIR, e)
@@ -417,6 +454,17 @@ def collect():
     g_scope_agents.clear()
     g_duty_ratio.clear()
     g_duty_seconds.clear()
+
+    # Per-agent duty cycle (byproduct) — every live transcript, main + workers,
+    # over its whole transcript window.
+    for t in transcripts:
+        secs, total, active, ratios = agent_psi.duty_cycle(t.intervals)
+        for cat, value in secs.items():
+            g_duty_seconds.labels(agent_id=t.agent_id, category=cat).set(value)
+        for cat, value in ratios.items():
+            g_duty_ratio.labels(agent_id=t.agent_id, category=cat).set(value)
+
+    transcripts = clip_to_windows(transcripts, now)
 
     # The main loop is a dispatcher (mostly parked between turns); its profile
     # is nothing like a worker sub-agent, so it is split out of the fleet and
@@ -436,14 +484,6 @@ def collect():
     # window on its own. That is what keeps this count and the composition
     # series describing the same fleet.
     g_live_agents.set(sum(1 for t in sub_transcripts if t.running))
-
-    # Per-agent duty cycle (byproduct) — every live transcript, main + workers.
-    for t in transcripts:
-        secs, total, active, ratios = agent_psi.duty_cycle(t.intervals)
-        for cat, value in secs.items():
-            g_duty_seconds.labels(agent_id=t.agent_id, category=cat).set(value)
-        for cat, value in ratios.items():
-            g_duty_ratio.labels(agent_id=t.agent_id, category=cat).set(value)
 
     def by_model(ts):
         groups = {}
@@ -477,17 +517,41 @@ def collect():
         )
 
 
+_render_lock = threading.Lock()
+_rendered = None  # (time.monotonic() when computed, body)
+
+
+def render_metrics():
+    """The /metrics body, shared by every request within CACHE_TTL_SECONDS.
+
+    The lock serializes collect() (it mutates the shared registry and the
+    transcript cache); a request that queued behind a computation reuses its
+    result instead of starting another.
+    """
+    global _rendered
+    with _render_lock:
+        if (_rendered is not None and CACHE_TTL_SECONDS > 0
+                and time.monotonic() - _rendered[0] < CACHE_TTL_SECONDS):
+            return _rendered[1]
+        collect()
+        _rendered = (time.monotonic(), generate_latest(REG))
+        return _rendered[1]
+
+
 class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.split("?", 1)[0] != "/metrics":
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"not found\n")
-            return
-        collect()
-        body = generate_latest(REG)
-        self.send_response(200)
-        self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+        path = self.path.split("?", 1)[0]
+        if path in ("/livez", "/healthz"):
+            # Liveness only: never touches transcripts or the render lock.
+            self._send(200, b"ok\n", "text/plain; charset=utf-8")
+        elif path == "/metrics":
+            self._send(200, render_metrics(), CONTENT_TYPE_LATEST)
+        else:
+            self._send(404, b"not found\n", "text/plain; charset=utf-8")
+
+    def _send(self, code, body, content_type):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -517,8 +581,12 @@ def main():
         "Observability: active tail silent >=%.0fs => unobservable",
         STALE_AFTER_SECONDS,
     )
-    collect()
-    HTTPServer(("0.0.0.0", PORT), MetricsHandler).serve_forever()
+    log.info(
+        "Scrape: incremental=%s, result cache ttl=%.1fs",
+        INCREMENTAL, CACHE_TTL_SECONDS,
+    )
+    render_metrics()
+    ThreadingHTTPServer(("0.0.0.0", PORT), MetricsHandler).serve_forever()
 
 
 if __name__ == "__main__":

@@ -75,6 +75,19 @@ Scenarios:
       instead of a flat "idle (parked)" block disagreeing with live_agents=0,
       a worker that returned inside the window still counts for the part of it
       it was alive, and the parked main loop keeps its idle tail.
+  (15) Incremental parsing: ``TranscriptCache.read`` equals
+      ``read_transcript`` after every one of a few hundred random-size appends
+      (lines split mid-way, out-of-order timestamps, API errors), for an
+      unterminated-but-complete last line, a partial last line, garbage and
+      non-object lines, truncation, a same-size in-place rewrite, a new inode
+      and a changed parse config; cached discovery equals uncached and evicts
+      files that leave the live window or disappear; and the exporter's
+      whole /metrics body is byte-identical with the cache and window clip
+      on versus a full, unclipped parse.
+  (16) The /metrics body is computed once for concurrent scrapes and reused
+      within AGENT_PSI_CACHE_TTL_SECONDS; expiry and TTL 0 recompute.
+  (17) /livez and /healthz answer 200 while a /metrics scrape is blocked, and
+      run no collection; unknown paths 404.
 
 Run:  python3 test_agent_psi_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
@@ -1147,6 +1160,300 @@ def run():
                    model="all", state=agent_psi.IDLE) or 0.0
     check("the returned worker adds no idle after its exit",
           approx(idle5, 0.0, tol=1e-6), f"got {idle5}")
+
+    # ---- Scenario 15: incremental parse == full parse ------------------
+    print("\nScenario 15: TranscriptCache matches read_transcript byte-for-byte")
+    import random
+
+    rng = random.Random(1234)
+    tmp6 = tempfile.mkdtemp(prefix="agent-psi-incr-")
+    now6 = time.time()
+
+    def lines_for(entries):
+        return b"".join(json.dumps(e).encode() + b"\n" for e in entries)
+
+    def synth(t0, n, tag):
+        """A mixed transcript: tools, prompts, bookkeeping, API errors, and a
+        few out-of-order timestamps."""
+        out, t = [], t0
+        for k in range(n):
+            t += rng.choice((0.0, 0.5, 2, 7, 40, 400))
+            ts = t - 30 if rng.random() < 0.05 else t  # out of order
+            r = rng.random()
+            tid = f"{tag}{k}"
+            if r < 0.3:
+                out.append(assistant(ts, tool_use_ids=[tid],
+                                     model=rng.choice(("claude-opus-5",
+                                                       "claude-sonnet-5")),
+                                     output_tokens=rng.choice((None, 3, 900))))
+                out.append(tool_result(ts + rng.choice((1, 90)), tid))
+            elif r < 0.45:
+                out.append(assistant(ts, model="claude-opus-5",
+                                     output_tokens=500))
+            elif r < 0.55:
+                out.append(prompt(ts))
+            elif r < 0.6:
+                out.append(api_error(ts, rng.choice(
+                    ("API Error: 529 Overloaded", "Prompt is too long"))))
+            else:
+                out.append(bookkeeping(ts))
+        return out
+
+    def same(path, cache, now, is_main, label):
+        a = agent_psi.read_transcript(path, now=now, is_main_loop=is_main,
+                                      session_id="sess6")
+        b = cache.read(path, now=now, is_main_loop=is_main, session_id="sess6")
+        check(label, a == b,
+              f"\n    full={a and (len(a.intervals), a.running, a.model)}"
+              f"\n    incr={b and (len(b.intervals), b.running, b.model)}")
+
+    for is_main in (False, True):
+        role = "main" if is_main else "sub"
+        path = os.path.join(tmp6, f"agent-{role}.jsonl")
+        cache = agent_psi.TranscriptCache()
+        blob = lines_for(synth(now6 - 4000, 300, role))
+        # Feed in random byte-sized appends, splitting lines mid-way, and
+        # compare after every append at a moving `now`.
+        pos, step, mismatches = 0, 0, 0
+        open(path, "wb").close()
+        while pos < len(blob):
+            cut = min(len(blob), pos + rng.randint(1, 4000))
+            with open(path, "ab") as fh:
+                fh.write(blob[pos:cut])
+            pos = cut
+            step += 1
+            t_now = now6 + step
+            a = agent_psi.read_transcript(path, now=t_now, is_main_loop=is_main,
+                                          session_id="sess6")
+            b = cache.read(path, now=t_now, is_main_loop=is_main,
+                           session_id="sess6")
+            if a != b:
+                mismatches += 1
+        check(f"{role}: {step} random appends (mid-line splits) all equal",
+              mismatches == 0, f"{mismatches} mismatches")
+        same(path, cache, now6 + 10_000, is_main,
+             f"{role}: equal at a far-future now (stale/unobservable tail)")
+
+        # A final line with no newline yet that already decodes is included
+        # by the full parse, so the incremental one must take it too.
+        with open(path, "ab") as fh:
+            fh.write(json.dumps(assistant(now6 + 1, tool_use_ids=["Z"])).encode())
+        same(path, cache, now6 + 2, is_main, f"{role}: unterminated JSON line")
+        with open(path, "ab") as fh:
+            fh.write(b"\n" + json.dumps(tool_result(now6 + 3, "Z")).encode()[:20])
+        same(path, cache, now6 + 4, is_main, f"{role}: partial trailing line")
+        with open(path, "ab") as fh:
+            fh.write(json.dumps(tool_result(now6 + 3, "Z")).encode()[20:]
+                     + b"\n\nnot json\n[1, 2]\n")
+        same(path, cache, now6 + 5, is_main,
+             f"{role}: completed line + blank/garbage/non-object lines")
+        with open(path, "ab") as fh:
+            fh.write(lines_for([api_error(now6 + 4.5), api_error(now6 + 4.2),
+                                api_error(now6 - 9000, "Login expired")]))
+        same(path, cache, now6 + 6, is_main,
+             f"{role}: out-of-order API errors sort as in the full parse")
+
+        def year_back(data, nth):
+            """Same-length edit: move the nth timestamp back a year."""
+            i = -1
+            for _ in range(nth + 1):
+                i = data.index(b'"timestamp": "', i + 1)
+            y = i + len(b'"timestamp": "')
+            year = int(data[y:y + 4]) - 1
+            return data[:y] + str(year).encode() + data[y + 4:]
+
+        def rewrite(data):
+            with open(path, "wb") as fh:
+                fh.write(data)
+            os.utime(path, ns=(time.time_ns(), time.time_ns() + 10**9))
+
+        # Truncation: the file is rewritten shorter -> full reset. Kept well
+        # over 2 * _SIG_BYTES so the head and tail checks below are disjoint.
+        with open(path, "wb") as fh:
+            fh.write(lines_for(synth(now6 - 100, 80, role + "t")))
+        check(f"{role}: rewrite fixture spans both signature windows",
+              os.path.getsize(path) > 3 * agent_psi._SIG_BYTES,
+              os.path.getsize(path))
+        same(path, cache, now6 + 6, is_main, f"{role}: truncated and rewritten")
+        # Same-length in-place rewrites: of the last line (bytes just before
+        # the consumed offset) and of the first one.
+        with open(path, "rb") as fh:
+            data = fh.read()
+        n_ts = data.count(b'"timestamp": "')
+        data = year_back(data, n_ts - 1)
+        rewrite(data)
+        same(path, cache, now6 + 7, is_main, f"{role}: rewrite of the last line")
+        data = year_back(data, 0)
+        rewrite(data)
+        same(path, cache, now6 + 7.5, is_main, f"{role}: rewrite of the first line")
+        # Rotation: a new inode whose head and tail bytes match the old file
+        # (only a middle line differs), so only the inode check can tell.
+        new_path = path + ".new"
+        with open(new_path, "wb") as fh:
+            fh.write(year_back(data, n_ts // 2)
+                     + lines_for(synth(now6 - 50, 40, role + "r")))
+        os.replace(new_path, path)
+        same(path, cache, now6 + 8, is_main, f"{role}: replaced (new inode)")
+        # A changed parse config must not reuse intervals built under the old.
+        a = agent_psi.read_transcript(path, now=now6 + 9, max_gap=5.0,
+                                      is_main_loop=is_main, session_id="sess6")
+        b = cache.read(path, now=now6 + 9, max_gap=5.0, is_main_loop=is_main,
+                       session_id="sess6")
+        check(f"{role}: parse config change re-parses", a == b, "differ")
+
+    # Cache-backed discovery equals the uncached one, and evicts files that
+    # leave the live window.
+    tmp7 = tempfile.mkdtemp(prefix="agent-psi-evict-")
+    sess7 = "c0ffee00-0000-0000-0000-000000000000"
+    subs7 = os.path.join(tmp7, "-home-someone", sess7, "subagents")
+    os.makedirs(subs7)
+    now7 = time.time()
+    write(os.path.join(tmp7, "-home-someone", f"{sess7}.jsonl"),
+          [prompt(now7 - 50), assistant(now7 - 40, model="claude-fable-5")])
+    for name in ("a1", "a2", "a3"):
+        write(os.path.join(subs7, f"agent-{name}.jsonl"), synth(now7 - 600, 50, name))
+    cache7 = agent_psi.TranscriptCache()
+    full7 = agent_psi.collect_live_transcripts(tmp7, now7)
+    incr7 = agent_psi.collect_live_transcripts(tmp7, now7, cache=cache7)
+    key = lambda ts: sorted(ts, key=lambda t: t.agent_id)  # noqa: E731
+    check("collect_live_transcripts: cached == uncached",
+          key(full7) == key(incr7) and len(incr7) == 4, f"{len(incr7)} live")
+    check("cache holds every live file", len(cache7) == 4, f"got {len(cache7)}")
+    old = now7 - agent_psi.DEFAULT_LIVE_WINDOW_SECONDS - 60
+    os.utime(os.path.join(subs7, "agent-a2.jsonl"), (old, old))
+    os.remove(os.path.join(subs7, "agent-a3.jsonl"))
+    incr7 = agent_psi.collect_live_transcripts(tmp7, now7, cache=cache7)
+    check("stale and deleted files are evicted",
+          len(cache7) == 2 and len(incr7) == 2, f"cache={len(cache7)}")
+
+    # The exporter's whole output is unchanged by the cache and the window
+    # clip: same frozen `now`, byte-identical /metrics body, across appends.
+    import types
+    from prometheus_client import generate_latest
+
+    tmp8 = tempfile.mkdtemp(prefix="agent-psi-e2e-eq-")
+    sess8 = "eeee0000-0000-0000-0000-000000000000"
+    subs8 = os.path.join(tmp8, "-home-someone", sess8, "subagents")
+    os.makedirs(subs8)
+    now8 = time.time()
+    files8 = [os.path.join(tmp8, "-home-someone", f"{sess8}.jsonl")] + [
+        os.path.join(subs8, f"agent-e{i}.jsonl") for i in range(3)]
+    for i, f in enumerate(files8):
+        write(f, synth(now8 - 6 * 3600, 400, f"e{i}"))
+    mod.PROJECTS_DIR = tmp8
+    real_time, real_clip = mod.time, mod.clip_to_windows
+
+    def body_at(t_now, cache, clip):
+        mod.time = types.SimpleNamespace(time=lambda: t_now,
+                                         monotonic=real_time.monotonic)
+        mod.TRANSCRIPT_CACHE = cache
+        mod.clip_to_windows = real_clip if clip else (lambda ts, now: ts)
+        try:
+            mod.collect()
+            return generate_latest(mod.REG)
+        finally:
+            mod.time, mod.clip_to_windows = real_time, real_clip
+
+    cache8 = agent_psi.TranscriptCache()
+    diffs = 0
+    for step in range(4):
+        for i, f in enumerate(files8):
+            with open(f, "ab") as fh:
+                fh.write(lines_for(synth(now8 - 200 + step * 30, 6, f"x{step}{i}")))
+        t_now = now8 + step * 30
+        ref = body_at(t_now, None, clip=False)
+        if body_at(t_now, cache8, clip=True) != ref:
+            diffs += 1
+    check("exporter body: cached + clipped == full parse, unclipped",
+          diffs == 0 and b"agent_psi_inference_full" in ref, f"{diffs} differ")
+    mod.TRANSCRIPT_CACHE = agent_psi.TranscriptCache()
+
+    # ---- Scenario 16: shared result cache ------------------------------
+    print("\nScenario 16: /metrics body is shared within the TTL")
+    import threading
+
+    calls = []
+    real_collect = mod.collect
+
+    def counting_collect():
+        calls.append(1)
+        time.sleep(0.05)
+        real_collect()
+
+    mod.collect = counting_collect
+    mod.CACHE_TTL_SECONDS = 60
+    mod._rendered = None
+    threads = [threading.Thread(target=mod.render_metrics) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    body = mod.render_metrics()
+    check("8 concurrent scrapes + 1 later one compute once", len(calls) == 1,
+          f"collect ran {len(calls)}x")
+    check("rendered body is the metrics text",
+          b"agent_psi_live_agents" in body, body[:80])
+    mod._rendered = (time.monotonic() - 61, body)
+    mod.render_metrics()
+    check("an expired body is recomputed", len(calls) == 2, f"{len(calls)}x")
+    mod.CACHE_TTL_SECONDS = 0
+    mod.render_metrics()
+    mod.render_metrics()
+    check("TTL 0 recomputes every scrape", len(calls) == 4, f"{len(calls)}x")
+
+    # ---- Scenario 17: liveness never waits on a scrape -----------------
+    print("\nScenario 17: /livez and /healthz answer while /metrics is busy")
+    import urllib.request
+    from urllib.error import HTTPError
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocked_collect():
+        calls.append(1)
+        entered.set()
+        release.wait(10)
+        real_collect()
+
+    mod.collect = blocked_collect
+    mod.CACHE_TTL_SECONDS = 5
+    mod._rendered = None
+    srv = mod.ThreadingHTTPServer(("127.0.0.1", 0), mod.MetricsHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    scrape = {}
+
+    def do_scrape():
+        with urllib.request.urlopen(base + "/metrics", timeout=15) as r:
+            scrape["status"], scrape["body"] = r.status, r.read()
+
+    st = threading.Thread(target=do_scrape)
+    st.start()
+    entered.wait(5)
+    before = len(calls)
+    for probe in ("/livez", "/healthz"):
+        t0 = time.monotonic()
+        with urllib.request.urlopen(base + probe, timeout=2) as r:
+            status, text = r.status, r.read()
+        check(f"{probe} -> 200 ok while a scrape is in flight",
+              status == 200 and text == b"ok\n"
+              and time.monotonic() - t0 < 1.0, f"{status} {text!r}")
+    check("probes did not run a collection", len(calls) == before,
+          f"{len(calls) - before} extra")
+    try:
+        urllib.request.urlopen(base + "/nope", timeout=2)
+        nf = None
+    except HTTPError as e:
+        nf = e.code
+    check("unknown path -> 404", nf == 404, f"got {nf}")
+    release.set()
+    st.join(15)
+    check("the blocked scrape still completes",
+          scrape.get("status") == 200
+          and b"agent_psi_live_agents" in scrape.get("body", b""), scrape)
+    srv.shutdown()
+    srv.server_close()
+    mod.collect = real_collect
 
     # ---- summary -------------------------------------------------------
     print()

@@ -441,16 +441,19 @@ def extract_api_errors(entries):
     An entry with no parseable timestamp is skipped — it cannot be placed in a
     window, and a windowed count is the only thing this feeds.
     """
-    out = []
-    for e in entries:
-        if e.get("isApiErrorMessage") is not True:
-            continue
-        ts = parse_ts(e.get("timestamp"))
-        if ts is None:
-            continue
-        out.append((ts, classify_api_error(_api_error_text(e))))
+    out = [p for p in (_entry_api_error(e) for e in entries) if p is not None]
     out.sort(key=lambda p: p[0])
     return tuple(out)
+
+
+def _entry_api_error(entry):
+    """(timestamp, kind) for one API-error entry, else None."""
+    if entry.get("isApiErrorMessage") is not True:
+        return None
+    ts = parse_ts(entry.get("timestamp"))
+    if ts is None:
+        return None
+    return (ts, classify_api_error(_api_error_text(entry)))
 
 
 # Internal moment: one timestamped point on the transcript timeline.
@@ -513,14 +516,23 @@ def extract_model(entries):
 
     counts = Counter()
     for e in entries:
-        if e.get("type") != "assistant":
-            continue
-        msg = e.get("message")
-        if not isinstance(msg, dict):
-            continue
-        fam = model_family(msg.get("model"))
+        fam = _entry_model(e)
         if fam:
             counts[fam] += 1
+    return _dominant_model(counts)
+
+
+def _entry_model(entry):
+    """Model family of one assistant entry, or None."""
+    if entry.get("type") != "assistant":
+        return None
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return None
+    return model_family(msg.get("model"))
+
+
+def _dominant_model(counts):
     if not counts:
         return UNKNOWN_MODEL
     return counts.most_common(1)[0][0]
@@ -586,14 +598,18 @@ def _entry_to_moment(entry):
 def _all_result_ids(entries):
     ids = set()
     for e in entries:
-        if e.get("type") != "user":
-            continue
-        for b in _content_blocks(e):
-            if isinstance(b, dict) and b.get("type") == "tool_result":
-                tid = b.get("tool_use_id")
-                if tid:
-                    ids.add(tid)
+        _add_result_ids(e, ids)
     return ids
+
+
+def _add_result_ids(entry, ids):
+    if entry.get("type") != "user":
+        return
+    for b in _content_blocks(entry):
+        if isinstance(b, dict) and b.get("type") == "tool_result":
+            tid = b.get("tool_use_id")
+            if tid:
+                ids.add(tid)
 
 
 def _classify_gap(prev, cur, max_gap, api_stall_max=DEFAULT_API_STALL_MAX_SECONDS):
@@ -765,31 +781,54 @@ def parse_intervals(entries, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
     if not moments:
         return []
 
-    intervals = []
-    for prev, cur in zip(moments, moments[1:]):
-        if cur.ts <= prev.ts:
-            continue
-        cat = _classify_gap(prev, cur, max_gap, api_stall_max)
-        stalled = cat == INFERENCE and _is_stalled_inference(
-            cur.ts - prev.ts, cur.output_tokens, stalled_tps, min_stall_gap,
-            api_error=cur.api_error,
-        )
-        intervals.append(Interval(prev.ts, cur.ts, cat, stalled))
+    intervals = _closed_intervals(
+        moments, max_gap, stalled_tps, min_stall_gap, api_stall_max
+    )
 
     if terminated:
         # The agent returned and exited: there is no "right now" to describe.
         return intervals
 
-    result_ids = _all_result_ids(entries)
-    last = moments[-1]
+    intervals.extend(_tail_intervals(
+        moments[-1], now, _all_result_ids(entries), max_gap, api_stall_tail,
+        api_stall_max, stale_after,
+    ))
+    return intervals
+
+
+def _gap_interval(prev, cur, max_gap, stalled_tps, min_stall_gap,
+                  api_stall_max):
+    """Closed Interval for consecutive (sorted) moments, or None if empty."""
+    if cur.ts <= prev.ts:
+        return None
+    cat = _classify_gap(prev, cur, max_gap, api_stall_max)
+    stalled = cat == INFERENCE and _is_stalled_inference(
+        cur.ts - prev.ts, cur.output_tokens, stalled_tps, min_stall_gap,
+        api_error=cur.api_error,
+    )
+    return Interval(prev.ts, cur.ts, cat, stalled)
+
+
+def _closed_intervals(moments, max_gap, stalled_tps, min_stall_gap,
+                      api_stall_max):
+    out = []
+    for prev, cur in zip(moments, moments[1:]):
+        iv = _gap_interval(prev, cur, max_gap, stalled_tps, min_stall_gap,
+                           api_stall_max)
+        if iv is not None:
+            out.append(iv)
+    return out
+
+
+def _tail_intervals(last, now, result_ids, max_gap, api_stall_tail,
+                    api_stall_max, stale_after):
+    """Non-empty trailing interval(s) after the last moment (see
+    ``_tail_interval``)."""
     pending = [i for i in last.tool_use_ids if i not in result_ids]
     tail = _tail_interval(
         last, now, pending, max_gap, api_stall_tail, api_stall_max, stale_after
     )
-    for iv in tail or ():
-        if iv.end > iv.start:
-            intervals.append(iv)
-    return intervals
+    return [iv for iv in tail or () if iv.end > iv.start]
 
 
 def is_running_transcript(entries):
@@ -813,12 +852,13 @@ def is_running_transcript(entries):
     if not moments:
         return False
     moments.sort(key=lambda m: m.ts)
-    last = moments[-1]
+    return _is_running_moment(moments[-1], _all_result_ids(entries))
+
+
+def _is_running_moment(last, result_ids):
     if last.kind != _ASST:
         return True
-    result_ids = _all_result_ids(entries)
-    pending = [i for i in last.tool_use_ids if i not in result_ids]
-    if pending:
+    if any(i not in result_ids for i in last.tool_use_ids):
         return True
     return last.stop_reason != "end_turn"
 
@@ -1082,9 +1122,11 @@ def read_transcript(path, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
     except OSError:
         return None
 
@@ -1158,24 +1200,239 @@ def collect_live_transcripts(projects_dir, now, max_gap=DEFAULT_MAX_GAP_SECONDS,
                              min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
                              api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
                              api_stall_max=DEFAULT_API_STALL_MAX_SECONDS,
-                             stale_after=DEFAULT_STALE_AFTER_SECONDS):
+                             stale_after=DEFAULT_STALE_AFTER_SECONDS,
+                             cache=None):
     """Read every transcript whose file was modified within ``live_window`` of
-    ``now``. Returns list[Transcript]."""
+    ``now``. Returns list[Transcript].
+
+    With a ``TranscriptCache``, each file is parsed incrementally (only bytes
+    appended since the last call) and files that left the live window are
+    evicted; the result is identical to the uncached full parse.
+    """
     live = []
+    seen = set()
     for path, session_id, is_main in discover_transcripts(projects_dir):
         try:
-            mtime = os.stat(path).st_mtime
+            st = os.stat(path)
         except OSError:
             continue
-        if now - mtime > live_window:
+        if now - st.st_mtime > live_window:
             continue
-        t = read_transcript(
-            path, now=now, max_gap=max_gap,
-            is_main_loop=is_main, session_id=session_id,
-            stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
-            api_stall_tail=api_stall_tail, api_stall_max=api_stall_max,
-            stale_after=stale_after,
-        )
+        if cache is None:
+            t = read_transcript(
+                path, now=now, max_gap=max_gap,
+                is_main_loop=is_main, session_id=session_id,
+                stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
+                api_stall_tail=api_stall_tail, api_stall_max=api_stall_max,
+                stale_after=stale_after,
+            )
+        else:
+            seen.add(path)
+            t = cache.read(
+                path, st, now=now, max_gap=max_gap,
+                is_main_loop=is_main, session_id=session_id,
+                stalled_tps=stalled_tps, min_stall_gap=min_stall_gap,
+                api_stall_tail=api_stall_tail, api_stall_max=api_stall_max,
+                stale_after=stale_after,
+            )
         if t is not None:
             live.append(t)
+    if cache is not None:
+        cache.retain(seen)
     return live
+
+
+# --- incremental parsing --------------------------------------------------
+# The first bytes of a file and the bytes just before the consumed offset are
+# re-checked on every change, so an in-place rewrite (same inode, not shorter)
+# is caught and re-parsed. A rewrite that keeps both and only edits the middle
+# is not: transcripts are append-only.
+_SIG_BYTES = 4096
+
+
+class _IncrementalState:
+    """Everything ``read_transcript`` derives from a file's entries, folded
+    one entry at a time.
+
+    Exactness: closed intervals depend only on consecutive SORTED moments, and
+    the tail / running / model / api-error outputs on the last moment plus
+    order-free aggregates (result-id set, model counts, error list). Appended
+    moments that keep timestamp order extend the closed intervals in place; an
+    out-of-order one marks the list dirty, and the next ``transcript()``
+    stable-sorts and rebuilds from moments (no JSON re-parse). Stable sort of
+    [sorted old] + [new in file order] equals a stable sort of the whole file.
+    """
+
+    __slots__ = ("key", "dev", "ino", "size", "mtime_ns", "offset", "head", "sig",
+                 "moments", "closed", "dirty", "result_ids", "model_counts",
+                 "api_errors", "api_sorted")
+
+    def __init__(self, key, st):
+        from collections import Counter
+
+        self.key = key
+        self.dev, self.ino = st.st_dev, st.st_ino
+        self.size = -1
+        self.mtime_ns = -1
+        self.offset = 0
+        self.head = b""
+        self.sig = b""
+        self.moments = []
+        self.closed = []
+        self.dirty = False
+        self.result_ids = set()
+        self.model_counts = Counter()
+        self.api_errors = []
+        self.api_sorted = True
+
+    def feed(self, entry, gap_args):
+        m = _entry_to_moment(entry)
+        if m is not None:
+            if self.moments and not self.dirty:
+                prev = self.moments[-1]
+                if m.ts < prev.ts:
+                    self.dirty = True
+                else:
+                    iv = _gap_interval(prev, m, *gap_args)
+                    if iv is not None:
+                        self.closed.append(iv)
+            self.moments.append(m)
+        _add_result_ids(entry, self.result_ids)
+        fam = _entry_model(entry)
+        if fam:
+            self.model_counts[fam] += 1
+        err = _entry_api_error(entry)
+        if err is not None:
+            if self.api_errors and err[0] < self.api_errors[-1][0]:
+                self.api_sorted = False
+            self.api_errors.append(err)
+
+
+class TranscriptCache:
+    """Per-path incremental parse state for ``collect_live_transcripts``.
+
+    Keyed by path; a changed (dev, inode), a file shorter than the consumed
+    offset, or changed bytes just before it reset that path to a full parse.
+    Only complete lines are consumed, except that a final unterminated line
+    which already decodes as a JSON object is taken too, because the full
+    parse would include it. Not thread-safe: callers serialize.
+    """
+
+    def __init__(self):
+        self._files = {}
+
+    def __len__(self):
+        return len(self._files)
+
+    def retain(self, paths):
+        """Evict every path not in ``paths`` (left the live window / gone)."""
+        for p in [p for p in self._files if p not in paths]:
+            del self._files[p]
+
+    def read(self, path, st=None, now=None, max_gap=DEFAULT_MAX_GAP_SECONDS,
+             is_main_loop=False, session_id=None,
+             stalled_tps=DEFAULT_STALLED_TOKENS_PER_SEC,
+             min_stall_gap=DEFAULT_MIN_STALL_GAP_SECONDS,
+             api_stall_tail=DEFAULT_API_STALL_TAIL_SECONDS,
+             api_stall_max=DEFAULT_API_STALL_MAX_SECONDS,
+             stale_after=DEFAULT_STALE_AFTER_SECONDS):
+        """Same contract and result as ``read_transcript``."""
+        gap_args = (max_gap, stalled_tps, min_stall_gap, api_stall_max)
+        try:
+            if st is None:
+                st = os.stat(path)
+            state = self._files.get(path)
+            if (state is None or state.key != gap_args
+                    or (state.dev, state.ino) != (st.st_dev, st.st_ino)):
+                state = _IncrementalState(gap_args, st)
+            if (st.st_size, st.st_mtime_ns) != (state.size, state.mtime_ns):
+                state = self._advance(path, state, st, gap_args)
+        except OSError:
+            self._files.pop(path, None)
+            return None
+        except BaseException:
+            # A half-fed state must never be reused.
+            self._files.pop(path, None)
+            raise
+        self._files[path] = state
+        return self._transcript(
+            state, path, st.st_mtime, now, is_main_loop, session_id,
+            max_gap, api_stall_tail, api_stall_max, stale_after,
+        )
+
+    @staticmethod
+    def _advance(path, state, st, gap_args):
+        with open(path, "rb") as fh:
+            if state.offset:
+                ok = st.st_size >= state.offset
+                if ok:
+                    ok = fh.read(len(state.head)) == state.head
+                if ok:
+                    fh.seek(state.offset - len(state.sig))
+                    ok = fh.read(len(state.sig)) == state.sig
+                if not ok:
+                    state = _IncrementalState(gap_args, st)
+            fh.seek(state.offset)
+            data = fh.read()
+        end = data.rfind(b"\n") + 1
+        lines = data[:end].split(b"\n")
+        rest = data[end:]
+        if rest.strip():
+            try:
+                if isinstance(json.loads(rest), dict):
+                    lines.append(rest)
+                    end = len(data)
+            except ValueError:
+                pass
+        elif rest:
+            end = len(data)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                state.feed(entry, gap_args)
+        if end:
+            if len(state.head) < _SIG_BYTES:
+                state.head = (state.head + data[:end])[:_SIG_BYTES]
+            state.sig = (state.sig + data[:end])[-_SIG_BYTES:]
+            state.offset += end
+        # Recorded from the pre-read stat: bytes appended after it make the
+        # next call re-check rather than be missed.
+        state.size, state.mtime_ns = st.st_size, st.st_mtime_ns
+        return state
+
+    @staticmethod
+    def _transcript(state, path, mtime, now, is_main_loop, session_id,
+                    max_gap, api_stall_tail, api_stall_max, stale_after):
+        if state.dirty:
+            state.moments.sort(key=lambda m: m.ts)
+            state.closed = _closed_intervals(state.moments, *state.key)
+            state.dirty = False
+        if not state.api_sorted:
+            state.api_errors.sort(key=lambda p: p[0])
+            state.api_sorted = True
+
+        if is_main_loop:
+            agent_id = "main_loop:" + (session_id or "")[:8]
+        else:
+            agent_id = _agent_id_from_path(path) or os.path.basename(path)
+        intervals = list(state.closed)
+        running = False
+        if state.moments:
+            last = state.moments[-1]
+            running = _is_running_moment(last, state.result_ids)
+            if is_main_loop or running:
+                intervals.extend(_tail_intervals(
+                    last, now, state.result_ids, max_gap, api_stall_tail,
+                    api_stall_max, stale_after,
+                ))
+        return Transcript(
+            agent_id, session_id, is_main_loop,
+            _dominant_model(state.model_counts), mtime, intervals, running,
+            tuple(state.api_errors),
+        )

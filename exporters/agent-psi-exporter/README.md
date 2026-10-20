@@ -291,7 +291,48 @@ throughput below this reads as stall, not generation), `AGENT_PSI_MIN_STALL_GAP_
 long reads as an API stall), `AGENT_PSI_API_STALL_MAX_SECONDS` (default 900 —
 ceiling on silent time attributable to an API stall),
 `AGENT_PSI_STALE_AFTER_SECONDS` (default 300 — silence on an *active* trailing
-interval past which the state is reported `unobservable` instead of asserted).
+interval past which the state is reported `unobservable` instead of asserted),
+`AGENT_PSI_CACHE_TTL_SECONDS` (default 5 — one rendered `/metrics` body is
+served to every scraper for this long; 0 recomputes per request),
+`AGENT_PSI_INCREMENTAL` (default 1 — `0` re-parses every live transcript from
+scratch on each scrape instead of reading only appended bytes).
+
+## Scrape cost
+
+Each live transcript is parsed **incrementally**: the exporter keeps, per path,
+the parsed state plus the consumed byte offset, and a scrape reads only the
+complete lines appended since the last one. A file that is replaced (new
+inode), truncated, or rewritten in place (its first or last-consumed 4 KiB
+changed) is re-parsed from scratch, and a file that leaves the live window is
+dropped from the cache. The output is identical to a full re-parse; the test
+suite asserts that byte-for-byte. Windowed math only looks at intervals inside
+the largest window, so hours-long main-loop transcripts don't slow it down.
+
+The server is threaded. Concurrent scrapes share one computation via the
+result cache. `GET /livez` and `GET /healthz` return `200 ok` without touching
+transcripts, so a liveness probe never queues behind a scrape.
+
+`bench_agent_psi.py` times scrapes on a synthetic corpus (default 23 files,
+~43 MiB, 6 files appended to between scrapes):
+
+```
+uv run --python 3.11 --with prometheus_client python3 bench_agent_psi.py
+```
+
+| exporter `/metrics` path | first scrape | steady-state mean | max |
+| --- | --- | --- | --- |
+| before (full re-parse, every interval in every window) | 947 ms | 850 ms | 952 ms |
+| incremental parse + window clip | 457 ms | 29 ms | 35 ms |
+
+| parse step only (`collect_live_transcripts`) | steady-state mean | peak RSS |
+| --- | --- | --- |
+| full re-parse | 524 ms | 36 MiB |
+| whole-file cache, re-parse changed files | 414 ms | 119 MiB |
+| incremental (`TranscriptCache`) | 2.5 ms | 43 MiB |
+
+The whole-file alternative barely helps, because the files that change are the
+live ones and the main-loop transcripts are the largest of them, and it holds
+every decoded entry in memory.
 
 ## Scrape target
 
@@ -304,7 +345,7 @@ ships in-repo at `monitoring/dashboards/agent-psi.json` (uid `agent-psi`); see
 ## Test
 
 ```
-python3 test_agent_psi_exporter.py   # exits 0/1; uv supplies prometheus_client in CI
+make test-agent-psi-exporter   # or: python3 test_agent_psi_exporter.py (needs prometheus_client)
 ```
 
 ## Deferred (phase 2/3)
