@@ -45,7 +45,7 @@ jobs:
 
   unit-tests:
     name: Unit + Fixture Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # temporary pin: tests not yet image-independent (26.04 breaks fake claude + tmux)
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +73,7 @@ jobs:
 
   e2e-tests:
     name: E2E Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # temporary pin: see unit-tests
     steps:
       - uses: actions/checkout@v4
 

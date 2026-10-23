@@ -94,6 +94,12 @@
 # CW_WATCHER_HEALTH_AUTORESTART var (or set it to anything but "1").
 * * * * *  hndrewaall CW_WATCHER_HEALTH_PANE=claude-container:0.0 CW_WATCHER_HEALTH_RESTART_HINT='Restart the event watcher via /claude-container:start-watchers' CW_WATCHER_HEALTH_AUTORESTART=1 /usr/local/bin/cw-cron-run watcher-health-check /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log
 
+# Inbound-chat delivery check: PID liveness cannot see a watcher whose output never
+# reaches the main loop (armed via a Bash background task, not Monitor), so alert
+# when an inbound message stays unread past the threshold. No-op until CW_INBOX_UNREAD_URL or
+# ~/.config/claude-container/inbox-unread-url names the unread-messages endpoint.
+* * * * *  hndrewaall CW_INBOX_DELIVERY_PANE=claude-container:0.0 /usr/local/bin/cw-cron-run inbox-delivery-check /usr/local/bin/cw-inbox-delivery-check > /dev/null 2>>/tmp/claude-watch-cron-inbox-delivery.log  # opaque-ref-ok
+
 # Session-store rotation. Once a day (04:17), bound the two unbounded growers
 # under ~/.config/session/: prune old queue-logs/ transcript archives (age +
 # count cap) and roll completed-tasks.jsonl once it exceeds the size threshold

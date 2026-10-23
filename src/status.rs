@@ -2134,6 +2134,16 @@ pub(crate) fn watcher_cleanly_exited_recently(
     }
 }
 
+/// Whether the clean-exit grace may mask a missing watcher of this mode.
+/// One-shot (block-print-exit) watchers exit 0 by design and the main loop
+/// restarts them, so the marker means "restart pending". A monitor-mode
+/// watcher's exit is the Monitor tool's expiry or a TaskStop: nothing
+/// restarts it unless the main loop re-arms it, so the marker must NOT hide
+/// it for the clean-exit window.
+pub fn clean_exit_grace_applies(mode: WatcherMode) -> bool {
+    mode != WatcherMode::Monitor
+}
+
 /// Age (seconds) of the freshest `<name>.monitor-intent` for `name` across
 /// ALL candidate dirs, or `None` if no intent file exists.
 ///
@@ -2573,6 +2583,12 @@ mod tests {
     }
 
     // --- clean-exit grace (block-print-exit flap fix) tests ---
+
+    #[test]
+    fn clean_exit_grace_skipped_for_monitor_mode() {
+        assert!(clean_exit_grace_applies(WatcherMode::Oneshot));
+        assert!(!clean_exit_grace_applies(WatcherMode::Monitor));
+    }
 
     #[test]
     fn clean_exit_recent_true_when_marker_fresher_than_pidfile_and_young() {

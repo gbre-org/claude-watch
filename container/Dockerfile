@@ -1405,6 +1405,7 @@ COPY container/bin/cw-theme-sync /usr/local/bin/cw-theme-sync
 # via send-keys (bypasses the event system, which is broken if
 # events are accumulating). Fired by the */2 cron entry in cw-default.
 COPY tools/event-must-act/cw-watcher-health-check /usr/local/bin/cw-watcher-health-check
+COPY tools/event-must-act/cw-inbox-delivery-check /usr/local/bin/cw-inbox-delivery-check
 
 # cw-cron-run + cw-cron-toggle — toggle baked cron.d entries without sudo.
 # cw-cron-run is the flag-file exec-wrapper prefixed in front of every
@@ -1446,6 +1447,7 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
              /usr/local/bin/self-mcp-reconnect \
              /usr/local/bin/cw-theme-sync \
              /usr/local/bin/cw-watcher-health-check \
+             /usr/local/bin/cw-inbox-delivery-check \
              /usr/local/bin/cw-cron-run \
              /usr/local/bin/cw-cron-toggle \
              /usr/local/bin/claude-event-watch
