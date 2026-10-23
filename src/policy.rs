@@ -9338,7 +9338,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // stale / dead_process independently catch a dead session), so
                 // genuine-down detection is preserved. 0 disables (legacy).
                 let clean_exit_grace = config.watcher_monitor.clean_exit_grace_secs as f64;
-                if clean_exit_grace > 0.0 {
+                // Monitor-mode watchers are exempt: their exit is the Monitor
+                // tool's ~30 min expiry (or a TaskStop), which delivers one
+                // notice and then NOTHING restarts the watcher unless the
+                // main loop re-arms it. The SIGTERM path writes the same
+                // `<name>.exit` marker, so honouring it here hid a monitor
+                // that expired and was never re-armed for the full
+                // clean_exit_grace_secs (10 min). `grace_secs` above still
+                // absorbs the normal expiry -> re-arm gap.
+                let clean_exit_applies = status::clean_exit_grace_applies(entry.mode);
+                if clean_exit_grace > 0.0 && clean_exit_applies {
                     let clean_exit_age =
                         status::watcher_clean_exit_age_secs_multi(&pid_dirs, &entry.name);
                     if status::watcher_cleanly_exited_recently(

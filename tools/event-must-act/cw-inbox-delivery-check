@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# cw-inbox-delivery-check — cron-driven inbound-message delivery check.
+#
+# Gap this closes: the daemon's watcher_monitor judges a watcher by PID
+# liveness. A monitor-mode watcher that was armed through the wrong tool (a
+# Bash `run_in_background` task instead of the Monitor tool) stays alive and
+# reads "ok", but its stdout only lands in a task output file and is never
+# streamed to the main loop, so inbound messages are never surfaced. PID
+# liveness cannot see that. This check asks the one question that can: is any
+# inbound message still UNREAD after N minutes? If so the delivery path is
+# broken (or the loop is wedged) regardless of what watcher-ctl says, and we
+# inject a [CLAUDE-WATCH] alert straight into the pane.
+#
+# Environment:
+#   CW_INBOX_UNREAD_URL — URL returning JSON {"messages":[{"id","ts","read_at"}]}
+#       of unread inbound messages (ts = epoch seconds). If unset, the first line
+#       of ~/.config/claude-container/inbox-unread-url is used; neither => exit 0.
+#   CW_INBOX_DELIVERY_STALE_MIN — minutes an inbound message may stay
+#       unread before alerting (default 5)
+#   CW_INBOX_DELIVERY_COOLDOWN_SECS — min seconds between injects (default 600)
+#   CW_INBOX_DELIVERY_STATE — cooldown ledger path
+#   CW_INBOX_DELIVERY_PANE — tmux pane target (unset => claude-watch resolves)
+#   CW_INBOX_DELIVERY_NOW — override "now" epoch (tests)
+# Default-open: any API/parse failure => exit 0, no inject.
+set -uo pipefail
+
+API="${CW_INBOX_UNREAD_URL:-}"
+if [ -z "$API" ] && [ -r "$HOME/.config/claude-container/inbox-unread-url" ]; then
+    API="$(head -n1 "$HOME/.config/claude-container/inbox-unread-url")"
+fi
+[ -n "$API" ] || exit 0
+STALE_MIN="${CW_INBOX_DELIVERY_STALE_MIN:-5}"
+COOLDOWN="${CW_INBOX_DELIVERY_COOLDOWN_SECS:-600}"
+STATE_DIR="${CLAUDE_EVENT_STATE_DIR:-$HOME/.config/claude-events}"
+STATE_FILE="${CW_INBOX_DELIVERY_STATE:-$STATE_DIR/inbox-delivery-last-inject}"
+PANE="${CW_INBOX_DELIVERY_PANE:-}"
+NOW="${CW_INBOX_DELIVERY_NOW:-$(date +%s)}"
+case "$STALE_MIN$COOLDOWN" in *[!0-9]*) exit 0 ;; esac
+
+body="$(curl -sf --max-time 10 "$API")" || exit 0
+# ids of unread inbound messages older than the threshold
+ids="$(printf '%s' "$body" | jq -r --argjson now "$NOW" --argjson m "$STALE_MIN" \
+    '[.messages[]? | select(.read_at == null and (.ts + $m*60) < $now) | .id] | join(" ")' 2>/dev/null)" || exit 0
+[ -n "$ids" ] || exit 0
+
+if [ "$COOLDOWN" -gt 0 ] && [ -f "$STATE_FILE" ]; then
+    LAST="$(cat "$STATE_FILE" 2>/dev/null || echo 0)"
+    case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+    [ $((NOW - LAST)) -lt "$COOLDOWN" ] && exit 0
+fi
+
+ALERT="[CLAUDE-WATCH] INBOX UNDELIVERED: inbound message(s) $ids unread >${STALE_MIN}min while the watcher may read healthy. Read them ($ids), then check the inbound-message watcher was armed with the Monitor tool (use its watcher-ctl run command and follow the printed Monitor command), NOT a Bash run_in_background task: a Bash task never streams output to you."
+rc=0
+if [ -n "$PANE" ]; then
+    claude-watch inject --pane "$PANE" --submit "$ALERT" || rc=$?
+else
+    claude-watch inject --submit "$ALERT" || rc=$?
+fi
+[ "$rc" -eq 0 ] || exit "$rc"
+mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+printf '%s\n' "$NOW" > "$STATE_FILE" 2>/dev/null || true
