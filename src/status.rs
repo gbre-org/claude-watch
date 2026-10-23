@@ -2140,7 +2140,7 @@ pub(crate) fn watcher_cleanly_exited_recently(
 /// watcher's exit is the Monitor tool's expiry or a TaskStop: nothing
 /// restarts it unless the main loop re-arms it, so the marker must NOT hide
 /// it for the clean-exit window.
-pub(crate) fn clean_exit_grace_applies(mode: WatcherMode) -> bool {
+pub fn clean_exit_grace_applies(mode: WatcherMode) -> bool {
     mode != WatcherMode::Monitor
 }
 
