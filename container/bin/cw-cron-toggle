@@ -38,6 +38,7 @@ KNOWN_JOBS=(
     watcher-health-check
     session-rotate
     hostjob-reconcile
+    quarantine-renotify
 )
 
 usage() {
@@ -53,7 +54,7 @@ Usage:
 
 Known jobs:
   active-agents  metrics  stale-ready-check  queue-check  watcher-health-check
-  session-rotate  hostjob-reconcile
+  session-rotate  hostjob-reconcile  quarantine-renotify
 
 Disabling takes effect on the next cron tick (~1 min) and persists across
 container redeploys via the claude-watch-state named volume. Flag files live

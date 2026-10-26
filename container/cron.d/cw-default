@@ -124,3 +124,10 @@
 # without the ~/repos bind-mount. `queue list` already runs this sweep inline;
 # this cron makes the leak self-heal even when no one lists the queue.
 */10 * * * *  hndrewaall /usr/local/bin/cw-cron-run hostjob-reconcile /home/hndrewaall/repos/claude-watch/tools/session-task/session-task queue reconcile-hostjobs > /tmp/claude-watch-cron-hostjob-reconcile.log 2>&1
+
+# Quarantined-item renotify. A quarantined queue item holds its scope until an
+# operator releases/resurrects/completes it, and the abandon-time notice is
+# one-shot. Every 5 minutes this re-emits the actionable queue-quarantined
+# event for items quarantined >= CW_QUARANTINE_RENOTIFY_MINUTES (default 15)
+# since their last notice; the command itself enforces the cadence.
+*/5 * * * *  hndrewaall /usr/local/bin/cw-cron-run quarantine-renotify /home/hndrewaall/repos/claude-watch/tools/session-task/session-task queue renotify-quarantined > /tmp/claude-watch-cron-quarantine-renotify.log 2>&1  # opaque-ref-ok
