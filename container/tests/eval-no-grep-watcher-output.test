@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Regression: eval-no-grep-watcher-output must not fire on prose (heredoc
+# bodies / quoted text) that merely mentions grep + a task-output path, but
+# must still deny real filtering of a task output file.
+set -u
+E="$(dirname "$0")/../bin/eval-no-grep-watcher-output"
+fail=0
+chk() { # want(0/1) label cmd
+  printf '%s' "$3" | "$E" >/dev/null 2>&1; rc=$?
+  if [ "$rc" != "$1" ]; then echo "FAIL: $2 (rc=$rc want $1)"; fail=1; fi
+}
+P=/tmp/claude-1000/x/tasks/abc.output  # opaque-ref-ok
+chk 1 "pipe"       "cat $P | grep EVENT"
+chk 1 "grep file"  "grep EVENT $P"
+chk 1 "tail file"  "tail -n5 $P"
+chk 1 "quoted path" "grep 'EVENT' \"$P\""
+chk 0 "plain cat"  "cat $P"
+chk 0 "heredoc prose" "session-task queue add --desc-file - <<'EOF'
+do not grep $P output, tail it never
+EOF"
+chk 0 "quoted prose" "echo 'grep and tail are banned' && cat $P"
+[ $fail = 0 ] && echo "ok"
+exit $fail
