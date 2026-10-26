@@ -515,6 +515,123 @@ def test_release_is_discoverable_in_help():
         assert "queue resurrect" in ab, ab
 
 
+# -------------------- renotify-quarantined --------------------
+
+
+def _renotify_env(tmp):
+    """Env with a fake claude-event on PATH that logs argv as JSON lines."""
+    bin_dir = Path(tmp) / "bin"
+    bin_dir.mkdir()
+    log = Path(tmp) / "events.log"
+    emitter = bin_dir / "claude-event"
+    emitter.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"open({str(log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+    )
+    emitter.chmod(0o755)
+    env = _env_for_tmp(tmp)
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+    del env["CLAUDE_EVENT_SESSION_TASK"]
+    env.pop("CW_QUARANTINE_RENOTIFY_MINUTES", None)
+    return env, log
+
+
+def _events(log):
+    if not log.exists():
+        return []
+    out = []
+    for line in log.read_text().splitlines():
+        argv = json.loads(line)
+        data = {}
+        for i, a in enumerate(argv):
+            if a == "--data":
+                k, _, v = argv[i + 1].partition("=")
+                data[k] = v
+        out.append({"message": argv[0], "data": data,
+                    "tag": argv[argv.index("--tag") + 1]})
+    return out
+
+
+def _backdate(tmp, qid, field, minutes):
+    from datetime import datetime, timedelta, timezone
+    path = Path(tmp) / ".config" / "session" / "queue.json"
+    q = json.loads(path.read_text())
+    for it in q["items"]:
+        if it["id"] == qid:
+            it[field] = (datetime.now(timezone.utc)
+                         - timedelta(minutes=minutes)).isoformat()
+    path.write_text(json.dumps(q))
+
+
+def test_renotify_quarantined_cadence_and_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, log = _renotify_env(tmp)
+        qid = _running_item(env, "renotify me", ["resource:renotify"])
+        _run(env, "queue", "abandon", qid, "--reason", "presumed dead",
+             expect_exit=0)
+        base = len(_events(log))
+
+        # Fresh quarantine: before the cadence, nothing is emitted.
+        _run(env, "queue", "renotify-quarantined", expect_exit=0)
+        assert len(_events(log)) == base
+        assert "quarantine_renotify_count" not in _show(env, qid)
+
+        # Past the cadence: actionable renotify #1.
+        _backdate(tmp, qid, "quarantined_at", 20)
+        _run(env, "queue", "renotify-quarantined", expect_exit=0)
+        evs = _events(log)
+        assert len(evs) == base + 1, evs
+        ev = evs[-1]
+        assert ev["tag"] == "queue-quarantined"
+        assert ev["data"]["tier"] == "actionable"
+        assert ev["data"]["queue_id"] == qid
+        assert "renotify #1" in ev["message"], ev["message"]
+        assert f"queue release {qid}" in ev["data"]["action"]
+        row = _show(env, qid)
+        assert row["quarantine_renotify_count"] == 1
+        assert row["quarantine_last_renotify_at"]
+
+        # Immediately again: cadence counts from the last renotify.
+        _run(env, "queue", "renotify-quarantined", expect_exit=0)
+        assert len(_events(log)) == base + 1
+
+        # After another cadence: #2, count increments.
+        _backdate(tmp, qid, "quarantine_last_renotify_at", 20)
+        _run(env, "queue", "renotify-quarantined", expect_exit=0)
+        evs = _events(log)
+        assert len(evs) == base + 2
+        assert "renotify #2" in evs[-1]["message"]
+        assert _show(env, qid)["quarantine_renotify_count"] == 2
+        # Still quarantined: the reminder never changes state.
+        assert _show(env, qid)["status"] == "quarantined"
+
+
+def test_renotify_quarantined_skips_released_items():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, log = _renotify_env(tmp)
+        qid = _running_item(env, "release me", ["resource:released"])
+        _run(env, "queue", "abandon", qid, "--reason", "x", expect_exit=0)
+        _run(env, "queue", "release", qid, "--reason", "gone", expect_exit=0)
+        base = len(_events(log))
+        _backdate(tmp, qid, "quarantined_at", 120)
+        _run(env, "queue", "renotify-quarantined", expect_exit=0)
+        assert len(_events(log)) == base
+        assert "quarantine_renotify_count" not in _show(env, qid)
+
+
+def test_renotify_quarantined_cadence_env_override():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, log = _renotify_env(tmp)
+        env["CW_QUARANTINE_RENOTIFY_MINUTES"] = "60"
+        qid = _running_item(env, "slow cadence", ["resource:slow"])
+        _run(env, "queue", "abandon", qid, "--reason", "x", expect_exit=0)
+        base = len(_events(log))
+        _backdate(tmp, qid, "quarantined_at", 20)
+        _run(env, "queue", "renotify-quarantined", expect_exit=0)
+        assert len(_events(log)) == base
+
+
 if __name__ == "__main__":
     import sys as _sys
     failures = 0

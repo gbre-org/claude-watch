@@ -122,6 +122,17 @@ spawned for the same work, both finished, and a duplicate reached a user. The
 scope lock existed to prevent exactly that, and a guess dissolved it. Silence
 is not death.
 
+The abandon-time notice is one-shot, so a missed or silenced notice would
+leave the scope held indefinitely. `queue renotify-quarantined` (run from cron
+every 5 minutes) therefore re-emits the actionable `queue-quarantined` event
+for every `quarantined` row whose last notice is at least the cadence old: 15
+minutes by default, overridable with `CW_QUARANTINE_RENOTIFY_MINUTES`. Each
+reminder says how long the item has been quarantined and its renotify number,
+and stamps `quarantine_renotify_count` and `quarantine_last_renotify_at` on the
+row. Released and terminal rows are skipped. Quarantine itself is unchanged:
+nothing auto-abandons, the reminders only keep the decision in front of the
+operator.
+
 `queue list` renders a quarantined item with a `?` head marker (we do not
 know if the agent is alive), the reason, and the release commands inline.
 

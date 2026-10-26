@@ -4510,6 +4510,93 @@ def cmd_queue_reconcile_hostjobs(args):
     print(f"reconciled {len(reconciled)} hostjob row(s)")
 
 
+def _quarantine_renotify_cadence_sec():
+    """Renotify cadence in seconds (env CW_QUARANTINE_RENOTIFY_MINUTES, default 15)."""
+    try:
+        minutes = float(os.environ.get("CW_QUARANTINE_RENOTIFY_MINUTES", "15"))
+    except ValueError:
+        minutes = 15.0
+    return max(0.0, minutes) * 60.0
+
+
+def _fmt_duration(seconds):
+    seconds = int(max(0, seconds))
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds // 60}m"
+
+
+def cmd_queue_renotify_quarantined(args):
+    """Re-emit the actionable ``queue-quarantined`` event for stale quarantines.
+
+    A quarantined item holds its scope until an operator releases,
+    resurrects or completes it, and the abandon-time notice is one-shot. If
+    that notice is missed, the scope stays held forever. This command is run
+    periodically (cron); for each ``quarantined`` row whose last notice
+    (``quarantined_at`` or ``quarantine_last_renotify_at``) is at least the
+    cadence old, it emits the event again and stamps
+    ``quarantine_renotify_count`` / ``quarantine_last_renotify_at``.
+    Released and terminal rows are never touched.
+    """
+    cadence = _quarantine_renotify_cadence_sec()
+    now = datetime.now(timezone.utc)
+    due = []
+    fh, data = _queue_open_locked("rw")
+    try:
+        for it in data["items"]:
+            if it.get("status") != "quarantined":
+                continue
+            last = None
+            for key in ("quarantined_at", "quarantine_last_renotify_at"):
+                try:
+                    t = datetime.fromisoformat(it.get(key) or "")
+                except (TypeError, ValueError):
+                    continue
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                if last is None or t > last:
+                    last = t
+            if last is None:
+                continue
+            if (now - last).total_seconds() < cadence:
+                continue
+            n = int(it.get("quarantine_renotify_count") or 0) + 1
+            it["quarantine_renotify_count"] = n
+            it["quarantine_last_renotify_at"] = now.isoformat()
+            started = it.get("quarantined_at") or it.get("created_at")
+            due.append((dict(it), n, started))
+        if due:
+            _queue_write_and_unlock(fh, data)
+        else:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    # Emit outside the lock so a slow/broken emitter never holds the queue.
+    for item, n, started in due:
+        elapsed = _elapsed_seconds(started)
+        _emit_quarantine_event(
+            item,
+            reason=item.get("quarantine_reason") or "",
+            prior_status=item.get("quarantined_from") or "",
+            elapsed_sec=elapsed,
+            silent=getattr(args, "silent", False),
+            renotify_n=n,
+            quarantined_for=_fmt_duration(elapsed or 0),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps([{"id": i["id"], "renotify_count": n}
+                          for i, n, _ in due], indent=2))
+    elif due:
+        for i, n, _ in due:
+            print(f"renotified {i['id']} (#{n})")
+    else:
+        print("no quarantined items due for renotify")
+
+
 def cmd_queue_list(args):
     fh, data = _queue_open_locked("rw")
     items = list(data["items"])
@@ -5053,6 +5140,51 @@ def _quarantine_action_text(qid: str) -> str:
     )
 
 
+def _emit_quarantine_event(target, *, reason, prior_status, elapsed_sec,
+                           silent=False, renotify_n=None, quarantined_for=None):
+    """Emit the actionable ``queue-quarantined`` claude-event for ``target``.
+
+    Shared by the one-shot notice at abandon time and the periodic
+    ``queue renotify-quarantined`` reminder (``renotify_n`` set), so both
+    carry the same data shape and action text.
+    """
+    qid = target["id"]
+    reason_str = reason if reason else "no reason given"
+    if renotify_n:
+        head = (
+            f"queue STILL QUARANTINED for {quarantined_for}, "
+            f"renotify #{renotify_n}: {qid}"
+        )
+    else:
+        head = f"queue QUARANTINED: {qid}"
+    data = {
+        "action": _quarantine_action_text(qid),
+        "queue_id": qid,
+        "group_id": target.get("group_id"),
+        "scope": target.get("scope", []),
+        "summary": _item_summary(target),
+        "elapsed_sec": elapsed_sec,
+        "reason": reason or "",
+        "prior_status": prior_status,
+        "quarantined_at": target.get("quarantined_at"),
+        "created_by": target.get("created_by", ""),
+        "tier": "actionable",
+    }
+    if renotify_n:
+        data["renotify_count"] = renotify_n
+    _claude_event_notify(
+        tag="queue-quarantined",
+        message=(
+            f"{head} ({_item_summary(target)}) "
+            f"-- scope still held, reason: {reason_str}. "
+            f"{_quarantine_action_text(qid)}"
+        ),
+        data=data,
+        priority="low",
+        silent=silent,
+    )
+
+
 def _emit_quarantine_notifications(target, args, *, started_at, prior_status):
     """Log / pingme / claude-event for an abandon that landed in quarantine.
 
@@ -5104,27 +5236,11 @@ def _emit_quarantine_notifications(target, args, *, started_at, prior_status):
     # The Pushover push above stays priority="normal" (unchanged); this
     # stamp only affects the claude-event tier that gates the main loop's
     # Bash calls via event_must_act.
-    _claude_event_notify(
-        tag="queue-quarantined",
-        message=(
-            f"queue QUARANTINED: {qid} ({_item_summary(target)}) "
-            f"-- scope still held, reason: {reason_str}. "
-            f"{_quarantine_action_text(qid)}"
-        ),
-        data={
-            "action": _quarantine_action_text(qid),
-            "queue_id": qid,
-            "group_id": target.get("group_id"),
-            "scope": target.get("scope", []),
-            "summary": _item_summary(target),
-            "elapsed_sec": elapsed_sec,
-            "reason": args.reason or "",
-            "prior_status": prior_status,
-            "quarantined_at": target.get("quarantined_at"),
-            "created_by": target.get("created_by", ""),
-            "tier": "actionable",
-        },
-        priority="low",
+    _emit_quarantine_event(
+        target,
+        reason=args.reason or "",
+        prior_status=prior_status,
+        elapsed_sec=elapsed_sec,
         silent=getattr(args, "silent", False),
     )
 
@@ -9298,6 +9414,18 @@ def build_parser():
     )
     q_reconcile_hj.add_argument("--json", action="store_true")
 
+    q_renotify_q = qsub.add_parser(
+        "renotify-quarantined",
+        help=(
+            "Re-emit the actionable queue-quarantined event for items that "
+            "have stayed quarantined past the cadence (default 15 minutes, "
+            "env CW_QUARANTINE_RENOTIFY_MINUTES). Run periodically from cron "
+            "so a missed one-shot notice cannot leave a scope held forever."
+        ),
+    )
+    q_renotify_q.add_argument("--json", action="store_true")
+    q_renotify_q.add_argument("--silent", action="store_true")
+
     q_show = qsub.add_parser("show", help="Show item details")
     q_show.add_argument("id")
 
@@ -10066,6 +10194,7 @@ def main():
             "add": cmd_queue_add,
             "list": cmd_queue_list,
             "reconcile-hostjobs": cmd_queue_reconcile_hostjobs,
+            "renotify-quarantined": cmd_queue_renotify_quarantined,
             "show": cmd_queue_show,
             "scope": cmd_queue_scope,
             "groups": cmd_queue_groups,
