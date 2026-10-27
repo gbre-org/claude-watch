@@ -349,6 +349,7 @@ test-event-must-act: ## event-must-act toolchain self-tests
 # a live Claude Code tmux pane, which can't be reproduced in unit tests).
 test-self-clear: ## self-clear config-only smoke tests
 	python3 tools/watchers/tests/test_self_clear_config.py
+	python3 tools/watchers/tests/test_self_clear_rewind_guard.py
 
 # self-login pure predicates + config paths. No terminal needed.
 test-self-login: ## self-login unit tests (pane predicates, code validation, config)

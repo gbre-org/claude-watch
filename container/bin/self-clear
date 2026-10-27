@@ -785,42 +785,99 @@ def confirm_clear_picker(pane, max_wait=3, poll_interval=0.2):
         "no Enter sent")
 
 
-def interrupt_and_wait(pane, timeout=60, poll_interval=0.5):
-    """Actively interrupt Claude Code and wait for idle prompt.
+# Minimum seconds between two Escape keypresses. Claude Code treats two
+# Escapes inside its double-press window on an idle prompt as "open Rewind",
+# so Escapes must never be sent back-to-back.
+ESC_MIN_GAP = 1.5
 
-    Rapid-fire Escape approach: press Escape, check quickly, repeat.
-    A single Escape often doesn't register during stuck API calls.
-    Every 5 Escape attempts, try Ctrl-B x2 (backgrounds foreground bash).
+_REWIND_MARKERS = ("Rewind", "Restore the conversation", "Enter to continue")
+
+
+def _rewind_text_present(pane_text):
+    """Pure: any Rewind-dialog marker in the captured pane text."""
+    if not pane_text:
+        return False
+    return (any(m in pane_text for m in _REWIND_MARKERS)
+            or _rewind_picker_visible(pane_text))
+
+
+_last_escape_at = [0.0]
+
+
+def send_escape(pane, min_gap=None):
+    """Send ONE Escape, first waiting out the minimum gap since the last one."""
+    gap = ESC_MIN_GAP if min_gap is None else min_gap
+    wait = _last_escape_at[0] + gap - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    run(["tmux", "send-keys", "-t", pane, "Escape"])
+    _last_escape_at[0] = time.time()
+
+
+def ensure_no_rewind(pane, max_tries=5, settle=0.5, stage=""):
+    """Dismiss a Rewind dialog (single Esc per pass), re-checking until clean.
+
+    Captures the pane first and sends NOTHING when no Rewind is showing (never
+    Escape an idle prompt). Returns True iff the pane is clean on exit.
+    """
+    for i in range(max_tries + 1):
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        if rc != 0 or not out:
+            return True
+        if not _rewind_text_present(out):
+            return True
+        if i == max_tries:
+            break
+        log(f"  ensure_no_rewind[{stage}]: Rewind open -- single Escape "
+            f"({i + 1}/{max_tries})")
+        send_escape(pane)
+        time.sleep(settle)
+    log(f"  WARNING: ensure_no_rewind[{stage}]: Rewind still open after retries")
+    return False
+
+
+def interrupt_and_wait(pane, timeout=60, poll_interval=0.5):
+    """Interrupt Claude Code and wait for an idle prompt.
+
+    Escapes are spaced >= ESC_MIN_GAP apart and never sent when the pane is
+    already idle, so they cannot chain into the double-Esc that opens Rewind.
+    A Rewind that does appear is dismissed with a single Escape.
+    Every 5 attempts, try Ctrl-B x2 (backgrounds foreground bash).
 
     Returns True if idle confirmed, False on timeout.
     """
-    # FleetView-aware: return keyboard focus to the MAIN loop (pane reselect +
-    # configured focus_main_keys) BEFORE the Escape blast, so an interrupt can
-    # never cancel a background agent's turn (mirrors src/tmux.rs).
     _return_focus_to_main(pane)
 
     deadline = time.time() + timeout
-    escape_count = 0
+    attempts = 0
     while time.time() < deadline:
-        if is_idle(pane):
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        out = out if (rc == 0 and out) else ""
+        if _rewind_text_present(out):
+            # Its own `❯ (current)` row looks idle -- dismiss, don't trust it.
+            ensure_no_rewind(pane, stage="interrupt")
+            attempts += 1
+            continue
+        if _is_idle_text(out):
             time.sleep(0.3)
-            if is_idle(pane):
+            out2, rc2 = run(["tmux", "capture-pane", "-t", pane, "-p"])
+            if rc2 == 0 and _is_idle_text(out2) and not _rewind_text_present(out2):
                 log("  interrupt_and_wait: idle confirmed")
                 return True
+            continue
 
-        if escape_count > 0 and escape_count % 5 == 0:
-            log(f"  interrupt_and_wait: trying Ctrl-B x2 (attempt {escape_count})")
+        if attempts > 0 and attempts % 5 == 0:
+            log(f"  interrupt_and_wait: trying Ctrl-B x2 (attempt {attempts})")
             run(["tmux", "send-keys", "-t", pane, "C-b"])
             time.sleep(0.3)
             run(["tmux", "send-keys", "-t", pane, "C-b"])
             time.sleep(poll_interval)
         else:
-            run(["tmux", "send-keys", "-t", pane, "Escape"])
+            send_escape(pane)
             time.sleep(poll_interval)
+        attempts += 1
 
-        escape_count += 1
-
-    log(f"  interrupt_and_wait: TIMEOUT after {escape_count} attempts")
+    log(f"  interrupt_and_wait: TIMEOUT after {attempts} attempts")
     return False
 
 
@@ -1024,6 +1081,7 @@ def child_main(pane, args):
 
     # Actively interrupt thinking by sending Escape and verifying via tmux.
     idle_ok = interrupt_and_wait(pane, timeout=args.timeout)
+    ensure_no_rewind(pane, stage="pre-/clear")
     log(f"  interrupt_and_wait: {'idle confirmed' if idle_ok else 'TIMEOUT'}")
     log(f"  pane after interrupt: {capture_pane_text(pane)}")
 
@@ -1146,19 +1204,18 @@ def child_main(pane, args):
 
     dismiss_feedback_prompt(pane)
 
-    # Last line of defence: NEVER type the resume prompt into an open Rewind
-    # picker, whatever the completion poll concluded. Confirm it (Enter on
-    # `(current)`) and wait for it to close before injecting.
-    for _ in range(10):
-        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
-        if rc != 0 or not out or not _rewind_picker_visible(out):
-            break
-        log("  pre-resume: Rewind picker still open -- confirming before resume")
-        _rewind_picker_confirm_once(pane, pane_text=out)
-        time.sleep(0.5)
+    # Last line of defence: NEVER type the resume prompt into a Rewind dialog.
+    # Dismiss with single Escapes, re-check until clean, and verify a clean
+    # idle prompt before injecting.
+    if not ensure_no_rewind(pane, stage="post-/clear"):
+        log("  ABORT-RESUME: Rewind still open after retries; not injecting")
+        return
 
     if not wait_for_idle(pane, timeout=30):
         log("  WARNING: idle wait timed out before resume inject")
+    if not ensure_no_rewind(pane, stage="pre-resume"):
+        log("  ABORT-RESUME: Rewind open before resume; not injecting")
+        return
     # escape=True: the resume prompt is the handoff into the fresh session and
     # must not be corrupted by anything left on the input line. It also submits
     # via Tab→Escape→Enter (the regular-text sequence), which only the
