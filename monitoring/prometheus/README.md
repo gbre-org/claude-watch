@@ -55,6 +55,12 @@ A `running` queue item that loses its owner is surfaced fast-then-slow:
    `[queue_check] no_binding_grace_secs` (default 150s). This is the
    FIRST, primary signal — no Prometheus required. Gated by
    `[queue_check] emit_events` (must be `true`; the container bakes it on).
+   Acking the event does NOT resolve the orphan, so the event RE-FIRES every
+   `[queue_check] orphan_escalate_cooldown_secs` (default 1800s) until the item
+   leaves `running`. Resolve with `session-task queue done <id>` (work
+   delivered) or `abandon <id> --reason ...`; `resurrect <id>` only to respawn;
+   never `block` it (a wait on another queue item is `queue depend <id> --add
+   <upstream>`).
 
 2. **Stage 2 — `WorkQueueOrphaned` Prometheus alert (external, ~15 min).**
    The work-queue-exporter emits `worktask_queue_item_has_live_owner=0` once

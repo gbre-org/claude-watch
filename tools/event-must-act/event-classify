@@ -519,15 +519,19 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     # MUST precede the claude-watch/* ambient catch-all so the orphan/stuck
     # signal lands in the actionable tier (N-call gate) instead of ambient.
     ("claude-watch", "queue-orphaned", None, ACTIONABLE,
-        "Queue item orphaned (running, owner dead); needs respawn/resurrect "
-        "or abandon decision."),
+        "Queue item orphaned (running, owner dead). Ack does NOT resolve it "
+        "and it re-fires. Resolve NOW: queue done (delivered) / queue abandon "
+        "--reason (not delivered) / queue resurrect (respawn only). Never "
+        "block it; to wait on another item use queue depend --add."),
     ("claude-watch", "queue-stuck", None, ACTIONABLE,
         "Queue item stuck (wedged, or running with a stale heartbeat); needs "
         "respawn/unwedge or abandon decision."),
     # Back-compat: a future producer emitting under source="queue".
     ("queue", "queue-orphaned", None, ACTIONABLE,
-        "Queue item orphaned (running, owner dead); needs respawn/resurrect "
-        "or abandon decision."),
+        "Queue item orphaned (running, owner dead). Ack does NOT resolve it "
+        "and it re-fires. Resolve NOW: queue done (delivered) / queue abandon "
+        "--reason (not delivered) / queue resurrect (respawn only). Never "
+        "block it; to wait on another item use queue depend --add."),
     ("queue", "queue-stuck", None, ACTIONABLE,
         "Queue item stuck (wedged, or running with a stale heartbeat); needs "
         "respawn/unwedge or abandon decision."),

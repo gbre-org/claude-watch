@@ -50,7 +50,10 @@
 //! State file `<state-dir>/queue-check-state.json` maps a per-(qid,
 //! condition) key to the ISO emit timestamp. An item that already fired
 //! for a condition won't re-fire for the SAME condition until it leaves
-//! the queue (drops out of `queue list --all`). The key includes the
+//! the queue (drops out of `queue list --all`), EXCEPT `orphaned`: acking
+//! the event never resolves an orphan, so orphaned entries expire after
+//! `orphan_escalate_cooldown_secs` and the event re-fires until the item
+//! leaves `running`. The key includes the
 //! condition so an item that transitions orphaned→wedged still surfaces
 //! the new condition once.
 //!
@@ -125,6 +128,36 @@ pub const EVENT_TAG_STUCK: &str = "queue-stuck";
 pub const EVENT_SOURCE: &str = "claude-watch";
 /// `source_name` disambiguator within `source=claude-watch`.
 pub const EVENT_SOURCE_NAME: &str = "queue-check";
+
+/// Imperative resolution rule shipped with every `queue-orphaned` event as
+/// `data.action` (surfaced by the watcher as the pending entry's reason).
+/// Keep in sync with the orphaned-running hard-gate banner
+/// (`container/bin/eval-orphaned-running-hard-gate`).
+pub const ORPHAN_ACTION: &str = "Acking does NOT resolve an orphan; this re-fires until the item leaves running. Resolve it NOW: `session-task queue done <id>` if the work was delivered, else `session-task queue abandon <id> --reason \"...\"`; `session-task queue resurrect <id>` only to respawn the agent. Do NOT `block` it (block is for external waits); to wait on another queue item use `session-task queue depend <id> --add <upstream>`.";
+
+/// Pure: drop `orphaned` dedup entries whose last emit is at least
+/// `renotify_secs` old (or unparseable), so a STILL-orphaned item re-fires on
+/// its normal interval. Acking the event never resolves the orphan, so a
+/// permanent single-emit dedup would silence it after the first ack. Entries
+/// for other conditions are untouched. `renotify_secs <= 0` disables expiry.
+pub fn expire_orphan_dedup(state: &State, now_epoch_secs: i64, renotify_secs: i64) -> State {
+    if renotify_secs <= 0 {
+        return state.clone();
+    }
+    state
+        .iter()
+        .filter(|(k, v)| {
+            if !k.ends_with("::orphaned") {
+                return true;
+            }
+            match parse_iso_epoch_secs(v) {
+                Some(t) => now_epoch_secs - t < renotify_secs,
+                None => false,
+            }
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
 
 /// The condition a queue item qualified under. Used as part of the
 /// dedup key and to pick the event tag.
@@ -653,6 +686,13 @@ pub fn build_message(condition: Condition, qualifying: &[Qualifying]) -> String 
     if n > TOP_N {
         msg.push_str(&format!(" (+{} more)", n - TOP_N));
     }
+    if condition == Condition::Orphaned {
+        // Appended AFTER the item list: event-ack keys on the first 80 chars,
+        // so the pending key stays stable.
+        msg.push_str(
+            ". ACK DOES NOT RESOLVE (re-fires): run `session-task queue done <id>` or `abandon <id> --reason ...` NOW; never `block`.",
+        );
+    }
     msg
 }
 
@@ -707,6 +747,10 @@ pub fn build_event_json(
             "top_summaries": top_summaries,
             "all_ids": all_ids,
             "items": details,
+            "action": match condition {
+                Condition::Orphaned => serde_json::Value::String(ORPHAN_ACTION.to_string()),
+                Condition::Stuck => serde_json::Value::Null,
+            },
         },
         "pid": pid,
         "user": user,
@@ -1302,9 +1346,13 @@ pub fn cmd_queue_check(
     // Build the active-agents join once (reads <state-dir>/active-agents.json).
     let (agent_map, state_present) = build_agent_liveness(&state_dir);
 
+    // Orphan dedup is time-limited: a still-orphaned item re-fires every
+    // `orphan_escalate_cooldown_secs` even after its event was acked.
+    let (_, _, renotify_secs, _) = hard_gate_knobs();
+    let dedup_view = expire_orphan_dedup(&pruned, now_epoch, renotify_secs);
     let mut qualifying = compute_qualifying(
         &all_items,
-        &pruned,
+        &dedup_view,
         now_epoch,
         stale_secs,
         grace_secs,
@@ -2205,6 +2253,59 @@ mod tests {
     }
 
     #[test]
+    fn orphan_dedup_expires_after_renotify_interval() {
+        let mut state = State::new();
+        state.insert(
+            "q-1::orphaned".to_string(),
+            "2026-06-03T00:00:00Z".to_string(),
+        );
+        state.insert("q-2::stuck".to_string(), "2026-06-03T00:00:00Z".to_string());
+        let t0 = parse_iso_epoch_secs("2026-06-03T00:00:00Z").unwrap();
+        // within interval: still suppressed
+        let v = expire_orphan_dedup(&state, t0 + 600, 1800);
+        assert!(v.contains_key("q-1::orphaned"));
+        // past interval: orphaned entry dropped (re-fires), stuck kept
+        let v = expire_orphan_dedup(&state, t0 + 1800, 1800);
+        assert!(!v.contains_key("q-1::orphaned"));
+        assert!(v.contains_key("q-2::stuck"));
+        // disabled
+        let v = expire_orphan_dedup(&state, t0 + 99999, 0);
+        assert!(v.contains_key("q-1::orphaned"));
+        // expired view makes a still-orphaned item qualify again
+        let items = vec![item("q-1", "running", Some(4242), None)];
+        let now = t0 + 1800;
+        let view = expire_orphan_dedup(&state, now, 1800);
+        let q = compute_qualifying(&items, &view, now, 15 * 60, GRACE, all_dead, no_agents);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn orphaned_event_ships_resolution_action() {
+        let q = vec![Qualifying {
+            id: "q-a".to_string(),
+            summary: "s".to_string(),
+            condition: Condition::Orphaned,
+            detail: "d".to_string(),
+            agent_id: None,
+        }];
+        let v = build_event_json(Condition::Orphaned, &q, "2026-06-03T01:30:00Z", "h", "u", 1);
+        let a = v["data"]["action"].as_str().unwrap();
+        for needle in [
+            "does NOT resolve",
+            "queue done",
+            "queue abandon",
+            "resurrect",
+            "block",
+            "depend",
+        ] {
+            assert!(a.contains(needle), "{needle} missing: {a}");
+        }
+        assert!(a.is_ascii());
+        let v = build_event_json(Condition::Stuck, &q, "2026-06-03T01:30:00Z", "h", "u", 1);
+        assert!(v["data"]["action"].is_null());
+    }
+
+    #[test]
     fn dedup_allows_new_condition_for_same_id() {
         // Already emitted "stuck" for q-1; now it's orphaned → fires.
         let items = vec![item("q-1", "running", Some(4242), None)];
@@ -2265,6 +2366,8 @@ mod tests {
         // Enriched: summary + detail are inline, not just the bare id.
         assert!(msg.contains("[s]"), "{msg}");
         assert!(msg.contains("(d)"), "{msg}");
+        assert!(msg.contains("ACK DOES NOT RESOLVE"), "{msg}");
+        assert!(msg.is_ascii());
     }
 
     #[test]
