@@ -555,6 +555,7 @@ test-hostjob: ## hostjob detached host-job runner tests
 		examples/compose/bin/tests/test_hostjob_broker.py \
 		examples/compose/bin/tests/test_hostjob_broker_stop_endpoint.py \
 		examples/compose/bin/tests/test_hostjob_queue.py \
+		examples/compose/bin/tests/test_hostjob_queue_remote.py \
 		examples/compose/bin/tests/test_hostjob_stop.py
 
 # Tests for examples/compose/ttyd/inject-autodark.py PASTE_EVENT_HANDLER_JS
