@@ -46,6 +46,11 @@ surfaced by `poll`/`list`), NOT the `hostjob:<label>` scope-token string:
 `--add` against existing queue ids; a scope token would be rejected). A new
 hostjob can also declare a dependency at launch via `--depends-on <qid>`.
 
+REMOTE QUEUE: with no local `session-task`, set HOSTJOB_QUEUE_REMOTE=ssh://[user@]host[:port]
+(or put it in ~/.config/claude-container/hostjob-queue-remote) to create/close the row on a
+remote queue host over ssh. Local session-task is always preferred. If the remote is
+unreachable the job still runs, stderr warns, and status.json records "queue_missing".
+
 All queue/event plumbing is FAIL-SOFT: if `session-task` / `claude-event` are
 missing or error, the job still runs (and the reaper still records its real
 status) — queue bookkeeping never blocks the actual host work.
@@ -246,7 +251,7 @@ def reconcile(label):
         # explicit False and status.json predating this field).
         qid = st.get("queue_id")
         if qid and st.get("queue_registered") is not True:
-            st_bin = shutil.which("session-task")
+            st_bin = _backend_for(st)
             if st_bin and _queue_register(st_bin, qid, if_absent=True):
                 st["queue_registered"] = True
                 write_status(label, st)
@@ -259,7 +264,7 @@ def reconcile(label):
         # once (mirrors the pending->running self-heal above).
         qid = st.get("queue_id")
         if qid and not st.get("queue_finalized"):
-            st_bin = shutil.which("session-task")
+            st_bin = _backend_for(st)
             if st_bin and _finalize_stopped_queue_item(st_bin, qid, st.get("stop_note")):
                 st["queue_finalized"] = True
                 write_status(label, st)
@@ -269,6 +274,95 @@ def reconcile(label):
 # --------------------------------------------------------------------------
 # queue integration (host-side; fail-soft)
 # --------------------------------------------------------------------------
+def _remote_setting():
+    """Return the configured remote queue spec (e.g. ``ssh://user@host``) or "".
+
+    Opt-in. Sources, first hit wins: env ``HOSTJOB_QUEUE_REMOTE``; then the first
+    non-comment line of ``~/.config/claude-container/hostjob-queue-remote``.
+    Only consulted when a local ``session-task`` is NOT on PATH.
+    """
+    v = (os.environ.get("HOSTJOB_QUEUE_REMOTE") or "").strip()
+    if v:
+        return v
+    path = os.path.join(os.path.expanduser("~"), ".config",
+                        "claude-container", "hostjob-queue-remote")
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    return ln
+    except Exception:
+        pass
+    return ""
+
+
+def _remote_backend(spec):
+    """Parse ``ssh://[user@]host[:port]`` into a backend dict, or None.
+
+    The transport is plain ``ssh`` (existing key, BatchMode so it can never
+    prompt) running the remote host's own ``session-task``; the remote command
+    name/path defaults to ``session-task`` and can be overridden with
+    ``HOSTJOB_QUEUE_REMOTE_CMD`` (non-interactive ssh often lacks ~/bin on PATH).
+    """
+    if not spec.startswith("ssh://"):
+        return None
+    rest = spec[len("ssh://"):].rstrip("/")
+    port = None
+    userhost = rest
+    if ":" in rest.rsplit("@", 1)[-1]:
+        userhost, _, port = rest.rpartition(":")
+    if not userhost or userhost.startswith("-"):
+        return None
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+           "-o", "StrictHostKeyChecking=accept-new"]
+    if port:
+        if not port.isdigit():
+            return None
+        ssh += ["-p", port]
+    ssh.append(userhost)
+    return {"ssh": ssh,
+            "cmd": os.environ.get("HOSTJOB_QUEUE_REMOTE_CMD") or "session-task",
+            "desc": "ssh://%s" % rest}
+
+
+def _queue_backend():
+    """Pick the queue transport. Returns ``(backend, why_missing)``.
+
+    ``backend`` is a str (path to local ``session-task`` — always preferred) or
+    a remote dict (see `_remote_backend`); None when neither is available, in
+    which case ``why_missing`` says why. Never raises.
+    """
+    st_bin = shutil.which("session-task")
+    if st_bin:
+        return st_bin, None
+    spec = _remote_setting()
+    if not spec:
+        return None, "session-task not on PATH and no HOSTJOB_QUEUE_REMOTE set"
+    be = _remote_backend(spec)
+    if be is None:
+        return None, "invalid HOSTJOB_QUEUE_REMOTE %r (want ssh://[user@]host[:port])" % spec
+    if not shutil.which("ssh"):
+        return None, "HOSTJOB_QUEUE_REMOTE set but ssh not on PATH"
+    return be, None
+
+
+def _st_argv(backend, *args):
+    """Build the argv that runs ``session-task <args>`` on `backend`."""
+    if isinstance(backend, dict):
+        remote = " ".join(shlex.quote(a) for a in (backend["cmd"],) + args)
+        return list(backend["ssh"]) + [remote]
+    return [backend] + list(args)
+
+
+def _backend_for(st):
+    """Backend recorded in a job's status (set at launch), else local which."""
+    be = st.get("queue_backend")
+    if be:
+        return be
+    return shutil.which("session-task")
+
+
 def _describe_cmd(label, cmd):
     """Build the queue-item DESCRIPTION for a hostjob: its real command line.
 
@@ -303,7 +397,7 @@ def _queue_register(st_bin, qid, if_absent=False):
     never block the actual host job. Split out from `_register_queue_item` so
     `reconcile()` can retry this exact step later without re-adding the row.
     """
-    argv = [st_bin, "queue", "register", qid]
+    argv = _st_argv(st_bin, "queue", "register", qid)
     if if_absent:
         argv.append("--if-absent")
     try:
@@ -350,7 +444,7 @@ def _finalize_stopped_queue_item(st_bin, qid, reason):
     False on any refusal/timeout/exception. NEVER raises — queue plumbing
     must never block the actual stop/poll operation.
     """
-    argv = [st_bin, "queue", "abandon", qid, "--reason", reason or "hostjob stopped"]
+    argv = _st_argv(st_bin, "queue", "abandon", qid, "--reason", reason or "hostjob stopped")
     try:
         r = subprocess.run(
             argv,
@@ -372,6 +466,21 @@ def _finalize_stopped_queue_item(st_bin, qid, reason):
         )
         return False
     return True
+
+
+# Side-channel from `_register_queue_item` to `cmd_run`: which backend was
+# chosen and, if no row could be made, why (recorded in status.json as
+# "queue_missing" so the missing row is never silent).
+_LAST_QUEUE = {"backend": None, "missing": None}
+
+
+def _queue_add_failed(msg, remote_desc=None):
+    where = " (remote %s)" % remote_desc if remote_desc else ""
+    _LAST_QUEUE["missing"] = msg + where
+    sys.stderr.write(
+        "hostjob: WARNING: %s%s — running UNqueued (job will NOT appear on "
+        "the queue site).\n" % (msg, where)
+    )
 
 
 def _register_queue_item(label, cmd=None, depends_on=None, register=True):
@@ -401,17 +510,23 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
     a live worker (the bug this retry was added to fix). NEVER raises — queue
     plumbing must never block the actual host job.
     """
-    st_bin = shutil.which("session-task")
+    st_bin, why = _queue_backend()
     if not st_bin:
+        _LAST_QUEUE["backend"] = None
+        _LAST_QUEUE["missing"] = why
         sys.stderr.write(
-            "hostjob: session-task not on PATH — running UNqueued.\n"
+            "hostjob: WARNING: no queue row — %s — running UNqueued "
+            "(job will NOT appear on the queue site).\n" % why
         )
         return None, None
+    _LAST_QUEUE["backend"] = st_bin
+    _LAST_QUEUE["missing"] = None
+    remote_desc = st_bin["desc"] if isinstance(st_bin, dict) else None
     scope = "hostjob:%s" % label
     description = _describe_cmd(label, cmd)
     try:
-        add_argv = [
-            st_bin, "queue", "add", description,
+        add_args = [
+            "queue", "add", description,
             "--scope", scope,
             "--summary", "hostjob: %s" % label,
             "--created-by", "hostjob",
@@ -419,7 +534,8 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
             "--json",
         ]
         for dep in (depends_on or []):
-            add_argv += ["--depends-on", dep]
+            add_args += ["--depends-on", dep]
+        add_argv = _st_argv(st_bin, *add_args)
         proc = subprocess.run(
             add_argv,
             stdin=subprocess.DEVNULL,
@@ -428,15 +544,13 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
             timeout=20,
         )
     except Exception as e:
-        sys.stderr.write(
-            "hostjob: queue add failed (%r) — running UNqueued.\n" % e
-        )
+        _queue_add_failed("queue add failed (%r)" % e, remote_desc)
         return None, None
     if proc.returncode != 0:
-        sys.stderr.write(
-            "hostjob: queue add exited %d — running UNqueued.\n%s\n"
-            % (proc.returncode, proc.stderr.decode("utf-8", "replace").strip())
-        )
+        _queue_add_failed(
+            "queue add exited %d: %s"
+            % (proc.returncode, proc.stderr.decode("utf-8", "replace").strip()),
+            remote_desc)
         return None, None
     try:
         info = json.loads(proc.stdout.decode("utf-8", "replace"))
@@ -444,9 +558,7 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
     except (ValueError, AttributeError):
         qid = None
     if not qid:
-        sys.stderr.write(
-            "hostjob: queue add gave no q-id — running UNqueued.\n"
-        )
+        _queue_add_failed("queue add gave no q-id", remote_desc)
         return None, None
     # When register=False (--no-queue), STOP here: the row exists (pending,
     # visible, dependable) but does NOT claim/serialize the hostjob:<label>
@@ -796,6 +908,7 @@ def cmd_run(args):
     # skips the scope-claiming `register` step (register=False → row stays
     # pending/non-serializing but visible + dependable). Fail-soft: queue_id
     # stays None if anything goes wrong.
+    _LAST_QUEUE["backend"], _LAST_QUEUE["missing"] = None, None
     queue_id, queue_registered = _register_queue_item(
         label,
         cmd=cmd,
@@ -828,6 +941,11 @@ def cmd_run(args):
             "ended_at": None,
             "queue_id": queue_id,
             "queue_registered": queue_registered,
+            # Transport used for the row (local path str or remote dict) so
+            # later poll/stop/reaper talk to the SAME queue; and, when no row
+            # could be created, why — so the invisibility is recorded.
+            "queue_backend": _LAST_QUEUE["backend"] if queue_id else None,
+            "queue_missing": None if queue_id else _LAST_QUEUE["missing"],
         },
     )
 
@@ -846,6 +964,10 @@ def cmd_run(args):
     env["HOSTJOB_STARTED"] = repr(started)
     env["HOSTJOB_CMD_JSON"] = json.dumps(cmd)
     env["HOSTJOB_QUEUE_ID"] = queue_id or ""
+    env["HOSTJOB_QUEUE_MISSING"] = (
+        "" if queue_id else (_LAST_QUEUE["missing"] or ""))
+    env["HOSTJOB_QUEUE_BACKEND_JSON"] = (
+        json.dumps(_LAST_QUEUE["backend"]) if queue_id else "")
     # So the reaper's own status.json rewrites (once it knows the worker pid,
     # and on exit) don't clobber a successful registration back to "unknown"
     # -- which would just make reconcile()'s self-heal redo a harmless but
@@ -879,7 +1001,8 @@ def cmd_run(args):
     elif queue_id:
         print("  queue: %s (scope hostjob:%s, registered)" % (queue_id, label))
     else:
-        print("  queue: (no row created — see warning above)")
+        print("  queue: (NO ROW — job is invisible on the queue site: %s)"
+              % (_LAST_QUEUE["missing"] or "see warning above"))
     print("  log: %s" % lp)
     if broker_url:
         print("  broker: %s (live tail via %s/tail/%s)"
@@ -903,6 +1026,22 @@ started = float(os.environ["HOSTJOB_STARTED"])
 cmd = json.loads(os.environ["HOSTJOB_CMD_JSON"])
 queue_id = os.environ.get("HOSTJOB_QUEUE_ID") or None
 queue_registered = os.environ.get("HOSTJOB_QUEUE_REGISTERED") == "1"
+try:
+    queue_backend = json.loads(os.environ.get("HOSTJOB_QUEUE_BACKEND_JSON") or "null")
+except Exception:
+    queue_backend = None
+if not queue_backend:
+    queue_backend = shutil.which("session-task")
+
+queue_missing = os.environ.get("HOSTJOB_QUEUE_MISSING") or None
+
+def st_argv(*args):
+    # Same builder as the CLI side: local path str, or remote ssh dict.
+    import shlex
+    if isinstance(queue_backend, dict):
+        remote = " ".join(shlex.quote(a) for a in (queue_backend["cmd"],) + args)
+        return list(queue_backend["ssh"]) + [remote]
+    return [queue_backend] + list(args)
 
 def write_status(data):
     tmp = sp + ".tmp.%d" % os.getpid()
@@ -914,19 +1053,19 @@ def finalize_queue(rc):
     # Flip the queue item done/abandon, then emit a hostjob-done event.
     # Every step is best-effort; a missing CLI or non-zero exit is ignored.
     if queue_id:
-        st_bin = shutil.which("session-task")
+        st_bin = queue_backend
         if st_bin:
             try:
                 if rc == 0:
                     subprocess.run(
-                        [st_bin, "queue", "done", queue_id],
+                        st_argv("queue", "done", queue_id),
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         timeout=20)
                 else:
                     subprocess.run(
-                        [st_bin, "queue", "abandon", queue_id,
-                         "--reason", "hostjob exit %s" % rc],
+                        st_argv("queue", "abandon", queue_id,
+                                "--reason", "hostjob exit %s" % rc),
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         timeout=20)
@@ -967,12 +1106,12 @@ def register_when_live():
     global queue_registered
     if not queue_id or queue_registered:
         return
-    st_bin = shutil.which("session-task")
+    st_bin = queue_backend
     if not st_bin:
         return
     try:
         r = subprocess.run(
-            [st_bin, "queue", "register", queue_id, "--if-absent"],
+            st_argv("queue", "register", queue_id, "--if-absent"),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=20)
@@ -1016,7 +1155,8 @@ def _registration_retry_loop(stop_event, worker_pid):
                     "status": "running", "rc": None, "pid": worker_pid,
                     "reaper_pid": os.getpid(), "started_at": started,
                     "ended_at": None, "queue_id": queue_id,
-                    "queue_registered": queue_registered,
+                    "queue_registered": queue_registered, "queue_backend": queue_backend,
+                    "queue_missing": queue_missing,
                 })
             except Exception:
                 pass
@@ -1087,7 +1227,8 @@ try:
         "label": label, "cmd": cmd, "cwd": cwd, "status": "running",
         "rc": None, "pid": worker_pid, "reaper_pid": os.getpid(),
         "started_at": started, "ended_at": None, "queue_id": queue_id,
-        "queue_registered": queue_registered,
+        "queue_registered": queue_registered, "queue_backend": queue_backend,
+                    "queue_missing": queue_missing,
     })
     # If the single register_when_live() attempt above didn't take, keep
     # retrying on a background thread rather than relying on the pump loop
@@ -1145,7 +1286,8 @@ write_status({
     "label": label, "cmd": cmd, "cwd": cwd, "status": status,
     "rc": rc, "pid": worker_pid, "reaper_pid": os.getpid(),
     "started_at": started, "ended_at": time.time(), "queue_id": queue_id,
-    "queue_registered": queue_registered,
+    "queue_registered": queue_registered, "queue_backend": queue_backend,
+                    "queue_missing": queue_missing,
 })
 
 # Queue/event finalization is the LAST thing the reaper does, and is fully
@@ -1385,7 +1527,7 @@ def _mark_stopped(label, st, rc=None, note=None):
     # call unconditionally (idempotent server-side).
     qid = st.get("queue_id")
     if qid and not st.get("queue_finalized"):
-        st_bin = shutil.which("session-task")
+        st_bin = _backend_for(st)
         if st_bin and _finalize_stopped_queue_item(st_bin, qid, note or st.get("stop_note")):
             st["queue_finalized"] = True
     write_status(label, st)

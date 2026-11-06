@@ -437,6 +437,28 @@ keeps the row but skips the scope-claiming `register` (non-serializing). If
 `session-task` / `claude-event` are absent the job still runs — queue
 bookkeeping never blocks the host work.
 
+**Remote queue (opt-in, for hosts without `session-task`).** A host that has no
+local `session-task` (e.g. a fresh Mac reached over the MCP tunnel) would
+otherwise run jobs UNqueued and invisible on the queue site. Point it at the
+queue host instead:
+
+```sh
+# env var, or the first line of ~/.config/claude-container/hostjob-queue-remote
+export HOSTJOB_QUEUE_REMOTE=ssh://user@queue-host[:port]
+# optional: remote command name/path (non-interactive ssh often lacks ~/bin)
+export HOSTJOB_QUEUE_REMOTE_CMD=/path/to/session-task
+```
+
+hostjob then runs the same `session-task queue add/register/done/abandon`
+calls over `ssh` (existing key; `BatchMode=yes`, 5s connect timeout, so it can
+never prompt or hang). The row is created at `run`, closed `done` on exit 0 or
+`abandon` (reason `hostjob exit N`) otherwise. A local `session-task` on PATH
+is always preferred and the remote is then never contacted. Fail-soft: if the
+remote is unreachable (or the setting is invalid) the job still runs, a
+`WARNING ... running UNqueued` goes to stderr, `run` prints `queue: (NO ROW ...)`,
+and the reason is stored as `queue_missing` in `status.json` so the missing row
+is never silent.
+
 **Live-tail line broker** (fail-soft): `run` lazily launches a loopback HTTP
 ring-buffer broker (port `HOSTJOB_BROKER_PORT`, default 8799) and tees each
 worker output line to it, so live-tail consumers (e.g. the queue-minisite) see
