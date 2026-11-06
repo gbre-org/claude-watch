@@ -449,6 +449,18 @@ export HOSTJOB_QUEUE_REMOTE=ssh://user@queue-host[:port]
 export HOSTJOB_QUEUE_REMOTE_CMD=/path/to/session-task
 ```
 
+Or keep both in the config file (env still overrides the file):
+
+```
+# ~/.config/claude-container/hostjob-queue-remote
+ssh://user@queue-host[:port]
+cmd=/path/to/session-task
+```
+
+The first non-comment line that is not `cmd=` is the URL (a file holding only
+the URL, as before, still works); `cmd=` is optional and defaults to
+`session-task`.
+
 hostjob then runs the same `session-task queue add/register/done/abandon`
 calls over `ssh` (existing key; `BatchMode=yes`, 5s connect timeout, so it can
 never prompt or hang). The row is created at `run`, closed `done` on exit 0 or

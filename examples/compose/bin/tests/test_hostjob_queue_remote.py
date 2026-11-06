@@ -179,6 +179,46 @@ class RemoteQueueTest(unittest.TestCase):
                         self._ssh_lines())
         self._clean("rem")
 
+    def _write_cfg(self, text):
+        d = os.path.join(self.iso.tmp, ".config", "claude-container")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "hostjob-queue-remote"), "w") as f:
+            f.write(text)
+        self._old_home = os.environ.get("HOME")
+        os.environ["HOME"] = self.iso.tmp
+        def _restore():
+            os.environ["HOME"] = self._old_home
+            os.remove(os.path.join(d, "hostjob-queue-remote"))
+            os.environ.pop("HOSTJOB_QUEUE_REMOTE_CMD", None)
+        self.addCleanup(_restore)
+
+    def test_file_cmd_used(self):
+        self._write_cfg("# c\nssh://op@queue.example\ncmd=/opt/bin/session-task\n")
+        be = self.mod._queue_backend()[0]
+        self.assertEqual(be["cmd"], "/opt/bin/session-task")
+        self.assertIn("op@queue.example", be["ssh"])
+        rc, _, err = self._run("filecmd", ["true"])
+        self.assertEqual(rc, 0, err)
+        add = self._wait_ssh("queue add")
+        self.assertIn("/opt/bin/session-task queue add", add[0])
+        self._wait_terminal("filecmd")
+        self._clean("filecmd")
+
+    def test_env_cmd_overrides_file(self):
+        self._write_cfg("ssh://op@queue.example\ncmd=/opt/bin/session-task\n")
+        os.environ["HOSTJOB_QUEUE_REMOTE_CMD"] = "/env/session-task"
+        self.assertEqual(self.mod._queue_backend()[0]["cmd"], "/env/session-task")
+
+    def test_cmd_line_first_still_finds_url(self):
+        self._write_cfg("cmd=/opt/bin/session-task\nssh://op@queue.example\n")
+        self.assertEqual(self.mod._remote_setting(), "ssh://op@queue.example")
+
+    def test_old_single_line_file_still_works(self):
+        self._write_cfg("ssh://op@queue.example\n")
+        be = self.mod._queue_backend()[0]
+        self.assertEqual(be["cmd"], "session-task")
+        self.assertEqual(self.mod._remote_setting(), "ssh://op@queue.example")
+
     def test_remote_failure_abandons_with_exit_code(self):
         os.environ["HOSTJOB_QUEUE_REMOTE"] = "ssh://op@queue.example"
         self._run("remfail", ["false"])
