@@ -1001,6 +1001,27 @@ port_listener_pids() {
     fi
 }
 
+# Is whatever LISTENs on 127.0.0.1:$port an mcp-host-bash instance?
+# Looks at the owning process's command line (lsof/ss -> ps). Returns 0
+# only when EVERY listener pid's command mentions "mcp-host-bash" (covers
+# the installed `mcp-host-bash-server` binary and the launcher). Returns 1
+# when the port has no listener, the owner cannot be determined (no
+# lsof/ss), or any listener is something else -- callers then fail loudly
+# rather than guess.
+port_held_by_mcp_host() {
+    local port=$1 pids pid cmd found=0
+    pids=$(port_listener_pids "$port")
+    [ -n "$pids" ] || return 1
+    for pid in $pids; do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        case "$cmd" in
+            *mcp-host-bash*) found=1 ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$found" = "1" ]
+}
+
 # pids of ssh processes carrying OUR reverse-forward spec. The spec is
 # specific enough (remote port + loopback + local port) that it will not
 # collide with an unrelated ssh, and matching on argv finds the tunnel
@@ -1311,11 +1332,40 @@ fi
 # -----------------------------------------------------------------------------
 
 if [ "$ENABLE" = "1" ]; then
-    start_detached "$MCP_HOST_BASH_BIN" --port "$MCP_LOCAL_PORT" </dev/null &
-    mcp_pid=$!
-
     probe_rc=0
-    wait_for_listener 127.0.0.1 "$MCP_LOCAL_PORT" 15 || probe_rc=$?
+    reuse=0
+    # Under launchd KeepAlive (or a kickstart) the previous server is
+    # detached and still holds the port. If it is an mcp-host-bash, REUSE
+    # it and go straight to the tunnel; if it is something else, fail
+    # loudly instead of spawning a doomed duplicate.
+    if service_is_up 127.0.0.1 "$MCP_LOCAL_PORT"; then
+        if port_held_by_mcp_host "$MCP_LOCAL_PORT"; then
+            reuse=1
+        else
+            cat >&2 <<EOF
+personal-mcp-host: FATAL: 127.0.0.1:$MCP_LOCAL_PORT is already in use by a process
+       that is not mcp-host-bash. Refusing to start or tunnel to it.
+         lsof -nP -iTCP:$MCP_LOCAL_PORT -sTCP:LISTEN
+EOF
+            exit 1
+        fi
+    else
+        start_detached "$MCP_HOST_BASH_BIN" --port "$MCP_LOCAL_PORT" </dev/null &
+        mcp_pid=$!
+        wait_for_listener 127.0.0.1 "$MCP_LOCAL_PORT" 15 || probe_rc=$?
+        # Race: our duplicate died on EADDRINUSE because another
+        # mcp-host-bash won the bind. Treat that as reuse, not fatal.
+        if [ "$probe_rc" = "2" ] && port_held_by_mcp_host "$MCP_LOCAL_PORT"; then
+            reuse=1
+        fi
+    fi
+
+    if [ "$reuse" = "1" ]; then
+        mcp_pid=""
+        echo "personal-mcp-host: reusing running mcp-host-bash on 127.0.0.1:$MCP_LOCAL_PORT (not starting a duplicate)" >&2
+        probe_rc=0
+    fi
+
     case "$probe_rc" in
         0)
             echo "personal-mcp-host: mcp-host-bash-server listening on 127.0.0.1:$MCP_LOCAL_PORT" >&2
