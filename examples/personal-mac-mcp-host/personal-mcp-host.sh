@@ -218,6 +218,17 @@
 #                              Pair with launchd's KeepAlive to leave the unit
 #                              registered without actually running mcp-host-bash
 #                              and the tunnel.
+#   EXTRA_REMOTE_FORWARDS      extra reverse forwards, space-separated
+#                              `REMOTE_PORT:HOST:LOCAL_PORT` specs, each added
+#                              to the tunnel argv as another `-R`. Example:
+#                              "9223:127.0.0.1:9222 2828:127.0.0.1:2828"
+#                              exposes a local browser-automation port on the
+#                              remote's loopback. Opt-in; unset = the single
+#                              MCP forward only. A malformed spec exits 2
+#                              BEFORE any ssh is started. Because the tunnel
+#                              runs with ExitOnForwardFailure=yes, a port
+#                              that cannot be bound on the remote takes the
+#                              WHOLE tunnel (MCP included) down.
 #   PERSONAL_MCP_SSH_EXTRA     extra space-separated `ssh -o KEY=VALUE` opts
 #                              appended to the tunnel's argv. For one-off
 #                              tuning (proxy jump, lower keep-alive cadence)
@@ -444,10 +455,32 @@ fi
 #                               who want to defeat first-connect MITM too.)
 # -----------------------------------------------------------------------------
 
+# Optional extra reverse forwards (EXTRA_REMOTE_FORWARDS). Validate every
+# spec up front: a typo must fail here, not as a dead tunnel on a host
+# that has no other way back in.
+extra_forward_args=()
+if [ -n "${EXTRA_REMOTE_FORWARDS:-}" ]; then
+    # shellcheck disable=SC2206
+    extra_forwards=( ${EXTRA_REMOTE_FORWARDS} )
+    for spec in "${extra_forwards[@]}"; do
+        if ! [[ "$spec" =~ ^[0-9]{1,5}:[A-Za-z0-9._-]+:[0-9]{1,5}$ ]]; then
+            echo "personal-mcp-host: bad EXTRA_REMOTE_FORWARDS entry '$spec'" >&2
+            echo "personal-mcp-host: expected REMOTE_PORT:HOST:LOCAL_PORT (e.g. 9223:127.0.0.1:9222)" >&2
+            exit 2
+        fi
+        if [ "${spec%%:*}" = "$REMOTE_PORT" ]; then
+            echo "personal-mcp-host: EXTRA_REMOTE_FORWARDS entry '$spec' reuses REMOTE_PORT $REMOTE_PORT" >&2
+            exit 2
+        fi
+        extra_forward_args+=( -R "$spec" )
+    done
+fi
+
 ssh_argv=(
     ssh
     -N
     -R "$tunnel_forward_spec"
+    ${extra_forward_args[@]+"${extra_forward_args[@]}"}
     -o ExitOnForwardFailure=yes
     -o ServerAliveInterval=30
     -o ServerAliveCountMax=3
@@ -885,6 +918,9 @@ run_tunnel_and_tail() {
     fi
     if [ "$TUNNEL_ONLY" = "0" ] || [ "$RESTART" = "1" ]; then
         echo "  live log:              $MCP_HOST_BASH_LOG"
+    fi
+    if [ -n "${EXTRA_REMOTE_FORWARDS:-}" ]; then
+        echo "  extra forwards:        $EXTRA_REMOTE_FORWARDS"
     fi
     if [ -n "${PERSONAL_MCP_SSH_EXTRA:-}" ]; then
         echo "  SSH extras:            $PERSONAL_MCP_SSH_EXTRA"
