@@ -47,8 +47,9 @@ surfaced by `poll`/`list`), NOT the `hostjob:<label>` scope-token string:
 hostjob can also declare a dependency at launch via `--depends-on <qid>`.
 
 REMOTE QUEUE: with no local `session-task`, set HOSTJOB_QUEUE_REMOTE=ssh://[user@]host[:port]
-(or put it in ~/.config/claude-container/hostjob-queue-remote) to create/close the row on a
-remote queue host over ssh. Local session-task is always preferred. If the remote is
+(or put it in ~/.config/claude-container/hostjob-queue-remote, optionally with a second
+line `cmd=/path/to/session-task`; env HOSTJOB_QUEUE_REMOTE_CMD overrides) to create/close
+the row on a remote queue host over ssh. Local session-task is always preferred. If the remote is
 unreachable the job still runs, stderr warns, and status.json records "queue_missing".
 
 All queue/event plumbing is FAIL-SOFT: if `session-task` / `claude-event` are
@@ -274,27 +275,41 @@ def reconcile(label):
 # --------------------------------------------------------------------------
 # queue integration (host-side; fail-soft)
 # --------------------------------------------------------------------------
-def _remote_setting():
-    """Return the configured remote queue spec (e.g. ``ssh://user@host``) or "".
+def _remote_config():
+    """Parse ``~/.config/claude-container/hostjob-queue-remote`` -> (spec, cmd).
 
-    Opt-in. Sources, first hit wins: env ``HOSTJOB_QUEUE_REMOTE``; then the first
-    non-comment line of ``~/.config/claude-container/hostjob-queue-remote``.
-    Only consulted when a local ``session-task`` is NOT on PATH.
+    Format: the first non-comment line that is not ``cmd=...`` is the remote spec
+    (``ssh://[user@]host[:port]``, the original single-line format); an optional
+    ``cmd=/path/to/session-task`` line sets the remote command. Missing/unreadable
+    file -> ("", "").
     """
-    v = (os.environ.get("HOSTJOB_QUEUE_REMOTE") or "").strip()
-    if v:
-        return v
     path = os.path.join(os.path.expanduser("~"), ".config",
                         "claude-container", "hostjob-queue-remote")
+    spec = cmd = ""
     try:
         with open(path) as fh:
             for ln in fh:
                 ln = ln.strip()
-                if ln and not ln.startswith("#"):
-                    return ln
+                if not ln or ln.startswith("#"):
+                    continue
+                if ln.startswith("cmd="):
+                    cmd = cmd or ln[len("cmd="):].strip()
+                elif not spec:
+                    spec = ln
     except Exception:
         pass
-    return ""
+    return spec, cmd
+
+
+def _remote_setting():
+    """Return the configured remote queue spec (e.g. ``ssh://user@host``) or "".
+
+    Opt-in. Sources, first hit wins: env ``HOSTJOB_QUEUE_REMOTE``; then the
+    config file (see `_remote_config`). Only consulted when a local
+    ``session-task`` is NOT on PATH.
+    """
+    v = (os.environ.get("HOSTJOB_QUEUE_REMOTE") or "").strip()
+    return v or _remote_config()[0]
 
 
 def _remote_backend(spec):
@@ -302,8 +317,9 @@ def _remote_backend(spec):
 
     The transport is plain ``ssh`` (existing key, BatchMode so it can never
     prompt) running the remote host's own ``session-task``; the remote command
-    name/path defaults to ``session-task`` and can be overridden with
-    ``HOSTJOB_QUEUE_REMOTE_CMD`` (non-interactive ssh often lacks ~/bin on PATH).
+    name/path defaults to ``session-task`` and can be overridden with env
+    ``HOSTJOB_QUEUE_REMOTE_CMD`` or a ``cmd=`` line in the config file (env wins;
+    non-interactive ssh often lacks ~/bin on PATH).
     """
     if not spec.startswith("ssh://"):
         return None
@@ -322,7 +338,8 @@ def _remote_backend(spec):
         ssh += ["-p", port]
     ssh.append(userhost)
     return {"ssh": ssh,
-            "cmd": os.environ.get("HOSTJOB_QUEUE_REMOTE_CMD") or "session-task",
+            "cmd": (os.environ.get("HOSTJOB_QUEUE_REMOTE_CMD", "").strip()
+                    or _remote_config()[1] or "session-task"),
             "desc": "ssh://%s" % rest}
 
 
