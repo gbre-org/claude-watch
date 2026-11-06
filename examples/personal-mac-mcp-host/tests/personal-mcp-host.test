@@ -54,6 +54,9 @@ Coverage:
     uses a command substitution, and a repeated randomized-offset
     SIGTERM tears the tunnel down cleanly every time.
   - --enable --print-cmd emits the MCP_HOST_BASH_BIN: launch block.
+  - --enable port ownership: port free -> spawn + tunnel; port held by an
+    mcp-host-bash -> reuse it (no duplicate) + tunnel; port held by
+    anything else -> fail loudly (exit 1), no tunnel.
 
 Run:  ./personal-mcp-host.test
 """
@@ -1757,6 +1760,156 @@ def test_restart_kickstarts_bootstrapped_launchd_units() -> None:
 # Run
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# --enable port-ownership handling (KeepAlive respawn / kickstart while the
+# detached server from the previous run still holds the port).
+# ---------------------------------------------------------------------------
+
+
+def _enable_scenario(port_state: str):
+    """Run `--enable` against a fake host/ssh. port_state is one of:
+      free   - nothing holds the port beforehand
+      mcp    - a pre-existing mcp-host-bash-named process holds it
+      other  - an unrelated process holds it
+    Returns (rc, output, spawned, ssh_started) where `spawned` says the
+    wrapper launched its own fake host (its pidfile exists)."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        port = _free_port()
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        env_path = tdp / ".env"
+        write_env(env_path, mcp_local_port=str(port), ssh_key_path=str(key_path))
+
+        host_pidfile = tdp / "host.pid"
+        fake_host = _make_fake_mcp_host(tdp, port, host_pidfile)
+        bindir = fake_host.parent
+        ssh_pidfile = tdp / "ssh.pid"
+        ssh = bindir / "ssh"
+        ssh.write_text(
+            "#!/usr/bin/env bash\n"
+            f'echo $$ > "{ssh_pidfile}"\n'
+            "exec sleep 600\n"
+        )
+        ssh.chmod(0o755)
+
+        env = {
+            "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PERSONAL_MCP_ENV_FILE": str(env_path),
+            "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+            "MCP_HOST_BASH_BIN": str(fake_host),
+        }
+
+        pre = None
+        pre_pidfile = tdp / "pre.pid"
+        if port_state == "mcp":
+            # Same fake launcher, but record to a different pidfile so we can
+            # tell it apart from a wrapper-spawned one.
+            (tdp / "pre").mkdir(exist_ok=True)
+            pre_host = _make_fake_mcp_host(tdp / "pre", port, pre_pidfile)
+            pre = subprocess.Popen([str(pre_host)], stderr=subprocess.DEVNULL)
+        elif port_state == "other":
+            other = tdp / "unrelated-listener.py"
+            other.write_text(
+                "import socket, time\n"
+                "s = socket.socket()\n"
+                "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                f"s.bind(('127.0.0.1', {port}))\n"
+                "s.listen(5)\n"
+                "time.sleep(600)\n"
+            )
+            pre = subprocess.Popen([sys.executable, str(other)])
+        try:
+            if pre is not None:
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    s = socket.socket()
+                    s.settimeout(0.2)
+                    try:
+                        s.connect(("127.0.0.1", port))
+                        s.close()
+                        break
+                    except OSError:
+                        s.close()
+                        time.sleep(0.1)
+
+            # Output goes to a FILE, not a pipe: the detached server and the
+            # tunnel inherit stderr and would keep a pipe open past the
+            # wrapper's exit, hanging communicate().
+            outfile = tdp / "wrapper.out"
+            with open(outfile, "w") as fh:
+                proc = subprocess.Popen(
+                    [str(SCRIPT), "--enable"],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            ssh_started = False
+            if port_state == "other":
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            else:
+                deadline = time.time() + 20
+                while time.time() < deadline and not ssh_pidfile.exists():
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                ssh_started = ssh_pidfile.exists()
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGTERM)
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                # A wrapper-spawned (detached) server outlives the wrapper.
+                for pf in (host_pidfile, ssh_pidfile):
+                    if pf.exists():
+                        try:
+                            os.kill(int(pf.read_text()), signal.SIGKILL)
+                        except (OSError, ValueError):
+                            pass
+            rc = proc.returncode
+            out = outfile.read_text(errors="replace")
+            return rc, out, host_pidfile.exists(), ssh_started
+        finally:
+            if pre is not None:
+                pre.kill()
+                pre.wait()
+
+
+def test_enable_port_free_spawns_server_and_tunnel() -> None:
+    rc, out, spawned, ssh_started = _enable_scenario("free")
+    expect(spawned, f"port free: wrapper should spawn the server; output:\n{out}")
+    expect(ssh_started, f"port free: tunnel should open; output:\n{out}")
+    expect("reusing" not in out, f"port free: must not claim reuse; output:\n{out}")
+
+
+def test_enable_port_held_by_mcp_host_reuses_and_tunnels() -> None:
+    """REGRESSION: a KeepAlive respawn/kickstart finds the original detached
+    server still on the port. The wrapper must reuse it (no duplicate, no
+    EADDRINUSE FATAL) and still open the tunnel."""
+    rc, out, spawned, ssh_started = _enable_scenario("mcp")
+    expect(not spawned, f"port held by mcp-host-bash: must NOT spawn a duplicate; output:\n{out}")
+    expect("reusing running mcp-host-bash" in out, f"should announce reuse; output:\n{out}")
+    expect(ssh_started, f"port held by mcp-host-bash: tunnel must open; output:\n{out}")
+    expect("FATAL" not in out, f"reuse must not log a FATAL; output:\n{out}")
+
+
+def test_enable_port_held_by_other_process_fails_loudly() -> None:
+    rc, out, spawned, ssh_started = _enable_scenario("other")
+    expect(rc == 1, f"port held by other: expected exit 1, got {rc}; output:\n{out}")
+    expect("FATAL" in out and "not mcp-host-bash" in out, f"should fail loudly; output:\n{out}")
+    expect(not spawned, f"port held by other: must not spawn; output:\n{out}")
+    expect(not ssh_started, f"port held by other: must not open the tunnel; output:\n{out}")
+
+
 tests = [
     test_help_exits_zero,
     test_bad_flag_exits_two,
@@ -1783,6 +1936,9 @@ tests = [
     test_green_path_sigterm_teardown_is_race_free,
     test_enable_print_cmd_emits_mcp_block,
     test_enable_ctrlc_leaves_host_service_running,
+    test_enable_port_free_spawns_server_and_tunnel,
+    test_enable_port_held_by_mcp_host_reuses_and_tunnels,
+    test_enable_port_held_by_other_process_fails_loudly,
     test_env_example_exists_and_has_required_keys,
     test_gitignore_excludes_env,
     test_script_uses_ssh_minus_capital_R_not_lowercase,

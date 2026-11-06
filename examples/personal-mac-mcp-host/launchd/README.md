@@ -201,12 +201,16 @@ the logs:
 - **Stopping the unit does not stop the MCP server.** A `bootout` /
   `kill TERM` tears down the tunnel and the tail only. The server keeps
   listening on `127.0.0.1:$MCP_LOCAL_PORT` until you stop it yourself.
-- **A `KeepAlive` respawn logs a harmless bind failure.** The respawned
-  wrapper tries to start `mcp-host-bash` again, the original is still
-  holding the port, so the duplicate exits with an "address already in
-  use" `FATAL` in `~/Library/Logs/personal-mcp-host.err.log`. The
-  reopened tunnel connects to the original server, so the bridge works;
-  the line is noise, not a failure to chase.
+- **A `KeepAlive` respawn reuses the running server.** The respawned
+  wrapper finds `127.0.0.1:$MCP_LOCAL_PORT` already LISTENing. If the
+  owner is an `mcp-host-bash` process (checked via `lsof`/`ss` + `ps`),
+  it logs `reusing running mcp-host-bash` and goes straight to opening
+  the tunnel; it does not start a duplicate. If the port is held by
+  anything else, or the owner cannot be identified, the wrapper exits 1
+  with a `FATAL ... not mcp-host-bash` and opens no tunnel, so a foreign
+  listener is never exposed through the reverse forward. If a duplicate
+  is spawned anyway and loses the bind race to another `mcp-host-bash`
+  ("address already in use"), that too is treated as reuse.
 
 Why `--enable` and not a bare argv: without the flag the wrapper runs
 its default **status-gate** mode, which does not start anything — it
