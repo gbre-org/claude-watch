@@ -439,6 +439,42 @@ def test_personal_mcp_ssh_extra_appended() -> None:
         )
 
 
+def test_extra_remote_forwards_add_r_flags() -> None:
+    """EXTRA_REMOTE_FORWARDS adds one -R per spec, after the MCP forward."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(
+            env_path,
+            extra_lines=['EXTRA_REMOTE_FORWARDS="9223:127.0.0.1:9222 2828:127.0.0.1:2828"'],
+        )
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        ssh = parse_blocks(lines).get("SSH", [])
+        rs = [ssh[i + 1] for i, t in enumerate(ssh) if t == "-R"]
+        expect(
+            rs == ["18766:127.0.0.1:8766", "9223:127.0.0.1:9222", "2828:127.0.0.1:2828"],
+            f"EXTRA_REMOTE_FORWARDS: unexpected -R list {rs}; argv {ssh}",
+        )
+        expect(ssh[-1].endswith("@remote.example.com"), f"target should be last; got {ssh[-2:]}")
+
+
+def test_no_extra_remote_forwards_by_default() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        ssh = parse_blocks(lines).get("SSH", [])
+        expect(ssh.count("-R") == 1, f"default argv should have exactly one -R; got {ssh}")
+
+
+def test_extra_remote_forwards_rejects_malformed() -> None:
+    for bad in ("9223", "9223:127.0.0.1", "abc:127.0.0.1:9222", "18766:127.0.0.1:9222"):
+        with tempfile.TemporaryDirectory() as td:
+            env_path = Path(td) / ".env"
+            write_env(env_path, extra_lines=[f'EXTRA_REMOTE_FORWARDS="{bad}"'])
+            _, _, err, rc = run_script(["--print-cmd"], env_file=env_path, expect_rc=None)
+            expect(rc == 2, f"EXTRA_REMOTE_FORWARDS={bad!r}: expected exit 2, got {rc}")
+
+
 def test_tunnel_only_flag_omits_mcp_block() -> None:
     """--tunnel-only --print-cmd emits ONLY the SSH: block — no
     MCP_HOST_BASH_BIN: block — because the wrapper does not launch
@@ -1949,6 +1985,9 @@ tests = [
     test_restart_exit_four_when_mcp_host_does_not_come_back,
     test_restart_exit_four_when_tunnel_dies_on_forward_failure,
     test_restart_kickstarts_bootstrapped_launchd_units,
+    test_extra_remote_forwards_add_r_flags,
+    test_no_extra_remote_forwards_by_default,
+    test_extra_remote_forwards_rejects_malformed,
 ]
 
 for t in tests:
