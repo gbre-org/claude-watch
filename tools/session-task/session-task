@@ -4457,6 +4457,41 @@ def _reconcile_hostjob_rows(items):
     return reconciled
 
 
+HOSTJOB_PUSHED_LOG_DIR = Path(
+    os.environ.get(
+        "HOSTJOB_PUSHED_LOG_DIR",
+        str(Path.home() / ".config" / "session" / "hostjob-logs"),
+    )
+)
+
+
+def cmd_queue_hostjob_log_sink(args):
+    """Receive a remote hostjob's output on stdin into
+    ``<HOSTJOB_PUSHED_LOG_DIR>/<label>/log`` (truncated at start, flushed per
+    chunk) so the queue web view can tail it. Also prunes pushed logs older
+    than 30 days."""
+    label = args.label
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", label):
+        print(f"invalid label {label!r}", file=sys.stderr)
+        sys.exit(2)
+    d = HOSTJOB_PUSHED_LOG_DIR / label
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        import time as _t
+        cutoff = _t.time() - 30 * 86400
+        for child in HOSTJOB_PUSHED_LOG_DIR.iterdir():
+            if child.is_dir() and child != d and child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+    except OSError:
+        pass
+    with open(d / "log", "wb", buffering=0) as out:
+        while True:
+            chunk = sys.stdin.buffer.readline()
+            if not chunk:
+                break
+            out.write(chunk)
+
+
 def cmd_queue_reconcile_hostjobs(args):
     """Sweep queue.json for leaked hostjob rows whose runner reports the
     worker is dead, and heal them in the shared store.
@@ -9414,6 +9449,12 @@ def build_parser():
     )
     q_reconcile_hj.add_argument("--json", action="store_true")
 
+    q_hj_sink = qsub.add_parser(
+        "hostjob-log-sink",
+        help="Receive a remote hostjob's output on stdin into the pushed-log dir.",
+    )
+    q_hj_sink.add_argument("label")
+
     q_renotify_q = qsub.add_parser(
         "renotify-quarantined",
         help=(
@@ -10194,6 +10235,7 @@ def main():
             "add": cmd_queue_add,
             "list": cmd_queue_list,
             "reconcile-hostjobs": cmd_queue_reconcile_hostjobs,
+            "hostjob-log-sink": cmd_queue_hostjob_log_sink,
             "renotify-quarantined": cmd_queue_renotify_quarantined,
             "show": cmd_queue_show,
             "scope": cmd_queue_scope,

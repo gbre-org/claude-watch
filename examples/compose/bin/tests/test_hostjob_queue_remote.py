@@ -179,6 +179,15 @@ class RemoteQueueTest(unittest.TestCase):
                         self._ssh_lines())
         self._clean("rem")
 
+    def test_remote_log_sink_started(self):
+        os.environ["HOSTJOB_QUEUE_REMOTE"] = "ssh://op@queue.example"
+        self._run("remlog", ["echo", "hi"])
+        self._wait_terminal("remlog")
+        hits = self._wait_ssh("queue hostjob-log-sink remlog")
+        self.assertEqual(len(hits), 1, self._ssh_lines())
+        self._wait_ssh("queue done")
+        self._clean("remlog")
+
     def _write_cfg(self, text):
         d = os.path.join(self.iso.tmp, ".config", "claude-container")
         os.makedirs(d, exist_ok=True)
