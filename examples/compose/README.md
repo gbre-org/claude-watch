@@ -471,6 +471,13 @@ remote is unreachable (or the setting is invalid) the job still runs, a
 and the reason is stored as `queue_missing` in `status.json` so the missing row
 is never silent.
 
+With a remote queue host the reaper also streams each output line over a second
+`ssh` to `session-task queue hostjob-log-sink <label>` on that host, which
+writes `~/.config/session/hostjob-logs/<label>/log` (override dir with
+`HOSTJOB_PUSHED_LOG_DIR`; logs older than 30 days are pruned). The queue site
+falls back to that file when the runner's own log dir is absent, so the live
+log pane works for remote jobs. Fail-soft: a dead sink never affects the job.
+
 **Live-tail line broker** (fail-soft): `run` lazily launches a loopback HTTP
 ring-buffer broker (port `HOSTJOB_BROKER_PORT`, default 8799) and tees each
 worker output line to it, so live-tail consumers (e.g. the queue-minisite) see

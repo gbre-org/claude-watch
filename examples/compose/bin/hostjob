@@ -1212,6 +1212,28 @@ def _post_line(line_bytes):
     except Exception:
         pass
 
+# Remote queue host: also push the output there (fail-soft) so the queue web
+# view, which cannot see this machine's files, can tail it.
+sink = None
+if isinstance(queue_backend, dict) and queue_id:
+    try:
+        sink = subprocess.Popen(
+            st_argv("queue", "hostjob-log-sink", label),
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception:
+        sink = None
+
+def _push_line(line_bytes):
+    global sink
+    if sink is None:
+        return
+    try:
+        sink.stdin.write(line_bytes)
+        sink.stdin.flush()
+    except Exception:
+        sink = None
+
 rc = None
 worker_pid = None
 try:
@@ -1283,6 +1305,7 @@ try:
         except Exception:
             pass
         _post_line(chunk)
+        _push_line(chunk)
     retry_stop.set()
     try:
         proc.stdout.close()
@@ -1306,6 +1329,13 @@ write_status({
     "queue_registered": queue_registered, "queue_backend": queue_backend,
                     "queue_missing": queue_missing,
 })
+
+if sink is not None:
+    try:
+        sink.stdin.close()
+        sink.wait(timeout=10)
+    except Exception:
+        pass
 
 # Queue/event finalization is the LAST thing the reaper does, and is fully
 # guarded — never let it crash the reaper or mask the recorded status.

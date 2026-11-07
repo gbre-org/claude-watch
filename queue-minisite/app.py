@@ -189,6 +189,25 @@ HOSTJOB_LOG_DIR = os.environ.get(
     "HOSTJOB_LOG_DIR",
     os.path.join(os.path.expanduser("~"), ".cache", "hostjob"),
 )
+# Logs PUSHED from a remote runner (a hostjob on another machine streams its
+# output to this host via `session-task queue hostjob-log-sink`) land in
+# `<HOSTJOB_PUSHED_LOG_DIR>/<label>/log`, under the already-mounted session
+# state dir, because the runner's own cache dir does not exist here.
+HOSTJOB_PUSHED_LOG_DIR = os.environ.get(
+    "HOSTJOB_PUSHED_LOG_DIR",
+    os.path.join(os.path.dirname(QUEUE_LOG_ARCHIVE_DIR.rstrip("/")), "hostjob-logs"),
+)
+
+
+def _hostjob_log_path(label: str) -> Path:
+    """Local runner log if present, else the pushed-from-remote copy."""
+    local = Path(HOSTJOB_LOG_DIR) / label / "log"
+    if local.exists():
+        return local
+    pushed = Path(HOSTJOB_PUSHED_LOG_DIR) / label / "log"
+    return pushed if pushed.exists() else local
+
+
 # Live-tail broker base URL. The hostjob reaper tees each worker output line
 # to a tiny host-side localhost line broker (`hostjob broker`, examples/compose/bin/hostjob)
 # that the minisite subscribes to over `host.docker.internal`. This is the
@@ -5089,7 +5108,7 @@ def _tail_hostjob_output(label: str, qid: str | None = None) -> Iterator[bytes]:
     last_data_at = started
     last_keepalive_at = started
 
-    out_path = Path(HOSTJOB_LOG_DIR) / label / "log"
+    out_path = _hostjob_log_path(label)
 
     yield _format_sse({
         "type": "meta",
