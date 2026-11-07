@@ -1946,6 +1946,77 @@ def test_enable_port_held_by_other_process_fails_loudly() -> None:
     expect(not ssh_started, f"port held by other: must not open the tunnel; output:\n{out}")
 
 
+def _classify(listeners: dict, vanish: set = frozenset()) -> int:
+    """Run the wrapper's real port_held_by_mcp_host against stub lsof/ps.
+    listeners: pid -> (command, ppid). pids in `vanish` are listed by lsof
+    but gone by the time ps looks. Returns the function's exit status."""
+    src = SCRIPT.read_text()
+    a = src.index("port_listener_pids() {")
+    b = src.index("# pids of ssh processes carrying OUR")
+    funcs = src[a:b]
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        bindir = tdp / "bin"
+        bindir.mkdir()
+        (bindir / "lsof").write_text(
+            "#!/bin/sh\nfor p in " + " ".join(str(k) for k in listeners) + "; do echo $p; done\n")
+        table = "\n".join(
+            f"{pid}|{cmd}|{ppid}" for pid, (cmd, ppid) in listeners.items()
+            if pid not in vanish)
+        (tdp / "table").write_text(table + "\n")
+        (bindir / "ps").write_text(
+            "#!/bin/sh\n"
+            "pid=$2; fld=$4\n"
+            f"line=$(grep \"^$pid|\" {tdp}/table) || exit 1\n"
+            "case $fld in command=) echo \"$line\" | cut -d'|' -f2;; ppid=) echo \"$line\" | cut -d'|' -f3;; esac\n")
+        for f in ("lsof", "ps"):
+            (bindir / f).chmod(0o755)
+        h = tdp / "h.sh"
+        h.write_text(funcs + "\nport_held_by_mcp_host 8766\n")
+        env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}",
+                   PERSONAL_MCP_PROBE_RETRIES="3")
+        return subprocess.run(["bash", str(h)], env=env).returncode
+
+
+def test_classifier_native_binary_listener_accepted() -> None:
+    expect(_classify({100: ("/h/bin/mcp-host-bash-server --port 8766", 1)}) == 0, "plain server must be accepted")
+
+
+def test_classifier_inherited_socket_child_accepted() -> None:
+    """REGRESSION (2026-11-06): lsof also lists a child (bash/tail/ssh) that
+    inherited the LISTEN fd; its command lacks mcp-host-bash, which used to
+    make the whole port look foreign."""
+    rc = _classify({
+        100: ("/h/bin/mcp-host-bash-server --port 8766", 1),
+        200: ("tail -f /h/log", 100),
+    })
+    expect(rc == 0, f"inherited-fd child of the server must not be foreign (rc={rc})")
+
+
+def test_classifier_vanished_listener_not_foreign() -> None:
+    """A dying listener lsof still lists but ps no longer finds must be
+    ignored, not treated as a squatter."""
+    rc = _classify({
+        100: ("/h/bin/mcp-host-bash-server --port 8766", 1),
+        300: ("", 1),
+    }, vanish={300})
+    expect(rc == 0, f"vanished co-listener must be ignored (rc={rc})")
+
+
+def test_classifier_all_vanished_is_not_accepted() -> None:
+    rc = _classify({300: ("x", 1)}, vanish={300})
+    expect(rc == 1, f"nothing live -> not accepted after retries (rc={rc})")
+
+
+def test_classifier_foreign_listener_rejected() -> None:
+    expect(_classify({400: ("python3 -m http.server 8766", 1)}) == 1, "foreign sole listener")
+    rc = _classify({
+        100: ("/h/bin/mcp-host-bash-server --port 8766", 1),
+        400: ("python3 -m http.server 8766", 1),
+    })
+    expect(rc == 1, f"foreign co-listener not descended from the server must be rejected (rc={rc})")
+
+
 tests = [
     test_help_exits_zero,
     test_bad_flag_exits_two,
@@ -1975,6 +2046,11 @@ tests = [
     test_enable_port_free_spawns_server_and_tunnel,
     test_enable_port_held_by_mcp_host_reuses_and_tunnels,
     test_enable_port_held_by_other_process_fails_loudly,
+    test_classifier_native_binary_listener_accepted,
+    test_classifier_inherited_socket_child_accepted,
+    test_classifier_vanished_listener_not_foreign,
+    test_classifier_all_vanished_is_not_accepted,
+    test_classifier_foreign_listener_rejected,
     test_env_example_exists_and_has_required_keys,
     test_gitignore_excludes_env,
     test_script_uses_ssh_minus_capital_R_not_lowercase,
