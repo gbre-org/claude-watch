@@ -1037,25 +1037,88 @@ port_listener_pids() {
     fi
 }
 
-# Is whatever LISTENs on 127.0.0.1:$port an mcp-host-bash instance?
-# Looks at the owning process's command line (lsof/ss -> ps). Returns 0
-# only when EVERY listener pid's command mentions "mcp-host-bash" (covers
-# the installed `mcp-host-bash-server` binary and the launcher). Returns 1
-# when the port has no listener, the owner cannot be determined (no
-# lsof/ss), or any listener is something else -- callers then fail loudly
-# rather than guess.
-port_held_by_mcp_host() {
-    local port=$1 pids pid cmd found=0
+# Is pid an mcp-host-bash process, or a descendant of one? A child the
+# server spawned (a bash session, tail, ssh...) can inherit the LISTEN
+# socket fd, so lsof lists it as a listener too -- its own command line
+# says "bash", not "mcp-host-bash", but it is NOT a foreign squatter.
+# Walks at most 8 ppid hops. Returns 0 yes, 1 no / process gone.
+pid_is_mcp_host_family() {
+    local pid=$1 cmd hops=0
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$hops" -lt 8 ]; do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        [ -n "$cmd" ] || return 1
+        case "$cmd" in
+            *mcp-host-bash*) return 0 ;;
+        esac
+        pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+        hops=$(( hops + 1 ))
+    done
+    return 1
+}
+
+# One classification pass. Returns 0 = mcp-host-bash (some live listener
+# is one, every other live listener is its descendant), 1 = foreign,
+# 2 = undecidable right now (no listener, or every listener vanished
+# between lsof and ps -- an exiting/starting server; callers retry).
+port_held_by_mcp_host_once() {
+    local port=$1 pids pid cmd live=0 found=0
     pids=$(port_listener_pids "$port")
-    [ -n "$pids" ] || return 1
+    [ -n "$pids" ] || return 2
     for pid in $pids; do
         cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        # Vanished between lsof and ps: it is exiting, not foreign.
+        [ -n "$cmd" ] || continue
+        live=1
         case "$cmd" in
             *mcp-host-bash*) found=1 ;;
-            *) return 1 ;;
         esac
     done
-    [ "$found" = "1" ]
+    [ "$live" = "1" ] || return 2
+    [ "$found" = "1" ] || return 1
+    # A matching listener exists; any non-matching one must descend from
+    # an mcp-host-bash (inherited socket), else it is a foreign co-owner.
+    for pid in $pids; do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        [ -n "$cmd" ] || continue
+        case "$cmd" in
+            *mcp-host-bash*) ;;
+            *) pid_is_mcp_host_family "$pid" || return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# Is whatever LISTENs on 127.0.0.1:$port an mcp-host-bash instance?
+# Returns 0 only for a positive match (see port_held_by_mcp_host_once).
+# Returns 1 when the owner is foreign, cannot be determined (no lsof/ss),
+# or stays undecidable. Undecidable passes (a listener that vanished
+# mid-probe, or the old server still shutting down while a respawned
+# wrapper probes) are retried for ~PERSONAL_MCP_PROBE_RETRIES x 0.3s
+# before giving up, so a transient race is never reported as "foreign".
+port_held_by_mcp_host() {
+    local port=$1 tries="${PERSONAL_MCP_PROBE_RETRIES:-10}" i rc
+    for (( i = 0; i < tries; i++ )); do
+        rc=0
+        port_held_by_mcp_host_once "$port" || rc=$?
+        case "$rc" in
+            0) return 0 ;;
+            1) return 1 ;;
+        esac
+        sleep 0.3
+    done
+    return 1
+}
+
+# Poll until NO process holds a LISTEN socket on the port (not merely
+# "connect refused": a dying server can still be listed by lsof).
+wait_for_no_listeners() {
+    local port=$1 timeout=$2 deadline
+    deadline=$(( $(date +%s) + timeout ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        [ -z "$(port_listener_pids "$port")" ] && return 0
+        sleep 0.2
+    done
+    return 1
 }
 
 # pids of ssh processes carrying OUR reverse-forward spec. The spec is
@@ -1117,7 +1180,7 @@ reap_mcp_port() {
         echo "personal-mcp-host: reaping MCP host holding 127.0.0.1:$port (pid $pid)" >&2
         teardown_pid "MCP host" "$pid" || true
     done
-    if wait_for_port_free 127.0.0.1 "$port" 5; then
+    if wait_for_port_free 127.0.0.1 "$port" 5 && wait_for_no_listeners "$port" 5; then
         return 0
     fi
     # Second sweep: a child that inherited the listening socket can keep
@@ -1129,7 +1192,7 @@ reap_mcp_port() {
         echo "personal-mcp-host: port still held after teardown; SIGKILL inherited holder (pid $pid)" >&2
         kill -KILL "$pid" 2>/dev/null || true
     done
-    wait_for_port_free 127.0.0.1 "$port" 5
+    wait_for_port_free 127.0.0.1 "$port" 5 && wait_for_no_listeners "$port" 5
 }
 
 # Is a launchd unit bootstrapped in this user's GUI domain? False on any
