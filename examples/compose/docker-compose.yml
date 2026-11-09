@@ -911,6 +911,10 @@ services:
       - 'fontFamily=Menlo,monospace'
       - -t
       - 'fontSize=14'
+      # Drop ttyd's beforeunload handler so reloading the tab doesn't
+      # raise the browser's "Leave site?" confirm dialog.
+      - -t
+      - 'disableLeaveAlert=true'
       - --
       - tmux
       - -u
