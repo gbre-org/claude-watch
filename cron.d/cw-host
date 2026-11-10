@@ -141,6 +141,15 @@ PATH=/usr/local/bin:/usr/bin:/bin:@CW_HOME@/bin
 # optional: session-rotate
 #17 4 * * *  @CW_USER@ session-task queue rotate > /dev/null 2>&1
 #
+# Quarantine nag: a `quarantined` queue item holds its scope until an operator
+# runs `queue done|resurrect|release`. Every 5 minutes re-emit a high-priority
+# `queue-quarantined` event for each item still quarantined past
+# CW_QUARANTINE_RENOTIFY_MINUTES (default 15), so a missed or acked-without-
+# action event can never leave one silent. Stops the moment the item leaves
+# quarantine.
+# optional: quarantine-renotify
+#*/5 * * * *  @CW_USER@ session-task queue renotify-quarantined > /dev/null 2>&1
+#
 # Agent activity snapshot producer: every-minute run of `cw-agent-stats
 # --loop`, the live per-agent tool-call / token counters the queue-minisite
 # header pills and Prometheus gauges read (tools/cw-agent-stats/README.md).

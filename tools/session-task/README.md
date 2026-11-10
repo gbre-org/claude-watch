@@ -398,3 +398,32 @@ ships in `cron.d/cw-host` for host/systemd deploys, tagged
 `# optional: session-rotate`; enable it at install time with
 `scripts/install-host-cron.sh --enable session-rotate` (or
 `CW_HOST_CRON_ENABLE=session-rotate`) — no template edit needed.
+
+## Quarantined items: persistent alerts and the three exits
+
+`queue abandon` on a running/wedged item does not free its scope; it moves the
+item to `quarantined` (the process may still be alive). A quarantined item
+holds its scope until an operator closes it, so it must never sit silently:
+
+- Entering quarantine emits a `queue-quarantined` claude-event
+  (priority `high`, `data.tier=actionable`) with the id, summary, scope,
+  reason and age. The `data` also carries `exits` (the three exit commands),
+  `ack_command`, `ack_clears_quarantine=false`, and for `hostjob:` rows
+  `is_hostjob`, `hostjob_label`, `exit_code` and `log_path`.
+- `session-task queue renotify-quarantined` (cron, every 5 minutes) re-emits
+  the event for every item still quarantined, once per cadence
+  (`CW_QUARANTINE_RENOTIFY_MINUTES`, default 15). Acking an event does not
+  silence it: the next sweep fires again until the item leaves quarantine.
+- The three exits:
+  - `session-task queue done <id>` - the work finished
+  - `session-task queue resurrect <id>` - respawn a replacement
+  - `session-task queue release <id> --reason '...'` - the process is gone
+
+hostjob rows: the hostjob reaper has just waited on the worker, so a job that
+exited (any rc) is proven finished. It closes the row with
+`queue done` (rc 0) or `queue abandon --confirmed-dead --reason "hostjob exit
+N (log: ...)"` (rc != 0), never a plain abandon, so ordinary CI failures no
+longer quarantine. Only a hostjob whose reaper vanished without recording an
+exit reaches quarantine, and then it alerts like any other. If the remote
+(ssh) queue is unreachable at exit, the row stays `running` and
+`queue reconcile-hostjobs` closes it from the recorded status.

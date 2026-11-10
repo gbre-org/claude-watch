@@ -5207,16 +5207,42 @@ def cmd_queue_abandon(args):
 
 
 
+def _quarantine_exits(qid: str) -> dict:
+    """The three copy-pasteable exits from a quarantine."""
+    return {
+        "done": f"session-task queue done {qid}",
+        "resurrect": f"session-task queue resurrect {qid}",
+        "release": f"session-task queue release {qid} --reason '<why>'",
+    }
+
+
 def _quarantine_action_text(qid: str) -> str:
     """Operator-facing instruction carried by the queue-quarantined event.
 
     Acking the event does NOT clear the quarantine: the row keeps holding its
-    scope until it is explicitly released or resurrected."""
+    scope until it is explicitly released or resurrected, and the periodic
+    sweep (`queue renotify-quarantined`) re-emits until then."""
+    ex = _quarantine_exits(qid)
     return (
-        "ACTION REQUIRED: acking does NOT clear it. If the job is dead or "
-        f"finished: `session-task queue release {qid} --reason '<why>'`; "
-        f"if it should still run: `session-task queue resurrect {qid}`."
+        "ACTION REQUIRED: acking does NOT clear it; this re-fires until the "
+        f"item leaves quarantine. Finished: `{ex['done']}`; should still "
+        f"run: `{ex['resurrect']}`; process gone: `{ex['release']}`."
     )
+
+
+def _quarantine_hostjob_info(target, reason):
+    """hostjob label / exit code / log path for a quarantined hostjob row."""
+    label = _extract_hostjob_label(target.get("scope") or [])
+    info = {"is_hostjob": bool(label)}
+    if label:
+        info["hostjob_label"] = label
+        m = re.search(r"hostjob exit (-?\d+)", reason or "")
+        if m:
+            info["exit_code"] = int(m.group(1))
+        m = re.search(r"log: ([^\s)]+)", reason or "")
+        if m:
+            info["log_path"] = m.group(1)
+    return info
 
 
 def _emit_quarantine_event(target, *, reason, prior_status, elapsed_sec,
@@ -5248,7 +5274,11 @@ def _emit_quarantine_event(target, *, reason, prior_status, elapsed_sec,
         "quarantined_at": target.get("quarantined_at"),
         "created_by": target.get("created_by", ""),
         "tier": "actionable",
+        "ack_command": f"event-ack ack <key> --action 'quarantine {qid}: <done|resurrect|release>'",
+        "exits": _quarantine_exits(qid),
+        "ack_clears_quarantine": False,
     }
+    data.update(_quarantine_hostjob_info(target, reason))
     if renotify_n:
         data["renotify_count"] = renotify_n
     _claude_event_notify(
@@ -5259,7 +5289,7 @@ def _emit_quarantine_event(target, *, reason, prior_status, elapsed_sec,
             f"{_quarantine_action_text(qid)}"
         ),
         data=data,
-        priority="low",
+        priority="high",
         silent=silent,
     )
 

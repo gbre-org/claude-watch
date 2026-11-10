@@ -632,6 +632,72 @@ def test_renotify_quarantined_cadence_env_override():
         assert len(_events(log)) == base
 
 
+def test_quarantine_event_is_high_priority_and_actionable():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, log = _renotify_env(tmp)
+        qid = _running_item(env, "ci waiter", ["hostjob:ci-wait"])
+        _run(env, "queue", "abandon", qid,
+             "--reason", "hostjob exit 4 (log: /tmp/x/log)", expect_exit=0)
+        argv = [json.loads(l) for l in log.read_text().splitlines()][-1]
+        assert argv[argv.index("--priority") + 1] == "high", argv
+        ev = _events(log)[-1]
+        d = ev["data"]
+        assert ev["tag"] == "queue-quarantined"
+        assert d["is_hostjob"] == "True" and d["hostjob_label"] == "ci-wait"
+        assert d["exit_code"] == "4" and d["log_path"] == "/tmp/x/log"
+        assert "event-ack ack" in d["ack_command"]
+        for cmd in (f"queue done {qid}", f"queue resurrect {qid}",
+                    f"queue release {qid} --reason"):
+            assert cmd in d["exits"], d["exits"]
+            assert cmd in d["action"], d["action"]
+
+
+def test_renotify_persists_until_released_then_stops():
+    """An ack of one event cannot silence it: the sweep re-emits every
+    cadence while the row stays quarantined, and stops once released."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env, log = _renotify_env(tmp)
+        qid = _running_item(env, "stubborn", ["resource:stubborn"])
+        _run(env, "queue", "abandon", qid, "--reason", "x", expect_exit=0)
+        base = len(_events(log))
+        for n in (1, 2, 3):
+            _backdate(tmp, qid, "quarantined_at", 20 * n)
+            if n > 1:
+                _backdate(tmp, qid, "quarantine_last_renotify_at", 20)
+            _run(env, "queue", "renotify-quarantined", expect_exit=0)
+            assert len(_events(log)) == base + n
+        _run(env, "queue", "release", qid, "--reason", "gone", expect_exit=0)
+        after = len(_events(log))
+        _backdate(tmp, qid, "quarantined_at", 600)
+        _run(env, "queue", "renotify-quarantined", expect_exit=0)
+        assert len(_events(log)) == after
+
+
+def test_hostjob_reaper_style_abandon_never_quarantines():
+    """What the hostjob reaper issues for a FINISHED job (exit != 0)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env, log = _renotify_env(tmp)
+        qid = _running_item(env, "ci waiter", ["hostjob:ci-fail"])
+        _run(env, "queue", "abandon", qid, "--confirmed-dead",
+             "--reason", "hostjob exit 1 (log: /l)", expect_exit=0)
+        row = _show(env, qid)
+        assert row["status"] == "abandoned", row
+        assert "hostjob exit 1" in row["abandon_reason"]
+        assert not [e for e in _events(log) if e["tag"] == "queue-quarantined"]
+
+
+def test_hostjob_reaper_lost_stays_quarantined_and_alerts():
+    """Reaper vanished: plain abandon (no proof of death) -> quarantine + alert."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env, log = _renotify_env(tmp)
+        qid = _running_item(env, "lost", ["hostjob:ci-lost"])
+        _run(env, "queue", "abandon", qid, "--reason", "reaper lost",
+             expect_exit=0)
+        assert _show(env, qid)["status"] == "quarantined"
+        evs = [e for e in _events(log) if e["tag"] == "queue-quarantined"]
+        assert len(evs) == 1 and evs[0]["data"]["is_hostjob"] == "True"
+
+
 if __name__ == "__main__":
     import sys as _sys
     failures = 0
