@@ -688,6 +688,16 @@ def main() -> int:
 
     # --- Enforcement starts here ---
 
+    marker_ids = list(dict.fromkeys(QUEUE_MARKER_RE.findall(prompt)))
+    if len(marker_ids) > 1:
+        reason = (
+            "prompt carries more than one 'Queue item:' id "
+            f"({', '.join(marker_ids)}) -- one queue item per agent; "
+            "spawn a separate agent for each item (no bundling)"
+        )
+        print(json.dumps(_deny(reason, _banner(reason))))
+        return 0
+
     match = QUEUE_MARKER_RE.search(prompt)
     if not match:
         reason = "no 'Queue item: q-XXXX' marker found in the Agent prompt"
