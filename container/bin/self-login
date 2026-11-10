@@ -60,6 +60,14 @@ travels around the session, and nothing waits on it:
 Operator-channel settings (env var wins over the optional TOML file at
 `$XDG_CONFIG_HOME/claude-watch/self-login.toml`; all optional):
 
+  notify_channel    env CLAUDE_SELF_LOGIN_NOTIFY_CHANNEL. `botchat` (default)
+                    sends one structured message through the botchat CLI,
+                    which does its own push notification, so no separate
+                    push is sent. `push` keeps the legacy direct push + chat.
+                    If the botchat send fails or the CLI is missing, the
+                    legacy push + chat path runs instead and the log says so.
+  botchat_cmd       env CLAUDE_SELF_LOGIN_BOTCHAT_CMD (default `botchat-send`).
+                    Invoked `<cmd> -F <file>` with a "# title" + bullets body.
   push_cmd          env CLAUDE_SELF_LOGIN_PUSH_CMD, else CLAUDE_WATCH_NOTIFY_CMD,
                     else `pingme` if on PATH. Invoked `<cmd> -p high <message>`.
   chat_send_cmd     env CLAUDE_SELF_LOGIN_CHAT_SEND_CMD. Invoked `<cmd> <message>`.
@@ -106,6 +114,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import traceback
@@ -433,6 +442,15 @@ def publish_url(pane: str, url: str) -> None:
         f"Claude Code needs a login. Open this link, authorize, copy the code. "
         f"{how}\n{url}\n(The dialog auto-cancels after "
         f"{code_timeout(cfg) // 60} min without a code.)",
+        title="Claude Code needs a login",
+        lines=[
+            f"Open this link and authorize: {url}",
+            "Copy the code it shows you",
+            how.replace("Reply to this chat with:  ", "Reply here: ")
+               .replace("Then run on the host:  ", "Then run on the host: "),
+            f"The dialog auto-cancels after {code_timeout(cfg) // 60} min "
+            f"without a code",
+        ],
     )
     emit_event(
         f"Claude Code login URL ready. Open it, authorize, then run: "
@@ -449,7 +467,8 @@ def publish_failure(pane: str, reason: str, tag: str = "self-login-failed",
     write_state({"status": "failed", "pane": pane, "reason": reason})
     if notify:
         # Out-of-band first, for the same reason publish_url does it.
-        tell_operator(load_settings(), f"self-login FAILED: {reason}")
+        tell_operator(load_settings(), f"self-login FAILED: {reason}",
+                      title="self-login failed", lines=[reason])
     emit_event(
         f"self-login FAILED: {reason}",
         tag=tag,
@@ -488,6 +507,8 @@ def load_settings() -> dict:
     except Exception as exc:
         log(f"  WARNING: could not read {_settings_path()}: {exc}")
     env_map = {
+        "notify_channel": "CLAUDE_SELF_LOGIN_NOTIFY_CHANNEL",
+        "botchat_cmd": "CLAUDE_SELF_LOGIN_BOTCHAT_CMD",
         "push_cmd": "CLAUDE_SELF_LOGIN_PUSH_CMD",
         "chat_send_cmd": "CLAUDE_SELF_LOGIN_CHAT_SEND_CMD",
         "chat_poll_cmd": "CLAUDE_SELF_LOGIN_CHAT_POLL_CMD",
@@ -541,8 +562,64 @@ def chat_operator(cfg: dict, message: str) -> bool:
     return rc == 0
 
 
-def tell_operator(cfg: dict, message: str, priority: str = "high") -> None:
-    """Every out-of-band channel; one failing never skips the others."""
+DEFAULT_BOTCHAT_CMD = "botchat-send"
+DEFAULT_NOTIFY_CHANNEL = "botchat"
+
+
+def structured_body(title: str, lines) -> str:
+    """A botchat-style body: "# title" then one "- " bullet per line."""
+    bullets = [f"- {ln.strip()}" for ln in lines if ln and ln.strip()]
+    return "\n".join([f"# {title.strip()}", "", *bullets]) + "\n"
+
+
+def botchat_operator(cfg: dict, title: str, lines) -> bool:
+    """Send one structured message via the botchat CLI. Never raises.
+
+    Botchat pushes to the operator's phone itself, so a True return means the
+    caller must NOT also push. False (CLI missing or send failed) means
+    nothing was delivered and the caller should fall back.
+    """
+    cmd = (cfg.get("botchat_cmd") or DEFAULT_BOTCHAT_CMD).split()
+    if not cmd or not shutil.which(cmd[0]):
+        log(f"  botchat: {cmd[0] if cmd else '(empty)'} not found")
+        return False
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+            f.write(structured_body(title, lines))
+            path = f.name
+        out, rc = sc.run(cmd + ["-F", path], timeout=30)
+    except Exception as exc:  # noqa: BLE001 - notification must never raise
+        log(f"  WARNING: botchat send raised: {exc!r}")
+        return False
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    if rc != 0:
+        log(f"  WARNING: botchat send failed (rc={rc}): {out!r}")
+        return False
+    log("  botchat message sent")
+    return True
+
+
+def tell_operator(cfg: dict, message: str, priority: str = "high",
+                  title: str = "", lines=None) -> None:
+    """Every out-of-band channel; one failing never skips the others.
+
+    Default channel is botchat (which pushes by itself). If that fails, the
+    legacy direct push + chat path runs, and the log says it fell back.
+    `title`/`lines` shape the botchat body; without them the message's own
+    lines become the bullets under a generic title.
+    """
+    channel = str(cfg.get("notify_channel") or DEFAULT_NOTIFY_CHANNEL).lower()
+    if channel == "botchat":
+        body_lines = lines if lines is not None else message.splitlines()
+        if botchat_operator(cfg, title or "Claude Code login", body_lines):
+            return
+        log("  botchat unavailable; falling back to direct push + chat")
     push_operator(cfg, message, priority)
     chat_operator(cfg, message)
 
