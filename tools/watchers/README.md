@@ -264,9 +264,13 @@ self-clear [--delay SECONDS] [--no-resume] [--timeout SECONDS]
 
 Forks immediately so the calling tool call can complete; the child polls
 the tmux pane via `claude-watch status --json`, injects `/clear` (vim-mode
-sequence: `Escape, dd, i, /clear, Enter`), waits for tokens to drop below
-`FRESH_SESSION_MAX_TOKENS` (30000), dismisses the post-/clear feedback
-prompt, then injects the resume prompt.
+sequence: `Escape, dd, i, /clear, Enter`), and confirms the clear on the
+FIRST poll that shows tokens at or below half the pre-/clear count (or below
+`FRESH_SESSION_MAX_TOKENS`, 30000, on an idle prompt). Polling stops there
+and `/clear` is never re-sent once a drop has been seen (a fresh session's
+baseline is ~50k and grows within seconds, so the end-of-window reading is
+not a valid success test). It then dismisses the post-/clear feedback
+prompt and injects the resume prompt.
 
 Environment defaults (all overridable via flag):
 

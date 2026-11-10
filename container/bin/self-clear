@@ -128,6 +128,41 @@ HANDOFF_FILE = _default_handoff_file()
 # and the session is bootstrapping — skip our resume inject.
 FRESH_SESSION_MAX_TOKENS = 30000
 
+# A /clear has TAKEN EFFECT once any completion-poll reading (taken while no
+# Rewind picker is visible) is at or below this fraction of the pre-/clear
+# token count. Nothing but a real clear (or an auto-compaction) can halve the
+# context: a failed /clear (typed as ordinary text, or swallowed by a modal)
+# only ever GROWS it. The absolute FRESH_SESSION_MAX_TOKENS floor alone is NOT
+# enough: a fresh session's baseline (system prompt + memory + SessionStart /
+# notification hook injections) is ~50k and climbs to ~80k within seconds, so
+# a clear that dropped 965k -> 52k was declared FAILED at the end of the poll
+# window and /clear was re-sent into the already-fresh session (double clear,
+# 2026-11-10). 0.5 keeps ample margin for that post-clear growth even when
+# self-clear is invoked early (e.g. 200k before -> a 100k ceiling).
+CLEAR_DROP_RATIO = 0.5
+
+
+def _clear_took_effect(tokens_before, tokens_now, idle_now):
+    """Pure: did this poll reading show that /clear took effect?
+
+    True when EITHER
+      * the legacy fresh-session check holds -- tokens below
+        FRESH_SESSION_MAX_TOKENS on an idle prompt (also covers the 0 reading
+        of a just-cleared, not-yet-counted session), OR
+      * a decisive DROP is observed: a real (non-zero) reading at or below
+        CLEAR_DROP_RATIO x tokens_before. Idle is not required here -- the
+        fresh session may already be busy with hook injections, and a busy
+        fresh session is still a cleared one.
+
+    Callers must only evaluate this on a snapshot with no Rewind picker
+    visible (the picker screen has no token line, so it reads 0).
+    """
+    if tokens_now < FRESH_SESSION_MAX_TOKENS and idle_now:
+        return True
+    if tokens_before > 0 and 0 < tokens_now <= tokens_before * CLEAR_DROP_RATIO:
+        return True
+    return False
+
 
 def log(msg):
     """Append a timestamped message to the self-clear log."""
@@ -1018,8 +1053,10 @@ def plan_argv(pane, args):
             " (those readings are unreliable while the picker is open)."
         )
         lines.append(
-            "  completion requires ALL THREE: picker gone AND tokens < "
-            f"{FRESH_SESSION_MAX_TOKENS} AND prompt idle."
+            "  completion requires: picker gone AND (tokens <= "
+            f"{CLEAR_DROP_RATIO} x tokens-before OR (tokens < "
+            f"{FRESH_SESSION_MAX_TOKENS} AND prompt idle)); confirmed on the"
+            " FIRST such reading -- polling stops and /clear is never re-sent."
         )
         lines.append(
             "  no-op (detection-gated, not version-gated) on pre-2.1.283"
@@ -1116,8 +1153,8 @@ def child_main(pane, args):
         # prompt to it. So picker-confirmation is folded INTO the
         # completion poll itself: every iteration, across the whole
         # `--delay` window, checks for and confirms the picker. Completion
-        # requires ALL THREE: picker gone, tokens dropped, prompt idle --
-        # never just the latter two. No-op (detection-gated) on the
+        # requires the picker gone AND `_clear_took_effect()` on that same
+        # snapshot -- never a token reading taken while the picker is open. No-op (detection-gated) on the
         # pre-2.1.283 direct-clear behavior, where the picker never appears.
         log(f"  polling for /clear completion (max {args.delay}s, "
             "picker-aware)...")
@@ -1162,7 +1199,11 @@ def child_main(pane, args):
             tokens_now = get_token_count()
             idle_now = _is_idle_text(pane_text)
             log(f"  poll: tokens={tokens_now} idle={idle_now}")
-            if tokens_now < FRESH_SESSION_MAX_TOKENS and idle_now:
+            # Confirm on the FIRST decisive reading and stop polling: the
+            # fresh session keeps growing afterwards, so judging the reading
+            # at the END of the window re-sent /clear after a clear that had
+            # already worked (2026-11-10 double clear).
+            if _clear_took_effect(tokens_before, tokens_now, idle_now):
                 log(f"  /clear confirmed (tokens {tokens_before} -> {tokens_now})")
                 clear_confirmed = True
                 break
@@ -1182,9 +1223,13 @@ def child_main(pane, args):
     tokens_after = get_token_count()
     log(f"  final: tokens={tokens_after} confirmed={clear_confirmed}")
 
-    if tokens_after > FRESH_SESSION_MAX_TOKENS:
-        # Session is already running — exo-watcher or user got there first,
-        # or all /clear attempts failed.
+    if not clear_confirmed and tokens_after > FRESH_SESSION_MAX_TOKENS:
+        # All /clear attempts failed and the session is still large. (Once a
+        # clear is CONFIRMED we always hand off: a fresh session's baseline is
+        # already above FRESH_SESSION_MAX_TOKENS and grows from hook
+        # injections within seconds, so the absolute count can no longer tell
+        # "someone else resumed" apart from "freshly cleared" -- skipping here
+        # would drop the resume prompt and the handoff marker.)
         log(f"SKIP-RESUME: session at {tokens_after} tokens > {FRESH_SESSION_MAX_TOKENS}. "
             f"{'All attempts failed' if not clear_confirmed else 'Already running'}.")
         return
