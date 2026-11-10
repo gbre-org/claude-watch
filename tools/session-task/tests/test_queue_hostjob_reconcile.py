@@ -429,3 +429,87 @@ def test_non_reconciled_done_row_is_not_revived():
         _write_status(env, "normal", {"status": "running", "queue_id": "q-n"})
         _run(env, "queue", "reconcile-hostjobs", "--json")
         assert _read_item(env, "q-n")["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# REMOTE-origin rows (hostjob_host set): runner state lives on another host,
+# so a missing local state dir is NOT proof of death.
+# ---------------------------------------------------------------------------
+def _remote_row(qid, label, *, age_seconds, **extra):
+    row = _running_hostjob_row(qid, label, age_seconds=age_seconds)
+    row["hostjob_host"] = "ssh://remote-mac"
+    row.update(extra)
+    return row
+
+
+def test_remote_row_no_local_state_dir_stays_open_even_when_visible():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        _write_queue(env, [_remote_row("q-rm", "macjob", age_seconds=3600)])
+        # Local state dir is visible and non-empty (other local jobs) but has
+        # no entry for this label -- the exact case that used to false-close.
+        _write_status(env, "otherjob", {"status": "running", "rc": None})
+        r = _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == []
+        assert _read_item(env, "q-rm")["status"] == "running"
+
+
+def test_remote_row_ignores_local_terminal_status_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        _write_queue(env, [_remote_row("q-rt", "macjob2", age_seconds=3600)])
+        _write_status(env, "macjob2", {"status": "done", "rc": 0})
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-rt")["status"] == "running"
+
+
+def test_remote_row_recent_heartbeat_keeps_open_despite_old_registration():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        beat = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        _write_queue(env, [_remote_row(
+            "q-rh", "macjob3", age_seconds=3 * 86400, last_heartbeat_at=beat)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-rh")["status"] == "running"
+
+
+def test_remote_row_stale_over_24h_is_gcd_to_abandoned():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        _write_queue(env, [_remote_row("q-rs", "macjob4", age_seconds=25 * 3600)])
+        r = _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert r.returncode == 0, r.stderr
+        it = _read_item(env, "q-rs")
+        assert it["status"] == "abandoned", it
+        assert "stale GC" in it["abandon_reason"]
+
+
+def test_remote_row_closed_by_reconcile_is_not_revived_from_local_state():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        row = _closed_by_reconcile(_remote_row("q-rr", "macjob5", age_seconds=900))
+        _write_queue(env, [row])
+        _write_status(env, "macjob5", {"status": "running", "queue_id": "q-rr"})
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-rr")["status"] == "done"
+
+
+def test_queue_add_remote_host_stamps_hostjob_host():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _run(env, "queue", "add", "d", "--scope", "hostjob:x",
+                 "--created-by", "hostjob", "--remote-host", "ssh://m",
+                 "--force-enqueue", "--json")
+        assert r.returncode == 0, r.stderr
+        qid = json.loads(r.stdout)["id"]
+        assert _read_item(env, qid)["hostjob_host"] == "ssh://m"
+
+
+def test_local_row_without_marker_unchanged_missing_dir_closes():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        _write_queue(env, [_running_hostjob_row("q-lc", "localjob", age_seconds=3600)])
+        _write_status(env, "otherjob", {"status": "running", "rc": None})
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-lc")["status"] == "done"
