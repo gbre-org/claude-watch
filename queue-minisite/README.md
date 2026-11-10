@@ -716,6 +716,7 @@ folder on purpose: it is the app's own default logo, not a brand slot.
 | `WORKLOAD_LOG_DIR` | `/workloads` | Workload `.output` archive dir, tailed by SSE for `workload:<label>` queue items. |
 | `HOSTJOB_LOG_DIR` | `/hostjobs` | Hostjob log dir, tailed by SSE for `hostjob:<label>` queue items. NOTE per-label-dir layout: the tail target is `<HOSTJOB_LOG_DIR>/<label>/log` (not a flat `<label>.output`). |
 | `CACHE_TTL_SECONDS` | `5` | Server-side cache TTL for the queue read. |
+| `API_PAYLOAD_TTL_SECONDS` | `5` | How long the rendered `/api/queue` body (and its ETag) is reused across all clients. `?history=N` (max 500) widens the done/abandoned windows; `If-None-Match` answers 304. |
 | `SSE_TAIL_MAX_IDLE_SECONDS` | `30` | Idle cap on SSE live-log streams. |
 | `SSE_TAIL_MAX_LIFETIME_SECONDS` | `3600` | Lifetime cap on SSE live-log streams. |
 | `SSE_TAIL_BACKFILL_LINES` | `200` | Historical-context backfill cap when a client first connects. |
