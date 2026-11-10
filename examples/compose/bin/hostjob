@@ -550,6 +550,11 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
             "--force-enqueue",
             "--json",
         ]
+        if isinstance(st_bin, dict):
+            # Remote transport: tell the queue host this row's runner state
+            # lives elsewhere so its reconciler never infers death from a
+            # missing local state dir.
+            add_args += ["--remote-host", st_bin.get("desc") or "remote"]
         for dep in (depends_on or []):
             add_args += ["--depends-on", dep]
         add_argv = _st_argv(st_bin, *add_args)
@@ -1137,6 +1142,24 @@ def register_when_live():
     except Exception:
         pass
 
+def _heartbeat_loop(stop_event, worker_pid, interval=300.0):
+    # Periodic `queue heartbeat` for rows on a REMOTE queue host. Fail-soft:
+    # refused (row not running yet) or errors are ignored.
+    while not stop_event.wait(interval):
+        if not pid_alive(worker_pid):
+            return
+        if not queue_registered:
+            continue
+        try:
+            subprocess.run(
+                st_argv("queue", "heartbeat", queue_id),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=20)
+        except Exception:
+            pass
+
+
 def _registration_retry_loop(stop_event, worker_pid):
     # register_when_live() gets exactly one shot, called once right after
     # Popen. If that single attempt fails (transient lock contention on the
@@ -1277,6 +1300,13 @@ try:
     # worker's stdout closes.
     retry_stop = threading.Event()
     retry_thread = None
+    if queue_id and isinstance(queue_backend, dict):
+        # Remote queue host cannot see our state dir: heartbeat the row so
+        # the queue site shows liveness and staleness GC stays accurate.
+        threading.Thread(
+            target=_heartbeat_loop, args=(retry_stop, worker_pid),
+            daemon=True,
+        ).start()
     if queue_id and not queue_registered:
         retry_thread = threading.Thread(
             target=_registration_retry_loop, args=(retry_stop, worker_pid),

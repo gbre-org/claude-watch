@@ -4054,6 +4054,8 @@ def cmd_queue_add(args):
         }
         if context is not None:
             item["context"] = context
+        if getattr(args, "remote_host", None):
+            item["hostjob_host"] = args.remote_host
         items.append(item)
 
         _recompute_group_heads(items)
@@ -4304,6 +4306,42 @@ def _hostjob_runner_owns_live(label, qid):
     )
 
 
+# REMOTE-origin hostjob rows (``hostjob_host`` set) have their runner state
+# dir on the remote host, invisible here, so a missing local status.json is
+# NOT evidence of death. They are only GC'd when the row has had no sign of
+# life (heartbeat / registration) for this long. The remote reaper's own
+# done/abandon flip is the normal close path; this is the leak backstop.
+HOSTJOB_REMOTE_STALE_SECONDS = int(
+    os.environ.get("HOSTJOB_REMOTE_STALE_SECONDS", str(24 * 3600))
+)
+
+
+def _remote_hostjob_stale_terminal(it, now):
+    """For a remote-origin hostjob row return a terminal transition dict when
+    it has had no heartbeat/registration for HOSTJOB_REMOTE_STALE_SECONDS,
+    else None (keep open)."""
+    last = (
+        it.get("last_heartbeat_at")
+        or it.get("registered_at")
+        or it.get("started_at")
+        or it.get("quarantined_at")
+        or it.get("created_at")
+    )
+    if not last:
+        return None
+    try:
+        age = (now - datetime.fromisoformat(last)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    if age <= HOSTJOB_REMOTE_STALE_SECONDS:
+        return None
+    return {
+        "status": "abandoned",
+        "reason": "remote hostjob %s: no heartbeat for %dh (stale GC)"
+        % (it.get("hostjob_host"), int(age // 3600)),
+    }
+
+
 def _reconcile_hostjob_rows(items):
     """Heal leaked hostjob rows whose runner reports the worker is dead.
 
@@ -4370,7 +4408,8 @@ def _reconcile_hostjob_rows(items):
                 # queue item. Skipped when another open row already owns the
                 # same hostjob scope.
                 label = _extract_hostjob_label(it.get("scope") or [])
-                if label and _hostjob_runner_owns_live(label, it.get("id")):
+                if (label and not it.get("hostjob_host")
+                        and _hostjob_runner_owns_live(label, it.get("id"))):
                     scope_key = "hostjob:" + label
                     taken = any(
                         o is not it
@@ -4412,7 +4451,12 @@ def _reconcile_hostjob_rows(items):
                     age = (now - started).total_seconds()
                 except (TypeError, ValueError):
                     age = None
-            eff = _hostjob_effective_terminal(label, age)
+            if it.get("hostjob_host"):
+                # Remote-origin row: local state dir says nothing. Only the
+                # long-staleness GC may close it.
+                eff = _remote_hostjob_stale_terminal(it, now)
+            else:
+                eff = _hostjob_effective_terminal(label, age)
             if eff is None:
                 continue
             if status == "quarantined":
@@ -9396,6 +9440,17 @@ def build_parser():
     )
     q_add.add_argument("--context")
     q_add.add_argument("--created-by")
+    q_add.add_argument(
+        "--remote-host",
+        default=None,
+        help=(
+            "Marks the row as created on behalf of a REMOTE host (its "
+            "runner state lives there, not here). Stored as "
+            "`hostjob_host`; the hostjob reconciler then never infers death "
+            "from a missing local state dir for this row. Used by "
+            "`hostjob` when it registers through a remote queue transport."
+        ),
+    )
     q_add.add_argument(
         "--depends-on",
         action="append",
