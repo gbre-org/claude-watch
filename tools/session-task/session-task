@@ -6233,6 +6233,43 @@ def cmd_queue_spawn_check(args):
     sys.exit(2)
 
 
+ONE_ITEM_PER_AGENT_MSG = "one queue item per agent \u2014 spawn a new agent"
+
+
+def _agent_other_nonterminal_item(items, agent_id, exclude_id):
+    """Return another item owned by ``agent_id`` that is not yet terminal.
+
+    "One queue item per agent" (Andrew, 2026-11-09: bundling two items on
+    one agent made the dashboard tail the same agent twice). Terminal =
+    done / abandoned; everything else (pending-spawn, running, wedged,
+    blocked, quarantined) still counts as owning the agent.
+    """
+    for it in items:
+        if it.get("id") == exclude_id:
+            continue
+        if it.get("agent_id") != agent_id:
+            continue
+        if it.get("status") in ("done", "abandoned"):
+            continue
+        return it
+    return None
+
+
+def _refuse_second_item_for_agent(fh, other, agent_id, target_id):
+    """Print the refusal, release the queue lock and exit non-zero."""
+    print(
+        f"REFUSED: agent {agent_id} already owns {other['id']} "
+        f"(status={other.get('status')}); cannot also own {target_id}.\n"
+        f"  {ONE_ITEM_PER_AGENT_MSG}.\n"
+        f"  (finish/abandon {other['id']} first if this is a legitimate "
+        f"resume onto a new item)",
+        file=sys.stderr,
+    )
+    fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
+    sys.exit(1)
+
+
 def cmd_queue_register(args):
     """Atomically claim a pending item as running (spawn-gating entry point).
 
@@ -6406,6 +6443,14 @@ def cmd_queue_register(args):
             print(bar, file=sys.stderr)
             sys.exit(2)
 
+        _explicit_aid = getattr(args, "agent_id", None)
+        _explicit_aid = (_explicit_aid.strip()
+                         if isinstance(_explicit_aid, str) else None)
+        if _explicit_aid:
+            _other = _agent_other_nonterminal_item(items, _explicit_aid, args.id)
+            if _other is not None:
+                _refuse_second_item_for_agent(fh, _other, _explicit_aid, args.id)
+
         target["status"] = "running"
         target["started_at"] = _fmt_ts()
         target["registered_at"] = target["started_at"]
@@ -6458,6 +6503,14 @@ def cmd_queue_register(args):
         resolved_aid = resolved_aid.strip() if isinstance(resolved_aid, str) else None
         if not resolved_aid:
             resolved_aid = _registering_subagent_agent_id(args.id)
+            # Heuristic (transcript-scan) resolution never fails the register:
+            # if that agent already owns another live item, skip the stamp.
+            if resolved_aid and _agent_other_nonterminal_item(
+                    items, resolved_aid, args.id) is not None:
+                print(f"warning: not stamping {resolved_aid} on {args.id}: "
+                      f"it already owns another live item "
+                      f"({ONE_ITEM_PER_AGENT_MSG})", file=sys.stderr)
+                resolved_aid = None
         if resolved_aid and target.get("agent_id") != resolved_aid:
             target["agent_id"] = resolved_aid
             target["agent_id_source"] = "register"
@@ -6566,6 +6619,10 @@ def cmd_queue_assign(args):
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             sys.exit(1)
+
+        _other = _agent_other_nonterminal_item(items, new_aid, args.id)
+        if _other is not None:
+            _refuse_second_item_for_agent(fh, _other, new_aid, args.id)
 
         old_aid = target.get("agent_id")
         old_source = target.get("agent_id_source")

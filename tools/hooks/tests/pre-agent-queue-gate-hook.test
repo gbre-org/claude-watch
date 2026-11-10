@@ -59,6 +59,30 @@ TEST_SCOPE_DONE = f"repo:{_REPO_BASE}-done"
 # test process. (The hook itself never validates; only `queue add` does.)
 os.environ["SESSION_TASK_REPOS_NO_VALIDATE"] = "1"
 
+# ISOLATION: the queue lives under $HOME (~/.config/session/queue.json) and
+# the hook + fixtures shell out to `session-task`. Point HOME at a throwaway
+# dir and put THIS checkout's session-task first on PATH so the suite never
+# writes rows (or fires claude-event / pingme / obligations side effects)
+# into the live queue.
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+_TEST_HOME = _tempfile.mkdtemp(prefix="queue-gate-hook-test-home-")
+_atexit.register(_shutil.rmtree, _TEST_HOME, ignore_errors=True)
+_BIN = Path(_TEST_HOME) / "bin"
+_BIN.mkdir()
+(_BIN / "session-task").symlink_to(
+    (Path(__file__).resolve().parents[2] / "session-task" / "session-task")
+)
+os.environ["HOME"] = _TEST_HOME
+os.environ["PATH"] = f"{_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
+for _k in ("PINGME_SESSION_TASK", "CLAUDE_EVENT_SESSION_TASK"):
+    os.environ[_k] = "0"
+os.environ["OBLIGATIONS_FORCE_START"] = "0"
+os.environ["QUEUE_LOG_ARCHIVE_DIR"] = str(Path(_TEST_HOME) / "queue-logs")
+os.environ["CLAUDE_AGENTS_STATE"] = str(Path(_TEST_HOME) / "active-agents.json")
+os.environ["CLAUDE_AGENTS_JSONL_ROOT"] = str(Path(_TEST_HOME) / "projects")
+
 # The `<org>/<repo>` prefixes the scope/target check recognises are
 # CONFIGURATION (`CLAUDE_REPO_ORGS`), not baked-in literals. Declare a
 # synthetic org for the fixtures; S6 below flips it off to prove the config is
@@ -715,6 +739,31 @@ def main() -> int:
             rc == 0 and _is_allow(out) and recovered,
             f"rc={rc} allow={_is_allow(out)} recovered={recovered}",
         ))
+
+    # 13. Two distinct Queue item ids -> deny (no bundling); repeating the
+    # SAME id is not bundling and still allows.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "general-purpose",
+            "prompt": f"Queue item: {running_id}\nAlso do Queue item: {mono_id}",
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "13a. two distinct Queue item ids denies",
+        rc == 0 and _is_deny(out),
+        f"rc={rc} out={out}",
+    ))
+    payload["tool_input"]["prompt"] = (
+        f"Queue item: {running_id}\nrepeat: Queue item: {running_id}"
+    )
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "13b. same Queue item id repeated allows",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
 
     total = len(results)
     passed = sum(1 for r in results if r)

@@ -81,6 +81,21 @@ of liveness). Accepted on `running` / `wedged` / `blocked`; refused on
 `pending` (nothing was spawned, so an owner would be invented) and on
 `done` / `abandoned` / `quarantined` (the item is over).
 
+### One queue item per agent (no bundling)
+
+An agent may own exactly one live queue item. `queue assign` and
+`queue register --agent-id` REFUSE (non-zero exit) to stamp an agent id that
+already owns another item that is not `done`/`abandoned`; the error names the
+existing item and says "one queue item per agent — spawn a new agent".
+Re-stamping the same item to the same agent is idempotent, and an agent whose
+old item is terminal can be moved onto a new one (the legitimate resume case).
+Owner resolution by transcript scan (no explicit id) skips the stamp with a
+warning instead of failing. The Agent-spawn gate hook
+(`tools/hooks/pre-agent-queue-gate-hook`) additionally DENIES a prompt carrying
+more than one distinct `Queue item: q-...` id. There is deliberately no bypass
+flag for the stamping refusal. Known gap: routing a second item's work to a
+live agent via `SendMessage` is not detectable and is not enforced.
+
 **Note on `--force-enqueue`**: dual purpose as of 2026-05-19 (rev 2):
 
   * **Bypass for the workload-scope hard-fail**. `queue add` REFUSES (exit 3,
