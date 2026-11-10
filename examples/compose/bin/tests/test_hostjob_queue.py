@@ -125,6 +125,24 @@ class QueueTest(unittest.TestCase):
         self._wait_terminal(label)
         self.mod.cmd_clean(type("A", (), {"label": label, "all": False})())
 
+    def test_nonzero_exit_closes_row_confirmed_dead_not_quarantined(self):
+        # A finished job (any rc) must close its row terminally. Plain
+        # `queue abandon` quarantines a running row; the reaper must pass
+        # --confirmed-dead and record rc + log path.
+        label = "fail-q"
+        self.mod.cmd_run(_RunArgs(label, ["false"], no_queue=False))
+        self._wait_terminal(label)
+        deadline = time.time() + 5
+        ab = []
+        while time.time() < deadline and not ab:
+            ab = [l for l in self._shim_lines() if l.startswith("queue abandon")]
+            time.sleep(0.05)
+        self.assertTrue(ab, self._shim_lines())
+        self.assertIn("--confirmed-dead", ab[0])
+        self.assertIn("hostjob exit 1", ab[0])
+        self.assertIn("log:", ab[0])
+        self.mod.cmd_clean(type("A", (), {"label": label, "all": False})())
+
     def test_no_queue_run_adds_but_does_not_register(self):
         # THE CORE FIX: --no-queue still creates a (pending) row with a q-id;
         # it only skips the scope-claiming `queue register`.

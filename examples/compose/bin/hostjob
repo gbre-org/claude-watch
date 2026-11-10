@@ -29,7 +29,10 @@ QUEUE INTEGRATION (first-class queue citizen)
 EVERY hostjob ALWAYS gets a first-class session-task queue row (scope
 `hostjob:<label>`, created-by `hostjob`); `run` stores the returned q-id in
 `status.json` under "queue_id" and prints it. The detached reaper, on worker
-exit, flips that queue item to `done` (rc==0) or `abandon` (rc!=0) and emits a
+exit, flips that queue item to `done` (rc==0) or `abandon --confirmed-dead`
+(rc!=0; the reaper just waited on the worker so death is PROVEN — a plain
+abandon would land the scope-owning row in `quarantined`, an alert-worthy
+"presumed dead" state, for a job that simply FINISHED) and emits a
 `claude-event --source hostjob --tag hostjob-done` so the main loop is notified
 (`done`/`abandon` work on a row in ANY status, so even an unregistered/pending
 row auto-closes fine).
@@ -461,7 +464,8 @@ def _finalize_stopped_queue_item(st_bin, qid, reason):
     False on any refusal/timeout/exception. NEVER raises — queue plumbing
     must never block the actual stop/poll operation.
     """
-    argv = _st_argv(st_bin, "queue", "abandon", qid, "--reason", reason or "hostjob stopped")
+    argv = _st_argv(st_bin, "queue", "abandon", qid, "--confirmed-dead",
+                    "--reason", reason or "hostjob stopped")
     try:
         r = subprocess.run(
             argv,
@@ -1087,7 +1091,8 @@ def finalize_queue(rc):
                 else:
                     subprocess.run(
                         st_argv("queue", "abandon", queue_id,
-                                "--reason", "hostjob exit %s" % rc),
+                                "--confirmed-dead",
+                                "--reason", "hostjob exit %s (log: %s)" % (rc, lp)),
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         timeout=20)
