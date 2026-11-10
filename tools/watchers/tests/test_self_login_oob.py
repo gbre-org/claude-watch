@@ -149,7 +149,8 @@ class TestOperatorDelivery(unittest.TestCase):
             chatted = Path(td) / "chatted"
             push = self._stub(td, "push", f'echo "$*" >> {pushed}\n')
             chat = self._stub(td, "chat", f'echo "$*" >> {chatted}\n')
-            env = {"CLAUDE_SELF_LOGIN_PUSH_CMD": push,
+            env = {"CLAUDE_SELF_LOGIN_NOTIFY_CHANNEL": "push",
+                   "CLAUDE_SELF_LOGIN_PUSH_CMD": push,
                    "CLAUDE_SELF_LOGIN_CHAT_SEND_CMD": chat,
                    "CLAUDE_SELF_LOGIN_CHAT_POLL_CMD": "true",
                    "CLAUDE_SELF_LOGIN_CHAT_SENDER": "op",
@@ -177,13 +178,70 @@ class TestOperatorDelivery(unittest.TestCase):
             chatted = Path(td) / "chatted"
             chat = self._stub(td, "chat", f'echo "$*" >> {chatted}\n')
             m = _import_self_login({"CLAUDE_SELF_LOGIN_LOG": f"{td}/log"})
-            cfg = {"push_cmd": self._stub(td, "badpush", "exit 3\n"), "chat_send_cmd": chat}
+            cfg = {"notify_channel": "push",
+                   "push_cmd": self._stub(td, "badpush", "exit 3\n"), "chat_send_cmd": chat}
             m.tell_operator(cfg, "hello")
             self.assertIn("hello", chatted.read_text())
 
     def test_no_channels_configured_is_silent_not_a_crash(self):
         m = _import_self_login()
-        m.tell_operator({}, "hello")
+        m.tell_operator({"notify_channel": "push"}, "hello")
+
+    def test_botchat_default_sends_structured_body_and_no_push(self):
+        with tempfile.TemporaryDirectory() as td:
+            body = Path(td) / "body"
+            pushed = Path(td) / "pushed"
+            bot = self._stub(td, "bc", f'[ "$1" = -F ] || exit 9\ncat "$2" > {body}\n')
+            push = self._stub(td, "push", f'echo "$*" >> {pushed}\n')
+            m = _import_self_login({"CLAUDE_SELF_LOGIN_LOG": f"{td}/log"})
+            cfg = {"botchat_cmd": bot, "push_cmd": push}
+            m.tell_operator(cfg, "x", title="T", lines=["Url: https://e.test/a",
+                                                         "Reply here: login code <CODE>"])
+            self.assertEqual(
+                body.read_text(),
+                "# T\n\n- Url: https://e.test/a\n- Reply here: login code <CODE>\n")
+            self.assertFalse(pushed.exists())
+
+    def test_botchat_failure_falls_back_to_push_and_logs(self):
+        with tempfile.TemporaryDirectory() as td:
+            pushed = Path(td) / "pushed"
+            bot = self._stub(td, "bc", "exit 2\n")
+            push = self._stub(td, "push", f'echo "$*" >> {pushed}\n')
+            m = _import_self_login({"CLAUDE_SELF_LOGIN_LOG": f"{td}/log"})
+            m.tell_operator({"botchat_cmd": bot, "push_cmd": push}, "hello")
+            self.assertIn("hello", pushed.read_text())
+            self.assertIn("falling back", Path(f"{td}/log").read_text())
+
+    def test_botchat_missing_falls_back_to_push(self):
+        with tempfile.TemporaryDirectory() as td:
+            pushed = Path(td) / "pushed"
+            push = self._stub(td, "push", f'echo "$*" >> {pushed}\n')
+            m = _import_self_login({"CLAUDE_SELF_LOGIN_LOG": f"{td}/log"})
+            m.tell_operator({"botchat_cmd": f"{td}/nope", "push_cmd": push}, "hello")
+            self.assertIn("hello", pushed.read_text())
+
+    def test_publish_url_via_botchat_is_structured(self):
+        with tempfile.TemporaryDirectory() as td:
+            body = Path(td) / "body"
+            bot = self._stub(td, "bc", f'cat "$2" > {body}\n')
+            env = {"CLAUDE_SELF_LOGIN_BOTCHAT_CMD": bot,
+                   "CLAUDE_SELF_LOGIN_CHAT_POLL_CMD": "true",
+                   "CLAUDE_SELF_LOGIN_CHAT_SENDER": "op",
+                   "XDG_CONFIG_HOME": td}
+            m = _import_self_login({"CLAUDE_SELF_LOGIN_STATE": f"{td}/state.json",
+                                    "CLAUDE_SELF_LOGIN_LOG": f"{td}/log"})
+            os.environ.update(env)
+            real_which = m.shutil.which
+            m.shutil.which = lambda n: real_which(n) if n == bot else None
+            try:
+                m.publish_url("%0", "https://example.test/authorize?x=1")
+            finally:
+                for k in env:
+                    os.environ.pop(k, None)
+            text = body.read_text()
+            self.assertTrue(text.startswith("# Claude Code needs a login\n"))
+            self.assertIn("- Open this link and authorize: https://example.test/authorize?x=1", text)
+            self.assertIn("- Reply here: login code <CODE>", text)
 
 
 class _FakeClock:

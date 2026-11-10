@@ -363,9 +363,17 @@ needs therefore routes through the session:
   back, and tells the operator. The daemon's `self_login_abandon_seconds`
   watchdog remains a second, independent backstop.
 
-All five settings may instead live in
-`$XDG_CONFIG_HOME/claude-watch/self-login.toml` (keys `push_cmd`,
-`chat_send_cmd`, `chat_poll_cmd`, `chat_sender`, `code_timeout_seconds`);
+- **Notification channel.** `notify_channel` (env
+  `CLAUDE_SELF_LOGIN_NOTIFY_CHANNEL`) defaults to `botchat`: the URL and the
+  exact reply format go out as one structured message (a `# ` title plus
+  bullets) through `botchat_cmd` (default `botchat-send -F <file>`). Botchat
+  pushes by itself, so no separate push is sent. If that send fails or the
+  CLI is missing, the legacy direct push + `chat_send_cmd` path runs and the
+  log records the fallback. `notify_channel = "push"` keeps the legacy path.
+
+All settings may instead live in
+`$XDG_CONFIG_HOME/claude-watch/self-login.toml` (keys `notify_channel`,
+`botchat_cmd`, `push_cmd`, `chat_send_cmd`, `chat_poll_cmd`, `chat_sender`, `code_timeout_seconds`);
 environment variables win. This is what lets the systemd-run daemon and a
 shell-run `self-login` behave identically without editing the unit.
 
