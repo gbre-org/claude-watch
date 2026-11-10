@@ -1575,11 +1575,54 @@
   // Tick — fetch + merge. After a successful merge re-hydrate local-time
   // so any new timestamp elements are converted to the viewer's tz.
   // ---------------------------------------------------------------------
+  // Polling discipline (a tab left open must never hammer the server):
+  //   - at most ONE request in flight; the next poll is scheduled only after
+  //     the previous one settles (setTimeout chain, not setInterval);
+  //   - nothing is scheduled while the tab is hidden; becoming visible polls
+  //     immediately;
+  //   - conditional requests: the last ETag rides If-None-Match and a 304
+  //     skips the merge entirely;
+  //   - errors back off exponentially (REFRESH_MS * 2^n, capped), reset on
+  //     the next success.
+  const MAX_BACKOFF_MS = 60000;
+  let pollTimer = null;
+  let inFlight = false;
+  let failures = 0;
+  let lastEtag = null;
+
+  function nextDelay() {
+    if (failures <= 0) return REFRESH_MS;
+    return Math.min(MAX_BACKOFF_MS, REFRESH_MS * Math.pow(2, failures));
+  }
+
+  function schedulePoll() {
+    if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+    if (document.hidden) return;  // resumed by the visibilitychange handler
+    pollTimer = setTimeout(poll, nextDelay());
+  }
+
+  async function poll() {
+    pollTimer = null;
+    if (inFlight) return;  // never overlap requests
+    inFlight = true;
+    try {
+      await tick();
+    } finally {
+      inFlight = false;
+      schedulePoll();
+    }
+  }
+
   async function tick() {
     try {
-      const r = await fetch('/api/queue', { cache: 'no-store' });
-      if (!r.ok) return;
+      const headers = {};
+      if (lastEtag) headers['If-None-Match'] = lastEtag;
+      const r = await fetch('/api/queue', { cache: 'no-store', headers });
+      if (r.status === 304) { failures = 0; return; }
+      if (!r.ok) { failures += 1; return; }
       const j = await r.json();
+      failures = 0;
+      lastEtag = r.headers.get('ETag') || null;
 
       mergeQueueRoot(j);
       mergeTopbarMeta(j);
@@ -1644,7 +1687,8 @@
         try { window.RelAge.tick(); } catch (_) { /* defensive */ }
       }
     } catch (_) {
-      // Network blip — try again next tick.
+      // Network blip — back off, then try again.
+      failures += 1;
     }
   }
 
@@ -1660,9 +1704,14 @@
 
   // Don't fire the first tick immediately on load — the server-rendered
   // first paint is already correct. Schedule the recurring tick.
-  setInterval(tick, REFRESH_MS);
+  schedulePoll();
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) tick();
+    if (document.hidden) {
+      if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+    } else if (!inFlight) {
+      if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+      poll();
+    }
   });
 
   // Expose internals for the test harness (test.html in the repo). The
@@ -1685,5 +1734,8 @@
     applySectionState,
     applySectionStateToEl,
     sectionDefaultOpen,
+    poll,
+    schedulePoll,
+    pollState: () => ({ inFlight, failures, lastEtag, scheduled: pollTimer !== null }),
   };
 })();

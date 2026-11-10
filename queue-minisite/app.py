@@ -232,6 +232,8 @@ HOSTJOB_STOP_GRACE_SECONDS = int(os.environ.get("HOSTJOB_STOP_GRACE_SECONDS", "5
 # the workload and hostjob label extractors / tail endpoints.
 _WORKLOAD_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 CACHE_TTL_SECONDS = float(os.environ.get("CACHE_TTL_SECONDS", "5"))
+# How long a rendered /api/queue body is reused across requests (any client).
+API_PAYLOAD_TTL_SECONDS = float(os.environ.get("API_PAYLOAD_TTL_SECONDS", "5"))
 # Cap on the recent done / abandoned tails — full list is hundreds of items.
 RECENT_DONE_LIMIT = int(os.environ.get("RECENT_DONE_LIMIT", "30"))
 RECENT_ABANDONED_LIMIT = int(os.environ.get("RECENT_ABANDONED_LIMIT", "20"))
@@ -529,9 +531,32 @@ class _Cache:
     payload: dict[str, Any] = field(default_factory=dict)
     fetched_at: float = 0.0
     error: str | None = None
+    # (st_mtime_ns, st_size) of queue.json when ``payload`` was parsed. When the
+    # TTL lapses but the file is byte-for-byte the same version, the 11MB
+    # re-parse is skipped (only the clock moved).
+    sig: tuple[int, int] | None = None
 
 
 _cache = _Cache()
+
+
+@dataclass
+class _ApiPayloadCache:
+    """Rendered ``GET /api/queue`` body, shared by every client.
+
+    Building the payload shapes every queue row (tens of thousands once the
+    done/abandoned history piles up), so it is done at most once per
+    ``API_PAYLOAD_TTL_SECONDS`` however many tabs poll, and the serialized bytes
+    plus a content ETag are kept so unchanged polls answer 304.
+    """
+
+    gen: float = -1.0  # _cache.fetched_at the body was built from
+    built_at: float = 0.0
+    body: bytes = b""
+    etag: str = ""
+
+
+_api_cache = _ApiPayloadCache()
 
 
 @dataclass
@@ -713,13 +738,35 @@ def _read_queue() -> tuple[dict[str, Any], str | None]:
         return {}, f"queue.json non-JSON: {exc}"
 
 
+def _queue_file_sig() -> tuple[int, int] | None:
+    try:
+        st = os.stat(QUEUE_PATH)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def _cached_queue() -> tuple[dict[str, Any], str | None]:
     now = time.time()
     if now - _cache.fetched_at < CACHE_TTL_SECONDS and _cache.fetched_at > 0:
         return _cache.payload, _cache.error
+    # fetched_at == 0 means a write route busted the cache: always re-read.
+    sig = _queue_file_sig()
+    if (
+        _cache.fetched_at > 0
+        and sig is not None
+        and sig == _cache.sig
+        and _cache.error is None
+        and _cache.payload
+    ):
+        _cache.fetched_at = now
+        return _cache.payload, _cache.error
     data, err = _read_queue()
     if err is None:
         _cache.payload = data
+        _cache.sig = sig
+    else:
+        _cache.sig = None
     _cache.error = err
     _cache.fetched_at = now
     return _cache.payload, _cache.error
@@ -2592,7 +2639,13 @@ def _asset_version() -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
-def _render_payload() -> dict[str, Any]:
+def _render_payload(
+    done_limit: int | None = None, abandoned_limit: int | None = None
+) -> dict[str, Any]:
+    done_limit = RECENT_DONE_LIMIT if done_limit is None else done_limit
+    abandoned_limit = (
+        RECENT_ABANDONED_LIMIT if abandoned_limit is None else abandoned_limit
+    )
     data, err = _cached_queue()
     items = data.get("items", []) if isinstance(data, dict) else []
     # Operator-declared manual scope locks (``session-task queue lock``),
@@ -2742,9 +2795,9 @@ def _render_payload() -> dict[str, Any]:
     merged.sort(key=lambda t: (t[0], t[1]), reverse=True)
     done_recent = [
         payload if kind == 0 else _shape_archived_done(payload, now)
-        for _iso, kind, payload in merged[:RECENT_DONE_LIMIT]
+        for _iso, kind, payload in merged[:done_limit]
     ]
-    abandoned_recent = abandoned[:RECENT_ABANDONED_LIMIT]
+    abandoned_recent = abandoned[:abandoned_limit]
 
     # Orphan tally drives the header pill. STARTING items (no agent
     # record yet, but inside the spawn-race window) are deliberately
@@ -2821,8 +2874,8 @@ def _render_payload() -> dict[str, Any]:
         "user": request.headers.get("X-Auth-Request-Email", ""),
         "queue_path": QUEUE_PATH,
         "schema_version": data.get("schema_version") if isinstance(data, dict) else None,
-        "recent_done_limit": RECENT_DONE_LIMIT,
-        "recent_abandoned_limit": RECENT_ABANDONED_LIMIT,
+        "recent_done_limit": done_limit,
+        "recent_abandoned_limit": abandoned_limit,
         # Whitelabel branding — see QUEUE_SITE_* env vars above.
         "site_title": SITE_TITLE,
         "site_logo_url": SITE_LOGO_URL,
@@ -2842,11 +2895,75 @@ def index() -> str:
     return render_template("index.html", **_render_payload())
 
 
+# Fields that change on every rebuild without the queue changing (clock-derived).
+# They are left out of the ETag so an idle queue answers 304; the client ticks
+# ages locally from ``age_epoch`` anyway.
+_ETAG_VOLATILE_KEYS = frozenset(
+    {"age", "age_seconds", "fetched_at", "cache_age_seconds"}
+)
+
+# Hard cap for ``?history=N`` so one request cannot ask for the whole archive.
+HISTORY_MAX = 500
+
+
+def _strip_volatile(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {
+            k: _strip_volatile(v)
+            for k, v in obj.items()
+            if k not in _ETAG_VOLATILE_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_volatile(v) for v in obj]
+    return obj
+
+
+def _build_api_body(
+    done_limit: int | None = None, abandoned_limit: int | None = None
+) -> tuple[bytes, str]:
+    payload = _render_payload(done_limit, abandoned_limit)
+    payload.pop("user", None)
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    stable = json.dumps(_strip_volatile(payload), sort_keys=True).encode("utf-8")
+    etag = hashlib.sha1(stable).hexdigest()
+    return body, etag
+
+
 @app.route("/api/queue")
 def api_queue() -> Any:
-    payload = _render_payload()
-    payload.pop("user", None)
-    return jsonify(payload)
+    """Queue snapshot.
+
+    Default view = every non-terminal item plus the most recent
+    ``RECENT_DONE_LIMIT`` done / ``RECENT_ABANDONED_LIMIT`` abandoned items.
+    ``?history=N`` widens both terminal windows to N rows (max ``HISTORY_MAX``).
+
+    The default body is built at most once per ``API_PAYLOAD_TTL_SECONDS`` and
+    shared across clients; it carries an ETag so ``If-None-Match`` polls get
+    ``304`` with no body.
+    """
+    raw_history = request.args.get("history")
+    if raw_history is not None:
+        try:
+            n = max(0, min(int(raw_history), HISTORY_MAX))
+        except ValueError:
+            return jsonify({"error": "history must be an integer"}), 400
+        body, etag = _build_api_body(n, n)
+    else:
+        _cached_queue()  # refresh/validate the parsed-file cache first
+        now = time.time()
+        if (
+            _api_cache.gen != _cache.fetched_at
+            or now - _api_cache.built_at >= API_PAYLOAD_TTL_SECONDS
+            or not _api_cache.body
+        ):
+            _api_cache.body, _api_cache.etag = _build_api_body()
+            _api_cache.gen = _cache.fetched_at
+            _api_cache.built_at = now
+        body, etag = _api_cache.body, _api_cache.etag
+    resp = Response(body, mimetype="application/json")
+    resp.set_etag(etag)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp.make_conditional(request)
 
 
 @app.route("/api/agent-stats")
