@@ -1495,6 +1495,20 @@
               aria-label="Ended tails are cleared 1 minute after they end. Activate to change (c)."
               title="How long a finished tail stays in the window (c). Cycles clear 1m → clear 5m → clear 15m → keep. Your choice is remembered in this browser.">clear 1m</button>
           </li>
+          {#- Landing view. OFF by default; multitail.js overwrites the pressed
+              state at load from this browser's stored choice. -#}
+          <li class="mt-option">
+            <span class="mt-option-text">
+              <span class="mt-option-name">Make multitail the default view</span>
+              <span class="mt-option-note">Open the queue site straight into multitail. A link with ?view=queue still shows the queue.</span>
+            </span>
+            <button
+              type="button"
+              id="multitail-default-view"
+              class="multitail-display"
+              aria-pressed="false"
+              title="Open the queue site in multitail instead of the queue list. Remembered in this browser.">default</button>
+          </li>
         </ul>
         <p class="mt-options-foot">
           Every choice here is remembered in this browser and applies as you make it.

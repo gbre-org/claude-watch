@@ -129,6 +129,10 @@ const initialHTML = `<!doctype html>
                     aria-pressed="true">subagents</button>
           </li>
           <li class="mt-option">
+            <button type="button" id="multitail-default-view" class="multitail-display"
+                    aria-pressed="false">default</button>
+          </li>
+          <li class="mt-option">
             <button type="button" id="multitail-retain"
                     class="multitail-display multitail-retain"
                     data-retention="1m">clear 1m</button>
@@ -906,12 +910,13 @@ console.log('\n-- ended-pane retention (`c`): clear after a delay, or keep');
     mt.retention() === '1m' && mt.retentionMs() === 60 * 1000,
     mt.retention() + ' / ' + mt.retentionMs() + 'ms');
   assert('the option set is small and cycles in order',
-    mt.RETENTION_OPTIONS.map((o) => o.key).join(',') === '1m,5m,15m,keep',
+    mt.RETENTION_OPTIONS.map((o) => o.key).join(',') === '5s,15s,30s,1m,5m,15m,keep',
     mt.RETENTION_OPTIONS.map((o) => o.key).join(','));
   assert('keep-forever is a real option, not a token entry',
     mt.RETENTION_OPTIONS[mt.RETENTION_OPTIONS.length - 1].ms === 0);
-  assert('nothing below a minute is offered (a grace period has to be one)',
-    mt.RETENTION_OPTIONS.every((o) => o.ms === 0 || o.ms >= 60 * 1000));
+  assert('5s, 15s and 30s are offered',
+    ['5s', '15s', '30s'].every((k) => mt.RETENTION_OPTIONS.some(
+      (o) => o.key === k && o.ms === parseInt(k, 10) * 1000)));
   assert('the pill shows the value rather than a pressed state',
     retainBtn.textContent === 'clear 1m' &&
     retainBtn.hasAttribute('aria-pressed') === false,
@@ -1005,7 +1010,7 @@ console.log('\n-- ended-pane retention (`c`): clear after a delay, or keep');
     mt.cycleRetention();
   }
   assert('cycling walks the options and wraps around',
-    seenOrder.join(',') === '1m,5m,15m,keep,1m', seenOrder.join(','));
+    seenOrder.join(',') === '1m,5m,15m,keep,5s', seenOrder.join(','));
 
   mt.setRetention('1m');
   retainBtn.dispatchEvent(
@@ -2367,6 +2372,39 @@ console.log('\n-- the SHIPPED cap: a ten-plus pane stack streams, and no slot le
   assert('and says it is reconnecting', /reconnecting/.test(statusOf(ids[1])),
     statusOf(ids[1]));
   mt.setMaxLiveStreams(CAP);
+}
+
+// ==========================================================================
+console.log('\n-- make multitail the default view (persisted, URL wins)');
+// ==========================================================================
+{
+  function boot2(seed, url) {
+    const d = new JSDOM(initialHTML, { runScripts: 'outside-only', url });
+    d.window.EventSource = class { constructor(u) { this.url = u; } close() {} };
+    if (typeof seed === 'function') seed(d.window);
+    d.window.eval(ansiSrc);
+    d.window.eval(src);
+    return d.window.__multitail;
+  }
+  const U = 'https://queue.example/';
+  const on = (w) => w.localStorage.setItem('qsite_mt_default_view', '1');
+  assert('off by default: lands on the queue', boot2(null, U).isOpen() === false);
+  assert('stored on: lands in multitail', boot2(on, U).isOpen() === true);
+  assert('?view=queue beats the preference', boot2(on, U + '?view=queue').isOpen() === false);
+  assert('#queue beats the preference', boot2(on, U + '#queue').isOpen() === false);
+  assert('?view=multitail opens even when the preference is off',
+    boot2(null, U + '?view=multitail').isOpen() === true);
+  assert('garbage stored value means off',
+    boot2((w) => w.localStorage.setItem('qsite_mt_default_view', 'yes'), U).isOpen() === false);
+  assert('storage that throws still works (queue view)', boot2((w) => {
+    Object.defineProperty(w, 'localStorage', { get() { throw new Error('blocked'); } });
+  }, U).isOpen() === false);
+  const m = boot2(null, U);
+  const btn = m.isOpen !== undefined && null;
+  m.setDefaultView(true);
+  assert('setDefaultView persists "1"', m.isDefaultView() === true);
+  m.setDefaultView(false);
+  assert('turning it off restores the queue default', m.isDefaultView() === false);
 }
 
 console.log(
