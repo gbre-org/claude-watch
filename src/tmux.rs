@@ -1966,6 +1966,14 @@ pub(crate) fn insert_key_landed_literal(before: Option<&str>, after: Option<&str
     after == Some(expected.as_str())
 }
 
+/// Pure: is it safe to send the INSERT-probe `i` to a pane with this capture?
+/// Only when a Claude Code input box (prompt row) is visible. A capture
+/// that failed (`None`) or shows no prompt (bare shell, modal) answers false:
+/// the `i` would be typed literally with nothing able to erase it.
+pub(crate) fn insert_probe_allowed(capture: Option<&str>) -> bool {
+    capture.is_some_and(|o| prompt_line_text(o).is_some())
+}
+
 /// Ensure the (vim-mode) input editor is in INSERT before typing a payload,
 /// leaving NO stray literal `i` on the prompt -- robust across Claude Code's
 /// `editorMode` (vim / normal) setting.
@@ -2019,7 +2027,20 @@ async fn ensure_insert_mode(pane: &str) {
     if is_insert_mode(pane).await {
         return;
     }
-    let before = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+    let before_cap = capture_pane(pane).await;
+    // (1b) No Claude Code input box on the pane (bare shell after an exit, a
+    // modal, ...): an `i` has no vim editor to switch and lands as a literal
+    // char that the literal-`i` cleanup below can never see (it keys on the
+    // glyph). 2026-11-12: an inject racing an auto-update exit left
+    // `i`, `iiiii` in front of the relaunch one-liner. Send NOTHING.
+    if !insert_probe_allowed(before_cap.as_deref()) {
+        debug!(
+            pane = %pane,
+            "ensure_insert_mode: no Claude Code prompt on the pane (shell or modal) -- skipping the INSERT probe"
+        );
+        return;
+    }
+    let before = before_cap.and_then(|o| prompt_line_text(&o));
     send_keys(pane, &["i"]).await;
     // Poll for the mode switch (2a) or a literal `i` (2b); never send more `i`.
     for _ in 0..3 {
@@ -2725,6 +2746,11 @@ pub(crate) async fn inject_text_no_submit(pane: &str, text: &str) {
 
 /// Inject a command into a shell prompt.
 pub async fn inject_shell(pane: &str, cmd: &str) {
+    // Clear whatever is already on the shell line (stray keystrokes from a
+    // racing injector) so the command is typed onto an empty line. Ctrl-U is
+    // kill-line in both zsh and bash; no vi/insert keys are ever sent here.
+    send_keys(pane, &["C-u"]).await;
+    sleep(Duration::from_millis(100)).await;
     send_literal(pane, cmd).await;
     sleep(Duration::from_millis(300)).await;
     send_keys(pane, &["Enter"]).await;
@@ -4908,6 +4934,23 @@ mod tests {
     // `inject_and_verify`. A landed submit clears the payload from the
     // prompt line; these pin the extractor so the verify check is sound.
     // -------------------------------------------------------------------
+
+    #[test]
+    fn insert_probe_not_allowed_on_shell_or_missing_capture() {
+        // 2026-11-12 incident pane: bare zsh after Claude exited.
+        let shell = "[claude-watch-update] Claude exited with code 0\n$ ";
+        assert!(!insert_probe_allowed(Some(shell)));
+        assert!(!insert_probe_allowed(Some("zsh: bad pattern: i[\n$ iiiii")));
+        assert!(!insert_probe_allowed(None));
+    }
+
+    #[test]
+    fn insert_probe_allowed_on_claude_prompt() {
+        assert!(insert_probe_allowed(Some(
+            "\u{276f} \n  bypass permissions on"
+        )));
+        assert!(insert_probe_allowed(Some("\u{276f} half typed")));
+    }
 
     #[test]
     fn prompt_line_text_extracts_text_after_cursor() {

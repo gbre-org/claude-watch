@@ -10227,6 +10227,21 @@ mod tests {
     }
 
     #[test]
+    fn exit_modal_action_confirms_the_reworded_background_work_dialog() {
+        // 2026-11-12 wording: "Exit and stop tasks / Move to background and
+        // exit / Stay". Detection keys on the title, so Enter (default-
+        // highlighted option 1) is still the deliberate answer.
+        let pane = "  Background work is running\n\
+             \u{276f} 1. Exit and stop tasks\n\
+               2. Move to background and exit\n\
+               3. Stay";
+        assert_eq!(
+            exit_modal_action(pane),
+            ExitModalAction::ConfirmBackgroundWorkExit
+        );
+    }
+
+    #[test]
     fn exit_modal_action_confirms_the_background_work_dialog() {
         assert_eq!(
             exit_modal_action(BACKGROUND_WORK_EXIT_PANE),
