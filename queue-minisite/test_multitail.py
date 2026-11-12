@@ -674,7 +674,7 @@ class MultitailTest(unittest.TestCase):
         of not yanking a pane the instant it goes final.
         """
         opts = self._retention_options()
-        self.assertEqual([k for k, _ in opts], ["1m", "5m", "15m", "keep"], opts)
+        self.assertEqual([k for k, _ in opts], ["5s", "15s", "30s", "1m", "5m", "15m", "keep"], opts)
         as_ms = {}
         for key, expr in opts:
             # Expressions are plain arithmetic on literals (`5 * 60 * 1000`).
@@ -683,7 +683,8 @@ class MultitailTest(unittest.TestCase):
         self.assertEqual(as_ms["keep"], 0)
         timed = [as_ms[k] for k, _ in opts if k != "keep"]
         self.assertEqual(timed, sorted(timed), as_ms)
-        self.assertTrue(all(ms >= 60_000 for ms in timed), as_ms)
+        self.assertEqual(as_ms["5s"], 5000)
+        self.assertEqual(as_ms["30s"], 30000)
 
     def test_retention_choice_is_persisted_per_viewer(self):
         """Stored in localStorage, guarded, under the site's key prefix.
@@ -1927,3 +1928,13 @@ class MultitailTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class DefaultViewOptionTests(unittest.TestCase):
+    def test_option_rendered_and_off_by_default(self):
+        tpl = (Path(__file__).parent / "templates" / "index.html").read_text()
+        self.assertRegex(
+            tpl, r'id="multitail-default-view"[^>]*aria-pressed="false"')
+        js = (Path(__file__).parent / "static" / "multitail.js").read_text()
+        self.assertIn("DEFAULT_DEFAULT_VIEW = false", js)
+        self.assertIn("'qsite_mt_default_view'", js)

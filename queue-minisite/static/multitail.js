@@ -461,14 +461,15 @@
 // only ever accumulates finished panes squeezes the running ones it exists to
 // show. The delay is the reader's, not ours:
 //
-//   RETENTION_OPTIONS  1m (default) · 5m · 15m · keep
+//   RETENTION_OPTIONS  5s · 15s · 30s · 1m (default) · 5m · 15m · keep
 //
 // A timed value counts from the moment the pane became ended, and the pane
 // SAYS SO: its status reads `ended · exit 0 · clears in 42s`, so the pane about
 // to go is the one announcing it, and anyone mid-read has a whole grace period
 // to press `c` (or the `clear` pill) and switch to `keep`, which retains ended
-// panes until they are closed by hand. Below a minute the grace stops being a
-// grace, so no sub-minute option exists; above a quarter of an hour `keep` is
+// panes until they are closed by hand. Sub-minute choices (5s/15s/30s) exist
+// for readers who want a tidy window and accept the short grace (the sweep
+// runs every RECONCILE_MS, so they clear within ~2s of the stated time); above a quarter of an hour `keep` is
 // the honest answer, so nothing between 15m and forever exists either.
 //
 // The sweep rides the existing RECONCILE_MS tick — there is no second timer —
@@ -520,6 +521,7 @@
   // a labelled row explaining a control that is not there.
   const vcapRow = document.getElementById('multitail-vcap-row');
   const subsModeBtn = document.getElementById('multitail-subs');
+  const defaultViewBtn = document.getElementById('multitail-default-view');
   // The options dialog and its one entry point on the header row.
   const optionsBtn = document.getElementById('multitail-options');
   const optionsModal = document.getElementById('multitail-options-modal');
@@ -643,6 +645,9 @@
   // `clear` pill cycles. `ms: 0` means "never clear" — see the header comment
   // for why the set stops at 15m and has nothing below a minute.
   const RETENTION_OPTIONS = [
+    { key: '5s', ms: 5 * 1000, label: 'clear 5s', aria: 'cleared 5 seconds after they end' },
+    { key: '15s', ms: 15 * 1000, label: 'clear 15s', aria: 'cleared 15 seconds after they end' },
+    { key: '30s', ms: 30 * 1000, label: 'clear 30s', aria: 'cleared 30 seconds after they end' },
     { key: '1m', ms: 60 * 1000, label: 'clear 1m', aria: 'cleared 1 minute after they end' },
     { key: '5m', ms: 5 * 60 * 1000, label: 'clear 5m', aria: 'cleared 5 minutes after they end' },
     { key: '15m', ms: 15 * 60 * 1000, label: 'clear 15m', aria: 'cleared 15 minutes after they end' },
@@ -662,6 +667,10 @@
   const VERBOSE_STORAGE_KEY = 'qsite_mt_verbose';
   const VERBOSE_CAP_STORAGE_KEY = 'qsite_mt_vcap';
   const SUBS_STORAGE_KEY = 'qsite_mt_subs';
+  // "Make multitail the default view": when on, opening the queue site lands in
+  // the multitail window. Per browser; OFF by default (the queue list).
+  const DEFAULT_VIEW_STORAGE_KEY = 'qsite_mt_default_view';
+  const DEFAULT_DEFAULT_VIEW = false;
   // Nested subagent tails are SHOWN by default. This flipped: they shipped
   // collapsed, on the reasoning that a pane costs a slice of the viewport and
   // one of the browser's scarce connections. Both costs are real, and both are
@@ -789,6 +798,7 @@
   // Whether a card's nested subagent tails are shown WITHOUT being asked for.
   // Read through the same guarded accessor as the other flags, so a viewer who
   // turned it off keeps it off and unreadable storage just means the default.
+  let defaultViewOn = readStoredFlag(DEFAULT_VIEW_STORAGE_KEY, DEFAULT_DEFAULT_VIEW);
   let subsShown = readStoredFlag(SUBS_STORAGE_KEY, DEFAULT_SUBS_SHOWN);
 
   // Does THIS card show its nested tails right now? The per-card choice wins
@@ -2184,6 +2194,9 @@
     if (subsModeBtn) {
       subsModeBtn.setAttribute('aria-pressed', subsShown ? 'true' : 'false');
     }
+    if (defaultViewBtn) {
+      defaultViewBtn.setAttribute('aria-pressed', defaultViewOn ? 'true' : 'false');
+    }
     overlay.classList.toggle('mt-wrap', wrapOn);
     overlay.classList.toggle('mt-show-ts', tsOn);
     overlay.classList.toggle('mt-verbose', verboseOn);
@@ -2348,6 +2361,22 @@
     }
   }
 
+  function setDefaultView(on) {
+    const next = !!on;
+    if (next === defaultViewOn) return;
+    defaultViewOn = next;
+    storeFlag(DEFAULT_VIEW_STORAGE_KEY, defaultViewOn);
+    syncDisplayButtons();
+  }
+
+  function setDefaultView(on) {
+    const next = !!on;
+    if (next === defaultViewOn) return;
+    defaultViewOn = next;
+    storeFlag(DEFAULT_VIEW_STORAGE_KEY, defaultViewOn);
+    syncDisplayButtons();
+  }
+
   function toggleWrap() { setWrap(!wrapOn); }
   function toggleTimestamps() { setTimestamps(!tsOn); }
   function toggleVerbose() { setVerbose(!verboseOn); }
@@ -2498,6 +2527,12 @@
       toggleSubagentsDefault();
     });
   }
+  if (defaultViewBtn) {
+    defaultViewBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      setDefaultView(!defaultViewOn);
+    });
+  }
   if (optionsBtn) {
     optionsBtn.addEventListener('click', (ev) => { ev.preventDefault(); toggleOptions(); });
   }
@@ -2518,6 +2553,25 @@
   // `wrap` is off while the panes wrap. The overlay is hidden until then, so
   // there is nothing to flash.
   syncDisplayButtons();
+
+  // Which view to land in. An explicit URL wins over the stored preference:
+  // `?view=queue` (or `#queue`) forces the list, `?view=multitail` (or
+  // `#multitail`) forces the window; otherwise the preference decides.
+  function requestedView() {
+    try {
+      const q = new URLSearchParams(window.location.search).get('view');
+      if (q === 'queue' || q === 'multitail') return q;
+      const h = (window.location.hash || '').replace(/^#/, '');
+      if (h === 'queue' || h === 'multitail') return h;
+    } catch (_) { /* no usable location — fall through to the preference */ }
+    return null;
+  }
+
+  function applyInitialView() {
+    const want = requestedView();
+    if (want === 'multitail' || (want === null && defaultViewOn)) openMode();
+  }
+  applyInitialView();
 
   // Delegated toggle click: #topbar-meta is rebuilt by refresh.js every tick,
   // so a listener bound to the button itself would die on the first merge
@@ -2710,6 +2764,11 @@
     isSubagentsShown: () => subsShown,
     SUBS_STORAGE_KEY,
     DEFAULT_SUBS_SHOWN,
+    DEFAULT_VIEW_STORAGE_KEY,
+    setDefaultView,
+    isDefaultView: () => defaultViewOn,
+    requestedView,
+    applyInitialView,
     openOptions,
     closeOptions,
     toggleOptions,
