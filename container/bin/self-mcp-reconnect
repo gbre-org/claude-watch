@@ -274,9 +274,25 @@ _RESULT_RE = re.compile(
 )
 
 
-def capture(pane: str) -> str:
-    """Capture the visible pane text (never the scrollback)."""
-    out, rc = sc.run(["tmux", "capture-pane", "-t", pane, "-p"])
+SCROLLBACK_LINES = 1000
+
+
+def capture(pane: str, full: bool = False) -> str:
+    """Capture the pane text.
+
+    Default: the VISIBLE screen only. `full=True` also pulls scrollback
+    (`-S -N`): Claude Code renders the `/mcp` picker inline, and with many
+    servers (built-in + user + claude.ai connectors) the list is TALLER than
+    the pane, so its top rows (and the title) scroll off the visible screen.
+    Parsing only the visible screen then yields a truncated list whose first
+    row is NOT the picker's first row (2026-11-12 / 2026-11-13: chrome-devtools
+    was scrolled off, so the parsed list started at personal-mbp and the tool
+    confirmed the wrong server).
+    """
+    cmd = ["tmux", "capture-pane", "-t", pane, "-p"]
+    if full:
+        cmd += ["-S", f"-{SCROLLBACK_LINES}"]
+    out, rc = sc.run(cmd)
     if rc != 0 or not out:
         return ""
     return out
@@ -309,21 +325,49 @@ def parse_server_rows(text: str):
         if TOP_MENU_TITLE in raw.lower():
             start = i + 1
     rows = []
+    seen = set()
     for raw in lines[start:]:
         low = raw.lower()
         if TOP_MENU_FOOTER in low or "for help" in low:
             break
         m = _NEW_ROW_RE.match(raw)
         if m and (m.group("glyph") in _STATUS_GLYPHS or m.group("cursor")):
-            rows.append((m.group("name"), (m.group("status") or "").strip(),
-                         bool(m.group("cursor"))))
-            continue
-        if "\xb7" in raw and any(g in raw for g in _STATUS_GLYPHS):
+            row = (m.group("name"), (m.group("status") or "").strip(),
+                   bool(m.group("cursor")))
+        elif "\xb7" in raw and any(g in raw for g in _STATUS_GLYPHS):
             m = _OLD_ROW_RE.match(raw)
-            if m:
-                rows.append((m.group("name"), m.group("status").strip(),
-                             bool(m.group("cursor"))))
+            if not m:
+                continue
+            row = (m.group("name"), m.group("status").strip(), bool(m.group("cursor")))
+        else:
+            continue
+        if row[0] in seen:      # stale re-render of the same list in scrollback
+            continue
+        seen.add(row[0])
+        rows.append(row)
     return rows
+
+
+def cursor_name(text: str):
+    """Name of the highlighted row in the top-level list, or None if the
+    highlighted row is not on screen."""
+    for name, _status, is_cursor in parse_server_rows(text):
+        if is_cursor:
+            return name
+    return None
+
+
+_DETAIL_HEADER_RE = re.compile(r"^\s*(?P<name>\S.*?)\s+MCP Server\s*$", re.M)
+
+
+def detail_header_name(text: str):
+    """Server named in the detail screen header ("<Name> MCP Server"), the
+    LAST such header on screen, or None. Claude Code may capitalise the first
+    letter, so callers compare case-insensitively."""
+    last = None
+    for m in _DETAIL_HEADER_RE.finditer(text):
+        last = m.group("name").strip()
+    return last
 
 
 def parse_action_rows(text: str):
@@ -370,15 +414,16 @@ def _send_key(pane: str, key: str, settle: float = 0.25) -> None:
     time.sleep(settle)
 
 
-def _poll_until(pane: str, predicate, timeout: float, interval: float = 0.4) -> str:
+def _poll_until(pane: str, predicate, timeout: float, interval: float = 0.4,
+                full: bool = False) -> str:
     """Poll capture(pane) until predicate(text) is true. Returns last text."""
     deadline = time.time() + timeout
-    text = capture(pane)
+    text = capture(pane, full=full)
     while time.time() < deadline:
         if predicate(text):
             return text
         time.sleep(interval)
-        text = capture(pane)
+        text = capture(pane, full=full)
     return text
 
 
@@ -423,10 +468,12 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
 
     # Poll until the title AND at least one parseable server row are on
     # screen: the title paints before the rows, and parsing a half-rendered
-    # picker is what used to yield "server list: []".
+    # picker is what used to yield "server list: []". Use the FULL capture
+    # (scrollback included): a long list overflows the pane and its top rows
+    # scroll off the visible screen.
     text = _poll_until(
         pane, lambda t: top_menu_visible(t) and bool(parse_server_rows(t)),
-        timeout=menu_timeout)
+        timeout=menu_timeout, full=True)
     if not top_menu_visible(text):
         log(f"  FAIL: top-level MCP menu never rendered. pane: {sc.capture_pane_text(pane)}")
         close_any_menu(pane)
@@ -448,14 +495,31 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
 
     target_idx = names.index(server)
     tools_before = rows[target_idx][1]
-    cursor_idx = next((i for i, r in enumerate(rows) if r[2]), 0)
-    downs = target_idx - cursor_idx
     if "fetch failed" in tools_before.lower() or "no active session" in tools_before.lower():
         log(f"  NOTE: {server} shows {tools_before!r} (connected but tool discovery failed); "
             "attempting Reconnect anyway")
-    log(f"  target row {target_idx} ({tools_before!r}), cursor at {cursor_idx}, sending {downs} Down")
-    for _ in range(max(0, downs)):
-        _send_key(pane, "Down")
+    log(f"  target row {target_idx} of {len(names)} ({tools_before!r})")
+
+    # Move the cursor by VERIFYING the highlighted row after every key, never
+    # by assuming an index: the cursor's start row is not necessarily the
+    # first parsed row (the real first row may be scrolled off screen).
+    max_steps = 2 * len(names) + 3
+    cur = None
+    for step in range(max_steps + 1):
+        cur = cursor_name(capture(pane))
+        if cur == server or step == max_steps:
+            break
+        if cur is None or cur not in names:
+            key = "Down"             # highlight off screen: walk until it shows
+        else:
+            key = "Down" if names.index(cur) < target_idx else "Up"
+        log(f"  cursor on {cur!r}, want {server!r}: sending {key}")
+        _send_key(pane, key)
+    if cur != server:
+        log(f"  FAIL: could not place cursor on {server!r} (last seen on {cur!r})")
+        close_any_menu(pane)
+        return {"ok": False, "server": server, "code": 4,
+                "reason": f"could not move the /mcp cursor onto {server!r} (last on {cur!r})"}
     _send_key(pane, "Enter", settle=0.6)
 
     text = _poll_until(pane, detail_menu_visible, timeout=menu_timeout)
@@ -463,6 +527,15 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
         log(f"  FAIL: detail screen for {server} never rendered. pane: {sc.capture_pane_text(pane)}")
         close_any_menu(pane)
         return {"ok": False, "server": server, "reason": "detail-screen-did-not-open", "code": 4}
+
+    # The header can be scrolled off a short pane: read it from scrollback.
+    header = detail_header_name(capture(pane, full=True)) or detail_header_name(text)
+    if header is None or header.lower() != server.lower():
+        log(f"  FAIL: detail screen header names {header!r}, expected {server!r}; aborting "
+            "before Reconnect")
+        close_any_menu(pane)
+        return {"ok": False, "server": server, "code": 4,
+                "reason": f"opened menu is for {header!r}, not {server!r}; refusing to Reconnect"}
 
     actions = parse_action_rows(text)
     log(f"  actions for {server}: {[(n, l) for n, l, _ in actions]}")
