@@ -254,7 +254,25 @@ class DoReconnectNonCancellingTest(unittest.TestCase):
                 "  ↑/↓ to navigate \xb7 Enter to confirm \xb7 Esc to cancel\n"
             ),
             (
-                "  mcp-adaptor\n"
+                "  Manage MCP servers\n"
+                " ❯ host-bash \xb7 ✔ connected \xb7 2 tools\n"
+                "   mcp-adaptor \xb7 ✘ failed\n"
+                "  ↑/↓ to navigate \xb7 Enter to confirm \xb7 Esc to cancel\n"
+            ),
+            (
+                "  Manage MCP servers\n"
+                "   host-bash \xb7 ✔ connected \xb7 2 tools\n"
+                " ❯ mcp-adaptor \xb7 ✘ failed\n"
+                "  ↑/↓ to navigate \xb7 Enter to confirm \xb7 Esc to cancel\n"
+            ),
+            (
+                "  Mcp-adaptor MCP Server\n"
+                " ❯ 1. Reconnect\n"
+                "   2. Disable\n"
+                "  ↑/↓ to navigate \xb7 Enter to select \xb7 Esc to back\n"
+            ),
+            (
+                "  Mcp-adaptor MCP Server\n"
                 " ❯ 1. Reconnect\n"
                 "   2. Disable\n"
                 "  ↑/↓ to navigate \xb7 Enter to select \xb7 Esc to back\n"
@@ -343,6 +361,138 @@ class RealPickerFixtureTest(unittest.TestCase):
             "  Manage MCP servers\n ❯ a-srv \xb7 ✔ connected \xb7 2 tools\n"
             "   b-srv \xb7 ✘ failed\n  Enter to confirm\n")
         self.assertEqual([r[0] for r in rows], ["a-srv", "b-srv"])
+
+
+class FakeMcpPane:
+    """Stateful fake of the inline `/mcp` picker in a SHORT tmux pane.
+
+    The list is taller than the pane, so the visible capture shows only the
+    tail of the render (title + top rows scrolled off) while a scrollback
+    capture (`-S`) shows everything. Models the 2026-11-12 / 2026-11-13
+    misfire: chrome-devtools (cursor start, row 0) is off screen.
+    """
+
+    HEIGHT = 5
+
+    def __init__(self, names, start=0, header_override=None):
+        self.names = list(names)
+        self.cursor = start
+        self.screen = "top"
+        self.keys = []
+        self.header_override = header_override
+        self.result = ""
+
+    def _top_lines(self):
+        out = ["Manage MCP servers", f"{len(self.names)} servers"]
+        for i, n in enumerate(self.names):
+            out.append(f"{' ❯' if i == self.cursor else '  '} ✔ {n}   3 tools")
+        out += ["https://code.claude.com/docs/en/mcp for help",
+                "↑/↓ to navigate \xb7 Enter to confirm \xb7 Esc to cancel"]
+        return out
+
+    def _detail_lines(self):
+        name = self.header_override or self.names[self.cursor]
+        return [f"{name} MCP Server", "Status: ✔ connected",
+                " ❯ 1. View tools", "   2. Reconnect", "   3. Disable",
+                "↑/↓ to navigate \xb7 Enter to select \xb7 Esc to back"]
+
+    def capture(self, full):
+        if self.screen == "top":
+            lines = self._top_lines()
+        elif self.screen == "detail":
+            lines = self._detail_lines()
+        else:
+            return self.result
+        return "\n".join(lines if full else lines[-self.HEIGHT:]) + "\n"
+
+    def run(self, cmd, timeout=10):
+        if cmd[:2] == ["tmux", "capture-pane"]:
+            return self.capture("-S" in cmd), 0
+        if cmd[:2] == ["tmux", "send-keys"]:
+            key = cmd[-1]
+            self.keys.append(key)
+            if self.screen == "top":
+                if key == "Down":
+                    self.cursor = min(self.cursor + 1, len(self.names) - 1)
+                elif key == "Up":
+                    self.cursor = max(self.cursor - 1, 0)
+                elif key == "Enter":
+                    self.screen = "detail"
+            elif self.screen == "detail" and key == "Enter":
+                # cursor in detail menu is on item 1 + number of Downs
+                downs = 0
+                for k in reversed(self.keys[:-1]):
+                    if k == "Down":
+                        downs += 1
+                    else:
+                        break
+                if downs == 1:
+                    self.screen = "done"
+                    self.result = f"Reconnected to {self.names[self.cursor]}.\n"
+                else:
+                    self.screen = "done"
+                    self.result = "View tools opened\n"
+            elif key == "Escape":
+                self.screen = "done"
+        return "", 0
+
+
+class WrongRowRegressionTest(unittest.TestCase):
+    """The tool reconnected chrome-devtools instead of personal-mbp because
+    the parsed list was truncated by pane height (first rows scrolled off)."""
+
+    NAMES = ["chrome-devtools", "personal-mbp", "easel", "claude.ai-Gmail"]
+
+    def setUp(self):
+        self.mod = _import_self_mcp_reconnect()
+
+    def _drive(self, pane_obj, server):
+        mod = self.mod
+        mod.sc.run = mock.MagicMock(side_effect=pane_obj.run)
+        mod.sc.capture_pane_text = mock.MagicMock(return_value="<mocked>")
+        mod.sc.ensure_main_loop_focus = mock.MagicMock(return_value=True)
+        mod.sc.inject = mock.MagicMock()
+        mod.time.sleep = lambda *_a, **_k: None
+        return mod.do_reconnect("p:0.0", server, menu_timeout=0.5, result_timeout=0.5)
+
+    def test_visible_capture_alone_would_have_truncated_the_list(self):
+        pane = FakeMcpPane(self.NAMES)
+        visible = pane.capture(full=False)
+        self.assertNotIn("chrome-devtools",
+                         [r[0] for r in self.mod.parse_server_rows(visible)])
+        full = pane.capture(full=True)
+        self.assertEqual([r[0] for r in self.mod.parse_server_rows(full)], self.NAMES)
+
+    def test_target_not_first_row_reconnects_the_right_server(self):
+        pane = FakeMcpPane(self.NAMES)
+        result = self._drive(pane, "personal-mbp")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(pane.cursor, 1)
+
+    def test_cursor_start_off_target_below_moves_up(self):
+        pane = FakeMcpPane(self.NAMES, start=3)
+        result = self._drive(pane, "personal-mbp")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Up", pane.keys)
+
+    def test_wrong_detail_header_aborts_before_reconnect(self):
+        pane = FakeMcpPane(self.NAMES, header_override="chrome-devtools")
+        result = self._drive(pane, "personal-mbp")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], 4)
+        self.assertIn("refusing to Reconnect", result["reason"])
+        # never confirmed a Reconnect: only the top-list Down + Enter happened
+        self.assertEqual(pane.keys.count("Enter"), 1)
+
+    def test_detail_header_name_parses_capitalised(self):
+        self.assertEqual(self.mod.detail_header_name("  Mcp-adaptor MCP Server\n x"),
+                         "Mcp-adaptor")
+
+    def test_scrollback_duplicate_renders_are_deduped(self):
+        pane = FakeMcpPane(self.NAMES)
+        one = pane.capture(full=True)
+        rows = self.mod.parse_server_rows(one + one)
+        self.assertEqual([r[0] for r in rows], self.NAMES)
 
 
 if __name__ == "__main__":
