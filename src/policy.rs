@@ -3238,6 +3238,16 @@ pub(crate) const MALFORMED_POST_CLEAR_GRACE_SECS: f64 = 60.0;
 /// `/clear` was being classified MALFORMED purely because the pre-clear turn's
 /// `<invoke>` block was still in the captured scrollback. The freshly-reset
 /// context is exempt for the boundary window.
+/// Gate for the "dead process" accumulator. A scrape of `tokens == 0 &&
+/// bashes == 0` alone is a PARSE result, not proof of death: overlays such as
+/// the background-task list view replace the normal footer. When the pane
+/// shows a known active-work UI (`active_ui`) AND a live Claude Code process
+/// exists (`/proc/<pid>/exe`), the session is alive and must not count toward
+/// the dead-process alert. Without live-UI evidence the zeros still count.
+pub(crate) fn dead_check_applies(active_ui: bool, claude_process_alive: bool) -> bool {
+    !(active_ui && claude_process_alive)
+}
+
 pub(crate) fn malformed_detection_post_clear(state: &State, tokens: u64, active_ui: bool) -> bool {
     if active_ui {
         return false;
@@ -7683,7 +7693,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         .is_some();
 
     // --- Dead process detection ---
-    if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
+    if tokens == 0
+        && bashes == 0
+        && !effective_pane.is_empty()
+        && dead_check_applies(active_ui, !crate::agent::find_claude_pids().is_empty())
+    {
         state.consecutive_dead_checks += 1;
         let dead_checks = state.consecutive_dead_checks;
         info!(dead_checks, "dead process detected: tokens=0, bashes=0");
@@ -12061,6 +12075,16 @@ cooldown = 300
             !malformed_detection_post_clear(&state, 120_000, false),
             "a clear older than the grace window must not exempt a later malform"
         );
+    }
+
+    #[test]
+    fn test_dead_check_applies_gate() {
+        // Task-list view: zeros on screen, UI active, process alive -> not dead.
+        assert!(!dead_check_applies(true, true));
+        // Real death or no live evidence still counts.
+        assert!(dead_check_applies(true, false));
+        assert!(dead_check_applies(false, true));
+        assert!(dead_check_applies(false, false));
     }
 
     #[test]
