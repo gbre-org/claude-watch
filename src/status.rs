@@ -177,6 +177,17 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
 /// always parenthesises its counters, while a roster row never does — so
 /// the `(` test separates them without depending on which glyph is in
 /// fashion.
+/// Footer hint of Claude Code's background-task list view
+/// (`Enter to view · x to stop`). That view REPLACES the normal
+/// `bypass permissions on · N shells` footer line while it is open, but the
+/// bare `N tokens` total is still drawn beneath it. The line is positive proof
+/// of a live session and doubles as a status-bar anchor so the token total is
+/// parsed (otherwise tokens/bashes read 0 and the dead-process detector fires
+/// on a healthy session).
+pub(crate) fn is_task_list_footer(line: &str) -> bool {
+    line.contains("Enter to view") && line.contains("x to stop")
+}
+
 pub(crate) fn is_agent_roster_row(line: &str) -> bool {
     let trimmed = line.trim_start();
     let starts_with_bullet = trimmed.starts_with('\u{25ef}') // ◯ — idle/running agent
@@ -263,6 +274,7 @@ pub(crate) fn pane_shows_active_ui(pane_text: &str) -> bool {
             || line.contains("active agent")
             || line.contains("Local agents")
             || line.contains(" Shells (")
+            || is_task_list_footer(line)
             // Completion-tail "N <shells|background tasks|monitors> still
             // running" (or the pane-width-truncated "still…" form) — printed
             // whenever background work outlives the thinking burst that
@@ -397,6 +409,7 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
             || line.contains("active agents")
             || line.contains("active agent")
             || line.contains("auto-compact")
+            || is_task_list_footer(line)
     };
 
     let has_status_bar = lines[start..].iter().any(|l| is_status_bar_marker(l));
@@ -2936,6 +2949,45 @@ mod tests {
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.tokens, Some(175630));
         assert_eq!(parsed.bashes, Some(5));
+    }
+
+    const TASK_LIST_VIEW_PANE: &str = "\u{276f}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  Enter to view \u{b7} x to stop\n\
+                        740832 tokens\n\
+\n\
+  \u{25cf} main\n\
+  \u{25ef} general-purpose 48m 51s \u{b7} \u{2193} 228.4k\n\
+  \u{25ef} general-purpose 49m 14s \u{b7} \u{2193} 216.9k\n\
+\u{276f} \u{25ef} media-hack      40m 11s \u{b7} \u{2193} 122.3k";
+
+    const NORMAL_FOOTER_PANE: &str = "\u{276f}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on \u{b7} 3 shells\n\
+                        741772 tokens\n\
+  \u{25cf} main\n\
+  \u{25ef} general-purpose 48m 51s \u{b7} \u{2193} 228.4k";
+
+    /// Regression: the task-list view replaces the bypass-permissions footer,
+    /// so tokens read 0 and the dead-process detector fired on a live session.
+    #[test]
+    fn test_task_list_view_footer_parses_tokens_and_is_active_ui() {
+        let parsed = parse_status_bar(TASK_LIST_VIEW_PANE);
+        assert_eq!(parsed.tokens, Some(740832));
+        assert!(pane_shows_active_ui(TASK_LIST_VIEW_PANE));
+    }
+
+    #[test]
+    fn test_normal_footer_still_parses() {
+        let parsed = parse_status_bar(NORMAL_FOOTER_PANE);
+        assert_eq!(parsed.tokens, Some(741772));
+        assert_eq!(parsed.bashes, Some(3));
+    }
+
+    #[test]
+    fn test_task_list_footer_predicate() {
+        assert!(is_task_list_footer("  Enter to view \u{b7} x to stop"));
+        assert!(!is_task_list_footer("press Enter to view the diff"));
     }
 
     #[test]
