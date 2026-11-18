@@ -485,6 +485,41 @@ class WrongRowRegressionTest(unittest.TestCase):
         # never confirmed a Reconnect: only the top-list Down + Enter happened
         self.assertEqual(pane.keys.count("Enter"), 1)
 
+    def test_headerless_detail_screen_still_reconnects(self):
+        """Newer Claude Code prints no '<Name> MCP Server' header (2026-11-18
+        code-4 failures); the verified cursor row + result check carry identity."""
+        pane = FakeMcpPane(self.NAMES)
+        pane._detail_lines = lambda: [
+            "Learn more:", "https://code.claude.com/docs/en/mcp", " ❯ 1. View tools",
+            "   2. Reconnect", "   3. Disable", "Enter to select \xb7 Esc to back"]
+        result = self._drive(pane, "personal-mbp")
+        self.assertTrue(result["ok"], result)
+
+    def test_detail_header_tolerates_border_and_suffix(self):
+        self.assertEqual(
+            self.mod.detail_header_name("\u2502 Personal-mbp MCP Server \u2502\n"),
+            "Personal-mbp")
+
+    def test_notify_done_emits_event_and_injects(self):
+        mod = self.mod
+        mod.sc.inject = mock.MagicMock()
+        mod.emit_event = mock.MagicMock()
+        mod.notify_done({"ok": False, "server": "x", "code": 4, "reason": "boom"}, "p:0.0")
+        msg = mod.emit_event.call_args[0][0]
+        self.assertIn("FAILED", msg)
+        self.assertIn("code=4", msg)
+        self.assertEqual(mod.emit_event.call_args[1]["tag"], "self-mcp-reconnect")
+        self.assertIn("code=4", mod.sc.inject.call_args[0][1])
+        self.assertFalse(mod.sc.inject.call_args[1]["escape"])
+
+    def test_notify_done_no_inject(self):
+        mod = self.mod
+        mod.sc.inject = mock.MagicMock()
+        mod.emit_event = mock.MagicMock()
+        mod.notify_done({"ok": True, "server": "x", "code": 0}, "p:0.0", inject=False)
+        mod.emit_event.assert_called_once()
+        mod.sc.inject.assert_not_called()
+
     def test_detail_header_name_parses_capitalised(self):
         self.assertEqual(self.mod.detail_header_name("  Mcp-adaptor MCP Server\n x"),
                          "Mcp-adaptor")

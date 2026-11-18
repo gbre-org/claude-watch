@@ -385,7 +385,10 @@ def cursor_name(text: str):
     return None
 
 
-_DETAIL_HEADER_RE = re.compile(r"^\s*(?P<name>\S.*?)\s+MCP Server\s*$", re.M)
+# Tolerates a leading border/glyph ("│ ", "● ") and trailing text after the
+# title, since newer Claude Code builds render the detail screen differently.
+_DETAIL_HEADER_RE = re.compile(
+    r"^[^\w\n]*(?P<name>[A-Za-z0-9_][A-Za-z0-9_.\-]*)\s+MCP Server\b[^\n]*$", re.M)
 
 
 def detail_header_name(text: str):
@@ -396,6 +399,13 @@ def detail_header_name(text: str):
     for m in _DETAIL_HEADER_RE.finditer(text):
         last = m.group("name").strip()
     return last
+
+
+def detail_mentions_server(text: str, server: str) -> bool:
+    """True if the detail screen text names `server` (case-insensitive),
+    ignoring the footer/hint lines. Fallback identity check for Claude Code
+    builds whose detail screen carries no "<Name> MCP Server" header."""
+    return server.lower() in text.lower()
 
 
 def parse_action_rows(text: str):
@@ -614,13 +624,25 @@ def _drive_menu(pane: str, server: str, menu_timeout: float, result_timeout: flo
         return {"ok": False, "server": server, "reason": "detail-screen-did-not-open", "code": 4}
 
     # The header can be scrolled off a short pane: read it from scrollback.
-    header = detail_header_name(capture(pane, full=True)) or detail_header_name(text)
-    if header is None or header.lower() != server.lower():
+    full = capture(pane, full=True)
+    header = detail_header_name(full) or detail_header_name(text)
+    if header is not None and header.lower() != server.lower():
         log(f"  FAIL: detail screen header names {header!r}, expected {server!r}; aborting "
             "before Reconnect")
         close_any_menu(pane)
         return {"ok": False, "server": server, "code": 4,
                 "reason": f"opened menu is for {header!r}, not {server!r}; refusing to Reconnect"}
+    if header is None:
+        # Newer Claude Code builds no longer print "<Name> MCP Server" (the
+        # 2026-11-17/18 failures). The cursor was verified on `server` before
+        # Enter, and the final result line is checked against `server` too, so
+        # a missing header is not fatal; require the name somewhere on the
+        # detail screen when it is there, else proceed with a loud note.
+        if detail_mentions_server(full, server) or detail_mentions_server(text, server):
+            log(f"  NOTE: no 'MCP Server' header; detail screen names {server!r} - proceeding")
+        else:
+            log("  NOTE: detail screen has no header and does not name the server; relying on "
+                f"the verified cursor row + result-line check. pane: {text!r}")
 
     actions = parse_action_rows(text)
     log(f"  actions for {server}: {[(n, l) for n, l, _ in actions]}")
@@ -698,6 +720,29 @@ def verify_via_cli(server: str) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
+def notify_done(result: dict, pane: str, inject: bool = True) -> None:
+    """Return control flow to the main loop: emit a claude-event and, when
+    enabled, queue a one-line message in the pane (non-cancelling inject).
+    Best effort; never raises."""
+    server = result.get("server")
+    ok = bool(result.get("ok"))
+    code = result.get("code", 1)
+    reason = result.get("reason")
+    line = (f"self-mcp-reconnect {'OK' if ok else 'FAILED'} server={server} "
+            f"code={code}" + (f" reason={reason}" if reason else ""))
+    try:
+        emit_event(line, tag="self-mcp-reconnect",
+                   priority="normal" if ok else "high",
+                   data={"server": server, "ok": str(ok).lower(), "code": code})
+    except Exception:
+        log(f"  WARNING: notify event failed: {traceback.format_exc()}")
+    if inject:
+        try:
+            sc.inject(pane, f"[{line}]", label="mcp-done", slash_command=False, escape=False)
+        except Exception:
+            log(f"  WARNING: notify inject failed: {traceback.format_exc()}")
+
+
 def do_run(args) -> dict:
     _bind_shared_log()
     pane = args.pane or sc.find_claude_pane()
@@ -713,6 +758,8 @@ def do_run(args) -> dict:
         result["cli_status"] = cli_line
 
     _write_state({"pane": pane, **result})
+    if getattr(args, "notify", True):
+        notify_done(result, pane, inject=getattr(args, "notify_inject", True))
     return result
 
 
@@ -741,6 +788,10 @@ def main():
                              "it is typed-and-queued: without the fork, the queued /mcp "
                              "would sit behind this very turn, which can't end until this "
                              "script — still blocked polling for the menu — returns.")
+    p_run.add_argument("--no-notify", dest="notify", action="store_false",
+                        help="Do not emit the completion claude-event / pane message")
+    p_run.add_argument("--no-notify-inject", dest="notify_inject", action="store_false",
+                        help="Emit the completion event only; skip the pane one-liner")
     p_run.add_argument("--json", action="store_true", help="Emit one JSON result object on stdout")
 
     sub.add_parser("status", help="Print the last run's state file as JSON")
