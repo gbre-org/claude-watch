@@ -1,0 +1,8 @@
+ Personal-mbp MCP Server
+
+ Status: ✘ failed
+
+ ❯ 1. Reconnect
+   2. Disable
+
+ ↑/↓ to navigate · Enter to select · Esc to back

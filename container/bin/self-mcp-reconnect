@@ -72,7 +72,14 @@ Exit codes:
      result payload / log; this is a real MCP-server-side problem, not a
      scripting bug.
   6  the result never appeared within the poll window (ambiguous — the menu
-     may still be open; best-effort Escape x2 is sent before exiting).
+     was closed defensively before exiting).
+
+Every exit path after `/mcp` is injected (success, each failure code, an
+exception, SIGTERM) runs a `finally` that Escapes out of the picker — but ONLY
+while the picker is confirmed on screen (an Escape at the normal prompt would
+cancel a running turn) — and re-captures the pane to confirm it is gone. If it
+cannot be closed a loud `self-mcp-reconnect-menu-stuck` claude-event is emitted
+and the result carries `menu_stuck: true`.
 """
 
 from __future__ import annotations
@@ -84,6 +91,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -236,8 +244,10 @@ def _write_state(payload: dict) -> None:
 # are unit-testable without a live tmux.
 # ---------------------------------------------------------------------------
 
-TOP_MENU_TITLE = "manage mcp servers"
-TOP_MENU_FOOTER = "enter to confirm"          # "... · Enter to confirm · Esc to cancel"
+TOP_MENU_TITLE = "mcp servers"                # "Manage MCP servers" / "MCP servers"
+# Footer phrases. The top list's footer has varied across Claude Code versions
+# ("Enter to confirm · Esc to cancel", "... · Esc to close"); match any.
+TOP_MENU_FOOTERS = ("enter to confirm", "esc to close", "esc to cancel")
 DETAIL_MENU_FOOTER = "enter to select"        # "... · Enter to select · Esc to back"
 
 # A server row in the top-level list. Two layouts are supported:
@@ -298,13 +308,31 @@ def capture(pane: str, full: bool = False) -> str:
     return out
 
 
+def _title_line(lines):
+    """Index of the LAST line carrying the picker title, or None."""
+    idx = None
+    for i, raw in enumerate(lines):
+        if TOP_MENU_TITLE in raw.lower():
+            idx = i
+    return idx
+
+
 def top_menu_visible(text: str) -> bool:
-    low = text.lower()
-    return TOP_MENU_TITLE in low and TOP_MENU_FOOTER in low
+    """The top-level server list: a title line ("MCP servers") followed by a
+    footer line ("Esc to close" / "Enter to confirm" / "Esc to cancel")."""
+    lines = text.splitlines()
+    t = _title_line(lines)
+    if t is None:
+        return False
+    return any(f in raw.lower() for raw in lines[t + 1:] for f in TOP_MENU_FOOTERS)
 
 
 def detail_menu_visible(text: str) -> bool:
-    return DETAIL_MENU_FOOTER in text.lower()
+    """A server's detail screen: the "Enter to select" footer WITHOUT the
+    top-list title (some versions put "Enter to select" on the top list too)."""
+    if DETAIL_MENU_FOOTER not in text.lower():
+        return False
+    return _title_line(text.splitlines()) is None
 
 
 def any_mcp_menu_visible(text: str) -> bool:
@@ -328,7 +356,7 @@ def parse_server_rows(text: str):
     seen = set()
     for raw in lines[start:]:
         low = raw.lower()
-        if TOP_MENU_FOOTER in low or "for help" in low:
+        if any(f in low for f in TOP_MENU_FOOTERS) or "for help" in low:
             break
         m = _NEW_ROW_RE.match(raw)
         if m and (m.group("glyph") in _STATUS_GLYPHS or m.group("cursor")):
@@ -427,20 +455,41 @@ def _poll_until(pane: str, predicate, timeout: float, interval: float = 0.4,
     return text
 
 
-def close_any_menu(pane: str, max_attempts: int = 3) -> bool:
-    """Best-effort: Escape out of any /mcp menu still on screen."""
+def close_any_menu(pane: str, max_attempts: int = 6) -> bool:
+    """Escape out of any /mcp menu confirmed on screen; True once it is gone.
+
+    Escape is sent ONLY while the picker is visible: an Escape at the normal
+    prompt can cancel the pane's running turn. Re-captures after every key and
+    retries up to `max_attempts` (detail screen -> list -> closed takes two).
+    """
     for _ in range(max_attempts):
-        text = capture(pane)
-        if not any_mcp_menu_visible(text):
+        if not any_mcp_menu_visible(capture(pane)):
             return True
         _send_key(pane, "Escape", settle=0.4)
     return not any_mcp_menu_visible(capture(pane))
+
+
+def emit_event(message: str, tag: str, priority: str = "high", data=None) -> None:
+    """Emit a claude-event. Best effort (claude-event may be absent)."""
+    if not shutil.which("claude-event"):
+        log(f"  claude-event not on PATH; skipping event emit (tag={tag})")
+        return
+    cmd = ["claude-event", "emit", message, "--tag", tag, "--source", "claude-watch",
+           "--source-name", "self-mcp-reconnect", "--priority", priority]
+    for k, v in (data or {}).items():
+        cmd += ["--data", f"{k}={v}"]
+    out, rc = sc.run(cmd, timeout=20)
+    if rc != 0:
+        log(f"  WARNING: claude-event emit failed (rc={rc}): {out!r}")
 
 
 def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: float) -> dict:
     """Drive the full `/mcp` -> server -> Reconnect flow. Returns a result dict:
 
     {"ok": bool, "server": str, "reason": str, "code": int, "tools_before": str|None}
+
+    Whatever happens inside (success, any failure code, an exception, a signal),
+    the `/mcp` picker is closed on the way out and verified gone.
     """
     log(f"START: pane={pane} server={server}")
     log(f"  pane state: {sc.capture_pane_text(pane)}")
@@ -449,6 +498,42 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
 
     if not sc.ensure_main_loop_focus(pane):
         log("  proceeding despite unconfirmed main-loop focus (see WARNING above)")
+
+    result = None
+    try:
+        result = _drive_menu(pane, server, menu_timeout, result_timeout, pre_result)
+    except Exception as exc:
+        log(f"  EXCEPTION during /mcp interaction: {traceback.format_exc()}")
+        result = {"ok": False, "server": server, "code": 1,
+                  "reason": f"exception during /mcp interaction: {exc!r}"}
+    finally:
+        closed = _ensure_menu_closed(pane, server)
+    if not closed:
+        result = dict(result, menu_stuck=True)
+    return result
+
+
+def _ensure_menu_closed(pane: str, server: str) -> bool:
+    """Close the picker and verify; emit a loud event if it will not close."""
+    try:
+        closed = close_any_menu(pane)
+    except Exception:
+        log(f"  EXCEPTION while closing the /mcp menu: {traceback.format_exc()}")
+        closed = False
+    if closed:
+        log("  /mcp menu confirmed closed (or never open)")
+        return True
+    log("  FAIL: /mcp menu STILL OPEN after Escape retries; emitting event")
+    emit_event(
+        f"self-mcp-reconnect could not close the /mcp panel (server={server}); "
+        "the session is blocked until someone presses Esc in the pane",
+        tag="self-mcp-reconnect-menu-stuck", priority="high",
+        data={"server": server, "pane": pane})
+    return False
+
+
+def _drive_menu(pane: str, server: str, menu_timeout: float, result_timeout: float,
+                pre_result) -> dict:
 
     # NON-CANCELLING by design (Andrew #6168-6171): do NOT call
     # `sc.interrupt_and_wait` and do NOT pass `escape=True` here. Both of
