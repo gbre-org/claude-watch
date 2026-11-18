@@ -278,6 +278,7 @@ class DoReconnectNonCancellingTest(unittest.TestCase):
                 "  ↑/↓ to navigate \xb7 Enter to select \xb7 Esc to back\n"
             ),
             "Reconnected to mcp-adaptor.\n",
+            "❯ \n",     # final close-check: picker gone, prompt is back
         ]
 
         def fake_run(cmd, timeout=10):
@@ -493,6 +494,169 @@ class WrongRowRegressionTest(unittest.TestCase):
         one = pane.capture(full=True)
         rows = self.mod.parse_server_rows(one + one)
         self.assertEqual([r[0] for r in rows], self.NAMES)
+
+
+class PanelPane:
+    """Stateful fake of the newer `/mcp` panel ("MCP servers" title, "Esc to
+    close" footer, "Local MCPs" group, cursor starting on the FIRST server) built
+    from captured-pane fixtures. Records every key sent and models Escape
+    (detail -> list -> closed). `crash_after` raises from send-keys after that
+    many keys; `stuck` makes Escape a no-op."""
+
+    FX = Path(__file__).resolve().parent / "fixtures"
+
+    def __init__(self, stuck=False, crash_after=None, fail_reconnect=False):
+        self.top_tpl = (self.FX / "mcp_picker_panel_cursor_off_target.txt").read_text()
+        self.detail = (self.FX / "mcp_picker_panel_detail_failed.txt").read_text()
+        self.names = ["chrome-devtools", "personal-mbp"]
+        self.cursor = 0
+        self.screen = "top"
+        self.keys = []
+        self.stuck = stuck
+        self.crash_after = crash_after
+        self.fail_reconnect = fail_reconnect
+        self.result = ""
+
+    def _top(self):
+        text = self.top_tpl
+        # move the cursor glyph to the active row
+        text = text.replace(" \u276f \u2714 chrome-devtools", "   \u2714 chrome-devtools")
+        text = text.replace("   \u2718 personal-mbp", " \u2718 personal-mbp")
+        if self.cursor == 0:
+            text = text.replace("   \u2714 chrome-devtools", " \u276f \u2714 chrome-devtools")
+        else:
+            text = text.replace(" \u2718 personal-mbp", " \u276f \u2718 personal-mbp")
+        return text
+
+    def run(self, cmd, timeout=10):
+        if cmd[:2] == ["tmux", "capture-pane"]:
+            if self.screen == "top":
+                return self._top(), 0
+            if self.screen == "detail":
+                return self.detail, 0
+            return self.result or "\u276f \n", 0
+        if cmd[:2] == ["tmux", "send-keys"]:
+            key = cmd[-1]
+            self.keys.append(key)
+            if self.crash_after is not None and len(self.keys) > self.crash_after:
+                raise RuntimeError("boom mid-interaction")
+            if key == "Escape":
+                if self.stuck:
+                    return "", 0
+                self.screen = "top" if self.screen == "detail" else "closed"
+            elif self.screen == "top":
+                if key == "Down":
+                    self.cursor = min(self.cursor + 1, 1)
+                elif key == "Up":
+                    self.cursor = max(self.cursor - 1, 0)
+                elif key == "Enter":
+                    self.screen = "detail"
+            elif self.screen == "detail" and key == "Enter":
+                self.screen = "closed"
+                self.result = ("Failed to reconnect to personal-mbp: ECONNREFUSED\n"
+                               if self.fail_reconnect else "Reconnected to personal-mbp.\n")
+        return "", 0
+
+
+class PanelClosesOnEveryExitTest(unittest.TestCase):
+    """Regression: the `/mcp` panel (title "MCP servers", footer "Esc to close",
+    cursor on a different server) was not recognised, so the tool returned
+    menu-did-not-open and left the panel open, blocking the session."""
+
+    def setUp(self):
+        self.mod = _import_self_mcp_reconnect()
+        self.events = []
+        self.mod.emit_event = lambda *a, **k: self.events.append((a, k))
+
+    def _drive(self, pane, server="personal-mbp"):
+        mod = self.mod
+        mod.sc.run = mock.MagicMock(side_effect=pane.run)
+        mod.sc.capture_pane_text = mock.MagicMock(return_value="<mocked>")
+        mod.sc.ensure_main_loop_focus = mock.MagicMock(return_value=True)
+        mod.sc.inject = mock.MagicMock()
+        mod.time.sleep = lambda *_a, **_k: None
+        return mod.do_reconnect("p:0.0", server, menu_timeout=0.3, result_timeout=0.3)
+
+    def test_panel_fixture_is_recognised_and_parsed(self):
+        top = PanelPane()._top()
+        self.assertTrue(self.mod.top_menu_visible(top))
+        self.assertFalse(self.mod.detail_menu_visible(top))
+        rows = self.mod.parse_server_rows(top)
+        self.assertEqual([(r[0], r[2]) for r in rows],
+                         [("chrome-devtools", True), ("personal-mbp", False)])
+        self.assertEqual(self.mod.cursor_name(top), "chrome-devtools")
+
+    def test_navigates_from_other_server_to_target_by_name(self):
+        pane = PanelPane()
+        result = self._drive(pane)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(pane.cursor, 1)
+        self.assertIn("Down", pane.keys)
+        self.assertEqual(pane.screen, "closed")
+        self.assertEqual(self.events, [])
+
+    def test_success_does_not_escape_at_the_normal_prompt(self):
+        pane = PanelPane()
+        self._drive(pane)
+        self.assertNotIn("Escape", pane.keys)
+
+    def test_failure_path_closes_the_panel(self):
+        # Server absent from the list -> code 4 failure with the panel open.
+        pane = PanelPane()
+        result = self._drive(pane, server="nonexistent")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], 4)
+        self.assertEqual(pane.screen, "closed")
+        self.assertIn("Escape", pane.keys)
+        self.assertNotIn("menu_stuck", result)
+
+    def test_failed_reconnect_result_leaves_prompt(self):
+        pane = PanelPane(fail_reconnect=True)
+        result = self._drive(pane)
+        self.assertEqual(result["code"], 5)
+        self.assertEqual(pane.screen, "closed")
+
+    def test_exception_mid_interaction_closes_the_panel(self):
+        # Crash on the 2nd key (after Down); the Escape that follows must still
+        # be sent, so let only the navigation key crash.
+        pane = PanelPane(crash_after=0)
+        orig = pane.run
+
+        def run(cmd, timeout=10):
+            if cmd[:2] == ["tmux", "send-keys"] and cmd[-1] != "Escape" and not pane.keys:
+                pane.keys.append(cmd[-1])
+                raise RuntimeError("boom mid-interaction")
+            pane.crash_after = None
+            return orig(cmd, timeout)
+        pane.run = run
+        result = self._drive(pane)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], 1)
+        self.assertIn("boom", result["reason"])
+        self.assertEqual(pane.screen, "closed")
+
+    def test_unclosable_panel_emits_loud_event(self):
+        pane = PanelPane(stuck=True)
+        result = self._drive(pane, server="nonexistent")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("menu_stuck"))
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0][1]["tag"], "self-mcp-reconnect-menu-stuck")
+
+    def test_close_any_menu_never_escapes_at_plain_prompt(self):
+        pane = PanelPane()
+        pane.screen = "closed"
+        self.mod.sc.run = mock.MagicMock(side_effect=pane.run)
+        self.mod.time.sleep = lambda *_a, **_k: None
+        self.assertTrue(self.mod.close_any_menu("p:0.0"))
+        self.assertEqual(pane.keys, [])
+
+    def test_top_menu_footer_variants(self):
+        for footer in ("Enter to confirm \xb7 Esc to cancel", "Esc to close",
+                       "Enter to select \xb7 Esc to close"):
+            text = f" MCP servers\n \u276f \u2714 a-srv   1 tools\n {footer}\n"
+            self.assertTrue(self.mod.top_menu_visible(text), footer)
+            self.assertFalse(self.mod.detail_menu_visible(text), footer)
 
 
 if __name__ == "__main__":

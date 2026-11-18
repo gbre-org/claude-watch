@@ -1,0 +1,12 @@
+ MCP servers
+ 3 servers
+
+   Local MCPs
+ ❯ ✔ chrome-devtools   29 tools
+   ✘ personal-mbp      failed
+
+   claude.ai
+     ✔ claude.ai Gmail   needs authentication
+
+ https://code.claude.com/docs/en/mcp for help
+ ↑/↓ to navigate · Enter to select · Esc to close
