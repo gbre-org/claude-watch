@@ -408,6 +408,25 @@ def detail_mentions_server(text: str, server: str) -> bool:
     return server.lower() in text.lower()
 
 
+_DETAIL_STATUS_RE = re.compile(r"^\W*Status:\s*(?P<st>[^\n]*)$", re.M | re.I)
+
+
+def detail_status_connected(text: str) -> bool:
+    """True if the LAST "Status:" line on a detail screen says connected."""
+    last = None
+    for m in _DETAIL_STATUS_RE.finditer(text):
+        last = m.group("st").lower()
+    return bool(last) and "connected" in last and "disconnected" not in last \
+        and "not connected" not in last
+
+
+def cli_status_connected(line: str) -> bool:
+    """True for a `claude mcp list` row such as "name: cmd - \u2714 Connected"."""
+    low = line.lower()
+    return "connected" in low and "disconnected" not in low \
+        and "not connected" not in low and "\u2718" not in low
+
+
 def parse_action_rows(text: str):
     """Return [(index, label, is_cursor), ...] from a detail screen."""
     rows = []
@@ -648,6 +667,21 @@ def _drive_menu(pane: str, server: str, menu_timeout: float, result_timeout: flo
     log(f"  actions for {server}: {[(n, l) for n, l, _ in actions]}")
     reconnect_rows = [(n, l, c) for (n, l, c) in actions if "reconnect" in l.lower()]
     if not reconnect_rows:
+        # A healthy, already-connected server offers no Reconnect action.
+        # That is a no-op success, not a failure; only "not connected AND no
+        # Reconnect" is the genuinely-broken (UI moved / unknown state) case.
+        if detail_status_connected(full) or detail_status_connected(text):
+            connected_via = "detail screen"
+        else:
+            cli_line = verify_via_cli(server)
+            connected_via = "claude mcp list" if cli_status_connected(cli_line) else None
+        if connected_via:
+            log(f"  NOTE: no Reconnect action but {server} is already connected "
+                f"({connected_via}); nothing to do")
+            close_any_menu(pane)
+            return {"ok": True, "server": server, "code": 0,
+                    "reason": None, "status": "already connected",
+                    "tools_before": tools_before}
         log(f"  FAIL: no 'Reconnect' action found for {server}")
         close_any_menu(pane)
         return {
