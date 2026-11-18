@@ -1,0 +1,18 @@
+  remote-http
+  MCP server
+
+  Status:           ✘ failed
+  Issue:            ECONNREFUSED: Unable to
+                    connect. Is the computer
+                    able to access the url?
+  Auth:             ◯ not authenticated
+  URL:              http://localhost:18768/mc
+                    p
+  Config location:  /home/user/.claude.
+                    json
+
+  ❯ Reconnect
+    Disable in this project
+    Back
+
+  Enter to select · Esc to go back

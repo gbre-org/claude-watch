@@ -299,6 +299,7 @@ class DoReconnectNonCancellingTest(unittest.TestCase):
             )
         )
         mod.sc.inject = mock.MagicMock()
+        mod.verify_live = lambda *a, **k: ("connected", "row", "")
 
         result = mod.do_reconnect(
             pane, "mcp-adaptor", menu_timeout=5.0, result_timeout=5.0
@@ -306,7 +307,7 @@ class DoReconnectNonCancellingTest(unittest.TestCase):
 
         self.assertEqual(result, {
             "ok": True, "server": "mcp-adaptor", "reason": None, "code": 0,
-            "tools_before": "✘ failed",
+            "tools_before": "✘ failed", "live_state": "connected",
         })
         mod.sc.interrupt_and_wait.assert_not_called()
 
@@ -382,11 +383,17 @@ class FakeMcpPane:
         self.keys = []
         self.header_override = header_override
         self.result = ""
+        self.reconnected = False
+        self.live_after = "✔"      # glyph the list shows after Reconnect
+
+    def reopen(self):
+        self.screen = "top"
 
     def _top_lines(self):
         out = ["Manage MCP servers", f"{len(self.names)} servers"]
         for i, n in enumerate(self.names):
-            out.append(f"{' ❯' if i == self.cursor else '  '} ✔ {n}   3 tools")
+            glyph = self.live_after if self.reconnected else "✔"
+            out.append(f"{' ❯' if i == self.cursor else '  '} {glyph} {n}   3 tools")
         out += ["https://code.claude.com/docs/en/mcp for help",
                 "↑/↓ to navigate \xb7 Enter to confirm \xb7 Esc to cancel"]
         return out
@@ -429,6 +436,7 @@ class FakeMcpPane:
                         break
                 if downs == 1:
                     self.screen = "done"
+                    self.reconnected = True
                     self.result = f"Reconnected to {self.names[self.cursor]}.\n"
                 else:
                     self.screen = "done"
@@ -452,8 +460,10 @@ class WrongRowRegressionTest(unittest.TestCase):
         mod.sc.run = mock.MagicMock(side_effect=pane_obj.run)
         mod.sc.capture_pane_text = mock.MagicMock(return_value="<mocked>")
         mod.sc.ensure_main_loop_focus = mock.MagicMock(return_value=True)
-        mod.sc.inject = mock.MagicMock()
+        mod.sc.inject = mock.MagicMock(
+            side_effect=lambda _p, text, **_k: pane_obj.reopen() if text == "/mcp" else None)
         mod.time.sleep = lambda *_a, **_k: None
+        mod.VERIFY_SECONDS = 0.3
         return mod.do_reconnect("p:0.0", server, menu_timeout=0.5, result_timeout=0.5)
 
     def test_visible_capture_alone_would_have_truncated_the_list(self):
@@ -510,7 +520,7 @@ class WrongRowRegressionTest(unittest.TestCase):
         self.assertEqual(result["code"], 0)
         self.assertEqual(result["status"], "already connected")
 
-    def test_no_reconnect_connected_per_cli_is_noop_success(self):
+    def test_no_reconnect_connected_on_list_row_is_noop_success(self):
         pane = self._no_reconnect_pane(None)
         self.mod.verify_via_cli = lambda s: f"{s}: x - \u2714 Connected"
         result = self._drive(pane, "personal-mbp")
@@ -589,9 +599,15 @@ class PanelPane:
         self.crash_after = crash_after
         self.fail_reconnect = fail_reconnect
         self.result = ""
+        self.reconnected = False
+
+    def reopen(self):
+        self.screen = "top"
 
     def _top(self):
         text = self.top_tpl
+        if self.reconnected:
+            text = text.replace("✘ personal-mbp      failed", "✔ personal-mbp      3 tools")
         # move the cursor glyph to the active row
         text = text.replace(" \u276f \u2714 chrome-devtools", "   \u2714 chrome-devtools")
         text = text.replace("   \u2718 personal-mbp", " \u2718 personal-mbp")
@@ -626,6 +642,7 @@ class PanelPane:
                     self.screen = "detail"
             elif self.screen == "detail" and key == "Enter":
                 self.screen = "closed"
+                self.reconnected = not self.fail_reconnect
                 self.result = ("Failed to reconnect to personal-mbp: ECONNREFUSED\n"
                                if self.fail_reconnect else "Reconnected to personal-mbp.\n")
         return "", 0
@@ -646,8 +663,10 @@ class PanelClosesOnEveryExitTest(unittest.TestCase):
         mod.sc.run = mock.MagicMock(side_effect=pane.run)
         mod.sc.capture_pane_text = mock.MagicMock(return_value="<mocked>")
         mod.sc.ensure_main_loop_focus = mock.MagicMock(return_value=True)
-        mod.sc.inject = mock.MagicMock()
+        mod.sc.inject = mock.MagicMock(
+            side_effect=lambda _p, text, **_k: pane.reopen() if text == "/mcp" else None)
         mod.time.sleep = lambda *_a, **_k: None
+        mod.VERIFY_SECONDS = 0.3
         return mod.do_reconnect("p:0.0", server, menu_timeout=0.3, result_timeout=0.3)
 
     def test_panel_fixture_is_recognised_and_parsed(self):
@@ -671,7 +690,10 @@ class PanelClosesOnEveryExitTest(unittest.TestCase):
     def test_success_does_not_escape_at_the_normal_prompt(self):
         pane = PanelPane()
         self._drive(pane)
-        self.assertNotIn("Escape", pane.keys)
+        # The only Escape allowed is the one closing the verify re-open of the
+        # list (the picker is on screen then); never one at the normal prompt.
+        self.assertLessEqual(pane.keys.count("Escape"), 1)
+        self.assertEqual(pane.screen, "closed")
 
     def test_failure_path_closes_the_panel(self):
         # Server absent from the list -> code 4 failure with the panel open.
@@ -730,6 +752,235 @@ class PanelClosesOnEveryExitTest(unittest.TestCase):
             text = f" MCP servers\n \u276f \u2714 a-srv   1 tools\n {footer}\n"
             self.assertTrue(self.mod.top_menu_visible(text), footer)
             self.assertFalse(self.mod.detail_menu_visible(text), footer)
+
+
+
+FX_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+def _fx(name):
+    return (FX_DIR / name).read_text()
+
+
+class LiveFailedHttpServerTest(unittest.TestCase):
+    """Real screens captured 2026-11-18 (identifiers scrubbed) for an HTTP MCP
+    server whose tunnel went away: the LIVE session shows it failed
+    (ECONNREFUSED) even though a fresh `claude mcp list` probe says Connected.
+
+    Facts: the list row is just "✘ <name>" (no status text); the detail screen
+    has a "Status: ✘ failed" field block and UNNUMBERED actions
+    ("❯ Reconnect / Disable in this project / Back"); the title is
+    "<name>" + "MCP server" on separate lines.
+    """
+
+    NAME = "remote-http"
+
+    def setUp(self):
+        self.mod = _import_self_mcp_reconnect()
+
+    def test_list_row_is_failed_without_status_text(self):
+        text = _fx("mcp_picker_2026-11_list_http_failed.txt")
+        self.assertTrue(self.mod.top_menu_visible(text))
+        state, row = self.mod.live_row_state(text, self.NAME)
+        self.assertEqual(state, "failed")
+        self.assertIn("\u2718", row)
+        self.assertEqual(self.mod.live_row_state(text, "chrome-devtools")[0], "connected")
+        self.assertEqual(self.mod.live_row_state(text, "claude.ai Gmail")[0], None)
+        self.assertEqual(self.mod.cursor_name(text), self.NAME)
+
+    def test_unnumbered_actions_are_parsed(self):
+        text = _fx("mcp_picker_2026-11_detail_http_failed.txt")
+        self.assertTrue(self.mod.detail_menu_visible(text))
+        acts = self.mod.parse_action_rows(text)
+        self.assertEqual([(n, l, c) for n, l, c in acts],
+                         [(1, "Reconnect", True), (2, "Disable in this project", False),
+                          (3, "Back", False)])
+        self.assertEqual(self.mod.detail_live_state(text), "failed")
+
+    def test_connected_detail_offers_no_reconnect(self):
+        text = _fx("mcp_picker_2026-11_detail_http_connected.txt")
+        labels = [l for _n, l, _c in self.mod.parse_action_rows(text)]
+        self.assertNotIn("Reconnect", labels)
+        self.assertEqual(self.mod.detail_live_state(text), "connected")
+
+    def test_numbered_actions_still_win(self):
+        acts = self.mod.parse_action_rows(
+            " Status: x\n \u276f 1. View tools\n   2. Reconnect\n  Enter to select\n")
+        self.assertEqual([l for _n, l, _c in acts], ["View tools", "Reconnect"])
+
+    def test_classify_state(self):
+        c = self.mod.classify_state
+        self.assertEqual(c("\u2714", "29 tools"), "connected")
+        self.assertEqual(c("\u2718", ""), "failed")
+        self.assertEqual(c("\u26a0", "needs authentication"), "needs-auth")
+        self.assertEqual(c("\u26a0", "tools fetch failed \xb7 connected"), "degraded")
+        self.assertEqual(c("", ""), "unknown")
+
+
+class LivePane:
+    """Stateful fake of the 2026-11 picker driven by the real-capture
+    fixtures. `healthy_after` = number of /mcp re-opens (after the Reconnect)
+    before the list row turns connected; None = never heals."""
+
+    NAME = "remote-http"
+
+    def __init__(self, start_connected=False, healthy_after=0, offer_reconnect=True):
+        self.connected = start_connected
+        self.healthy_after = healthy_after
+        self.offer_reconnect = offer_reconnect
+        self.screen = "top"
+        self.keys = []
+        self.reopens_after_reconnect = 0
+        self.reconnect_fired = False
+        self.result = ""
+
+    def _row_ok(self):
+        if self.connected:
+            return True
+        return (self.reconnect_fired and self.healthy_after is not None
+                and self.reopens_after_reconnect > self.healthy_after)
+
+    def reopen(self):
+        self.screen = "top"
+        if self.reconnect_fired:
+            self.reopens_after_reconnect += 1
+
+    def _top(self):
+        text = _fx("mcp_picker_2026-11_list_http_failed.txt")
+        if self._row_ok():
+            text = text.replace("\u2718 remote-http", "\u2714 remote-http          4 tools")
+        return text
+
+    def _detail(self):
+        if self._row_ok() and self.connected:
+            return _fx("mcp_picker_2026-11_detail_http_connected.txt")
+        text = _fx("mcp_picker_2026-11_detail_http_failed.txt")
+        if not self.offer_reconnect:
+            text = text.replace("  \u276f Reconnect\n", "  \u276f Disable in this project\n")
+            text = text.replace("    Disable in this project\n    Back",
+                                "    Back").replace(
+                "  \u276f Disable in this project\n    Back",
+                "  \u276f Disable in this project\n    Back")
+        return text
+
+    def run(self, cmd, timeout=10):
+        if cmd[:2] == ["tmux", "capture-pane"]:
+            if self.screen == "top":
+                return self._top(), 0
+            if self.screen == "detail":
+                return self._detail(), 0
+            return self.result or "\u276f \n", 0
+        if cmd[:2] == ["tmux", "send-keys"]:
+            key = cmd[-1]
+            self.keys.append(key)
+            if key == "Escape":
+                self.screen = "top" if self.screen == "detail" else "closed"
+            elif self.screen == "top" and key == "Enter":
+                self.screen = "detail"
+            elif self.screen == "detail" and key == "Enter":
+                self.screen = "closed"
+                self.reconnect_fired = True
+                self.result = f"Reconnected to {self.NAME}.\n"
+        return "", 0
+
+
+class LiveStateDecidesTest(unittest.TestCase):
+    NAME = "remote-http"
+
+    def setUp(self):
+        self.mod = _import_self_mcp_reconnect()
+        self.events = []
+        self.mod.emit_event = lambda *a, **k: self.events.append((a, k))
+        self.cli_calls = []
+
+        def cli(server):
+            self.cli_calls.append(server)
+            return f"{server}: http://x (HTTP) - \u2714 Connected"
+        self.mod.verify_via_cli = cli
+
+    def _drive(self, pane):
+        mod = self.mod
+        mod.sc.run = mock.MagicMock(side_effect=pane.run)
+        mod.sc.capture_pane_text = mock.MagicMock(return_value="<mocked>")
+        mod.sc.ensure_main_loop_focus = mock.MagicMock(return_value=True)
+        mod.sc.inject = mock.MagicMock(
+            side_effect=lambda _p, text, **_k: pane.reopen() if text == "/mcp" else None)
+        mod.time.sleep = lambda *_a, **_k: None
+        mod.VERIFY_SECONDS = 0.4
+        return mod.do_reconnect("p:0.0", self.NAME, menu_timeout=0.3, result_timeout=0.3)
+
+    def test_failed_row_presses_the_reconnect_action_and_verifies_live(self):
+        pane = LivePane(start_connected=False, healthy_after=0)
+        result = self._drive(pane)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["live_state"], "connected")
+        self.assertTrue(pane.reconnect_fired)
+        self.assertEqual(self.cli_calls, [], "claude mcp list must never decide success")
+        self.assertEqual(pane.screen, "closed")
+
+    def test_reconnect_line_ok_but_row_still_failed_is_failure_with_screen(self):
+        pane = LivePane(start_connected=False, healthy_after=None)
+        result = self._drive(pane)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], 5)
+        self.assertEqual(result["live_state"], "failed")
+        self.assertIn("remote-http", result["screen"])
+        self.assertIn("\u2718", result["screen"])
+        self.assertEqual(pane.screen, "closed")
+
+    def test_row_recovers_within_the_retry_window(self):
+        pane = LivePane(start_connected=False, healthy_after=2)
+        self.mod.VERIFY_SECONDS = 5.0
+        result = self._drive(pane)
+        self.assertTrue(result["ok"], result)
+        self.assertGreaterEqual(pane.reopens_after_reconnect, 3)
+
+    def test_live_connected_without_reconnect_is_noop_success(self):
+        pane = LivePane(start_connected=True)
+        # the list fixture is failed; model a healthy session's list too
+        orig = pane._top
+        pane._top = lambda: orig().replace("\u2718 remote-http", "\u2714 remote-http          4 tools")
+        result = self._drive(pane)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "already connected")
+        self.assertEqual(result["live_state"], "connected")
+        self.assertFalse(pane.reconnect_fired)
+        self.assertEqual(self.cli_calls, [])
+
+    def test_cli_connected_cannot_rescue_a_failed_live_row_without_reconnect(self):
+        # The exact production misfire: live row failed, no Reconnect parsed,
+        # `claude mcp list` says Connected -> must NOT be ok.
+        pane = LivePane(start_connected=False, healthy_after=None, offer_reconnect=False)
+        result = self._drive(pane)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], 4)
+        self.assertEqual(result["live_state"], "failed")
+        self.assertIn("Status:", result["screen"])
+        self.assertEqual(self.cli_calls, [])
+
+    def test_do_run_reports_cli_vs_live_discrepancy(self):
+        mod = self.mod
+        mod.sc.find_claude_pane = lambda: "p:0.0"
+        mod._write_state = lambda *_a, **_k: None
+        mod.do_reconnect = lambda *a, **k: {
+            "ok": False, "server": self.NAME, "code": 5, "live_state": "failed",
+            "reason": "x"}
+        args = mock.MagicMock(pane=None, server=self.NAME, menu_timeout=1, result_timeout=1,
+                              verify=True, notify=False)
+        result = mod.do_run(args)
+        self.assertIn("discrepancy", result)
+        self.assertIn("live state wins", result["discrepancy"])
+        self.assertFalse(result["ok"])
+
+    def test_do_run_no_discrepancy_when_they_agree(self):
+        mod = self.mod
+        mod.sc.find_claude_pane = lambda: "p:0.0"
+        mod._write_state = lambda *_a, **_k: None
+        mod.do_reconnect = lambda *a, **k: {
+            "ok": True, "server": self.NAME, "code": 0, "live_state": "connected"}
+        args = mock.MagicMock(pane=None, server=self.NAME, menu_timeout=1, result_timeout=1,
+                              verify=True, notify=False)
+        self.assertNotIn("discrepancy", mod.do_run(args))
 
 
 if __name__ == "__main__":
