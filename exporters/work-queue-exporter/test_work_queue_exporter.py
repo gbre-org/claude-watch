@@ -1819,6 +1819,49 @@ def run_scenarios():
     check("S28h series cleared once the item leaves quarantine", v is None,
           f"got {v!r}")
 
+    # 28w: waiting items -- no owner by design, never orphaned; overdue
+    # waits and unacked completions get their own series.
+    w_item = make_running_item("q-s28w", "waiting on a PR")
+    w_item["status"] = "waiting"
+    w_item["wait_on"] = {"kind": "pr", "ref": "https://h/o/r/pull/9"}
+    w_item["waiting_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=600)
+    ).isoformat()
+    w_item["wait_deadline"] = (
+        datetime.now(timezone.utc) + timedelta(hours=1)
+    ).isoformat()
+    write_queue(qjson, [w_item])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_waiting_age_seconds", "q-s28w")
+    check("S28w waiting_age emitted", v is not None and 590 <= v <= 660,
+          f"got {v!r}")
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-s28w")
+    check("S28w waiting item has NO has_live_owner series (never orphaned)",
+          v is None, f"got {v!r}")
+    v = find_any_sample(mod, "worktask_queue_item_wait_overdue_seconds", "q-s28w")
+    check("S28w not overdue before the deadline", v is None, f"got {v!r}")
+    n = find_sample(mod, "worktask_queue_items_total", {"status": "waiting"})
+    check("S28w status count reports the waiting item", n == 1.0, f"got {n!r}")
+    w_item["wait_deadline"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=300)
+    ).isoformat()
+    w_item["wait_on"] = {"kind": "coordinator", "ref": "ack"}
+    w_item["pending_completion"] = {
+        "agent_id": "a", "at": (
+            datetime.now(timezone.utc) - timedelta(seconds=120)
+        ).isoformat(),
+    }
+    write_queue(qjson, [w_item])
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_wait_overdue_seconds", "q-s28w")
+    check("S28w overdue series emitted past the deadline",
+          v is not None and 290 <= v <= 360, f"got {v!r}")
+    v = find_any_sample(
+        mod, "worktask_queue_item_unacked_completion_age_seconds", "q-s28w")
+    check("S28w unacked completion age emitted",
+          v is not None and 110 <= v <= 180, f"got {v!r}")
+
     # 28i: a run whose only real assistant turn came AFTER the death line
     # (the death was a retried early call). One archive holds one agent run,
     # so that turn still identifies the model — attribution must not depend

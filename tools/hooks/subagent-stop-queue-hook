@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""SubagentStop hook -- records a PENDING COMPLETION for the finished agent's
+queue item.
+
+The instant a subagent ends, Claude Code fires SubagentStop with a payload of
+the shape::
+
+    {
+      "hook_event_name": "SubagentStop",
+      "agent_id": "agent-abc123...",
+      "last_assistant_message": "...the agent's final text...",
+      ...
+    }
+
+This hook runs ``session-task queue agent-finished --agent-id <id>
+--message-stdin`` (final message on stdin). That moves every item the agent
+still owns from ``running`` to ``waiting`` on the coordinator and stamps a
+``pending_completion`` record, so the queue never shows a running item with a
+dead owner, and NOTHING is closed on the coordinator's behalf. The
+coordinator must ack with ``session-task queue done <id>`` or
+``session-task queue wait <id> --on <kind:ref>``; the
+``unacked_agent_completion`` obligation gate blocks its tool calls until it
+does.
+
+Default-open: malformed payload, missing agent_id, missing ``session-task``,
+non-zero exit or timeout are all swallowed (logged) -- a hook failure must
+never disturb the agent teardown. ``SESSION_TASK_BIN`` overrides the CLI path
+(tests).
+
+Wiring (settings.json)::
+
+    {"hooks": {"SubagentStop": [{"hooks": [
+        {"type": "command",
+         "command": "/path/to/subagent-stop-queue-hook", "timeout": 20}]}]}}
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ERR_LOG = Path(os.path.expanduser("~/.config/claude/subagent-stop-queue-hook.log"))
+
+
+def _log(msg: str) -> None:
+    try:
+        ERR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with ERR_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(msg.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    agent_id = payload.get("agent_id") or payload.get("agentId")
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        return 0
+    message = payload.get("last_assistant_message") or ""
+    if not isinstance(message, str):
+        message = ""
+    cli = os.environ.get("SESSION_TASK_BIN") or shutil.which("session-task")
+    if not cli:
+        _log("session-task not found; skipping")
+        return 0
+    try:
+        r = subprocess.run(
+            [cli, "queue", "agent-finished", "--agent-id", agent_id.strip(),
+             "--message-stdin"],
+            input=message, capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            _log(f"agent-finished rc={r.returncode}: {r.stderr.strip()[:300]}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log(f"agent-finished failed: {exc}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

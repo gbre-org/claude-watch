@@ -434,6 +434,66 @@ swallow the NEW run's completion.
 > kill <label>` — the replace path exists for *re-running*, and it always
 > ends with either a new run or exit `3`.
 
+## Waiting items and agent-completion acks
+
+Goal: a `running` item with no owner never exists, and no agent completion is
+handled behind the coordinator's back.
+
+**States.** `waiting` is a parked state like `blocked`: no agent owner, scope
+released, never an orphan. It carries `wait_on` (`kind` + `ref`),
+`wait_deadline`, optional `wait_note`, `wait_done_on_success`.
+
+```
+session-task queue wait <id> --on <kind:ref> [--deadline 2h] [--note T] [--done-on-success]
+session-task queue unwait <id>                 # waiting -> pending (manual)
+session-task queue sweep [-n] [--json]         # cron: follow-through + overdue
+session-task queue agent-finished --agent-id A [--message-stdin]   # hook entry
+```
+
+Kinds: `pr:<url>`, `ci:<repo>@<sha|run>`, `workload:<label>`,
+`hostjob:<label>`, `reply:<channel>:<msg-id>`, `event:<tag>`, `train:<ref>`.
+
+**Agent completion is an ack, not a guess.**
+
+1. When a subagent ends, the `SubagentStop` hook (`subagent-stop-queue-hook`)
+   runs `queue agent-finished`. Every item the agent still owns moves from
+   `running` to `waiting` on `coordinator:ack` and gets a `pending_completion`
+   record (agent id, time, tail of its final message). Nothing is closed.
+2. The coordinator must ack each one explicitly, with exactly one of
+   `session-task queue done <id>` (delivered) or
+   `session-task queue wait <id> --on <kind:ref>` (still waiting on
+   something). `queue abandon` also resolves it. `unwait` and `event-ack` do
+   not count.
+3. Until it does, the `unacked_agent_completion` obligation gate
+   (`container/bin/eval-unacked-agent-completion`, seeded by
+   `obligations-init`) refuses the coordinator's non-exempt Bash calls, naming
+   the item and both commands. The `session-task queue ...` ack commands are
+   exempt, as are the other gates' clear-paths.
+
+**Follow-through is automatic.** `queue sweep` (cron, every 2 minutes) reads
+the pending event queue and the consumed-event log; when the awaited event
+arrives the item returns to `pending` (a `queue-wait-resolved` event tells the
+coordinator to act), or closes as `done` for `--done-on-success` waits whose
+event reports success. A wait past its deadline raises one `queue-wait-overdue`
+event and the exporter's `WorkQueueWaitOverdue` alert, never the orphan alert.
+Event matching: `workload` -> `workload-done` with `data.label`; `pr` ->
+`pr-status-change` mentioning the PR (merged = success, CI failure / closed =
+failure); `ci` -> `ci-run-*finished`; `train` -> `train-landed`; `event` -> tag
+equality; `hostjob` -> hostjob events naming the label; `reply` -> any event
+carrying the message id.
+
+**Display.** `queue list` shows `waiting: on pr:<url> (deadline ...)`; the
+queue site shows waiting items in the parked section with a "waiting on
+<kind:ref>" badge, or "agent finished - awaiting ack" for an unacked
+completion. Exporter series: `worktask_queue_item_waiting_age_seconds`,
+`worktask_queue_item_wait_overdue_seconds`,
+`worktask_queue_item_unacked_completion_age_seconds`; waiting items emit no
+`has_live_owner` series.
+
+`queue heartbeat <id> --pid N` keeps working (back-compat) but is no longer
+the recommended way to keep an ownerless item quiet: use `queue wait`.
+`WorkQueueOrphaned` remains as a can't-happen backstop.
+
 ## Schema (v2)
 
 ```json

@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""eval-unacked-agent-completion - obligations evaluator (hard gate).
+
+Blocks the MAIN LOOP's non-exempt Bash tool calls while any queue item carries
+an UNACKED AGENT COMPLETION: its agent ended (the SubagentStop hook ran
+`session-task queue agent-finished`, which moved the item to status=waiting on
+the coordinator and stamped `pending_completion`).
+
+WHY: an agent finishing is an event the coordinator must consciously dispose
+of -- the work may be delivered, or it may be parked on CI / a merge / a
+reply. Letting items linger `running` with a dead owner was the source of
+repeated orphan alerts. Nothing handles the completion behind the
+coordinator's back; instead the coordinator is stopped until it acks.
+
+Cleared ONLY by an explicit ack, which removes `pending_completion` (or moves
+the item out of `waiting`):
+  session-task queue done <id>
+  session-task queue wait <id> --on <kind:ref> [--deadline D] [--done-on-success]
+(`queue abandon` also resolves it.) Nothing else counts -- not event-ack,
+not unwait (refused while unacked).
+
+Reads queue.json directly (no daemon join). exit 0 = ALLOW, 1 = DENY with a
+banner on stderr. Default-open: missing/corrupt queue file, exempt command, or
+any unexpected exception -> ALLOW. Queue path: $CLAUDE_QUEUE_FILE or
+~/.config/session/queue.json.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# Recovery surface: the ack commands themselves plus the CLIs that clear other
+# gates (so two gates can never deadlock each other).
+_EXEMPT_PATTERNS = [
+    r"session-task\s+queue(\s|$)",
+    r"obligations(\s|$)",
+    r"agent-ack(\s|$)",
+    r"agent-msg(\s|$)",
+    r"agent-tail(\s|$)",
+    r"event-ack(\s|$)",
+    r"event-classify(\s|$)",
+    r"claude-watch-ack(\s|$)",
+    r"claude-watch-dispatch(\s|$)",
+    r"signal-history(\s|$)",
+    r"signal-ack(\s|$)",
+    r"signal-mark-read(\s|$)",
+    r"botchat-send(\s|$)",
+    r"botchat-unread-check(\s|$)",
+    r"botchat-history(\s|$)",
+    r"botchat-show(\s|$)",
+    r"botchat-wait(\s|$)",
+    r"/opt/claude-container/watchers/",
+]
+_EXEMPT_RE = re.compile(r"^\s*(" + "|".join(_EXEMPT_PATTERNS) + r")")
+
+
+def _queue_file() -> Path:
+    o = os.environ.get("CLAUDE_QUEUE_FILE", "").strip()
+    return Path(o) if o else Path(os.path.expanduser("~/.config/session/queue.json"))
+
+
+def _unacked() -> list:
+    try:
+        data = json.loads(_queue_file().read_text())
+    except (OSError, ValueError):
+        return []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [
+        it for it in items
+        if isinstance(it, dict) and it.get("status") == "waiting"
+        and isinstance(it.get("pending_completion"), dict)
+    ]
+
+
+def _emit_deny(items) -> None:
+    lines = [
+        "UNACKED-AGENT-COMPLETION: %d agent(s) finished and their queue "
+        "item(s) need YOUR explicit ack. The main loop is BLOCKED until each "
+        "is acked." % len(items),
+        "",
+    ]
+    for it in items:
+        pc = it["pending_completion"]
+        lines.append("  - %s  [%s]  (agent %s finished %s)" % (
+            it.get("id", "?"), (it.get("summary") or "")[:80],
+            pc.get("agent_id", "?"), pc.get("at", "?")))
+        tail = (pc.get("message_tail") or "").strip().splitlines()
+        for ln in tail[-3:]:
+            lines.append("        | " + ln[:160])
+    lines.extend([
+        "",
+        "For EACH item, ack with exactly one of:",
+        "  - delivered:           session-task queue done <id>",
+        "  - still waiting on X:  session-task queue wait <id> --on <kind:ref> "
+        "[--deadline 2h] [--done-on-success]",
+        "      kinds: pr:<url> ci:<repo>@<sha|run> workload:<label> "
+        "hostjob:<label> reply:<chan>:<msg-id> event:<tag> train:<ref>",
+        "  - (gave up:            session-task queue abandon <id> --reason ...)",
+        "A waiting item reopens or closes itself when its event arrives.",
+        "event-ack does NOT clear this gate. Last resort: "
+        "obligations override \"<reason>\" --duration <N>.",
+    ])
+    print("\n".join(lines), file=sys.stderr)
+
+
+def evaluate(cmd: str) -> int:
+    if not cmd or not cmd.strip():
+        return 0
+    if _EXEMPT_RE.match(cmd):
+        return 0
+    items = _unacked()
+    if not items:
+        return 0
+    _emit_deny(items)
+    return 1
+
+
+def _self_test() -> int:
+    import tempfile
+    failures = []
+
+    def fail(m):
+        failures.append(m)
+
+    def setup(td, items):
+        os.environ["CLAUDE_QUEUE_FILE"] = str(Path(td) / "queue.json")
+        if items is not None:
+            (Path(td) / "queue.json").write_text(json.dumps({"items": items}))
+
+    pend = {"id": "q-1", "status": "waiting", "summary": "x",
+            "pending_completion": {"agent_id": "a-1", "at": "t",
+                                   "message_tail": "PR opened"}}
+    with tempfile.TemporaryDirectory() as td:
+        setup(td, None)
+        if evaluate("ls") != 0:
+            fail("missing queue file should allow")
+    with tempfile.TemporaryDirectory() as td:
+        setup(td, [pend])
+        if evaluate("ls") != 1:
+            fail("unacked completion should DENY")
+        if evaluate("") != 0:
+            fail("empty command allows")
+        for c in ("session-task queue done q-1",
+                  "session-task queue wait q-1 --on pr:x",
+                  "obligations override x --duration 5",
+                  "event-ack list", "botchat-send --mark-read 1"):
+            if evaluate(c) != 0:
+                fail("exempt command should allow: %r" % c)
+    with tempfile.TemporaryDirectory() as td:
+        acked = dict(pend)
+        acked.pop("pending_completion")
+        setup(td, [acked, {"id": "q-2", "status": "running"},
+                   {"id": "q-3", "status": "done", "pending_completion": {}}])
+        if evaluate("ls") != 0:
+            fail("acked / running / done items must not gate")
+    with tempfile.TemporaryDirectory() as td:
+        setup(td, [])
+        (Path(td) / "queue.json").write_text("{not json")
+        if evaluate("ls") != 0:
+            fail("corrupt queue should allow (default-open)")
+    os.environ.pop("CLAUDE_QUEUE_FILE", None)
+    if failures:
+        print("FAIL: %d case(s):" % len(failures), file=sys.stderr)
+        for f in failures:
+            print("  " + f, file=sys.stderr)
+        return 1
+    print("OK: all cases pass.")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        return _self_test()
+    try:
+        return evaluate(sys.stdin.read())
+    except Exception:  # noqa: BLE001 -- default-open on unexpected
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

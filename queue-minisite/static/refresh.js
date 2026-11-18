@@ -595,7 +595,7 @@
     // blocked section. Visible symptom: "BLOCKED 1" on first paint,
     // then disappears ~5s later.
     let head = '';
-    head += '<span class="badge state-blocked" title="parked on an external blocker; no live agent expected">blocked</span>';
+    head += `<span class="badge state-blocked" title="parked on an external blocker or event; no live agent expected">${esc(it.badge_label || 'blocked')}</span>`;
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;

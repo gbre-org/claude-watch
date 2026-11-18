@@ -58,6 +58,25 @@ Usage:
                                                  # pending if a peer holds
                                                  # the scope; always lifts
                                                  # the block, never refuses)
+    session-task queue wait <id> --on KIND:REF [--deadline 2h] [--note TEXT]
+                                 [--done-on-success]
+                                                 # PREFERRED way to park an
+                                                 # item on something external
+                                                 # (pr:/ci:/workload:/hostjob:/
+                                                 # reply:/event:/train:). No
+                                                 # agent owner needed, never
+                                                 # orphaned; also ACKS a
+                                                 # finished agent's completion
+    session-task queue unwait <id>               # waiting -> pending (manual)
+    session-task queue sweep [--json] [-n]       # cron: reopen/close waiting
+                                                 # items when their event
+                                                 # arrives; flag overdue waits
+    session-task queue agent-finished --agent-id ID [--message-stdin]
+                                                 # SubagentStop hook entry:
+                                                 # records a PENDING COMPLETION
+                                                 # (item -> waiting on the
+                                                 # coordinator); ack it with
+                                                 # `queue done` or `queue wait`
     session-task queue spawn-check <id> [--json] # "am I clear to spawn?" check
     session-task queue force-start <id> --reason TEXT [--no-interrupt]
                                                        # MANUAL OVERRIDE: promote
@@ -152,6 +171,8 @@ Abandoning a live scope (quarantine):
 """
 
 import argparse
+import contextlib
+import io
 import fcntl
 import gzip
 import json
@@ -354,7 +375,9 @@ HOSTJOB_STARTING_WINDOW_SECONDS = float(
 #   "can still edit deps" gate (`queue depend`). `blocked` IS included here
 #   -- a parked item is still something the operator wants to see and can
 #   still be unblocked / re-deped. Visibility != scope-holding.
-ACTIVE_STATUSES = ("pending", "running", "wedged", "blocked", "quarantined")
+ACTIVE_STATUSES = (
+    "pending", "running", "wedged", "blocked", "waiting", "quarantined",
+)
 SERIALIZING_STATUSES = ("pending", "running", "wedged", "quarantined")
 RUNNING_STATUSES = ("running", "wedged", "quarantined")
 
@@ -4742,6 +4765,9 @@ def cmd_queue_list(args):
         elif status == "blocked":
             head_mark = "~"
             color, color_reset = YELLOW, RESET
+        elif status == "waiting":
+            head_mark = "w"
+            color, color_reset = YELLOW, RESET
         elif status == "quarantined":
             # `?` because that is exactly what a quarantine means: we do
             # NOT know whether the agent is alive. Magenta so it can't be
@@ -4774,6 +4800,8 @@ def cmd_queue_list(args):
             print(f"  wedged : {it.get('wedged_reason')}")
         if status == "blocked" and it.get("block_reason"):
             print(f"  blocked: {it.get('block_reason')}")
+        if status == "waiting":
+            print(f"  waiting: {_wait_describe(it)}")
         if status == "quarantined":
             # A quarantine is the one state where the operator MUST be told
             # what it means (scope still held) and how to end it — the whole
@@ -4875,6 +4903,7 @@ def cmd_queue_groups(args):
         pending = [m for m in members if m.get("status") == "pending"]
         wedged = [m for m in members if m.get("status") == "wedged"]
         blocked = [m for m in members if m.get("status") == "blocked"]
+        waiting = [m for m in members if m.get("status") == "waiting"]
         head = _group_head(items, gid)
         out.append({
             "group_id": gid,
@@ -4883,6 +4912,7 @@ def cmd_queue_groups(args):
             "pending_count": len(pending),
             "wedged_count": len(wedged),
             "blocked_count": len(blocked),
+            "waiting_count": len(waiting),
             "head_id": head["id"] if head else None,
             "members": [m["id"] for m in sorted(members, key=_sort_key)],
         })
@@ -4943,6 +4973,11 @@ def cmd_queue_done(args):
         was_quarantined = target.get("status") == "quarantined"
         target["status"] = "done"
         target["completed_at"] = _fmt_ts()
+        if target.get("pending_completion"):
+            # `done` is one of the two valid acks of an agent completion.
+            target["completion_acked_at"] = target["completed_at"]
+            target["completion_acked_by"] = "done"
+            target.pop("pending_completion", None)
         if was_quarantined:
             target["quarantine_released_at"] = target["completed_at"]
             target["quarantine_released_by"] = "agent-completed"
@@ -7548,6 +7583,525 @@ def cmd_queue_block(args):
         )
 
 
+# ---------------------------------------------------------------------------
+# `waiting` state: an item whose agent is finished/absent but whose WORK is
+# parked on something external (PR checks, a merge, a workload, a reply...).
+#
+# Design goal: a `running` row with no owner must never exist, not even
+# briefly, AND no completion may be handled behind the coordinator's back.
+#   1. `queue agent-finished` (run by the SubagentStop hook the instant an
+#      agent exits) moves the agent's still-running items to `waiting` on
+#      `coordinator:ack` and records a PENDING COMPLETION on the item. It
+#      NEVER closes anything: whether the work is done is the coordinator's
+#      call.
+#   2. The pending completion must be ACKED explicitly -- `queue done <id>`
+#      or `queue wait <id> --on <kind:ref>` (or `abandon`); nothing else
+#      counts. Until then the `unacked_agent_completion` obligation gate
+#      refuses the coordinator's tool calls (container/bin/
+#      eval-unacked-agent-completion), naming the item and both commands.
+#   3. Only the FOLLOW-THROUGH is automatic: `queue sweep` (cron) reopens or
+#      closes a waiting item when the named event arrives, and flags waits
+#      past their deadline (`queue-wait-overdue`).
+# The WorkQueueOrphaned alert stays as a can't-happen backstop.
+# ---------------------------------------------------------------------------
+
+WAIT_KINDS = (
+    "pr", "ci", "workload", "hostjob", "reply", "event", "train",
+    "coordinator",
+)
+WAIT_DEFAULT_DEADLINE = timedelta(hours=4)
+WAIT_COORDINATOR_DEADLINE = timedelta(minutes=15)
+WAIT_EVENT_LOOKBACK_SECONDS = 120
+WAITABLE_STATUSES = ("pending", "running", "wedged", "blocked", "waiting")
+COMPLETION_MESSAGE_TAIL = 2000
+
+
+def _parse_wait_on(spec):
+    """'kind:ref' -> (kind, ref). Raises ValueError on a bad spec."""
+    kind, sep, ref = (spec or "").partition(":")
+    kind = kind.strip().lower()
+    ref = ref.strip()
+    if not sep or kind not in WAIT_KINDS or not ref:
+        raise ValueError(
+            f"bad --on {spec!r}: expected <kind>:<ref> with kind in "
+            f"{', '.join(WAIT_KINDS)} (e.g. pr:https://host/o/r/pull/7, "
+            "ci:repo@abc123, workload:my-label, reply:botchat:7849, "
+            "event:some-tag, hostjob:label, train:topic)"
+        )
+    return kind, ref
+
+
+def _parse_deadline(s):
+    """'90s|30m|2h|1d' -> timedelta."""
+    m = re.match(r"^(\d+)([smhd])$", (s or "").strip())
+    if not m:
+        raise ValueError(f"bad --deadline {s!r} (use Ns/Nm/Nh/Nd)")
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(seconds=n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit])
+
+
+def _parse_ts_safe(ts):
+    if not ts:
+        return None
+    try:
+        d = datetime.fromisoformat(ts)
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wait_describe(it):
+    w = it.get("wait_on") or {}
+    if w.get("kind") == "coordinator":
+        out = ("agent finished -- AWAITING YOUR ACK (`queue done` or "
+               "`queue wait --on ...`)")
+    else:
+        out = f"on {w.get('kind')}:{w.get('ref')}"
+    if it.get("wait_deadline"):
+        out += f" (deadline {it['wait_deadline']})"
+    if it.get("wait_note"):
+        out += f" -- {it['wait_note']}"
+    return out
+
+
+def _apply_wait(target, kind, ref, deadline, note, done_on_success, by):
+    """Mutate `target` into status=waiting. Caller holds the queue lock and
+    recomputes group heads. The agent binding moves to `last_agent_id`: a
+    waiting item has no owner, and keeping `agent_id` would trip the
+    one-item-per-agent check for a dead agent's successor. A real (non-
+    coordinator) wait ACKS any pending completion."""
+    now = datetime.now(timezone.utc)
+    prior = target.get("status")
+    if target.get("agent_id"):
+        target["last_agent_id"] = target.pop("agent_id")
+    if kind != "coordinator" and target.get("pending_completion"):
+        target["completion_acked_at"] = now.isoformat()
+        target["completion_acked_by"] = f"wait:{kind}:{ref}"
+        target.pop("pending_completion", None)
+    target["status"] = "waiting"
+    target["waiting_at"] = now.isoformat()
+    target["waiting_from"] = prior
+    target["wait_on"] = {"kind": kind, "ref": ref}
+    target["wait_deadline"] = (now + deadline).isoformat()
+    target["wait_note"] = note or ""
+    target["wait_done_on_success"] = bool(done_on_success)
+    target["wait_set_by"] = by
+    target.pop("wait_overdue_notified_at", None)
+    target["group_head"] = False
+
+
+def _wake_fields(target, how):
+    """waiting -> pending bookkeeping (caller holds lock)."""
+    target["status"] = "pending"
+    target["wait_resolved_at"] = _fmt_ts()
+    target["wait_resolved_by"] = how
+    target["last_wait_on"] = target.pop("wait_on", None)
+    for k in ("wait_deadline", "wait_overdue_notified_at"):
+        target.pop(k, None)
+
+
+def cmd_queue_wait(args):
+    """Park an item on something external: status=waiting.
+
+    This is THE way to leave work whose owner is done/absent but whose
+    outcome is still pending -- CI for a PR, a merge-queue landing, a
+    workload, a reply from the operator, a hostjob. It is also how a
+    finished agent's pending completion is ACKED when the work is not yet
+    delivered (the other ack is `queue done`).
+
+    A waiting item has no agent owner, releases its scope, is NOT an orphan,
+    and is shown as "waiting on <thing>" everywhere (queue list, dashboard).
+
+    `--on KIND:REF` kinds: pr:<url>, ci:<repo>@<sha|run>, workload:<label>,
+    hostjob:<label>, reply:<channel>:<msg-id>, event:<tag>, train:<ref>.
+    (`coordinator:` is reserved for `agent-finished`.)
+
+    `queue sweep` resolves it when the matching claude-event arrives: the item
+    returns to `pending` (re-spawn / re-register it), or goes straight to
+    `done` with --done-on-success when the event reports success. Past
+    --deadline (default 4h) the sweep raises a `queue-wait-overdue` event
+    and the exporter's WorkQueueWaitOverdue alert -- never the orphan alert.
+
+    Allowed from pending/running/wedged/blocked/waiting (re-waiting replaces
+    the previous wait). Replaces `heartbeat --pid <bg pid>` as the way to
+    keep a running item with no live agent honest.
+    """
+    try:
+        kind, ref = _parse_wait_on(args.on)
+        if kind == "coordinator":
+            raise ValueError("kind 'coordinator' is reserved for "
+                             "`queue agent-finished`")
+        deadline = (_parse_deadline(args.deadline) if args.deadline
+                    else WAIT_DEFAULT_DEADLINE)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        if target.get("status") not in WAITABLE_STATUSES:
+            print(
+                f"wait refused: {args.id} status={target.get('status')!r} "
+                f"(must be one of {', '.join(WAITABLE_STATUSES)})",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        _apply_wait(target, kind, ref, deadline, args.note,
+                    args.done_on_success, by="cli")
+        _recompute_group_heads(items)
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    log_completed(
+        f"[queue {args.id} WAITING] {target.get('description','')} "
+        f"({_wait_describe(updated)})",
+        extra={"source": "queue", "event": "wait", "id": args.id,
+               "wait_on": updated["wait_on"]},
+    )
+    if args.json:
+        print(json.dumps(updated, indent=2))
+    else:
+        print(f"waiting: {args.id} {_wait_describe(updated)}")
+
+
+def cmd_queue_unwait(args):
+    """waiting -> pending (manual wake; `sweep` does this from events).
+    Refused while an agent completion is unacked: ack it with `queue done`
+    or `queue wait --on ...` first."""
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        problem = None
+        if target is None:
+            problem = "not found"
+        elif target.get("status") != "waiting":
+            problem = f"status={target.get('status')!r} (must be waiting)"
+        elif target.get("pending_completion"):
+            problem = ("an agent completion is UNACKED: run `queue done` or "
+                       "`queue wait --on <kind:ref>` first")
+        if problem:
+            print(f"unwait refused: {args.id} {problem}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        _wake_fields(target, "manual")
+        _recompute_group_heads(items)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    print(f"unwaited: {args.id} -> pending")
+
+
+def _event_dirs():
+    qdir = Path(os.environ.get("CLAUDE_EVENT_QUEUE")
+                or os.environ.get("CRON_EVENT_QUEUE")
+                or Path.home() / "claude-events")
+    ldir = Path(os.environ.get("CLAUDE_EVENT_LOG_DIR")
+                or Path.home() / ".config" / "claude-events")
+    return qdir, ldir
+
+
+def _event_ts(ev):
+    iso = ev.get("timestamp_iso")
+    if iso:
+        d = _parse_ts_safe(iso)
+        if d:
+            return d
+    t = ev.get("timestamp")
+    if isinstance(t, (int, float)):
+        return datetime.fromtimestamp(t, timezone.utc)
+    return None
+
+
+def _load_recent_events(since, tail_lines=5000):
+    """Events newer than `since`: pending queue files + the consumed log tail
+    (the watcher moves events into the log, so both must be read)."""
+    qdir, ldir = _event_dirs()
+    out = []
+
+    def keep(ev):
+        if not isinstance(ev, dict):
+            return
+        ts = _event_ts(ev)
+        if ts is None or ts >= since:
+            out.append(ev)
+
+    try:
+        for f in sorted(qdir.glob("*.json")):
+            if f.name.startswith("."):
+                continue
+            try:
+                keep(json.loads(f.read_text()))
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    try:
+        lines = (ldir / "consumed.jsonl").read_text().splitlines()[-tail_lines:]
+        for ln in lines:
+            try:
+                keep(json.loads(ln))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
+def _wait_match(wait_on, ev):
+    """(matched, success) for one event against one wait. Pure."""
+    kind, ref = wait_on.get("kind"), wait_on.get("ref", "")
+    tag = str(ev.get("tag", ""))
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    raw = json.dumps(ev, sort_keys=True)
+    low = str(ev.get("message", "")).lower()
+    failed_words = ("fail", "error", "killed", "cancel", "closed")
+    rc = data.get("exit_code", data.get("rc"))
+    rc_ok = rc in (None, 0, "0")
+    if kind == "workload":
+        if tag != "workload-done" or data.get("label") != ref:
+            return False, False
+        return True, rc_ok and data.get("killed") not in (True, "True", "true")
+    if kind == "hostjob":
+        if "hostjob" not in tag or ref not in raw:
+            return False, False
+        return True, rc_ok and not any(w in low for w in failed_words)
+    if kind == "ci":
+        if not tag.startswith("ci-run") or not tag.endswith("finished"):
+            return False, False
+        sha = ref.split("@", 1)[-1]
+        if ref not in raw and sha[:12] not in raw:
+            return False, False
+        concl = str(data.get("conclusion") or data.get("status") or "").lower()
+        ok = (concl in ("success", "passed", "pass", "ok")) if concl else (
+            rc_ok and not any(w in low for w in failed_words))
+        return True, ok
+    if kind == "pr":
+        if tag != "pr-status-change":
+            return False, False
+        num = ref.rstrip("/").rsplit("/", 1)[-1]
+        if ref not in raw and f"pr #{num}" not in low:
+            return False, False
+        if "merged" in low:
+            return True, True
+        if "ci failure" in low or "closed" in low:
+            return True, False
+        return False, False
+    if kind == "train":
+        return (tag == "train-landed" and ref in raw), True
+    if kind == "event":
+        return tag == ref, True
+    if kind == "reply":
+        _, _, msgid = ref.partition(":")
+        return (bool(msgid) and msgid in raw
+                and not tag.startswith("queue-")), True
+    return False, False
+
+
+def cmd_queue_sweep(args):
+    """Resolve `waiting` items from claude-events and flag overdue waits.
+
+    Meant for cron (every couple of minutes). For each waiting item, looks
+    for a matching event (pending queue dir + consumed log) newer than the
+    wait. A match wakes the item to `pending` -- or closes it as `done` when
+    it was set with --done-on-success and the event reports success. Items
+    past their deadline get ONE `queue-wait-overdue` event (and the
+    exporter's WorkQueueWaitOverdue alert). `coordinator` waits (unacked
+    agent completions) never auto-resolve; they only age toward overdue.
+    -n/--dry-run reports without writing.
+    """
+    now = datetime.now(timezone.utc)
+    fh, data = _queue_open_locked("rw")
+    woke, closed, overdue = [], [], []
+    try:
+        items = data["items"]
+        waiting = [it for it in items if it.get("status") == "waiting"]
+        events = []
+        if waiting:
+            oldest = min(
+                (_parse_ts_safe(it.get("waiting_at")) or now) for it in waiting
+            ) - timedelta(seconds=WAIT_EVENT_LOOKBACK_SECONDS)
+            events = _load_recent_events(oldest)
+        for it in waiting:
+            w = it.get("wait_on") or {}
+            since = (_parse_ts_safe(it.get("waiting_at")) or now) - timedelta(
+                seconds=WAIT_EVENT_LOOKBACK_SECONDS)
+            hit = None
+            if w.get("kind") != "coordinator":
+                for ev in events:
+                    ets = _event_ts(ev)
+                    if ets is not None and ets < since:
+                        continue
+                    matched, ok = _wait_match(w, ev)
+                    if matched:
+                        hit = (ev, ok)
+                        if ok:
+                            break
+            if hit:
+                ev, ok = hit
+                rec = {"id": it["id"], "wait_on": w, "success": ok,
+                       "event_tag": ev.get("tag"),
+                       "summary": _item_summary(it)}
+                if ok and it.get("wait_done_on_success"):
+                    closed.append(rec)
+                else:
+                    woke.append(rec)
+                    if not args.dry_run:
+                        _wake_fields(it, f"event:{ev.get('tag')}")
+                continue
+            dl = _parse_ts_safe(it.get("wait_deadline"))
+            if dl and now > dl and not it.get("wait_overdue_notified_at"):
+                overdue.append({"id": it["id"], "wait_on": w,
+                                "summary": _item_summary(it),
+                                "deadline": it.get("wait_deadline")})
+                if not args.dry_run:
+                    it["wait_overdue_notified_at"] = now.isoformat()
+        if args.dry_run:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        else:
+            _recompute_group_heads(items)
+            _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    if not args.dry_run:
+        for rec in closed:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_queue_done(argparse.Namespace(id=rec["id"]))
+        for rec in woke:
+            w = rec["wait_on"]
+            _claude_event_notify(
+                tag="queue-wait-resolved",
+                message=(
+                    f"queue wait resolved: {rec['id']} ({rec['summary']}) "
+                    f"{w.get('kind')}:{w.get('ref')} -> "
+                    f"{'success' if rec['success'] else 'FAILURE'}; item is "
+                    f"pending again -- act on it (re-spawn, or "
+                    f"`session-task queue done {rec['id']}`)"
+                ),
+                data={"queue_id": rec["id"], "wait_on": w,
+                      "success": rec["success"],
+                      # a failed/closed wait needs action; success is a
+                      # routine reopen the coordinator will see in the queue
+                      **({"tier": "ambient"} if rec["success"] else {})},
+                priority="low" if rec["success"] else "normal",
+            )
+        for rec in overdue:
+            w = rec["wait_on"]
+            _claude_event_notify(
+                tag="queue-wait-overdue",
+                message=(
+                    f"queue WAIT OVERDUE: {rec['id']} ({rec['summary']}) was "
+                    f"waiting on {w.get('kind')}:{w.get('ref')} past "
+                    f"{rec['deadline']}. Decide: `session-task queue done "
+                    f"{rec['id']}`, `queue wait {rec['id']} --on ... "
+                    f"--deadline ...` (extend), or `queue abandon "
+                    f"{rec['id']}`."
+                ),
+                data={"queue_id": rec["id"], "wait_on": w,
+                      "deadline": rec["deadline"]},
+                priority="normal",
+            )
+    if args.json:
+        print(json.dumps({"woke": woke, "closed": closed,
+                          "overdue": overdue}, indent=2))
+    else:
+        print(f"sweep: woke={len(woke)} closed={len(closed)} "
+              f"overdue={len(overdue)}" + (" (dry-run)" if args.dry_run else ""))
+
+
+def cmd_queue_agent_finished(args):
+    """An agent has ended: no item may stay `running` on it, and the
+    coordinator must explicitly deal with the completion.
+
+    Run by the SubagentStop hook the instant the agent exits. Items owned by
+    --agent-id (row `agent_id`, or the spawn binding) that are still
+    running/wedged are moved to status=waiting on `coordinator:ack` and get a
+    PENDING COMPLETION record (agent id, time, tail of its final message --
+    pass the message on stdin with --message-stdin). NOTHING is closed or
+    resolved for the coordinator: it must ack with `queue done <id>` or
+    `queue wait <id> --on <kind:ref>` (or `abandon`). Until it does, the
+    `unacked_agent_completion` obligation gate refuses the coordinator's
+    tool calls. Idempotent: items already done/waiting/blocked/abandoned (the
+    agent already moved them) are skipped.
+    """
+    aid = args.agent_id
+    message = sys.stdin.read() if args.message_stdin else ""
+    bound = set()
+    try:
+        bp = Path(os.environ.get(
+            "CLAUDE_AGENT_QUEUE_BINDINGS_PATH",
+            str(Path.home() / ".config/claude/agent-queue-bindings.json")))
+        rec = (json.loads(bp.read_text()).get("bindings") or {}).get(aid)
+        if isinstance(rec, dict) and rec.get("queue_id"):
+            bound.add(rec["queue_id"])
+    except (OSError, ValueError, AttributeError):
+        pass
+    fh, data = _queue_open_locked("rw")
+    moved = []
+    try:
+        items = data["items"]
+        now = _fmt_ts()
+        for it in items:
+            if it.get("status") not in ("running", "wedged"):
+                continue
+            if it.get("agent_id") != aid and it.get("id") not in bound:
+                continue
+            _apply_wait(it, "coordinator", "ack", WAIT_COORDINATOR_DEADLINE,
+                        f"agent {aid} exited with the item still running",
+                        False, by=f"agent:{aid}")
+            it["pending_completion"] = {
+                "agent_id": aid,
+                "at": now,
+                "message_tail": message.strip()[-COMPLETION_MESSAGE_TAIL:],
+            }
+            moved.append((it["id"], _item_summary(it)))
+        if moved:
+            _recompute_group_heads(items)
+            _queue_write_and_unlock(fh, data)
+        else:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    for qid, summ in moved:
+        _claude_event_notify(
+            tag="queue-agent-finished",
+            message=(
+                f"agent {aid} finished; {qid} ({summ}) has an UNACKED "
+                f"completion and the coordinator is gated until you ack it: "
+                f"`session-task queue done {qid}` (work delivered) or "
+                f"`session-task queue wait {qid} --on <pr:|ci:|workload:|"
+                f"reply:|event:|hostjob:|train:KIND:REF> [--done-on-success]` "
+                f"(still waiting on something)."
+            ),
+            data={"queue_id": qid, "agent_id": aid,
+                  "options": ["done", "wait --on"]},
+            priority="normal",
+        )
+    print(f"agent-finished: {aid} pending-completions={len(moved)} "
+          + ",".join(q for q, _ in moved))
+
+
 def cmd_queue_unblock(args):
     """Flip a blocked queue item back to status=running, or to status=pending
     (serialized) if a peer now holds its scope.
@@ -9982,6 +10536,64 @@ def build_parser():
         help="Suppress the pingme + claude-event notifications for this operation.",
     )
 
+    q_wait = qsub.add_parser(
+        "wait",
+        help=(
+            "PREFERRED over `heartbeat --pid`/`block` for work parked on "
+            "something external: status=waiting on KIND:REF. No agent owner "
+            "needed, never orphaned, auto-reopened/closed by `queue sweep` "
+            "when the matching claude-event arrives, flagged overdue past "
+            "--deadline. Also ACKS a finished agent's pending completion."
+        ),
+    )
+    q_wait.add_argument("id")
+    q_wait.add_argument(
+        "--on", required=True, metavar="KIND:REF",
+        help=(
+            "pr:<url> | ci:<repo>@<sha|run> | workload:<label> | "
+            "hostjob:<label> | reply:<channel>:<msg-id> | event:<tag> | "
+            "train:<ref>"
+        ),
+    )
+    q_wait.add_argument("--deadline", metavar="DUR",
+                        help="Ns/Nm/Nh/Nd (default 4h)")
+    q_wait.add_argument("--note", default="")
+    q_wait.add_argument(
+        "--done-on-success", action="store_true",
+        help="close the item as done (instead of reopening it to pending) "
+             "when the awaited event reports success")
+    q_wait.add_argument("--json", action="store_true")
+
+    q_unwait = qsub.add_parser(
+        "unwait", help="waiting -> pending (manual wake; refused while an "
+                       "agent completion is unacked)")
+    q_unwait.add_argument("id")
+
+    q_sweep = qsub.add_parser(
+        "sweep",
+        help=(
+            "Cron entry: reopen waiting items to pending (or close as done "
+            "for --done-on-success) when their awaited claude-event arrives; "
+            "emit queue-wait-overdue for waits past their deadline."
+        ),
+    )
+    q_sweep.add_argument("-n", "--dry-run", action="store_true")
+    q_sweep.add_argument("--json", action="store_true")
+
+    q_afin = qsub.add_parser(
+        "agent-finished",
+        help=(
+            "SubagentStop hook entry: record a PENDING COMPLETION for the "
+            "finished agent's still-running items (-> waiting on the "
+            "coordinator; message tail read with --message-stdin). Never "
+            "closes anything; the coordinator must ack with `queue done` or "
+            "`queue wait --on ...`, enforced by the unacked_agent_completion "
+            "obligation gate."
+        ),
+    )
+    q_afin.add_argument("--agent-id", required=True)
+    q_afin.add_argument("--message-stdin", action="store_true")
+
     q_unblock = qsub.add_parser(
         "unblock",
         help=(
@@ -10395,6 +11007,10 @@ def main():
             "unwedge": cmd_queue_unwedge,
             "block": cmd_queue_block,
             "unblock": cmd_queue_unblock,
+            "wait": cmd_queue_wait,
+            "unwait": cmd_queue_unwait,
+            "sweep": cmd_queue_sweep,
+            "agent-finished": cmd_queue_agent_finished,
             "spawn-check": cmd_queue_spawn_check,
             "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,

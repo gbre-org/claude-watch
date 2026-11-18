@@ -288,6 +288,7 @@ test-hooks: ## obligations + PreToolUse/PostToolUse hook suites
 	tools/hooks/tests/user-prompt-claude-watch-alert-record-hook.test
 	tools/hooks/tests/pre-tool-dispatch-gate-hook.test
 	tools/hooks/tests/post-tool-agent-arm-hook.test
+	tools/hooks/tests/subagent-stop-queue-hook.test
 	tools/hooks/pre-agent-background-required-hook --test
 	tools/hooks/pre-agent-worktree-isolation-hook --test
 	tools/hooks/worktree-create-hook --test
@@ -341,6 +342,7 @@ test-event-must-act: ## event-must-act toolchain self-tests
 	python3 tools/event-must-act/event-ack --self-test
 	python3 tools/event-must-act/eval-event-must-act --self-test
 	python3 container/bin/eval-orphaned-running-hard-gate --self-test
+	python3 container/bin/eval-unacked-agent-completion --self-test
 	tools/event-must-act/tests/cw-watcher-health-check.test
 	tools/event-must-act/tests/cw-inbox-delivery-check.test
 	tools/event-must-act/tests/producer-tier-e2e.test
@@ -809,6 +811,7 @@ TOOL_LINKS := \
 	event-ack=tools/event-must-act/event-ack \
 	eval-event-must-act=tools/event-must-act/eval-event-must-act \
 	eval-orphaned-running-hard-gate=container/bin/eval-orphaned-running-hard-gate \
+	eval-unacked-agent-completion=container/bin/eval-unacked-agent-completion \
 	user-prompt-ambient-inject-hook=tools/event-must-act/user-prompt-ambient-inject-hook \
 	cw-watcher-health-check=tools/event-must-act/cw-watcher-health-check \
 	cw-inbox-delivery-check=tools/event-must-act/cw-inbox-delivery-check \

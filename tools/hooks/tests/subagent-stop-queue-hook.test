@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Tests for subagent-stop-queue-hook (SubagentStop -> pending completion).
+
+Cases:
+  1. SubagentStop payload for an agent that owns a running item -> item moves
+     to waiting on the coordinator with a pending_completion (message tail kept)
+  2. Nothing is closed: status is waiting, never done
+  3. Unknown agent -> no change
+  4. Malformed stdin / missing agent_id -> exit 0, no change (default-open)
+  5. Missing session-task binary -> exit 0
+  6. Replay of the same payload is idempotent
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOK = HERE.parent / "subagent-stop-queue-hook"
+SESSION_TASK = HERE.parent.parent / "session-task" / "session-task"
+
+
+def _env(tmp, **extra):
+    env = os.environ.copy()
+    env.update({
+        "HOME": tmp,
+        "PINGME_SESSION_TASK": "0",
+        "CLAUDE_EVENT_SESSION_TASK": "0",
+        "SESSION_TASK_BIN": str(SESSION_TASK),
+        "CLAUDE_AGENT_QUEUE_BINDINGS_PATH": str(Path(tmp) / "b.json"),
+    })
+    env.update(extra)
+    return env
+
+
+def _st(env, *argv):
+    r = subprocess.run([sys.executable, str(SESSION_TASK), *argv],
+                       capture_output=True, text=True, env=env, timeout=20)
+    assert r.returncode == 0, (argv, r.stdout, r.stderr)
+    return r.stdout
+
+
+def _hook(env, payload, raw=None):
+    return subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=raw if raw is not None else json.dumps(payload),
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+
+
+def _owned_running(env, agent_id):
+    qid = json.loads(_st(env, "queue", "add", "work", "--scope", "repo:h-a",
+                         "--summary", "s", "--json"))["id"]
+    _st(env, "queue", "register", qid, "--json")
+    path = Path(env["HOME"]) / ".config/session/queue.json"
+    d = json.loads(path.read_text())
+    for it in d["items"]:
+        if it["id"] == qid:
+            it["agent_id"] = agent_id
+    path.write_text(json.dumps(d))
+    return qid
+
+
+def _item(env, qid):
+    return json.loads(_st(env, "queue", "show", qid))
+
+
+def test_stop_records_pending_completion_without_closing():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env(tmp)
+        qid = _owned_running(env, "agent-xyz")
+        r = _hook(env, {"hook_event_name": "SubagentStop",
+                        "agent_id": "agent-xyz",
+                        "last_assistant_message": "PR opened, CI pending"})
+        assert r.returncode == 0, r.stderr
+        it = _item(env, qid)
+        assert it["status"] == "waiting"
+        assert it["wait_on"]["kind"] == "coordinator"
+        assert "CI pending" in it["pending_completion"]["message_tail"]
+        r = _hook(env, {"agent_id": "agent-xyz"})  # replay
+        assert r.returncode == 0
+        assert _item(env, qid)["status"] == "waiting"
+
+
+def test_unknown_agent_and_bad_input_are_noops():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env(tmp)
+        qid = _owned_running(env, "agent-1")
+        assert _hook(env, {"agent_id": "someone-else"}).returncode == 0
+        assert _hook(env, None, raw="not json").returncode == 0
+        assert _hook(env, {"no": "agent"}).returncode == 0
+        assert _item(env, qid)["status"] == "running"
+
+
+def test_missing_cli_is_default_open():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env(tmp, SESSION_TASK_BIN="/nonexistent/session-task")
+        r = _hook(env, {"agent_id": "agent-1"})
+        assert r.returncode == 0
+
+
+if __name__ == "__main__":
+    import traceback
+    failed = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except Exception:  # noqa: BLE001
+                failed += 1
+                print(f"FAIL {name}")
+                traceback.print_exc()
+    sys.exit(1 if failed else 0)

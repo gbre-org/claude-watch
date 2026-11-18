@@ -272,6 +272,12 @@ OBLIGATIONS_HOOKS: list[tuple[str, str, str]] = [
     # on every error path -- a hook failure can never block a spawn
     # that already happened.
     ("PostToolUse", "Agent", "/usr/local/bin/post-tool-agent-arm-hook"),
+    # SubagentStop: the instant a subagent exits, record a PENDING COMPLETION
+    # for its queue item (`session-task queue agent-finished`): the item moves
+    # running -> waiting-on-the-coordinator and the `unacked_agent_completion`
+    # obligation gate blocks the coordinator until it acks with `queue done`
+    # or `queue wait --on ...`. Never closes anything itself. Default-open.
+    ("SubagentStop", "", "/usr/local/bin/subagent-stop-queue-hook"),
     # Auto-mark Signal attachment files as read after a Read of any path
     # under ~/signal-queue/attachments/. Mirrors the host's PostToolUse
     # "Read" matcher. Inert in the container by default (no signal-queue
