@@ -495,6 +495,44 @@ class WrongRowRegressionTest(unittest.TestCase):
         result = self._drive(pane, "personal-mbp")
         self.assertTrue(result["ok"], result)
 
+    def _no_reconnect_pane(self, status_line):
+        pane = FakeMcpPane(self.NAMES)
+        lines = ["personal-mbp MCP Server"] + ([status_line] if status_line else []) + [
+            " \u276f 1. View tools", "   2. Disable",
+            "\u2191/\u2193 to navigate \xb7 Enter to select \xb7 Esc to back"]
+        pane._detail_lines = lambda: lines
+        return pane
+
+    def test_no_reconnect_but_connected_on_detail_is_noop_success(self):
+        pane = self._no_reconnect_pane("Status: \u2714 connected")
+        result = self._drive(pane, "personal-mbp")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(result["status"], "already connected")
+
+    def test_no_reconnect_connected_per_cli_is_noop_success(self):
+        pane = self._no_reconnect_pane(None)
+        self.mod.verify_via_cli = lambda s: f"{s}: x - \u2714 Connected"
+        result = self._drive(pane, "personal-mbp")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "already connected")
+
+    def test_no_reconnect_and_not_connected_still_code_4(self):
+        pane = self._no_reconnect_pane("Status: \u2718 failed")
+        self.mod.verify_via_cli = lambda s: f"{s}: x - \u2718 Failed to connect"
+        result = self._drive(pane, "personal-mbp")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], 4)
+        self.assertIn("no Reconnect action", result["reason"])
+
+    def test_status_helpers(self):
+        m = self.mod
+        self.assertTrue(m.detail_status_connected("Status: \u2714 connected\n"))
+        self.assertFalse(m.detail_status_connected("Status: disconnected\n"))
+        self.assertFalse(m.detail_status_connected("nothing"))
+        self.assertTrue(m.cli_status_connected("a: b - \u2714 Connected"))
+        self.assertFalse(m.cli_status_connected("a: b - \u2718 Failed to connect"))
+
     def test_detail_header_tolerates_border_and_suffix(self):
         self.assertEqual(
             self.mod.detail_header_name("\u2502 Personal-mbp MCP Server \u2502\n"),
