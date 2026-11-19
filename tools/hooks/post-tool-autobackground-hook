@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""PostToolUse hook -- an auto-backgrounded Bash call is a FAILURE signal.
+
+When a Bash call exceeds its timeout the harness moves it to the background and
+puts a notice in the tool result ("... did not complete within its Ns timeout
+and was moved to the background"). Hitting that means the caller ran a long job
+in the foreground instead of `workload run` / `hostjob run`. This hook detects
+the notice (main loop AND subagents) and emits a claude-event, tag
+`autobackground-hit`, carrying the agent id, the queue id (when the agent is
+bound), and the command, so the coordinator can correct the offender.
+
+Never blocks; always prints `{}`. Default-open on any error.
+Env: CLAUDE_EVENT_BIN (override emitter, for tests),
+CLAUDE_AGENT_QUEUE_BINDINGS_PATH (bindings file).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+NOTICE = re.compile(
+    r"did not complete within[^.\n]{0,80}?timeout[^.\n]{0,40}?moved to the background",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _flatten(v) -> str:
+    if isinstance(v, str):
+        return v
+    try:
+        return json.dumps(v)
+    except Exception:  # noqa: BLE001
+        return str(v)
+
+
+def is_hit(payload) -> bool:
+    if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+        return False
+    ti = payload.get("tool_input") or {}
+    if isinstance(ti, dict) and str(ti.get("run_in_background")).lower() in ("true", "1"):
+        return False  # deliberate background: no notice, not an auto-background
+    return bool(NOTICE.search(_flatten(payload.get("tool_response"))))
+
+
+def _queue_id(agent_id: str) -> str:
+    if not agent_id:
+        return ""
+    path = os.environ.get("CLAUDE_AGENT_QUEUE_BINDINGS_PATH") or os.path.expanduser(
+        "~/.config/claude/agent-queue-bindings.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)["bindings"][agent_id]["queue_id"]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def emit(payload) -> None:
+    aid = payload.get("agent_id")
+    aid = aid.strip() if isinstance(aid, str) else ""
+    ti = payload.get("tool_input") or {}
+    cmd = (ti.get("command") if isinstance(ti, dict) else "") or ""
+    scope = "subagent" if aid else "main-loop"
+    qid = _queue_id(aid)
+    msg = (f"AUTO-BACKGROUND HIT ({scope}{' ' + aid if aid else ''}"
+           f"{' ' + qid if qid else ''}): a Bash call exceeded its timeout and was moved "
+           f"to the background. Foreground long work is a failure: use "
+           f"`workload run <label> -- <cmd>` or `hostjob run`. Command: {cmd[:200]}")
+    argv = [os.environ.get("CLAUDE_EVENT_BIN", "claude-event"), "emit", msg,
+            "--tag", "autobackground-hit", "--priority", "high",
+            "--source", "claude-watch",
+            "--data", f"scope={scope}", "--data", f"agent_id={aid}",
+            "--data", f"queue_id={qid}", "--data", f"command={cmd[:500]}"]
+    subprocess.run(argv, timeout=4, capture_output=True, check=False)
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        if is_hit(payload):
+            emit(payload)
+    except Exception:  # noqa: BLE001 -- default-open
+        pass
+    print("{}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

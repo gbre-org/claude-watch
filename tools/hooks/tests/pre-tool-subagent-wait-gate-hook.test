@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Tests for pre-tool-subagent-wait-gate-hook and post-tool-autobackground-hook."""
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PRE = HERE.parent / "pre-tool-subagent-wait-gate-hook"
+POST = HERE.parent / "post-tool-autobackground-hook"
+fails = 0
+
+
+def run(hook, payload, env=None):
+    e = os.environ.copy()
+    e.update(env or {})
+    p = subprocess.run([sys.executable, str(hook)], input=json.dumps(payload),
+                       capture_output=True, text=True, env=e, timeout=15)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+def check(name, cond):
+    global fails
+    print(("ok: " if cond else "FAIL: ") + name)
+    fails += 0 if cond else 1
+
+
+def bash(cmd, agent="a1", **extra):
+    ti = {"command": cmd, **extra}
+    p = {"tool_name": "Bash", "tool_input": ti}
+    if agent:
+        p["agent_id"] = agent
+    return p
+
+
+def denied(d):
+    return d.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+
+
+DENY = [
+    "sleep 100; cat /tmp/claude-1000/x/tasks/abc.output",
+    "end=$((SECONDS+100)); until [ -s /tmp/claude-1000/-h/s/tasks/b1.output ] || [ $SECONDS -gt $end ]; do sleep 3; done",
+    "until [ -f x ]; do sleep 1; done",
+    "while pgrep ffmpeg; do sleep 0.5; done",
+    "sleep 6",
+    "sleep 100",
+    "sleep 2m",
+    "cd x && sleep 30 && ls",
+    "tail -f /tmp/claude-1000/a/tasks/xyz.output",
+    "while true\ndo\n sleep 1\ndone",
+]
+ALLOW = [
+    "sleep 1", "sleep 5", "sleep 0.5; echo hi", "ls /tmp", "grep sleep notes.md",
+    "workload run job -- rsync -a a b", "workload log job",
+    "for f in *.mkv; do echo $f; done", "echo until done", "cat tasks.txt",
+]
+for c in DENY:
+    check(f"subagent deny {c[:50]!r}", denied(run(PRE, bash(c))))
+    check(f"main-loop allow {c[:50]!r}", run(PRE, bash(c, agent=None)) == {})
+for c in ALLOW:
+    check(f"subagent allow {c[:50]!r}", run(PRE, bash(c)) == {})
+check("subagent deny run_in_background",
+      denied(run(PRE, bash("ls", run_in_background=True))))
+check("subagent allow run_in_background false",
+      run(PRE, bash("ls", run_in_background=False)) == {})
+check("main-loop allow run_in_background",
+      run(PRE, bash("ls", agent=None, run_in_background=True)) == {})
+check("subagent deny timeout 120000", denied(run(PRE, bash("ls", timeout=120000))))
+check("subagent allow timeout 15000", run(PRE, bash("ls", timeout=15000)) == {})
+check("main-loop allow timeout 600000",
+      run(PRE, bash("ls", agent=None, timeout=600000)) == {})
+rd = {"tool_name": "Read", "agent_id": "a1",
+      "tool_input": {"file_path": "/tmp/claude-1000/p/s/tasks/abc.output"}}
+check("subagent deny Read task output", denied(run(PRE, rd)))
+rd.pop("agent_id")
+check("main-loop allow Read task output", run(PRE, rd) == {})
+check("subagent allow Read normal",
+      run(PRE, {"tool_name": "Read", "agent_id": "a1",
+                "tool_input": {"file_path": "/etc/hostname"}}) == {})
+check("deny message names workload", "workload run" in
+      run(PRE, bash("sleep 99"))["hookSpecificOutput"]["permissionDecisionReason"])
+check("non-dict payload allow", run(PRE, []) == {})
+check("blank agent_id is main loop", run(PRE, bash("sleep 99", agent="  ")) == {})
+
+# ---- PostToolUse auto-background detector ----
+NOTICE = ("Command did not complete within its 120s timeout and was moved to the "
+          "background. Task id: b9x")
+with tempfile.TemporaryDirectory() as td:
+    log = Path(td) / "events.jsonl"
+    stub = Path(td) / "ce"
+    stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    bind = Path(td) / "b.json"
+    bind.write_text(json.dumps({"bindings": {"a1": {"queue_id": "q-2026-11-19-zzzz"}}}))
+    env = {"CLAUDE_EVENT_BIN": str(stub), "CLAUDE_AGENT_QUEUE_BINDINGS_PATH": str(bind)}
+
+    def post(cmd, resp, agent="a1", **ti):
+        p = {"tool_name": "Bash", "tool_input": {"command": cmd, **ti},
+             "tool_response": resp}
+        if agent:
+            p["agent_id"] = agent
+        return run(POST, p, env)
+
+    def lines():
+        return log.read_text().splitlines() if log.exists() else []
+
+    check("post always {}", post("ls", {"stdout": "x"}) == {} and lines() == [])
+    post("sleep 200", {"stdout": NOTICE})
+    check("subagent hit emits", len(lines()) == 1 and "autobackground-hit" in lines()[0]
+          and "q-2026-11-19-zzzz" in lines()[0] and "agent_id=a1" in lines()[0]
+          and "sleep 200" in lines()[0])
+    post("sleep 200", NOTICE, agent=None)
+    check("main-loop hit emits", len(lines()) == 2 and "scope=main-loop" in lines()[1])
+    post("sleep 200", {"stdout": NOTICE}, run_in_background=True)
+    check("deliberate background not a hit", len(lines()) == 2)
+    p = run(POST, {"tool_name": "Read", "tool_response": NOTICE}, env)
+    check("non-Bash ignored", p == {} and len(lines()) == 2)
+    check("bad json default-open",
+          subprocess.run([sys.executable, str(POST)], input="{{", capture_output=True,
+                         text=True).stdout.strip() == "{}")
+
+print("FAILS:", fails)
+sys.exit(1 if fails else 0)
