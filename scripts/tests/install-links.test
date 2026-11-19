@@ -172,6 +172,13 @@ for name, src in tool_links.items():
     check(p.is_file(), f"{name}: source {src} exists as a file")
     check(os.access(p, os.X_OK), f"{name}: source {src} is executable")
 
+# SubagentStop hook: omitting it left the unacked_agent_completion gate with no
+# producer on a host install.
+check(
+    tool_links.get("subagent-stop-queue-hook") == "tools/hooks/subagent-stop-queue-hook",
+    "subagent-stop-queue-hook is linked by `make install`",
+)
+
 # -----------------------------------------------------------------------------
 print("4. Public-repo hygiene: no private-path sentinel in the linked paths")
 # -----------------------------------------------------------------------------
