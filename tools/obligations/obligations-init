@@ -230,6 +230,21 @@ def _eval_bin(name: str) -> str:
     return os.path.join(base, name)
 
 
+def _eval_cmd(name: str) -> str:
+    """Evaluator command for a row that must work on a container AND a host.
+
+    ``$CW_EVAL_BIN_DIR`` wins when set. Otherwise the baked container path is
+    used when that file exists; when it does not (a host install, where
+    ``make install`` links the evaluator into ``~/bin`` and ``/usr/local/bin``
+    has none), the BARE name is returned so the evaluator predicate resolves
+    it via PATH. A hardcoded absolute path that does not exist would be
+    default-open and silently enforce nothing."""
+    if os.environ.get("CW_EVAL_BIN_DIR", "").strip():
+        return _eval_bin(name)
+    baked = _eval_bin(name)
+    return baked if os.path.exists(baked) else name
+
+
 def _resolve_cli() -> str | None:
     """Resolve the obligations CLI path. Prefer PATH, fall back to known
     install locations. Returns None when not found."""
@@ -723,7 +738,7 @@ def seed_unacked_agent_completion(cli: str, *, dry_run: bool = False,
         return 0
 
     predicate_params = _main_loop_only_evaluator_params(
-        _eval_bin("eval-unacked-agent-completion"))
+        _eval_cmd("eval-unacked-agent-completion"))
 
     cmd = [
         cli, "add",

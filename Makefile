@@ -798,6 +798,7 @@ TOOL_LINKS := \
 	pre-agent-background-required-hook=tools/hooks/pre-agent-background-required-hook \
 	pre-agent-worktree-isolation-hook=tools/hooks/pre-agent-worktree-isolation-hook \
 	worktree-create-hook=tools/hooks/worktree-create-hook \
+	subagent-stop-queue-hook=tools/hooks/subagent-stop-queue-hook \
 	agent-msg=tools/agent-msg/agent-msg \
 	agent-tail=tools/agent-tail/agent-tail \
 	pr-branches=tools/pr-branches/pr-branches \
