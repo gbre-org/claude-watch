@@ -662,6 +662,39 @@ g_quarantined_age = Gauge(
     ["id", "summary"],
     registry=REG,
 )
+g_waiting_age = Gauge(
+    "worktask_queue_item_waiting_age_seconds",
+    (
+        "Seconds since `waiting_at` for items in the `waiting` state -- "
+        "work parked on something external (`kind`:`ref`, e.g. pr / ci / "
+        "workload / reply) or, kind=coordinator, a finished agent's "
+        "completion awaiting the coordinator's ack. A waiting item has NO "
+        "agent owner by design and is never counted as an orphan."
+    ),
+    ["id", "summary", "kind", "ref"],
+    registry=REG,
+)
+g_wait_overdue = Gauge(
+    "worktask_queue_item_wait_overdue_seconds",
+    (
+        "Seconds past `wait_deadline` for a waiting item whose awaited "
+        "event never arrived. Series exists ONLY while overdue. Drives "
+        "WorkQueueWaitOverdue (the distinct, non-orphan alert for waits)."
+    ),
+    ["id", "summary", "kind", "ref"],
+    registry=REG,
+)
+g_unacked_completion_age = Gauge(
+    "worktask_queue_item_unacked_completion_age_seconds",
+    (
+        "Seconds since an agent finished with its queue item still "
+        "unacknowledged (`pending_completion` set). The obligation gate "
+        "blocks the coordinator until it acks via `queue done` / `queue "
+        "wait --on`, so a long-lived one means the gate is not doing its job."
+    ),
+    ["id", "summary"],
+    registry=REG,
+)
 c_api_deaths = Counter(
     "worktask_queue_agent_api_deaths",
     (
@@ -1263,6 +1296,9 @@ def collect():
     g_progress_age.clear()
     g_owner_unknown_age.clear()
     g_quarantined_age.clear()
+    g_waiting_age.clear()
+    g_wait_overdue.clear()
+    g_unacked_completion_age.clear()
     g_owner_unknown_count.set(0)
 
     # Seeded so every known status reports a 0 series rather than
@@ -1271,7 +1307,7 @@ def collect():
     # long-lived one is something an operator should be able to alert on.
     status_counts = {
         "pending": 0, "running": 0, "wedged": 0, "blocked": 0,
-        "quarantined": 0, "done": 0, "abandoned": 0,
+        "waiting": 0, "quarantined": 0, "done": 0, "abandoned": 0,
     }
     priority_counts = {}
     group_counts = {}
@@ -1491,6 +1527,34 @@ def collect():
                     id=it.get("id", ""),
                     summary=(it.get("summary") or "")[:80] or "(no summary)",
                 ).set(max(0.0, (now - q_ts).total_seconds()))
+
+        # Waiting items: parked on a named external event (or on the
+        # coordinator's ack of a finished agent). No agent owner by design,
+        # so NO has_live_owner series is emitted for them -- they can never
+        # trip WorkQueueOrphaned. Overdue waits get their own series.
+        if status == "waiting":
+            w_on = it.get("wait_on") or {}
+            w_labels = dict(
+                id=it.get("id", ""),
+                summary=(it.get("summary") or "")[:80] or "(no summary)",
+                kind=str(w_on.get("kind", ""))[:32],
+                ref=str(w_on.get("ref", ""))[:120],
+            )
+            w_ts = _parse_ts(it.get("waiting_at"))
+            if w_ts:
+                g_waiting_age.labels(**w_labels).set(
+                    max(0.0, (now - w_ts).total_seconds()))
+            w_dl = _parse_ts(it.get("wait_deadline"))
+            if w_dl and now > w_dl:
+                g_wait_overdue.labels(**w_labels).set(
+                    (now - w_dl).total_seconds())
+            pc = it.get("pending_completion")
+            if isinstance(pc, dict):
+                pc_ts = _parse_ts(pc.get("at"))
+                if pc_ts:
+                    g_unacked_completion_age.labels(
+                        id=w_labels["id"], summary=w_labels["summary"],
+                    ).set(max(0.0, (now - pc_ts).total_seconds()))
 
         # Ready-stuck / locked-age gauges.
         # A pending group-head may be intentionally held by a scope lock

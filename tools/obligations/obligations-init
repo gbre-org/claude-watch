@@ -122,6 +122,7 @@ NO_GREP_WATCHER_OUTPUT_TAG = "[default-seed] no_grep_watcher_output"
 EVENT_MUST_ACT_TAG = "[default-seed] event_must_act"
 AGENT_ACK_PENDING_TAG = "[default-seed] agent_ack_pending"
 ORPHANED_RUNNING_HARD_GATE_TAG = "[default-seed] orphaned_running_hard_gate"
+UNACKED_AGENT_COMPLETION_TAG = "[default-seed] unacked_agent_completion"
 QUEUE_READY_UNSPAWNED_TAG = "[default-seed] queue_ready_unspawned"
 NO_BACKGROUNDED_WATCHER_TAG = "[default-seed] no_backgrounded_watcher"
 SUBAGENT_QUEUE_MUTATING_BANNED_TAG = "[default-seed] subagent_queue_mutating_banned"
@@ -700,6 +701,76 @@ def seed_orphaned_running_hard_gate(cli: str, *, dry_run: bool = False,
         return 1
     if verbose:
         print(f"orphaned_running_hard_gate: seeded "
+              f"(rc={proc.returncode})", file=sys.stderr)
+    return 0
+
+
+def seed_unacked_agent_completion(cli: str, *, dry_run: bool = False,
+                                  force: bool = False,
+                                  verbose: bool = False) -> int:
+    """Add the unacked_agent_completion obligation.
+
+    Blocks the MAIN LOOP's non-exempt Bash while any queue item carries a
+    pending agent completion (the SubagentStop hook ran `session-task queue
+    agent-finished`). Cleared ONLY by an explicit ack: `session-task queue
+    done <id>` or `session-task queue wait <id> --on <kind:ref>`. Modeled on
+    seed_orphaned_running_hard_gate: an evaluator behind an is_main_loop
+    scope-guard so it NEVER fires inside a subagent."""
+    if not force and _row_already_present(cli, UNACKED_AGENT_COMPLETION_TAG):
+        if verbose:
+            print("unacked_agent_completion: already seeded -- skipping",
+                  file=sys.stderr)
+        return 0
+
+    predicate_params = _main_loop_only_evaluator_params(
+        _eval_bin("eval-unacked-agent-completion"))
+
+    cmd = [
+        cli, "add",
+        "--tool-pattern", "Bash",
+        "--predicate", "all_of",
+        "--params", json.dumps(predicate_params),
+        "--ttl", "0",  # non-expiring
+        "--enforcement", "gate",
+        "--deny-msg", UNACKED_AGENT_COMPLETION_TAG,
+        "--created-by", "obligations-init",
+        "--json",
+    ]
+    # Shared recovery-CLI allowlist (includes `session-task queue`, the ack
+    # surface itself).
+    for pat in DEFAULT_EXEMPT_PATTERNS:
+        cmd.extend(["--exempt-tool-pattern", pat])
+    # Cross-gate deadlock-break: exempt the botchat mark-read gate's OWN
+    # clearing commands.
+    for exempt in (
+        "Bashcmd:botchat-send,botchat-unread-check,botchat-history,"
+        "botchat-show,botchat-wait,botchat-ack",
+        "Bash:botchat-send",
+        "Bash:botchat-unread-check",
+        "mcp__host-bash__run_command:botchat-send",
+        "mcp__host-bash__run_script:botchat-send",
+    ):
+        cmd.extend(["--exempt-tool-pattern", exempt])
+
+    if dry_run:
+        print("DRY-RUN: " + " ".join(cmd))
+        return 0
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print("obligations-init: obligations add failed "
+              f"rc={proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        return 1
+    if verbose:
+        print(f"unacked_agent_completion: seeded "
               f"(rc={proc.returncode})", file=sys.stderr)
     return 0
 
@@ -1419,6 +1490,7 @@ SEEDERS = {
     "agent_ack_pending": seed_agent_ack_pending,
     "queue_ready_unspawned": seed_queue_ready_unspawned,
     "orphaned_running_hard_gate": seed_orphaned_running_hard_gate,
+    "unacked_agent_completion": seed_unacked_agent_completion,
     "no_backgrounded_watcher": seed_no_backgrounded_watcher,
     "subagent_queue_mutating_banned": seed_subagent_queue_mutating_banned,
     "shell_substitution_in_free_text": seed_shell_substitution_in_free_text,
@@ -1511,6 +1583,10 @@ def main() -> int:
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
 
+    rc_unacked = seed_unacked_agent_completion(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+
     rc6 = seed_no_backgrounded_watcher(
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
@@ -1542,7 +1618,7 @@ def main() -> int:
     )
 
     # Return first non-zero exit code (if any)
-    return rc or rc2 or rc3 or rc4 or rc5 or rc_orphan or rc6 or rc7 or rc_fts or rc_bg or rc8
+    return rc or rc2 or rc3 or rc4 or rc5 or rc_orphan or rc_unacked or rc6 or rc7 or rc_fts or rc_bg or rc8
 
 
 if __name__ == "__main__":

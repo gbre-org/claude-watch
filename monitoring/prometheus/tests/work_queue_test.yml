@@ -119,6 +119,38 @@ tests:
               summary: "Work-queue item q-f is running but orphaned"
               description: "Running queue item q-f (stranded) has no live agent owner (agent \"\"; empty = never-spawned, set = died-after-spawn) and remained so long after the Stage-1 queue-orphaned claude-event should have prompted the main loop. Re-register + re-spawn the work, or abandon the item."
 
+  # --------------------------------------------------------------------
+  # WorkQueueWaitOverdue -- the distinct alert for a `waiting` item whose
+  # awaited event never arrived. Waiting items emit no has_live_owner series
+  # at all, so they can never fire WorkQueueOrphaned.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "an overdue wait fires WorkQueueWaitOverdue after 5m, never the orphan alert"
+    input_series:
+      - series: 'worktask_queue_item_wait_overdue_seconds{id="q-w",summary="parked",kind="pr",ref="https://h/pull/7",job="work-queue"}'
+        values: '300+0x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: WorkQueueWaitOverdue
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: WorkQueueWaitOverdue
+        exp_alerts:
+          - exp_labels:
+              alertname: WorkQueueWaitOverdue
+              id: q-w
+              summary: parked
+              kind: pr
+              ref: "https://h/pull/7"
+              job: work-queue
+              severity: warning
+            exp_annotations:
+              summary: "Work-queue wait overdue: q-w on pr:https://h/pull/7"
+              description: "Queue item q-w (parked) has been waiting on pr:https://h/pull/7, 5m 0s past its deadline. Decide: `session-task queue done q-w`, extend with `session-task queue wait q-w --on ... --deadline ...`, or abandon it."
+      - eval_time: 25m
+        alertname: WorkQueueOrphaned
+        exp_alerts: []
+
   - interval: 1m
     name: "blocked items never fire WorkQueueOrphaned"
     input_series:

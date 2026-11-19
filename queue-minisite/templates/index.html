@@ -783,7 +783,7 @@
           aria-label="View details for {{ it.id }}, including the block reason"
           title="Click to view item details + the full block reason.">
           <header class="item-head">
-            <span class="badge state-blocked" title="parked on an external blocker; no live agent expected">blocked</span>
+            <span class="badge state-blocked" title="parked on an external blocker or event; no live agent expected">{{ it.badge_label or 'blocked' }}</span>
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>

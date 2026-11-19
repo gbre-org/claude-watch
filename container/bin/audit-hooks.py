@@ -111,6 +111,8 @@ KNOWN_BUILTINS = {
     # subagent_queue_item_running obligations predicate. Default-baked
     # alongside the other gate hooks above.
     "post-tool-agent-arm-hook",
+    # SubagentStop hook recording a pending queue completion.
+    "subagent-stop-queue-hook",
     # obligations-init: idempotent default-row seeder invoked by the
     # entrypoint. Not a hook, but it's referenced from settings.json-
     # adjacent paths in the entrypoint so list it here for completeness.

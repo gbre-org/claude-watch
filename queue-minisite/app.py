@@ -291,6 +291,11 @@ STATUS_SECTION: dict[str, str] = {
     "wedged": "wedged",
     "quarantined": "quarantined",
     "pending": "pending",
+    # `waiting` (work parked on a named external event, or a finished
+    # agent awaiting the coordinator's ack) shares the blocked section: it
+    # is parked with no live owner by design. Its badge reads "waiting on
+    # <thing>" (badge_label), never "running"/orphaned.
+    "waiting": "blocked",
     "blocked": "blocked",
     "done": "done",
     "abandoned": "abandoned",
@@ -1847,6 +1852,40 @@ def _compute_ready_now(
     return True
 
 
+def _waiting_reason(item: dict[str, Any]) -> str:
+    """Human text for a `waiting` item (shown where a block reason would be)."""
+    w = item.get("wait_on") or {}
+    if w.get("kind") == "coordinator":
+        msg = (
+            "Agent finished; this completion is UNACKED. Ack with "
+            "`session-task queue done <id>` or `session-task queue wait <id> "
+            "--on <kind:ref>`."
+        )
+        tail = ((item.get("pending_completion") or {}).get("message_tail") or "").strip()
+        if tail:
+            msg += "\n\nAgent's final message:\n" + tail[-600:]
+        return msg
+    msg = f"Waiting on {w.get('kind')}:{w.get('ref')}"
+    if item.get("wait_deadline"):
+        msg += f" (deadline {item['wait_deadline']})"
+    if item.get("wait_note"):
+        msg += f"\n{item['wait_note']}"
+    return msg
+
+
+def _badge_label(item: dict[str, Any], status: str) -> str:
+    """Badge text for the blocked-section card: 'blocked' or 'waiting on X'."""
+    if status != "waiting":
+        return "blocked"
+    w = item.get("wait_on") or {}
+    if w.get("kind") == "coordinator":
+        return "agent finished - awaiting ack"
+    ref = str(w.get("ref", ""))
+    if len(ref) > 40:
+        ref = ref[:37] + "..."
+    return f"waiting on {w.get('kind')}:{ref}"
+
+
 def _shape(
     item: dict[str, Any],
     now: datetime,
@@ -1969,6 +2008,9 @@ def _shape(
     elif status == "blocked" and blocked_at:
         age_anchor = blocked_at
         age_label = "blocked"
+    elif status == "waiting" and _parse_iso(item.get("waiting_at")):
+        age_anchor = _parse_iso(item.get("waiting_at"))
+        age_label = "waiting"
     elif status == "pending" and created:
         age_anchor = created
         age_label = "pending"
@@ -2100,7 +2142,11 @@ def _shape(
         "priority": item.get("priority", ""),
         "created_by": item.get("created_by", ""),
         "abandon_reason": item.get("abandon_reason", ""),
-        "block_reason": item.get("block_reason", ""),
+        "block_reason": (
+            item.get("block_reason", "") if status != "waiting"
+            else _waiting_reason(item)
+        ),
+        "badge_label": _badge_label(item, status),
         # Manual scope-lock (``queue lock``) state. ``locked`` gates the
         # LOCKED badge + suppresses the READY badge / demotes FORCE START in
         # the pending card. ``lock_blockers`` are the overlapping locked
@@ -6506,6 +6552,7 @@ def api_queue_meta(qid: str) -> Any:
         # Empty string for every non-blocked item -> the front-end hides
         # the section.
         "block_reason": shaped["block_reason"],
+        "badge_label": shaped["badge_label"],
         "created_at": shaped["created_at_iso"],
         "started_at": shaped["started_at_iso"],
         "completed_at": shaped["completed_at_iso"],

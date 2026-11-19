@@ -31,7 +31,7 @@
 #   `cw-cron-run <job-name> ...` guard. To stop/resume a job without
 #   root, flip its flag file via `cw-cron-toggle disable|enable <name>`
 #   (job-names: active-agents, metrics, stale-ready-check, queue-check,
-#   watcher-health-check, session-rotate, hostjob-reconcile). Flags live under the uid-1000-writable,
+#   watcher-health-check, session-rotate, hostjob-reconcile, queue-wait-sweep). Flags live under the uid-1000-writable,
 #   named-volume-persistent /var/lib/claude-watch/cron-disabled. Takes
 #   effect next tick; persists across redeploys. See docs/cron-toggle.md.
 
@@ -124,6 +124,14 @@
 # without the ~/repos bind-mount. `queue list` already runs this sweep inline;
 # this cron makes the leak self-heal even when no one lists the queue.
 */10 * * * *  hndrewaall /usr/local/bin/cw-cron-run hostjob-reconcile /home/hndrewaall/repos/claude-watch/tools/session-task/session-task queue reconcile-hostjobs > /tmp/claude-watch-cron-hostjob-reconcile.log 2>&1
+
+# Waiting-item sweep. Every 2 minutes, reopen (to pending) or close (done, for
+# --done-on-success waits) every `waiting` queue item whose awaited claude-event
+# (workload-done, pr-status-change merged, ci-run-finished, train-landed, ...)
+# has arrived, and emit one `queue-wait-overdue` event per wait past its
+# deadline. This is the automatic FOLLOW-THROUGH half of the waiting state; the
+# coordinator still decides what to wait on (`session-task queue wait --on`).
+*/2 * * * *  hndrewaall /usr/local/bin/cw-cron-run queue-wait-sweep /home/hndrewaall/repos/claude-watch/tools/session-task/session-task queue sweep > /tmp/claude-watch-cron-queue-wait-sweep.log 2>&1
 
 # Quarantined-item renotify. A quarantined queue item holds its scope until an
 # operator releases/resurrects/completes it, and the abandon-time notice is

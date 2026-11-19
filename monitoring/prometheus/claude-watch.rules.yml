@@ -183,6 +183,26 @@ groups:
             `session-task queue assign {{ $labels.id }} --agent <agent_id>`,
             spawn the missing agent, or abandon the item.
 
+      # WorkQueueWaitOverdue -- a `waiting` item (work parked on a named
+      # external event: pr / ci / workload / reply / ..., or a finished
+      # agent's completion awaiting the coordinator's ack) whose
+      # `wait_deadline` has passed. Waiting items have no agent owner by
+      # design and NEVER raise WorkQueueOrphaned; this is their own alert.
+      # The queue-wait-overdue claude-event fires first; this is the backstop.
+      - alert: WorkQueueWaitOverdue
+        expr: worktask_queue_item_wait_overdue_seconds > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Work-queue wait overdue: {{ $labels.id }} on {{ $labels.kind }}:{{ $labels.ref }}"
+          description: >-
+            Queue item {{ $labels.id }} ({{ $labels.summary }}) has been
+            waiting on {{ $labels.kind }}:{{ $labels.ref }}, {{ $value |
+            humanizeDuration }} past its deadline. Decide: `session-task
+            queue done {{ $labels.id }}`, extend with `session-task queue
+            wait {{ $labels.id }} --on ... --deadline ...`, or abandon it.
+
       # WorkQueueStuckSoft -- a running item with long runtime AND stale (or
       # absent) progress. The base series is running_elapsed; each `unless
       # on(id)` clause subtracts a class of item that is demonstrably still

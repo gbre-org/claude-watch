@@ -1042,6 +1042,9 @@ COPY tools/hooks/pre-agent-queue-gate-hook \
 # the spawned agent_id to its q-id and letting the predicate read the
 # binding on every PreToolUse).
 COPY tools/hooks/post-tool-agent-arm-hook /usr/local/bin/post-tool-agent-arm-hook
+# subagent-stop-queue-hook -- SubagentStop hook: records a pending completion
+# for the finished agent's queue item (`session-task queue agent-finished`).
+COPY tools/hooks/subagent-stop-queue-hook /usr/local/bin/subagent-stop-queue-hook
 # claude-watch alert gate -- PreToolUse hook that DENIES every non-exempt
 # tool call while any `[CLAUDE-WATCH]` alert is pending in
 # ~/.config/claude-watch/pending-alerts.json. Companion UserPromptSubmit
@@ -1117,6 +1120,7 @@ RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/post-tool-obligations-update-hook \
             /usr/local/bin/post-tool-mark-attachment-read-hook \
             /usr/local/bin/post-tool-agent-arm-hook \
+            /usr/local/bin/subagent-stop-queue-hook \
             /usr/local/bin/pre-tool-claude-watch-alert-gate-hook \
             /usr/local/bin/user-prompt-claude-watch-alert-record-hook \
             /usr/local/bin/claude-watch-ack \
@@ -1165,6 +1169,11 @@ COPY container/bin/eval-agent-ack-pending /usr/local/bin/eval-agent-ack-pending
 # until the item is RESOLVED (session-task queue done/abandon/resurrect). NOT
 # satisfiable by event-ack. Default-open on missing/corrupt state.
 COPY container/bin/eval-orphaned-running-hard-gate /usr/local/bin/eval-orphaned-running-hard-gate
+
+# eval-unacked-agent-completion - obligations evaluator that blocks the main
+# loop's non-exempt Bash while a finished agent's queue completion is
+# unacked (cleared only by `session-task queue done` / `queue wait --on`).
+COPY container/bin/eval-unacked-agent-completion /usr/local/bin/eval-unacked-agent-completion
 
 # eval-queue-ready-unspawned — obligations evaluator that blocks Bash tool
 # calls when session-task queue has items with status=pending and
