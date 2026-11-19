@@ -60,9 +60,18 @@ Configuration (defaults portable; override via CLI flag or env var):
   --lock-file PATH   (env $CLAUDE_SELF_MCP_RECONNECT_LOCK)
   --state-file PATH  (env $CLAUDE_SELF_MCP_RECONNECT_STATE)
 
+LIVE STATE IS THE ONLY JUDGE. Newer Claude Code builds render the detail
+actions UNNUMBERED ("❯ Reconnect / Disable in this project / Back") and show a
+"Status:" field; the list row for a dead server is just "✘ <name>". Success is
+decided only from the live session's own /mcp rows (re-opened after the
+action, retried ~15s). `claude mcp list` probes in a separate process, so it is
+advisory: it is reported as `cli_status`, and a disagreement with the live
+state is reported as `discrepancy` in the result, never used to return ok.
+
 Exit codes:
-  0  reconnect confirmed (the inline result line named our target server and
-     said "Reconnected to <name>.").
+  0  reconnect confirmed: the inline result line said "Reconnected to <name>."
+     AND the re-opened live /mcp row is connected; or the live screen already
+     showed the server connected with no Reconnect action (no-op).
   1  usage / no Claude Code pane / internal error.
   4  the server was not in the `/mcp` list, the "Reconnect" action was not
      found on its detail screen, or the menu never rendered — a shape change
@@ -341,6 +350,13 @@ def any_mcp_menu_visible(text: str) -> bool:
 
 def parse_server_rows(text: str):
     """Return [(name, status_text, is_cursor), ...] in on-screen order.
+    (See `_parse_rows` for the variant that also carries the status glyph.)
+    """
+    return [(n, st, cur) for (n, st, cur, _g) in _parse_rows(text)]
+
+
+def _parse_rows(text: str):
+    """Return [(name, status_text, is_cursor, glyph), ...] in on-screen order.
 
     Tolerates both the v2.1.287+ grouped layout (glyph, name, aligned status)
     and the legacy `name · glyph status` layout. Only lines after the
@@ -361,12 +377,14 @@ def parse_server_rows(text: str):
         m = _NEW_ROW_RE.match(raw)
         if m and (m.group("glyph") in _STATUS_GLYPHS or m.group("cursor")):
             row = (m.group("name"), (m.group("status") or "").strip(),
-                   bool(m.group("cursor")))
+                   bool(m.group("cursor")), m.group("glyph"))
         elif "\xb7" in raw and any(g in raw for g in _STATUS_GLYPHS):
             m = _OLD_ROW_RE.match(raw)
             if not m:
                 continue
-            row = (m.group("name"), m.group("status").strip(), bool(m.group("cursor")))
+            st = m.group("status").strip()
+            row = (m.group("name"), st, bool(m.group("cursor")),
+                   next((g for g in _STATUS_GLYPHS if g in st), ""))
         else:
             continue
         if row[0] in seen:      # stale re-render of the same list in scrollback
@@ -420,6 +438,44 @@ def detail_status_connected(text: str) -> bool:
         and "not connected" not in last
 
 
+def classify_state(glyph: str, status: str = "") -> str:
+    """Map a list-row glyph/status (or a detail "Status:" value) to one of
+    "connected" / "failed" / "needs-auth" / "degraded" / "unknown"."""
+    low = (status or "").lower()
+    if "needs auth" in low or "needs sign" in low or "not authenticated" in low:
+        return "needs-auth"
+    if glyph in ("\u2718", "\u2717") or "failed" in low and "fetch failed" not in low:
+        return "failed"
+    if "disconnected" in low or "not connected" in low:
+        return "failed"
+    if glyph in ("\u2714", "\u2713") and "failed" not in low:
+        return "connected"
+    if glyph or low:
+        return "degraded" if ("connected" in low or glyph) else "unknown"
+    return "unknown"
+
+
+def live_row_state(text: str, server: str):
+    """(state, row_text) of `server`'s row on the LIVE /mcp list screen, or
+    (None, None) if the row is not on screen. The list shows the session's own
+    client state — unlike `claude mcp list`, which probes in a fresh process."""
+    for name, status, _cur, glyph in _parse_rows(text):
+        if name == server:
+            return classify_state(glyph, status), f"{glyph} {name} {status}".strip()
+    return None, None
+
+
+def detail_live_state(text: str):
+    """State from the LAST "Status:" line of a detail screen, or None."""
+    last = None
+    for m in _DETAIL_STATUS_RE.finditer(text):
+        last = m.group("st")
+    if last is None:
+        return None
+    glyph = next((g for g in _STATUS_GLYPHS if g in last), "")
+    return classify_state(glyph, last)
+
+
 def cli_status_connected(line: str) -> bool:
     """True for a `claude mcp list` row such as "name: cmd - \u2714 Connected"."""
     low = line.lower()
@@ -427,8 +483,21 @@ def cli_status_connected(line: str) -> bool:
         and "not connected" not in low and "\u2718" not in low
 
 
+# Newer Claude Code builds (2026-11) render the detail actions UNNUMBERED:
+#   "  \u276f Reconnect" / "    Disable in this project" / "    Back"
+# at a fixed 4-column label indent (field values and their wrapped
+# continuations sit in a far-right column, so they never match).
+_PLAIN_ACTION_RE = re.compile(
+    r"^ {2}(?:(?P<cursor>[" + _CURSOR_CHARS + r"]) | {2})(?P<label>\S.*?)\s*$")
+
+
 def parse_action_rows(text: str):
-    """Return [(index, label, is_cursor), ...] from a detail screen."""
+    """Return [(index, label, is_cursor), ...] from a detail screen.
+
+    Numbered rows ("1. Reconnect") are used when present; otherwise the
+    unnumbered block directly above the "Enter to select" footer is parsed and
+    numbered 1..n in on-screen order.
+    """
     rows = []
     for raw in text.splitlines():
         m = _ACTION_ROW_RE.match(raw)
@@ -437,7 +506,27 @@ def parse_action_rows(text: str):
         cursor_char = (m.group("cursor") or "").strip()
         is_cursor = cursor_char != "" and not cursor_char[0].isalnum()
         rows.append((int(m.group("num")), m.group("label").strip(), is_cursor))
-    return rows
+    if rows:
+        return rows
+    lines = text.splitlines()
+    foot = None
+    for i, raw in enumerate(lines):
+        if DETAIL_MENU_FOOTER in raw.lower():
+            foot = i
+    if foot is None:
+        return []
+    block = []
+    for raw in reversed(lines[:foot]):
+        if not raw.strip():
+            if block:
+                continue
+            continue
+        m = _PLAIN_ACTION_RE.match(raw)
+        if not m:
+            break
+        block.append((m.group("label").strip(), bool(m.group("cursor"))))
+    block.reverse()
+    return [(i + 1, label, cur) for i, (label, cur) in enumerate(block)]
 
 
 def find_last_result(text: str):
@@ -561,6 +650,36 @@ def _ensure_menu_closed(pane: str, server: str) -> bool:
     return False
 
 
+VERIFY_SECONDS = 15.0
+
+
+def _tail(text: str, n: int = 40) -> str:
+    return "\n".join(l.rstrip() for l in text.splitlines()[-n:])
+
+
+def verify_live(pane: str, server: str, menu_timeout: float,
+                total: float = None, retry_gap: float = 1.0):
+    """Re-open /mcp and read `server`'s row until it is connected or `total`
+    seconds pass. Returns (state, row_text, screen_tail). The picker is closed
+    after every look. state is None if the row never appeared."""
+    total = VERIFY_SECONDS if total is None else total
+    deadline = time.time() + total
+    state = row = screen = None
+    while True:
+        close_any_menu(pane)
+        sc.inject(pane, "/mcp", label="mcp-verify", slash_command=True, escape=False)
+        text = _poll_until(
+            pane, lambda t: top_menu_visible(t) and bool(parse_server_rows(t)),
+            timeout=min(menu_timeout, max(2.0, deadline - time.time())), full=True)
+        state, row = live_row_state(text, server)
+        screen = _tail(text)
+        close_any_menu(pane)
+        log(f"  verify-live: {server} -> {state!r} ({row!r})")
+        if state == "connected" or time.time() >= deadline:
+            return state, row, screen
+        time.sleep(retry_gap)
+
+
 def _drive_menu(pane: str, server: str, menu_timeout: float, result_timeout: float,
                 pre_result) -> dict:
 
@@ -593,6 +712,7 @@ def _drive_menu(pane: str, server: str, menu_timeout: float, result_timeout: flo
         close_any_menu(pane)
         return {"ok": False, "server": server, "reason": "menu-did-not-open", "code": 4}
 
+    list_text = text
     rows = parse_server_rows(text)
     names = [r[0] for r in rows]
     log(f"  server list: {names}")
@@ -666,28 +786,29 @@ def _drive_menu(pane: str, server: str, menu_timeout: float, result_timeout: flo
     actions = parse_action_rows(text)
     log(f"  actions for {server}: {[(n, l) for n, l, _ in actions]}")
     reconnect_rows = [(n, l, c) for (n, l, c) in actions if "reconnect" in l.lower()]
+    # LIVE state of the server in THIS session (never `claude mcp list`, which
+    # probes in a separate process and says nothing about this client).
+    live_before = (detail_live_state(full) or detail_live_state(text)
+                   or live_row_state(list_text, server)[0] or "unknown")
+    list_row = live_row_state(list_text, server)[1]
+    log(f"  live state before: {live_before} (list row: {list_row!r})")
     if not reconnect_rows:
-        # A healthy, already-connected server offers no Reconnect action.
-        # That is a no-op success, not a failure; only "not connected AND no
-        # Reconnect" is the genuinely-broken (UI moved / unknown state) case.
-        if detail_status_connected(full) or detail_status_connected(text):
-            connected_via = "detail screen"
-        else:
-            cli_line = verify_via_cli(server)
-            connected_via = "claude mcp list" if cli_status_connected(cli_line) else None
-        if connected_via:
-            log(f"  NOTE: no Reconnect action but {server} is already connected "
-                f"({connected_via}); nothing to do")
+        if live_before == "connected":
+            # A healthy server offers no Reconnect action: genuine no-op.
+            log(f"  NOTE: no Reconnect action and the live screen says {server} is "
+                "connected; nothing to do")
             close_any_menu(pane)
-            return {"ok": True, "server": server, "code": 0,
-                    "reason": None, "status": "already connected",
+            return {"ok": True, "server": server, "code": 0, "reason": None,
+                    "status": "already connected", "live_state": "connected",
                     "tools_before": tools_before}
-        log(f"  FAIL: no 'Reconnect' action found for {server}")
+        log(f"  FAIL: no 'Reconnect' action found for {server} (live state {live_before})")
+        screen = _tail(text)
         close_any_menu(pane)
         return {
             "ok": False, "server": server,
-            "reason": f"no Reconnect action on detail screen: {[l for _, l, _ in actions]!r}",
-            "code": 4,
+            "reason": f"no Reconnect action on detail screen: {[l for _, l, _ in actions]!r} "
+                      f"(live state {live_before})",
+            "code": 4, "live_state": live_before, "screen": screen,
         }
     target_num = reconnect_rows[0][0]
     cursor_num = next((n for (n, _, c) in actions if c), actions[0][0] if actions else 1)
@@ -732,8 +853,18 @@ def _drive_menu(pane: str, server: str, menu_timeout: float, result_timeout: flo
                 "reason": f"reconnected but tools fetch failed: {reason} "
                           "(server-side session is dead; re-auth/restart the host adapter)"}
     if status == "ok":
-        log(f"  SUCCESS: Reconnected to {server}.")
-        return {"ok": True, "server": server, "reason": None, "code": 0, "tools_before": tools_before}
+        # The inline "Reconnected" line is necessary but not sufficient: judge
+        # success from the live /mcp row after re-opening the list.
+        state, row, screen = verify_live(pane, server, menu_timeout)
+        if state == "connected":
+            log(f"  SUCCESS: Reconnected to {server}; live row confirms ({row!r})")
+            return {"ok": True, "server": server, "reason": None, "code": 0,
+                    "tools_before": tools_before, "live_state": state}
+        log(f"  FAIL: result line said Reconnected but live row is {state!r} ({row!r})")
+        return {"ok": False, "server": server, "code": 5, "tools_before": tools_before,
+                "live_state": state, "screen": screen,
+                "reason": f"reconnect reported success but the live /mcp row for {server} "
+                          f"is {state!r} after {VERIFY_SECONDS:.0f}s: {row!r}"}
 
     log(f"  Claude Code reported failure: Failed to reconnect to {server}: {reason}")
     return {"ok": False, "server": server, "reason": reason, "code": 5, "tools_before": tools_before}
@@ -790,6 +921,15 @@ def do_run(args) -> dict:
         cli_line = verify_via_cli(args.server)
         log(f"  verify (claude mcp list): {cli_line}")
         result["cli_status"] = cli_line
+        # Advisory only: `claude mcp list` probes in a separate process and can
+        # disagree with this session's client. It never decides ok.
+        live = result.get("live_state")
+        if live is not None and cli_status_connected(cli_line) != (live == "connected"):
+            result["discrepancy"] = (
+                f"live session says {live!r} but `claude mcp list` says "
+                f"{'connected' if cli_status_connected(cli_line) else 'not connected'}; "
+                "live state wins")
+            log(f"  DISCREPANCY: {result['discrepancy']}")
 
     _write_state({"pane": pane, **result})
     if getattr(args, "notify", True):

@@ -1,0 +1,23 @@
+  MCP servers
+  8 servers
+
+    Local MCPs (/home/user/.claude.json)
+    ✔ chrome-devtools           33 tools
+    ✔ remote-box                3 tools
+
+    User MCPs (/home/user/.claude.json)
+  ❯ ✘ remote-http
+
+    claude.ai
+    ✔ claude.ai Claude Docs     8 tools
+    ⚠ claude.ai Gmail           needs sign-in
+    ⚠ claude.ai Google Calen…   needs sign-in
+    ⚠ claude.ai Google Drive    needs sign-in
+
+    Built-in MCPs (always available)
+    ✔ easel                     1 tool
+
+  Learn more:
+  https://code.claude.com/docs/en/mcp
+
+  Enter to view · Esc to close

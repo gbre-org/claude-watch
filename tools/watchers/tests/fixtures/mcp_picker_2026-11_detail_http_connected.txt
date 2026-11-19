@@ -1,0 +1,16 @@
+  remote-http
+  MCP server
+
+  Status:           ✔ connected
+  Auth:             ◯ not authenticated
+  URL:              http://localhost:18768/mc
+                    p
+  Config location:  /home/user/.claude.
+                    json
+  Tools:            4 tools
+
+  ❯ View tools
+    Disable in this project
+    Back
+
+  Enter to select · Esc to go back
