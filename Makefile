@@ -289,6 +289,7 @@ test-hooks: ## obligations + PreToolUse/PostToolUse hook suites
 	tools/hooks/tests/pre-tool-dispatch-gate-hook.test
 	tools/hooks/tests/post-tool-agent-arm-hook.test
 	tools/hooks/tests/subagent-stop-queue-hook.test
+	tools/hooks/tests/pre-tool-subagent-wait-gate-hook.test
 	tools/hooks/pre-agent-background-required-hook --test
 	tools/hooks/pre-agent-worktree-isolation-hook --test
 	tools/hooks/worktree-create-hook --test
@@ -799,6 +800,8 @@ TOOL_LINKS := \
 	pre-agent-worktree-isolation-hook=tools/hooks/pre-agent-worktree-isolation-hook \
 	worktree-create-hook=tools/hooks/worktree-create-hook \
 	subagent-stop-queue-hook=tools/hooks/subagent-stop-queue-hook \
+	pre-tool-subagent-wait-gate-hook=tools/hooks/pre-tool-subagent-wait-gate-hook \
+	post-tool-autobackground-hook=tools/hooks/post-tool-autobackground-hook \
 	agent-msg=tools/agent-msg/agent-msg \
 	agent-tail=tools/agent-tail/agent-tail \
 	pr-branches=tools/pr-branches/pr-branches \

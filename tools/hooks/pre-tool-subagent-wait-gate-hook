@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""PreToolUse hook -- subagents must not wait or run long jobs inside Bash.
+
+Long-running or waiting work has to be VISIBLE: `workload run <label> -- <cmd>`
+on the host (tmux `tasks` session, shown on the operator's dashboard) or
+`hostjob run` via the Mac MCP. A subagent that sleeps, polls, or lets a Bash
+call hit its timeout is invisible and blocks its own progress.
+
+Applies ONLY when the payload carries a non-empty `agent_id` (the harness sets
+it only for subagent calls). The main loop is never affected. There is NO
+bypass for subagents.
+
+Denied for subagent Bash calls:
+  * `run_in_background` truthy
+  * a `timeout` parameter over 15000 ms
+  * any `sleep` over 5 seconds
+  * any `until`/`while` loop whose body contains `sleep`
+  * any command that references a Claude task output file
+    (`.../tasks/<id>.output`); the Read tool on such a path is denied too.
+
+Default-open on internal errors. Embedded tests live in
+tests/pre-tool-subagent-wait-gate-hook.test.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+
+MAX_TIMEOUT_MS = 15000
+MAX_SLEEP_S = 5.0
+
+_TASK_OUTPUT = re.compile(r"/tasks/[^\s'\"]+\.output\b")
+_SLEEP = re.compile(r"(?:^|[;&|\s({`])sleep\s+([^\s;&|)}`]+)")
+_LOOP = re.compile(
+    r"\b(?:until|while)\b.*?\bdo\b.*?(?:^|[;&|\s({`])sleep\b", re.DOTALL)
+_UNITS = {"": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+
+REPLACEMENT = (
+    "Long jobs and waiting: run anything over ~15s as "
+    "`workload run <label> -- <cmd>` (then return, or `workload log <label>`); "
+    "Mac work via `hostjob run` on the gb-mini MCP. Never sleep, poll, "
+    "background a Bash call, or read a task .output file in your own shell."
+)
+
+
+def _truthy(v) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return bool(v) and v is not False
+
+
+def _sleep_seconds(arg: str):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", arg)
+    if not m:
+        return None
+    return float(m.group(1)) * _UNITS[m.group(2)]
+
+
+def violation(tool_name: str, tool_input: dict):
+    """Return a short violation description, or None."""
+    if tool_name == "Read":
+        p = tool_input.get("file_path", "")
+        if isinstance(p, str) and _TASK_OUTPUT.search(p):
+            return "reading a Claude task .output file"
+        return None
+    if tool_name != "Bash":
+        return None
+    if _truthy(tool_input.get("run_in_background")):
+        return "run_in_background Bash"
+    t = tool_input.get("timeout")
+    if isinstance(t, (int, float)) and not isinstance(t, bool) and t > MAX_TIMEOUT_MS:
+        return f"Bash timeout {int(t)} ms exceeds {MAX_TIMEOUT_MS} ms"
+    cmd = tool_input.get("command")
+    if not isinstance(cmd, str):
+        return None
+    if _TASK_OUTPUT.search(cmd):
+        return "reading or polling a Claude task .output file"
+    if _LOOP.search(cmd):
+        return "until/while loop containing sleep"
+    for m in _SLEEP.finditer(cmd):
+        secs = _sleep_seconds(m.group(1))
+        if secs is not None and secs > MAX_SLEEP_S:
+            return f"sleep {m.group(1)} (over {int(MAX_SLEEP_S)}s)"
+    return None
+
+
+def evaluate(payload) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    aid = payload.get("agent_id", "")
+    if not (isinstance(aid, str) and aid.strip()):
+        return {}  # main loop: unchanged
+    ti = payload.get("tool_input")
+    if not isinstance(ti, dict):
+        return {}
+    why = violation(payload.get("tool_name", ""), ti)
+    if not why:
+        return {}
+    reason = f"subagent-wait-gate: {why}. {REPLACEMENT}"
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": "!! BLOCKED (subagent): " + reason,
+    }
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        out = evaluate(json.loads(raw) if raw.strip() else {})
+    except Exception:  # noqa: BLE001 -- default-open
+        out = {}
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
