@@ -1717,7 +1717,26 @@
   // The log is not there YET. Back off and try again — do NOT mark the pane
   // terminal, and release the stream slot so a pane that can use one now gets
   // it (a pane in backoff is not a pane waiting for a slot).
+  // A RUNNING item whose plain-text log has stayed missing this long never
+  // launched (e.g. `workload run` registered the queue item then died before
+  // the pane/log existed). Stop retrying and say so.
+  const LAUNCH_FAILED_AFTER_MS = 30000;
+
   function scheduleStreamRetry(pane, kind, detail) {
+    if (kind === 'open-failed' && !pane.sawData) {
+      if (!pane.missingLogSince) pane.missingLogSince = Date.now();
+      if (Date.now() - pane.missingLogSince >= LAUNCH_FAILED_AFTER_MS) {
+        pane.terminal = true;
+        pane.retryAt = 0;
+        setPaneStatus(pane, 'launch failed / no log', 'mt-err');
+        appendPaneNote(pane, 'launch failed / no log — item ' + (pane.qid || pane.key) +
+          ' is running but its log has not appeared for ' +
+          Math.round((Date.now() - pane.missingLogSince) / 1000) + 's (' +
+          (detail || kind) + ')');
+        releaseSlot(pane);
+        return;
+      }
+    }
     pane.retryAttempts += 1;
     pane.retryAt = Date.now() + retryDelayMs(pane.retryAttempts);
     // One note, not one per attempt: the status line carries the countdown, so
@@ -1803,6 +1822,7 @@
       }
       pane.retryAttempts = 0;
       pane.retryNoteShown = false;
+      pane.missingLogSince = 0;
     }
   }
 

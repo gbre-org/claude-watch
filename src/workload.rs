@@ -2020,6 +2020,13 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
     let _ = fs::remove_file(kill_emitted_file(label));
     let _ = fs::remove_file(&script_capture_path);
 
+    // Create `<label>.output` with a header line BEFORE anything that can
+    // fail or be killed (queue binding, script write, pane creation). The
+    // live-tail consumers (queue-minisite) must always find a log for a
+    // queue item this command has registered; the wrapper later APPENDS
+    // (`exec >>`) its own banner. Failures below write their reason here.
+    let header_len = write_launch_header(&out_path, label, &command, &started_at);
+
     // Try to capture the script content NOW (before the workload
     // starts) so a later modify/delete of the script doesn't affect
     // what the modal shows. Fail-soft: no capture means the modal
@@ -2046,6 +2053,11 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
     // instead, loudly, with the underlying error attached.
     let caller_supplied_qid = queue_id.is_some();
     let mut effective_queue_id: Option<String> = queue_id.map(str::to_string);
+    // Ignore HUP/TERM/INT from here until the launch is verified: a tool
+    // call being torn down mid-launch must not strand a registered queue
+    // item with no pane and no log. (SIGKILL cannot be shielded; the
+    // `.output` header above keeps that case visible.)
+    let _shield = SignalShield::new();
     if effective_queue_id.is_none() {
         match auto_create_and_register_queue_item(label, &command) {
             Ok(qid) => {
@@ -2053,6 +2065,7 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
                 effective_queue_id = Some(qid);
             }
             Err(e) => {
+                append_launch_error(&out_path, &format!("queue auto-registration failed: {e}"));
                 eprintln!(
                     "Refusing to start workload '{label}': queue auto-registration \
                      failed and every workload must be bound to a queue item.\n  \
@@ -2108,8 +2121,21 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
         effective_queue_id.as_deref(),
     );
 
+    // Only an item THIS invocation auto-created is ours to abandon on a
+    // failed launch; a caller-supplied qid belongs to the caller.
+    let auto_qid: Option<String> = if caller_supplied_qid {
+        None
+    } else {
+        effective_queue_id.clone()
+    };
     if let Err(e) = fs::write(&script_path, script) {
         eprintln!("Failed to write script: {e}");
+        abort_launch(
+            label,
+            &out_path,
+            auto_qid.as_deref(),
+            &format!("failed to write wrapper script: {e}"),
+        );
         return 1;
     }
     let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700));
@@ -2141,17 +2167,41 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
     let pane_id = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Ok(o) => {
-            eprintln!(
-                "Failed to create pane: {}",
-                String::from_utf8_lossy(&o.stderr)
+            let msg = format!(
+                "failed to create tmux pane: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
             );
+            eprintln!("{msg}");
+            abort_launch(label, &out_path, auto_qid.as_deref(), &msg);
             return 1;
         }
         Err(e) => {
-            eprintln!("Failed to create pane: {e}");
+            let msg = format!("failed to create tmux pane: {e}");
+            eprintln!("{msg}");
+            abort_launch(label, &out_path, auto_qid.as_deref(), &msg);
             return 1;
         }
     };
+
+    // Verify the launch actually took (pane alive, or the wrapper already
+    // ran and left output / an exit marker) within ~3s. A pane that
+    // vanished with nothing written is a silent launch failure.
+    if !wait_for_launch(
+        &out_path,
+        &exit_path,
+        header_len,
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+        || pane_alive(&pane_id),
+    ) {
+        let msg = format!(
+            "pane {pane_id} did not start the workload within 3s \
+             (pane gone, no output, no exit marker)"
+        );
+        eprintln!("{msg}");
+        abort_launch(label, &out_path, auto_qid.as_deref(), &msg);
+        return LAUNCH_FAILED_EXIT;
+    }
 
     rebalance();
 
@@ -2175,6 +2225,115 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
          `workload wait` as a background task."
     );
     0
+}
+
+/// Exit code for a workload whose pane was created but never started the
+/// payload (see [`wait_for_launch`]).
+pub const LAUNCH_FAILED_EXIT: i32 = 76;
+
+/// Write the `.output` header (label, command, start time) and return its
+/// byte length, so [`wait_for_launch`] can tell the wrapper's later output
+/// apart from it. Best effort: a write failure yields 0.
+fn write_launch_header(out_path: &Path, label: &str, command: &str, started_at: &str) -> u64 {
+    let header = format!(
+        "[workload launch] label={label} started={started_at}\n\
+         [workload launch] command={command}\n"
+    );
+    match fs::write(out_path, &header) {
+        Ok(()) => header.len() as u64,
+        Err(_) => 0,
+    }
+}
+
+/// Append a launch-failure line to `.output` so a tail shows WHY.
+fn append_launch_error(out_path: &Path, msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path)
+    {
+        let _ = writeln!(f, "[workload launch FAILED] {msg}");
+    }
+}
+
+/// True once the launch is observably live: pane alive, an exit marker
+/// exists, or the log grew past the launch header. Polls until `timeout`.
+fn wait_for_launch(
+    out_path: &Path,
+    exit_path: &Path,
+    header_len: u64,
+    timeout: Duration,
+    interval: Duration,
+    pane_is_alive: impl Fn() -> bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if pane_is_alive()
+            || exit_path.exists()
+            || fs::metadata(out_path)
+                .map(|m| m.len() > header_len)
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Record a failed launch in `.output` and abandon the auto-created queue
+/// item (if any) so it is never left `running` with no pid.
+fn abort_launch(label: &str, out_path: &Path, auto_qid: Option<&str>, msg: &str) {
+    append_launch_error(out_path, msg);
+    let Some(qid) = auto_qid else { return };
+    let Some(cli) = find_session_task_cli() else {
+        return;
+    };
+    let reason = format!(
+        "workload {label} launch failed: {msg} (log={})",
+        out_path.display()
+    );
+    let _ = run_session_task_with_timeout(
+        &cli,
+        &[
+            "queue".to_string(),
+            "abandon".to_string(),
+            qid.to_string(),
+            "--confirmed-dead".to_string(),
+            "--force".to_string(),
+            "--reason".to_string(),
+            reason,
+            "--silent".to_string(),
+        ],
+        10,
+    );
+}
+
+/// RAII guard ignoring SIGHUP/SIGTERM/SIGINT for the launch window.
+struct SignalShield {
+    prev: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+impl SignalShield {
+    fn new() -> Self {
+        let mut prev = Vec::new();
+        for sig in [libc::SIGHUP, libc::SIGTERM, libc::SIGINT] {
+            let old = unsafe { libc::signal(sig, libc::SIG_IGN) };
+            prev.push((sig, old));
+        }
+        SignalShield { prev }
+    }
+}
+
+impl Drop for SignalShield {
+    fn drop(&mut self) {
+        for (sig, old) in &self.prev {
+            unsafe { libc::signal(*sig, *old) };
+        }
+    }
 }
 
 /// CLI: `workload list`
@@ -3580,6 +3739,62 @@ mod tests {
             "an unbindable workload must refuse to start with \
              QUEUE_BINDING_REQUIRED_EXIT, not run unbound (got {rc})"
         );
+    }
+
+    #[test]
+    fn launch_header_is_written_and_wait_for_launch_detects_dead_pane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("x.output");
+        let exit = tmp.path().join("x.exit");
+        let hl = write_launch_header(&out, "x", "'true'", "2026-01-01T00:00:00");
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert!(body.contains("label=x") && body.contains("command='true'"));
+        assert_eq!(hl, body.len() as u64);
+        let short = Duration::from_millis(200);
+        let tick = Duration::from_millis(20);
+        // Pane gone, nothing past the header, no exit marker: failed launch.
+        assert!(!wait_for_launch(&out, &exit, hl, short, tick, || false));
+        // Pane alive.
+        assert!(wait_for_launch(&out, &exit, hl, short, tick, || true));
+        // Output grew (wrapper ran, pane already closed).
+        append_launch_error(&out, "grew");
+        assert!(wait_for_launch(&out, &exit, hl, short, tick, || false));
+    }
+
+    #[test]
+    fn abort_launch_logs_reason_and_abandons_only_auto_created_item() {
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let rec = tmp.path().join("rec");
+        let stub = tmp.path().join("st");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+                shell_quote(&rec.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755));
+        unsafe { std::env::set_var("SESSION_TASK_CLI", &stub) };
+        let out = tmp.path().join("y.output");
+        abort_launch("y", &out, Some("q-test-0001"), "boom");
+        let rec_before = std::fs::read_to_string(&rec).unwrap();
+        // Caller-supplied item (None) is left alone.
+        abort_launch("y", &out, None, "boom2");
+        let rec_after = std::fs::read_to_string(&rec).unwrap();
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+        assert!(rec_before.contains("abandon") && rec_before.contains("q-test-0001"));
+        assert!(rec_before.contains("--confirmed-dead"));
+        assert_eq!(rec_before, rec_after);
+        let log = std::fs::read_to_string(&out).unwrap();
+        assert!(log.contains("[workload launch FAILED] boom"));
     }
 
     #[test]

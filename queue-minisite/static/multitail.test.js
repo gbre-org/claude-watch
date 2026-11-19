@@ -1255,6 +1255,23 @@ console.log('\n-- the other two "nothing is showing" states are NOT retries');
 console.log('\n-- retries lose to `ended`, and do not fight the slot cap');
 // ==========================================================================
 {
+  // A running item whose log stays missing > 30s never launched: the pane
+  // must say "launch failed / no log" and stop retrying.
+  resetQueue([card('q-ghost', 'workload', 'ghost launch')]);
+  mt.openMode();
+  latestStreamFor('q-ghost').emit({ type: 'error', kind: 'open-failed', error: 'nope' });
+  const g = paneRecord('q-ghost');
+  assert('first miss still retries', g.terminal === false && g.retryAt > 0);
+  g.missingLogSince = Date.now() - 31000;
+  g.retryAt = Date.now() - 1;
+  mt.pumpSlots();
+  latestStreamFor('q-ghost').emit({ type: 'error', kind: 'open-failed', error: 'nope' });
+  assert('log missing >30s settles as launch failed',
+    g.terminal === true && /launch failed \/ no log/.test(statusOf('q-ghost')),
+    statusOf('q-ghost'));
+  assert('and the note names the item',
+    /q-ghost/.test(paneFor('q-ghost').textContent));
+
   // A job that finished before its log ever appeared must settle, not retry
   // forever.
   resetQueue([card('q-gone', 'workload', 'finished before logging')]);
