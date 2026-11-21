@@ -1556,7 +1556,13 @@ def _queue_item_is_ready_now(items, item):
     # Explicit deps: any unmet dep keeps the item not-ready. Mirrors
     # session-task._item_is_ready. Missing or non-done targets are
     # permanent blockers -- same semantics as the canonical impl.
-    deps = item.get("depends_on") or []
+    # Deps live as ``task:<id>`` scope tokens (canonical) and/or the legacy
+    # ``depends_on`` list; honour both or dep-blocked items look stale-ready.
+    deps = list(item.get("depends_on") or [])
+    for tok in (item.get("scope") or []):
+        if isinstance(tok, str) and tok.startswith("task:") and tok[5:]:
+            if tok[5:] not in deps:
+                deps.append(tok[5:])
     if deps:
         items_by_id = {it.get("id"): it for it in items if it.get("id")}
         for dep_id in deps:
