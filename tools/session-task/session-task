@@ -7862,6 +7862,49 @@ def _load_recent_events(since, tail_lines=5000):
     return out
 
 
+CI_SHA_MIN_PREFIX = 7
+
+
+def _ci_repo_key(name):
+    """Normalise a repo name: drop an optional owner/ prefix, lowercase."""
+    return str(name or "").strip().rsplit("/", 1)[-1].lower()
+
+
+def _ci_ref_matches(ref, data, raw):
+    """True when a `ci:<repo>@<sha|run>` ref names the CI event `data`.
+
+    The repo compares owner-optionally (`org/repo` == `repo`). The sha
+    prefix-matches in EITHER direction (>= CI_SHA_MIN_PREFIX hex chars), so
+    a short ref matches a full 40-char sha in the event and vice versa. A
+    short all-digit ident is a run number/id and matches exactly, never as
+    a substring. Events without structured fields fall back to a substring
+    search of the raw event.
+    """
+    repo, sep, ident = ref.rpartition("@")
+    if not sep:
+        repo, ident = "", ref
+    repo_k, ident = _ci_repo_key(repo), ident.strip().lower()
+    ev_repo = _ci_repo_key(data.get("repo"))
+    if repo_k and ev_repo and repo_k != ev_repo:
+        return False
+    if not ident:
+        return False
+    runs = {str(data.get(k)) for k in ("run_number", "run_id")
+            if data.get(k) not in (None, "")}
+    if ident in runs:
+        return True
+    is_hex = re.fullmatch(r"[0-9a-f]+", ident) is not None
+    if is_hex and len(ident) >= CI_SHA_MIN_PREFIX:
+        ev_sha = str(data.get("sha") or "").strip().lower()
+        if ev_sha:
+            return ev_sha.startswith(ident) or (
+                len(ev_sha) >= CI_SHA_MIN_PREFIX and ident.startswith(ev_sha))
+        return ident[:CI_SHA_MIN_PREFIX] in raw.lower()
+    if not data.get("sha") and not runs:
+        return ref.lower() in raw.lower()
+    return False
+
+
 def _wait_match(wait_on, ev):
     """(matched, success) for one event against one wait. Pure."""
     kind, ref = wait_on.get("kind"), wait_on.get("ref", "")
@@ -7883,8 +7926,7 @@ def _wait_match(wait_on, ev):
     if kind == "ci":
         if not tag.startswith("ci-run") or not tag.endswith("finished"):
             return False, False
-        sha = ref.split("@", 1)[-1]
-        if ref not in raw and sha[:12] not in raw:
+        if not _ci_ref_matches(ref, data, raw):
             return False, False
         concl = str(data.get("conclusion") or data.get("status") or "").lower()
         ok = (concl in ("success", "passed", "pass", "ok")) if concl else (
