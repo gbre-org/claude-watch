@@ -7905,6 +7905,67 @@ def _ci_ref_matches(ref, data, raw):
     return False
 
 
+TRAIN_TAGS = ("train-landed", "train-dropped", "train-conflict")
+_TRAIN_BRANCH_RE = re.compile(r"train/[A-Za-z0-9._/-]*[A-Za-z0-9_]")
+
+
+def _train_event_fields(tag, ev):
+    """(repo_key, [branches]) for a train-* event.
+
+    The producer emits the message only (no structured data): `<repo>: landed
+    N branch(es) ... -> <sha>: train/a, train/b. One post-merge ...` or
+    `<repo>: train/a DROPPED ...` / `<repo>: train/a conflicts with ...`.
+    Structured `data.repo` / `data.branch(es)` win when present. A landed
+    batch lists several branches; dropped/conflict name exactly one, right
+    after the repo prefix (later text is free-form and never matched).
+    """
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    msg = str(ev.get("message") or "")
+    head, sep, rest = msg.partition(": ")
+    repo = data.get("repo") or (head if sep and " " not in head.strip() else "")
+    branches = []
+    for k in ("branches", "branch"):
+        v = data.get(k)
+        if isinstance(v, str):
+            v = [v]
+        if isinstance(v, (list, tuple)):
+            branches += [str(b) for b in v if b]
+    if not branches:
+        found = _TRAIN_BRANCH_RE.findall(rest if sep else msg)
+        branches = found if tag == "train-landed" else found[:1]
+    return _ci_repo_key(repo), [b.strip().lower() for b in branches]
+
+
+def _train_branch_key(b):
+    b = str(b or "").strip().lower()
+    return b[len("train/"):] if b.startswith("train/") else b
+
+
+def _train_ref_matches(ref, tag, ev):
+    """(matched, success) for `train:<repo>@<branch>` against one event.
+
+    The repo compares owner-optionally; the branch may be given with or
+    without the `train/` prefix and is matched exactly against the event's
+    branch list. landed -> success; dropped/conflict -> matched failure
+    (wakes the item rather than closing it).
+    """
+    if tag not in TRAIN_TAGS:
+        return False, False
+    repo, sep, branch = ref.rpartition("@")
+    if not sep:
+        repo, branch = "", ref
+    want = _train_branch_key(branch)
+    if not want:
+        return False, False
+    ev_repo, branches = _train_event_fields(tag, ev)
+    repo_k = _ci_repo_key(repo)
+    if repo_k and ev_repo and repo_k != ev_repo:
+        return False, False
+    if want not in {_train_branch_key(b) for b in branches}:
+        return False, False
+    return True, tag == "train-landed"
+
+
 def _wait_match(wait_on, ev):
     """(matched, success) for one event against one wait. Pure."""
     kind, ref = wait_on.get("kind"), wait_on.get("ref", "")
@@ -7944,7 +8005,7 @@ def _wait_match(wait_on, ev):
             return True, False
         return False, False
     if kind == "train":
-        return (tag == "train-landed" and ref in raw), True
+        return _train_ref_matches(ref, tag, ev)
     if kind == "event":
         return tag == ref, True
     if kind == "reply":
