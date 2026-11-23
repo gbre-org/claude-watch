@@ -1,0 +1,23 @@
+ Manage MCP servers
+ 3 servers
+
+   Local MCPs
+   ❯ ✔ chrome-devtools   29 tools
+     ✘ personal-mbp
+
+  personal-mbp
+  MCP server
+
+  Status:           ✘ failed
+  Issue:            connection timed out
+                    after 30000ms
+  Auth:             ◯ not authenticated
+  URL:              http://localhost:18768/mcp
+
+  Couldn't reconnect to personal-mbp
+
+  ❯ Reconnect
+    Disable in this project
+    Back
+
+  Enter to select · Esc to go back
