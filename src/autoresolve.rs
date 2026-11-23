@@ -523,6 +523,90 @@ const HARD_DENY: &[(&str, &str)] = &[
     ("/library", "system"),
 ];
 
+/// Words (split on anything but alphanumerics, `_`, `-`, `.`) that mean a
+/// command removes, overwrites or destroys something. Used only by the
+/// "can't be sure" notice path, which is deliberately conservative: a hit
+/// anywhere, even inside a quoted string, keeps the answer No.
+const DESTRUCTIVE_WORDS: &[&str] = &[
+    "rm",
+    "rmdir",
+    "unlink",
+    "shred",
+    "dd",
+    "truncate",
+    "mv",
+    "tee",
+    "sudo",
+    "doas",
+    "destroy",
+    "rmi",
+    "prune",
+    "clean",
+    "wipefs",
+    "fdisk",
+    "parted",
+    "mkswap",
+    "srm",
+    "trash",
+    "-delete",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "--delete",
+    "--remove",
+    "--rm",
+    "--force",
+    "-f",
+    "--hard",
+    "-i",
+    "--in-place",
+];
+
+/// True when the command contains no removal- or destruction-class token and
+/// no hard-deny class (reuses `HARD_DENY`: network, secrets, git history,
+/// system paths, `find`, `xargs`, `eval` ...).
+pub fn no_destructive_tokens(command: &str) -> bool {
+    if hard_deny_class(command).is_some() {
+        return false;
+    }
+    let lower = command.to_ascii_lowercase();
+    let words = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .filter(|w| !w.is_empty());
+    for w in words {
+        if DESTRUCTIVE_WORDS.contains(&w)
+            || w.starts_with("mkfs")
+            || w.starts_with("--remove")
+            || w.starts_with("--delete")
+        {
+            return false;
+        }
+    }
+    // Clobbering redirects: any `>` / `>>` / `>|` whose target is not /dev/*
+    // or an fd duplication (`2>&1`).
+    let chars: Vec<char> = lower.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '>' {
+            continue;
+        }
+        let mut j = i + 1;
+        while matches!(chars.get(j), Some('>') | Some('|')) {
+            j += 1;
+        }
+        if chars.get(j) == Some(&'&') {
+            continue;
+        }
+        while matches!(chars.get(j), Some(' ') | Some('\t')) {
+            j += 1;
+        }
+        let target: String = chars[j..].iter().take(5).collect();
+        if !target.starts_with("/dev/") {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn hard_deny_class(command: &str) -> Option<&'static str> {
     let lower = command.to_ascii_lowercase();
     HARD_DENY
@@ -1512,7 +1596,28 @@ pub fn decide_dialog(
             resolved,
             prompt: Box::new(prompt),
         },
-        Decision::Deny { reason } => no(reason, prompt.command.clone(), prompt.agent.clone()),
+        Decision::Deny { reason } => {
+            // The only blocker is the safety check's "can't be sure it read
+            // this command" notice (a parse-uncertainty message, not a
+            // finding): answer Yes for an agent's command that has no
+            // removal-class token at all.
+            let unsure = prompt
+                .warning
+                .as_deref()
+                .map(|w| w.to_ascii_lowercase().starts_with(UNSURE_WARNING_PREFIX))
+                .unwrap_or(false);
+            if unsure
+                && prompt.agent.is_some()
+                && prompt.variants.iter().all(|v| no_destructive_tokens(v))
+            {
+                return Verdict::Yes {
+                    rule_ids: vec!["unsure-notice-no-removal".to_string()],
+                    resolved: Vec::new(),
+                    prompt: Box::new(prompt),
+                };
+            }
+            no(reason, prompt.command.clone(), prompt.agent.clone())
+        }
     }
 }
 
@@ -2715,15 +2820,52 @@ mod tests {
         assert!(p.warning.as_deref().unwrap().contains("dangerous removal"));
         let reason = dialog_reason_line(&d.body).expect("reason line");
         assert!(reason.starts_with("Claude Code can't be sure"));
-        // Always decided, never Undecided; agent is identified.
         match verdict(UNBOXED) {
-            Verdict::Yes { prompt, .. } => {
-                assert_eq!(prompt.agent.as_deref(), Some("general-purpose"))
+            Verdict::Yes {
+                prompt, rule_ids, ..
+            } => {
+                assert_eq!(prompt.agent.as_deref(), Some("general-purpose"));
+                assert_eq!(rule_ids, vec!["unsure-notice-no-removal".to_string()]);
             }
-            Verdict::No { agent, .. } => {
-                assert_eq!(agent.as_deref(), Some("general-purpose"))
-            }
+            v => panic!("must be Yes: {v:?}"),
         }
+    }
+
+    #[test]
+    fn unsure_notice_yes_requires_no_removal_tokens() {
+        let with = |from: &str, to: &str| UNBOXED.replace(from, to);
+        let rm = with("echo \"== $a\";", "rm -f x; echo \"== $a\";");
+        assert!(matches!(verdict(&rm), Verdict::No { .. }), "rm");
+        // rm inside a quoted string is still a hit (conservative).
+        let q = with("echo \"== $a\";", "echo 'rm me'; echo \"== $a\";");
+        assert!(matches!(verdict(&q), Verdict::No { .. }), "quoted rm");
+        let f = with("echo \"== $a\";", "find . -name x -delete; echo \"== $a\";");
+        assert!(matches!(verdict(&f), Verdict::No { .. }), "find -delete");
+        // Clobber redirect onto a real path; /dev/null and 2>&1 stay fine.
+        let c = with("done", "done > out.txt");
+        assert!(matches!(verdict(&c), Verdict::No { .. }), "clobber");
+        let d = with("done", "done > /dev/null");
+        assert!(matches!(verdict(&d), Verdict::Yes { .. }), "/dev/null");
+        // Not agent-origin (plain `Bash command`): never the unsure path.
+        let na = with(
+            "Bash command \u{b7} from the general-purpose agent",
+            "Bash command",
+        );
+        assert!(matches!(verdict(&na), Verdict::No { .. }), "no agent");
+        for cmd in [
+            "git clean -fd",
+            "docker rmi x",
+            "zfs destroy p/d",
+            "truncate -s 0 f",
+            "dd if=a of=b",
+            "mkfs.ext4 x",
+            "torrent-ctl --remove x",
+            "mv a b",
+            "git reset --hard",
+        ] {
+            assert!(!no_destructive_tokens(cmd), "{cmd}");
+        }
+        assert!(no_destructive_tokens("ls -la 2>&1 | grep foo"));
     }
 
     #[test]
