@@ -601,6 +601,9 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("*", "hostjob-launch-failed", None, ACTIONABLE,
         "Host job never produced a log or heartbeat; row abandoned, "
         "needs the runner host checked + relaunch."),
+    ("*", "hostjob-telemetry-broken", None, ACTIONABLE,
+        "Remote host job silent at the queue (alive or unverifiable); "
+        "fix the heartbeat/log pipe, row NOT abandoned."),
     ("*", "hostjob-lost", None, ACTIONABLE,
         "Remote host job went silent for 24h; row abandoned."),
 
@@ -948,6 +951,7 @@ def _self_test() -> int:
         (("queue", "hostjob-failed", ""), ACTIONABLE),
         (("queue", "hostjob-launch-failed", ""), ACTIONABLE),
         (("queue", "hostjob-lost", ""), ACTIONABLE),
+        (("queue", "hostjob-telemetry-broken", ""), ACTIONABLE),
         (("claude-watch", "memory-reminder", ""), AMBIENT),
         (("manual", "watcher-cleanup", ""), AMBIENT),
         # claude-watch/* catch-all stays ambient for non-keepalive tags.

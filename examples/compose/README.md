@@ -889,3 +889,23 @@ The bind-mounted host state under `~/.claude`, `~/.config/session`, `~/.local/sh
 ## Persistent macOS auto-start for `mcp-host-bash-server`
 
 For operators who want `mcp-host-bash-server` to stay running across logouts and reboots without manually respawning it after each one, the repo ships a macOS `launchd` LaunchAgent template at [`launchd/org.claude-watch.mcp-host-bash.plist`](launchd/org.claude-watch.mcp-host-bash.plist). See [`launchd/README.md`](launchd/README.md) for the full install walkthrough (`make install-mcp-host-bash-server`, copy the plist into `~/Library/LaunchAgents/`, edit absolute paths + `EnvironmentVariables`, `launchctl bootstrap`, verify with `launchctl print` + `lsof -i :8766`, and the bootout / re-bootstrap flow for picking up changes).
+
+### Remote hostjob telemetry (heartbeat + log push)
+
+A hostjob whose queue lives on another machine (`HOSTJOB_QUEUE_REMOTE=ssh://...`)
+reaches the queue host only through ssh. If that ssh key is bound to a
+forced-command allow-list, the list must include **`queue heartbeat`** and
+**`queue hostjob-log-sink`** in addition to `add|register|done|abandon`;
+otherwise the worker runs fine but the queue sees no log and no heartbeat.
+
+The queue host never abandons a silent remote row on its own evidence. It
+asks the runner host through `HOSTJOB_HOST_PROBE_CMD` (exit 0 = worker alive,
+1 = gone, other = unknown; env `HOSTJOB_PROBE_LABEL/QID/HOST`). Alive emits an
+actionable `hostjob-telemetry-broken` event and leaves the row running;
+unknown quarantines it (scope held) and emits the same event; only "gone"
+abandons.
+
+Migrating a long-lived job started by an older reaper without restarting it:
+fix the allow-list (the old reaper's periodic heartbeat then starts landing),
+and backfill the log from the runner host with
+`tail -n +1 -F ~/.cache/hostjob/<label>/log | ssh <queue-host> session-task queue hostjob-log-sink <label>`.

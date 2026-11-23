@@ -485,6 +485,7 @@ def test_remote_row_recent_heartbeat_keeps_open_despite_old_registration():
 def test_remote_row_stale_over_24h_is_gcd_to_abandoned():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
+        _probe(env, tmp, 1)
         _write_queue(env, [_remote_row("q-rs", "macjob4", age_seconds=25 * 3600)])
         _push_log(env, "macjob4")
         r = _run(env, "queue", "reconcile-hostjobs", "--json")
@@ -541,8 +542,17 @@ def _events(env):
     return out
 
 
+def _probe(env, tmp, rc):
+    """Install a host-probe command that exits `rc` (0 alive / 1 gone)."""
+    sh = Path(tmp, "probe.sh")
+    sh.write_text("#!/bin/sh\nexit %d\n" % rc)
+    sh.chmod(0o755)
+    env["HOSTJOB_HOST_PROBE_CMD"] = str(sh)
+
+
 def _launch_env(tmp):
     env = _env_for_tmp(tmp)
+    env.pop("HOSTJOB_HOST_PROBE_CMD", None)
     for k in ("CLAUDE_EVENT_QUEUE", "CRON_EVENT_QUEUE"):
         env.pop(k, None)
     env["CLAUDE_EVENT_SESSION_TASK"] = "1"
@@ -552,6 +562,7 @@ def _launch_env(tmp):
 def test_remote_no_log_no_heartbeat_past_grace_is_abandoned_with_event():
     with tempfile.TemporaryDirectory() as tmp:
         env = _launch_env(tmp)
+        _probe(env, tmp, 1)
         _write_queue(env, [_remote_row("q-lf", "dubjobs", age_seconds=300)])
         r = _run(env, "queue", "reconcile-hostjobs", "--json")
         assert r.returncode == 0, r.stderr
@@ -586,6 +597,7 @@ def test_remote_pushed_log_for_this_run_keeps_running():
 def test_remote_stale_pushed_log_from_older_run_does_not_count():
     with tempfile.TemporaryDirectory() as tmp:
         env = _launch_env(tmp)
+        _probe(env, tmp, 1)
         _write_queue(env, [_remote_row("q-ls", "rerun", age_seconds=300)])
         _push_log(env, "rerun", "old run\n")
         old = datetime.now(timezone.utc).timestamp() - 86400
@@ -607,6 +619,7 @@ def test_remote_heartbeat_after_registration_keeps_running_without_log():
 def test_queue_list_reaps_launch_failed_and_emits_once():
     with tempfile.TemporaryDirectory() as tmp:
         env = _launch_env(tmp)
+        _probe(env, tmp, 1)
         _write_queue(env, [_remote_row("q-l1", "dead1", age_seconds=300)])
         _run(env, "queue", "list", "--all")
         _run(env, "queue", "list", "--all")
@@ -641,3 +654,59 @@ def test_reaper_nonzero_exit_abandon_emits_actionable_hostjob_failed():
         _run(env, "queue", "abandon", "q-hg", "--confirmed-dead", "--force",
              "--reason", "operator stop")
         assert len([e for e in _events(env) if "hostjob-failed" in json.dumps(e)]) == n
+
+
+# ---------------------------------------------------------------------------
+# A LIVE remote worker whose telemetry never reaches the queue must NEVER be
+# abandoned on queue-side silence alone (incident: long-lived dub job alive on
+# the host while its heartbeat/log RPCs were denied by the ssh allow-list).
+# ---------------------------------------------------------------------------
+def _tag_events(env, tag):
+    return [e for e in _events(env) if tag in json.dumps(e)]
+
+
+def test_live_worker_without_pushed_log_is_not_abandoned_and_alerts_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _probe(env, tmp, 0)  # host says: alive
+        _write_queue(env, [_remote_row("q-al", "alive1", age_seconds=4 * 3600)])
+        for _ in range(2):
+            r = _run(env, "queue", "reconcile-hostjobs", "--json")
+            assert r.returncode == 0, r.stderr
+        it = _read_item(env, "q-al")
+        assert it["status"] == "running", it
+        evs = _tag_events(env, "hostjob-telemetry-broken")
+        assert len(evs) == 1 and "actionable" in json.dumps(evs[0])
+        assert not _tag_events(env, "hostjob-launch-failed")
+
+
+def test_unprobeable_host_quarantines_not_abandons():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)  # no probe configured -> unknown
+        _write_queue(env, [_remote_row("q-un", "unk1", age_seconds=300)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        it = _read_item(env, "q-un")
+        assert it["status"] == "quarantined", it  # scope still held
+        assert len(_tag_events(env, "hostjob-telemetry-broken")) == 1
+        # Re-sweeping neither abandons nor re-alerts.
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-un")["status"] == "quarantined"
+        assert len(_tag_events(env, "hostjob-telemetry-broken")) == 1
+
+
+def test_probe_failure_exit_code_is_unknown_not_gone():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _probe(env, tmp, 255)  # ssh failure
+        _write_queue(env, [_remote_row("q-pf", "pf1", age_seconds=300)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-pf")["status"] == "quarantined"
+
+
+def test_stale_24h_remote_row_without_probe_is_not_abandoned():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _push_log(env, "stale1")
+        _write_queue(env, [_remote_row("q-st", "stale1", age_seconds=25 * 3600)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-st")["status"] == "quarantined"
