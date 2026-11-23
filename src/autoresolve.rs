@@ -997,6 +997,13 @@ fn strip_chrome(line: &str) -> &str {
                     | '\u{2500}'
                     | '\u{2501}'
                     | '\u{2550}'
+                    // Dashed rules (the unboxed dialog layout's separator).
+                    | '\u{254c}'
+                    | '\u{254d}'
+                    | '\u{2504}'
+                    | '\u{2505}'
+                    | '\u{2508}'
+                    | '\u{2509}'
             )
     })
 }
@@ -1004,7 +1011,10 @@ fn strip_chrome(line: &str) -> &str {
 fn option_row(line: &str) -> Option<(u32, String, bool)> {
     let mut rest = strip_chrome(line);
     let mut cursor = false;
-    if let Some(r) = rest.strip_prefix('\u{276f}') {
+    if let Some(r) = rest
+        .strip_prefix('\u{276f}')
+        .or_else(|| rest.strip_prefix('>'))
+    {
         cursor = true;
         rest = r.trim_start();
     }
@@ -1021,6 +1031,31 @@ const ACCEPTED_WARNING_PREFIXES: &[&str] = &[
     "dangerous rm operation on critical path:",
     "dangerous rm operation on possibly-empty variable path",
 ];
+
+/// Informational line printed when the safety check could not parse the
+/// command (possibly wrapped over several rows). It never changes the
+/// decision: the allow rules still have to cover the whole command.
+const UNSURE_WARNING_PREFIX: &str = "claude code can't be sure it read this command";
+
+/// Description line the unboxed layout prints above the command.
+fn is_leading_description(line: &str) -> bool {
+    line.eq_ignore_ascii_case("run shell command")
+}
+
+/// Text after `Bash command` in a title: `from X`, `· from X` or empty.
+fn title_suffix(title: &str) -> &str {
+    title["bash command".len()..]
+        .trim()
+        .trim_start_matches(['\u{b7}', '-', '\u{2013}', '\u{2014}'])
+        .trim()
+}
+
+fn agent_from_title(title: &str) -> Option<String> {
+    let rest = title_suffix(title).strip_prefix("from ")?.trim();
+    let rest = rest.strip_prefix("the ").unwrap_or(rest);
+    let rest = rest.strip_suffix(" agent").unwrap_or(rest).trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
 
 fn looks_like_description(line: &str) -> bool {
     let first = line.chars().next();
@@ -1100,7 +1135,7 @@ pub fn parse_bash_prompt(frame: &str) -> Result<BashPrompt, String> {
         })
         .ok_or("no 'Bash command' title")?;
     let title = strip_chrome(tail[t]);
-    let rest = title["bash command".len()..].trim();
+    let rest = title_suffix(title);
     let agent = if rest.is_empty() {
         None
     } else if let Some(a) = rest.strip_prefix("from ") {
@@ -1135,6 +1170,20 @@ pub fn parse_bash_prompt(frame: &str) -> Result<BashPrompt, String> {
         block.push((s.to_string(), full));
     }
     let mut warning = None;
+    // Unboxed layout: leading description line, trailing (possibly wrapped)
+    // "can't be sure" notice.
+    if block.len() >= 2 && is_leading_description(&block[0].0) {
+        block.remove(0);
+    }
+    if let Some(i) = block
+        .iter()
+        .position(|(t, _)| t.to_ascii_lowercase().starts_with(UNSURE_WARNING_PREFIX))
+    {
+        if i > 0 {
+            let tail: Vec<String> = block.drain(i..).map(|b| b.0).collect();
+            warning = Some(tail.join(" "));
+        }
+    }
     if let Some((last, _)) = block.last() {
         if last.to_ascii_lowercase().starts_with("dangerous ") {
             if ACCEPTED_WARNING_PREFIXES
@@ -1316,14 +1365,25 @@ pub fn classify_screen(frame: &str) -> Screen {
     }
 
     let lo = q.saturating_sub(25);
-    let Some(top) = (lo..q)
+    // Boxed layout: a rounded top border. Unboxed layout (no border at all):
+    // the `Bash command ...` header line is itself the top.
+    let boxed = (lo..q)
         .rev()
-        .find(|&i| tail[i].trim_start().starts_with('\u{256d}'))
-    else {
-        return Screen::Undecided("no box top above the question".into());
-    };
-    let Some(t) = (top + 1..q).find(|&i| !strip_chrome(tail[i]).is_empty()) else {
-        return Screen::Undecided("no title line".into());
+        .find(|&i| tail[i].trim_start().starts_with('\u{256d}'));
+    let unboxed = (lo..q).rev().find(|&i| {
+        strip_chrome(tail[i])
+            .to_ascii_lowercase()
+            .starts_with("bash command")
+    });
+    let t = match (boxed, unboxed) {
+        (Some(top), _) => {
+            let Some(t) = (top + 1..q).find(|&i| !strip_chrome(tail[i]).is_empty()) else {
+                return Screen::Undecided("no title line".into());
+            };
+            t
+        }
+        (None, Some(t)) => t,
+        (None, None) => return Screen::Undecided("no box top above the question".into()),
     };
     let body = tail[t + 1..q]
         .iter()
@@ -1407,9 +1467,13 @@ pub fn decide_dialog(
     };
     let raw_cmd = dialog.body.clone();
     let agent_of = |t: &str| {
-        t.to_ascii_lowercase()
-            .find(" from ")
-            .map(|i| t[i + 6..].trim().to_string())
+        if t.to_ascii_lowercase().starts_with("bash command") {
+            agent_from_title(t)
+        } else {
+            t.to_ascii_lowercase()
+                .find(" from ")
+                .map(|i| t[i + 6..].trim().to_string())
+        }
     };
     if !dialog
         .title
@@ -1599,7 +1663,9 @@ pub fn dialog_reason_line(body: &str) -> Option<String> {
         .map(str::trim)
         .find(|l| {
             let lo = l.to_ascii_lowercase();
-            lo.starts_with("dangerous ") || lo.contains("could not be checked")
+            lo.starts_with("dangerous ")
+                || lo.contains("could not be checked")
+                || lo.starts_with(UNSURE_WARNING_PREFIX)
         })
         .map(str::to_string)
 }
@@ -2628,6 +2694,36 @@ mod tests {
         );
         let n = refusal_note("rm -f $Q/*.json", "unparseable:x");
         assert!(n.contains("rm -f $Q/*.json") && n.contains("unparseable"));
+    }
+
+    const UNBOXED: &str = include_str!("../tests/fixtures/autoresolve_unboxed_subagent_unsure.txt");
+
+    #[test]
+    fn unboxed_subagent_dialog_with_unsure_warning_decides_first_cycle() {
+        // Regression: no box border, dashed rule, `Bash command · from the X
+        // agent` header, "can't be sure" notice. Was Undecided("no box top").
+        let Screen::Dialog(d) = classify_screen(UNBOXED) else {
+            panic!("must classify as a dialog on the first capture")
+        };
+        assert_eq!(d.no_digit(), Some(2));
+        let p = parse_bash_prompt(UNBOXED).expect("parses");
+        assert_eq!(p.agent.as_deref(), Some("general-purpose"));
+        assert!(p.command.starts_with("cd /tmp/claude-1000/"));
+        assert!(p.command.ends_with("cut -c1-400; done"), "{}", p.command);
+        assert!(!p.command.contains("Run shell command"));
+        assert!(!p.command.contains("can't be sure"));
+        assert!(p.warning.as_deref().unwrap().contains("dangerous removal"));
+        let reason = dialog_reason_line(&d.body).expect("reason line");
+        assert!(reason.starts_with("Claude Code can't be sure"));
+        // Always decided, never Undecided; agent is identified.
+        match verdict(UNBOXED) {
+            Verdict::Yes { prompt, .. } => {
+                assert_eq!(prompt.agent.as_deref(), Some("general-purpose"))
+            }
+            Verdict::No { agent, .. } => {
+                assert_eq!(agent.as_deref(), Some("general-purpose"))
+            }
+        }
     }
 
     #[test]
