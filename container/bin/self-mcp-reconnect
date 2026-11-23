@@ -82,6 +82,10 @@ Exit codes:
      scripting bug.
   6  the result never appeared within the poll window (ambiguous — the menu
      was closed defensively before exiting).
+  7  TRUE FAILURE: the dialog itself said the reconnect failed ("Couldn't
+     reconnect to <name>", or "Status: ✘ failed" with an "Issue:" line, or
+     needs-authentication). reason = "reconnect-failed: <issue text>". The
+     result carries `issue`, and always `pane_restored` (true/false).
 
 Every exit path after `/mcp` is injected (success, each failure code, an
 exception, SIGTERM) runs a `finally` that Escapes out of the picker — but ONLY
@@ -344,8 +348,26 @@ def detail_menu_visible(text: str) -> bool:
     return _title_line(text.splitlines()) is None
 
 
+MODAL_FOOTERS = TOP_MENU_FOOTERS + (DETAIL_MENU_FOOTER, "esc to go back", "esc to back")
+BOTTOM_LINES = 6
+
+
+def modal_footer_at_bottom(text: str) -> bool:
+    """True if a /mcp modal footer ("Enter to select \xb7 Esc to go back", ...)
+    sits in the last few non-empty lines of the screen.
+
+    Claude Code renders the picker inline, so an earlier "MCP servers" title
+    can still be on screen above a server's detail dialog; the title-based
+    predicates then say "no menu" while the dialog is plainly open. A footer at
+    the BOTTOM of the screen is the reliable signal that a modal is up (the
+    normal prompt's footer is "? for shortcuts" and never matches).
+    """
+    tail = [l for l in text.splitlines() if l.strip()][-BOTTOM_LINES:]
+    return any(f in l.lower() for l in tail for f in MODAL_FOOTERS)
+
+
 def any_mcp_menu_visible(text: str) -> bool:
-    return top_menu_visible(text) or detail_menu_visible(text)
+    return top_menu_visible(text) or detail_menu_visible(text) or modal_footer_at_bottom(text)
 
 
 def parse_server_rows(text: str):
@@ -547,6 +569,55 @@ def find_last_result(text: str):
     return last
 
 
+_COULDNT_RE = re.compile(r"Couldn.t reconnect to (?P<name>[A-Za-z0-9_][A-Za-z0-9_.\-]*)", re.I)
+_FIELD_RE = re.compile(r"^\s*[A-Za-z][A-Za-z ]{1,20}:\s")
+
+
+def _issue_text(text: str):
+    """Text of the LAST "Issue:" field on a detail screen, with its wrapped
+    continuation lines joined, or None."""
+    lines = text.splitlines()
+    idx = None
+    for i, raw in enumerate(lines):
+        if re.match(r"^\W*Issue:", raw, re.I):
+            idx = i
+    if idx is None:
+        return None
+    parts = [re.sub(r"^\W*Issue:\s*", "", lines[idx], flags=re.I).strip()]
+    for raw in lines[idx + 1:]:
+        if not raw.strip() or _FIELD_RE.match(raw) or "enter to select" in raw.lower():
+            break
+        if not raw.startswith(" " * 8):     # field values wrap in a far-right column
+            break
+        parts.append(raw.strip())
+    return " ".join(p for p in parts if p) or None
+
+
+def parse_failure_dialog(text: str):
+    """Recognise a TRUE reconnect failure shown on the server detail dialog.
+
+    Returns a dict {"kind", "server", "issue", "explicit"} or None.
+      * "Couldn't reconnect to X" (explicit=True): the fresh outcome banner of
+        the attempt just made.
+      * "Status: \u2718 failed" (+ "Issue: ...") or a needs-authentication
+        status (explicit=False): the standing state; callers must not trust it
+        until the attempt had time to run, since a failed server shows it
+        BEFORE Reconnect is pressed too.
+    """
+    m = _COULDNT_RE.search(text)
+    state = detail_live_state(text)
+    issue = _issue_text(text)
+    if m:
+        return {"kind": "failed", "server": m.group("name"),
+                "issue": issue or "couldn't reconnect", "explicit": True}
+    if state == "failed" and issue:
+        return {"kind": "failed", "server": None, "issue": issue, "explicit": False}
+    if state == "needs-auth":
+        return {"kind": "needs-auth", "server": None,
+                "issue": issue or "needs authentication", "explicit": False}
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Menu navigation — raw `tmux send-keys` on purpose: this is a MODAL, not the
 # vim-mode chat prompt, and these are NAVIGATION keys (Down/Enter through a
@@ -573,7 +644,7 @@ def _poll_until(pane: str, predicate, timeout: float, interval: float = 0.4,
     return text
 
 
-def close_any_menu(pane: str, max_attempts: int = 6) -> bool:
+def close_any_menu(pane: str, max_attempts: int = 8) -> bool:
     """Escape out of any /mcp menu confirmed on screen; True once it is gone.
 
     Escape is sent ONLY while the picker is visible: an Escape at the normal
@@ -626,8 +697,11 @@ def do_reconnect(pane: str, server: str, menu_timeout: float, result_timeout: fl
                   "reason": f"exception during /mcp interaction: {exc!r}"}
     finally:
         closed = _ensure_menu_closed(pane, server)
+    result = dict(result, pane_restored=bool(closed))
     if not closed:
-        result = dict(result, menu_stuck=True)
+        result["menu_stuck"] = True
+        result["reason"] = ((result.get("reason") or "") +
+                            " [PANE NOT RESTORED: /mcp dialog still open, press Esc in the pane]").strip()
     return result
 
 
@@ -651,6 +725,7 @@ def _ensure_menu_closed(pane: str, server: str) -> bool:
 
 
 VERIFY_SECONDS = 15.0
+FAILURE_SETTLE_SECONDS = 3.0
 
 
 def _tail(text: str, n: int = 40) -> str:
@@ -818,12 +893,28 @@ def _drive_menu(pane: str, server: str, menu_timeout: float, result_timeout: flo
         _send_key(pane, "Down")
     _send_key(pane, "Enter", settle=0.8)
 
+    pressed_at = time.time()
+
     def _got_new_result(t: str) -> bool:
         r = find_last_result(t)
-        return r is not None and r != pre_result and not any_mcp_menu_visible(t)
+        if r is not None and r != pre_result and not any_mcp_menu_visible(t):
+            return True
+        # The dialog stays open on a TRUE failure; do not wait for a success
+        # line that will never come. The standing "Status: failed" needs a
+        # moment to be believed (it is shown before the press as well).
+        f = parse_failure_dialog(t)
+        return bool(f) and (f["explicit"] or time.time() - pressed_at >= FAILURE_SETTLE_SECONDS)
 
     text = _poll_until(pane, _got_new_result, timeout=result_timeout)
     result = find_last_result(text)
+    failure = parse_failure_dialog(text) if any_mcp_menu_visible(text) else None
+    if failure:
+        issue = failure["issue"]
+        log(f"  TRUE FAILURE: {failure['kind']} for {server}: {issue}")
+        close_any_menu(pane)
+        return {"ok": False, "server": server, "code": 7, "issue": issue,
+                "tools_before": tools_before, "live_state": failure["kind"],
+                "reason": f"reconnect-failed: {issue}"}
 
     # Regardless of what we found, never leave a menu standing.
     if any_mcp_menu_visible(text):
@@ -885,6 +976,22 @@ def verify_via_cli(server: str) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
+def summary_line(result: dict) -> str:
+    """One-line console report: server, outcome, issue text, pane state."""
+    ok = bool(result.get("ok"))
+    restored = result.get("pane_restored")
+    restored_txt = ("pane_restored=yes" if restored else
+                    "pane_restored=NO (dialog still open)" if restored is False
+                    else "pane_restored=n/a")
+    reason = result.get("reason")
+    issue = result.get("issue")
+    return (f"self-mcp-reconnect {'OK' if ok else 'FAILED'} server={result.get('server')} "
+            f"code={result.get('code', 1)}"
+            + (f" issue={issue}" if issue else "")
+            + (f" reason={reason}" if reason and reason != issue else "")
+            + f" {restored_txt}")
+
+
 def notify_done(result: dict, pane: str, inject: bool = True) -> None:
     """Return control flow to the main loop: emit a claude-event and, when
     enabled, queue a one-line message in the pane (non-cancelling inject).
@@ -893,12 +1000,13 @@ def notify_done(result: dict, pane: str, inject: bool = True) -> None:
     ok = bool(result.get("ok"))
     code = result.get("code", 1)
     reason = result.get("reason")
-    line = (f"self-mcp-reconnect {'OK' if ok else 'FAILED'} server={server} "
-            f"code={code}" + (f" reason={reason}" if reason else ""))
+    line = summary_line(result)
     try:
         emit_event(line, tag="self-mcp-reconnect",
                    priority="normal" if ok else "high",
-                   data={"server": server, "ok": str(ok).lower(), "code": code})
+                   data={"server": server, "ok": str(ok).lower(), "code": code,
+                         "issue": result.get("issue") or "",
+                         "pane_restored": str(result.get("pane_restored")).lower()})
     except Exception:
         log(f"  WARNING: notify event failed: {traceback.format_exc()}")
     if inject:
@@ -985,6 +1093,7 @@ def main():
         if args.json:
             print(json.dumps(result))
         else:
+            print(summary_line(result))
             print(f"[self-mcp-reconnect] {result}")
         sys.exit(result.get("code", 1))
 

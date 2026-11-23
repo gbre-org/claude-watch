@@ -307,7 +307,7 @@ class DoReconnectNonCancellingTest(unittest.TestCase):
 
         self.assertEqual(result, {
             "ok": True, "server": "mcp-adaptor", "reason": None, "code": 0,
-            "tools_before": "✘ failed", "live_state": "connected",
+            "tools_before": "✘ failed", "live_state": "connected", "pane_restored": True,
         })
         mod.sc.interrupt_and_wait.assert_not_called()
 
@@ -815,6 +815,138 @@ class LiveFailedHttpServerTest(unittest.TestCase):
         self.assertEqual(c("\u26a0", "needs authentication"), "needs-auth")
         self.assertEqual(c("\u26a0", "tools fetch failed \xb7 connected"), "degraded")
         self.assertEqual(c("", ""), "unknown")
+
+
+class FailureDialogTest(unittest.TestCase):
+    """True failure outcomes ("Couldn't reconnect", Status failed + Issue) are
+    terminal results (code 7) and the dialog is always dismissed."""
+
+    FIX = "mcp_picker_2026-11_detail_reconnect_failed_inline_title.txt"
+
+    def setUp(self):
+        self.mod = _import_self_mcp_reconnect()
+
+    def test_parses_couldnt_reconnect_with_wrapped_issue(self):
+        f = self.mod.parse_failure_dialog(_fx(self.FIX))
+        self.assertEqual(f["kind"], "failed")
+        self.assertTrue(f["explicit"])
+        self.assertEqual(f["server"], "personal-mbp")
+        self.assertEqual(f["issue"], "connection timed out after 30000ms")
+
+    def test_standing_status_failed_with_issue_is_not_explicit(self):
+        f = self.mod.parse_failure_dialog(_fx("mcp_picker_2026-11_detail_http_failed.txt"))
+        self.assertFalse(f["explicit"])
+        self.assertTrue(f["issue"].startswith("ECONNREFUSED"))
+
+    def test_connected_detail_is_not_a_failure(self):
+        self.assertIsNone(self.mod.parse_failure_dialog(
+            _fx("mcp_picker_2026-11_detail_http_connected.txt")))
+
+    def test_needs_auth_is_a_failure(self):
+        f = self.mod.parse_failure_dialog(
+            "  srv\n  MCP server\n\n  Status:  \u26a0 needs authentication\n\n"
+            "  \u276f Authenticate\n    Back\n\n  Enter to select \xb7 Esc to go back\n")
+        self.assertEqual(f["kind"], "needs-auth")
+
+    def test_modal_detected_even_with_stale_title_above(self):
+        # The old title-based predicates said "no menu" for this screen, so the
+        # defensive close never pressed Esc and the dialog stayed open.
+        text = _fx(self.FIX)
+        self.assertTrue(self.mod.modal_footer_at_bottom(text))
+        self.assertTrue(self.mod.any_mcp_menu_visible(text))
+
+    def test_plain_prompt_is_not_a_modal(self):
+        self.assertFalse(self.mod.any_mcp_menu_visible(
+            "some chat about MCP servers\n\n\u276f \n  ? for shortcuts\n"))
+
+    def test_summary_line_fields(self):
+        line = self.mod.summary_line({"ok": False, "server": "personal-mbp", "code": 7,
+                                      "issue": "connection timed out after 30000ms",
+                                      "reason": "reconnect-failed: connection timed out after 30000ms",
+                                      "pane_restored": True})
+        self.assertIn("FAILED server=personal-mbp code=7", line)
+        self.assertIn("issue=connection timed out after 30000ms", line)
+        self.assertIn("pane_restored=yes", line)
+        bad = self.mod.summary_line({"ok": False, "server": "x", "code": 7, "pane_restored": False})
+        self.assertIn("pane_restored=NO", bad)
+
+
+class FailureDriveTest(unittest.TestCase):
+    """End to end through do_reconnect: Reconnect pressed, dialog stays open
+    showing the failure; Esc must be repeated until the prompt is back."""
+
+    NAME = "personal-mbp"
+
+    class Pane:
+        def __init__(self, escapes_needed=2, stuck=False):
+            self.screen = "top"
+            self.keys = []
+            self.escapes_needed = escapes_needed
+            self.esc_seen = 0
+            self.stuck = stuck
+
+        def reopen(self):
+            self.screen = "top"
+
+        def run(self, cmd, timeout=10):
+            if cmd[:2] == ["tmux", "capture-pane"]:
+                if self.screen == "top":
+                    return _fx("mcp_picker_2026-11_list_http_failed.txt").replace(
+                        "remote-http", "personal-mbp"), 0
+                if self.screen == "detail":
+                    return _fx("mcp_picker_2026-11_detail_http_failed.txt").replace(
+                        "remote-http", "personal-mbp"), 0
+                if self.screen == "failed":
+                    return _fx(FailureDialogTest.FIX), 0
+                return "\u276f \n  ? for shortcuts\n", 0
+            if cmd[:2] == ["tmux", "send-keys"]:
+                key = cmd[-1]
+                self.keys.append(key)
+                if key == "Escape" and not self.stuck:
+                    self.esc_seen += 1
+                    if self.esc_seen >= self.escapes_needed:
+                        self.screen = "closed"
+                elif key == "Enter":
+                    self.screen = {"top": "detail", "detail": "failed"}.get(self.screen, self.screen)
+            return "", 0
+
+    def setUp(self):
+        self.mod = _import_self_mcp_reconnect()
+        self.events = []
+        self.mod.emit_event = lambda *a, **k: self.events.append((a, k))
+
+    def _drive(self, pane):
+        mod = self.mod
+        mod.sc.run = mock.MagicMock(side_effect=pane.run)
+        mod.sc.capture_pane_text = mock.MagicMock(return_value="<mocked>")
+        mod.sc.ensure_main_loop_focus = mock.MagicMock(return_value=True)
+        mod.sc.inject = mock.MagicMock(
+            side_effect=lambda _p, text, **_k: pane.reopen() if text == "/mcp" else None)
+        mod.time.sleep = lambda *_a, **_k: None
+        mod.FAILURE_SETTLE_SECONDS = 0.0
+        return mod.do_reconnect("p:0.0", self.NAME, menu_timeout=0.3, result_timeout=0.3)
+
+    def test_true_failure_is_code_7_and_pane_restored_with_multiple_escapes(self):
+        pane = self.Pane(escapes_needed=3)
+        result = self._drive(pane)
+        self.assertEqual(result["code"], 7, result)
+        self.assertEqual(result["reason"], "reconnect-failed: connection timed out after 30000ms")
+        self.assertEqual(result["issue"], "connection timed out after 30000ms")
+        self.assertTrue(result["pane_restored"])
+        self.assertEqual(pane.screen, "closed")
+        self.assertGreaterEqual(pane.keys.count("Escape"), 3)
+        self.assertNotIn("menu_stuck", result)
+
+    def test_unrestorable_pane_is_reported_explicitly(self):
+        pane = self.Pane(stuck=True)
+        result = self._drive(pane)
+        self.assertEqual(result["code"], 7)
+        self.assertFalse(result["pane_restored"])
+        self.assertTrue(result["menu_stuck"])
+        self.assertIn("PANE NOT RESTORED", result["reason"])
+        self.assertLessEqual(pane.keys.count("Escape"), 8 + 8 + 8)  # bounded
+        self.assertTrue(any(a[1]["tag"] == "self-mcp-reconnect-menu-stuck"
+                            for a in self.events))
 
 
 class LivePane:
