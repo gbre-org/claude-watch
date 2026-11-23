@@ -417,6 +417,20 @@ add one.
 >   caller execs — which is why [`cron.d/cw-host`](cron.d/cw-host) points at the
 >   `ExecStart` path (see [Host cron](#host-cron)).
 
+### Workload pane housekeeping
+
+Finished `claude-watch workload run` panes stay in the `tasks` tmux session
+until closed, and a session with enough of them runs out of window rows
+(`no space for new pane`). `claude-watch workload prune [--older-than 6h] [-n]`
+closes the panes of workloads that are DONE and finished longer ago than the
+given age (`30m`, `2h`, `1d`; default `6h`); `-n/--dry-run` only lists them.
+Running workloads are never touched. State, `.output` logs and queue history
+are kept, so `workload log <label>` still works for pruned workloads;
+`workload list` hides pruned entries unless given `--all`. `workload run` also
+auto-prunes panes finished more than 10 minutes ago, once, when the session is
+at ~90% of its pane capacity or tmux reports the pane limit, and says so on
+stderr.
+
 ### Host cron
 
 Some of claude-watch's jobs are cron-driven rather than daemon-driven: the
