@@ -1077,27 +1077,29 @@ def write_status(data):
 
 def finalize_queue(rc):
     # Flip the queue item done/abandon, then emit a hostjob-done event.
-    # Every step is best-effort; a missing CLI or non-zero exit is ignored.
+    # Every step is best-effort, but the flip is RETRIED (a remote queue host
+    # reached over ssh can fail transiently; a single dropped flip leaves the
+    # row `running` with nobody told).
     if queue_id:
         st_bin = queue_backend
         if st_bin:
-            try:
-                if rc == 0:
-                    subprocess.run(
-                        st_argv("queue", "done", queue_id),
-                        stdin=subprocess.DEVNULL,
+            if rc == 0:
+                flip = st_argv("queue", "done", queue_id)
+            else:
+                flip = st_argv("queue", "abandon", queue_id,
+                               "--confirmed-dead",
+                               "--reason", "hostjob exit %s (log: %s)" % (rc, lp))
+            for attempt in range(4):
+                try:
+                    r = subprocess.run(
+                        flip, stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         timeout=20)
-                else:
-                    subprocess.run(
-                        st_argv("queue", "abandon", queue_id,
-                                "--confirmed-dead",
-                                "--reason", "hostjob exit %s (log: %s)" % (rc, lp)),
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        timeout=20)
-            except Exception:
-                pass
+                    if r.returncode == 0:
+                        break
+                except Exception:
+                    pass
+                time.sleep(3 * (attempt + 1))
     ce_bin = shutil.which("claude-event")
     if ce_bin:
         try:
@@ -1150,7 +1152,11 @@ def register_when_live():
 def _heartbeat_loop(stop_event, worker_pid, interval=300.0):
     # Periodic `queue heartbeat` for rows on a REMOTE queue host. Fail-soft:
     # refused (row not running yet) or errors are ignored.
-    while not stop_event.wait(interval):
+    # First beat after ~30s (not `interval`): the queue host treats a remote
+    # row with no log and no heartbeat for ~2min as a failed launch.
+    wait_s = min(30.0, interval)
+    while not stop_event.wait(wait_s):
+        wait_s = interval
         if not pid_alive(worker_pid):
             return
         if not queue_registered:
@@ -1351,11 +1357,14 @@ try:
 except Exception as e:
     rc = 127
     status = "crashed"
+    _err = ("\n[hostjob reaper error] %r\n" % e).encode()
     try:
         with open(lp, "ab", buffering=0) as f:
-            f.write(("\n[hostjob reaper error] %r\n" % e).encode())
+            f.write(_err)
     except Exception:
         pass
+    # Also push it to the queue host so the q-site shows WHY (not "no log").
+    _push_line(_err)
 
 write_status({
     "label": label, "cmd": cmd, "cwd": cwd, "status": status,
