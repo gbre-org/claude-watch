@@ -459,9 +459,26 @@ enum WorkloadAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         cmd: Vec<String>,
     },
-    /// Show running workloads
+    /// Show workloads (pruned ones hidden unless --all)
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Include workloads whose finished pane was pruned
+        #[arg(short, long)]
+        all: bool,
+    },
+    /// Close tmux panes of FINISHED workloads (never running ones)
+    ///
+    /// Keeps state, `.output` logs and queue history, so `workload log
+    /// <label>` still works for pruned workloads. `workload run` also
+    /// auto-prunes (panes done >10m) when the session hits its pane limit.
+    Prune {
+        /// Only prune workloads finished at least this long ago (30m, 2h, 1d)
+        #[arg(long, default_value = "6h")]
+        older_than: String,
+        /// List what would be pruned without closing anything
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
     /// Block until workload completes, print final output.
     ///
     /// DISABLED BY DEFAULT — workloads emit a `workload-done` claude-event
@@ -1817,7 +1834,11 @@ fn run_workload(action: WorkloadAction) -> i32 {
             }
             workload::cmd_run(&label, &cmd, queue_id.as_deref())
         }
-        WorkloadAction::List => workload::cmd_list(),
+        WorkloadAction::List { all } => workload::cmd_list(all),
+        WorkloadAction::Prune {
+            older_than,
+            dry_run,
+        } => workload::cmd_prune(&older_than, dry_run),
         WorkloadAction::Wait {
             label,
             lines,

@@ -670,6 +670,213 @@ fn rebalance() {
         .output();
 }
 
+// ---------------------------------------------------------------------------
+// PRUNING FINISHED PANES (`workload prune`)
+// ---------------------------------------------------------------------------
+//
+// A finished workload's pane lingers in the `tasks` session. tmux has no
+// explicit pane cap, but every pane costs at least two rows (content +
+// border) of the window, so a session that accumulates ~150 done panes runs
+// out of room and `split-window` fails with "no space for new pane" -- which
+// is how `workload run` itself used to die.
+//
+// Pruning closes ONLY the tmux pane. The registry entry in `state.json`, the
+// `<label>.output` / `.exit` files and the queue history are left alone, so
+// `workload log <label>` keeps working; a `<label>.pruned` marker lets
+// `workload list` hide the entry by default (`--all` shows it).
+
+/// Age used by the automatic prune `workload run` does when the session is
+/// at its pane limit.
+pub const AUTO_PRUNE_AGE_SECS: u64 = 600;
+
+fn pruned_file(label: &str) -> PathBuf {
+    PathBuf::from(WORKLOAD_DIR).join(format!("{label}.pruned"))
+}
+
+fn is_pruned(label: &str) -> bool {
+    pruned_file(label).exists()
+}
+
+/// Parse `30m` / `2h` / `1d` / `90s` into seconds.
+pub fn parse_age_secs(s: &str) -> Result<u64, String> {
+    crate::session_event::parse_duration_secs(s.trim())
+        .map_err(|_| format!("invalid age '{s}' (expected e.g. 30m, 2h, 1d)"))
+}
+
+/// Pane ids currently in the `tasks` session (empty on tmux error).
+fn session_pane_ids() -> BTreeSet<String> {
+    match Command::new("tmux")
+        .args(["list-panes", "-t", SESSION, "-F", "#{pane_id}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// Unix mtime (seconds) of a label's `.exit` marker = when it finished.
+fn finished_at_secs(label: &str) -> Option<u64> {
+    let m = fs::metadata(exit_file(label)).ok()?.modified().ok()?;
+    m.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Pure: which workloads may be pruned. A workload qualifies only when its
+/// pane is still in the session, it has an exit marker (so it is DONE; a
+/// running workload has none), and it finished at least `min_age_secs` ago.
+/// Returns `(label, pane_id)` pairs in label order.
+pub fn select_prunable(
+    state: &WorkloadState,
+    alive_panes: &BTreeSet<String>,
+    finished_at: impl Fn(&str) -> Option<u64>,
+    now_secs: u64,
+    min_age_secs: u64,
+) -> Vec<(String, String)> {
+    state
+        .iter()
+        .filter(|(_, e)| !e.pane_id.is_empty() && alive_panes.contains(&e.pane_id))
+        .filter_map(|(label, e)| {
+            let fin = finished_at(label)?;
+            (now_secs.saturating_sub(fin) >= min_age_secs)
+                .then(|| (label.clone(), e.pane_id.clone()))
+        })
+        .collect()
+}
+
+/// Close the given panes via `kill`, calling `mark` for each success.
+/// Returns `(pruned, failed)` label lists.
+pub fn prune_panes(
+    targets: &[(String, String)],
+    mut kill: impl FnMut(&str) -> bool,
+    mut mark: impl FnMut(&str),
+) -> (Vec<String>, Vec<String>) {
+    let (mut ok, mut bad) = (Vec::new(), Vec::new());
+    for (label, pane) in targets {
+        if kill(pane) {
+            mark(label);
+            ok.push(label.clone());
+        } else {
+            bad.push(label.clone());
+        }
+    }
+    (ok, bad)
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn kill_pane_cli(pane: &str) -> bool {
+    Command::new("tmux")
+        .args(["kill-pane", "-t", pane])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Prune finished panes older than `min_age_secs`. Returns the number
+/// pruned (or that would be, on a dry run).
+fn prune_now(min_age_secs: u64, dry_run: bool, quiet: bool) -> usize {
+    let state = load_state();
+    let alive = session_pane_ids();
+    let targets = select_prunable(
+        &state,
+        &alive,
+        finished_at_secs,
+        now_epoch_secs(),
+        min_age_secs,
+    );
+    if dry_run {
+        for (label, pane) in &targets {
+            println!("would prune {label} ({pane})");
+        }
+        return targets.len();
+    }
+    let (ok, bad) = prune_panes(&targets, kill_pane_cli, |l| {
+        let _ = fs::write(pruned_file(l), b"");
+    });
+    if !ok.is_empty() {
+        rebalance();
+    }
+    if !quiet {
+        for l in &ok {
+            println!("pruned {l}");
+        }
+        for l in &bad {
+            eprintln!("failed to close pane for {l}");
+        }
+    }
+    ok.len()
+}
+
+/// CLI: `workload prune [--older-than 6h] [-n]`
+pub fn cmd_prune(older_than: &str, dry_run: bool) -> i32 {
+    let age = match parse_age_secs(older_than) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    if !session_exists() {
+        eprintln!("No '{SESSION}' tmux session. Run: claude-watch task init");
+        return 1;
+    }
+    let state = load_state();
+    let alive = session_pane_ids();
+    let total = alive.len();
+    let running = state
+        .iter()
+        .filter(|(l, e)| alive.contains(&e.pane_id) && finished_at_secs(l).is_none())
+        .count();
+    let n = prune_now(age, dry_run, false);
+    let verb = if dry_run { "would prune" } else { "pruned" };
+    println!(
+        "{verb} {n} finished pane(s) older than {older_than}; {running} running kept, \
+         {total} pane(s) in session before. Output logs and queue history kept \
+         (`workload log <label>` still works)."
+    );
+    0
+}
+
+/// Pure: is the session at/over ~90% of the pane capacity its window height
+/// allows (each pane needs a content row plus a border row)?
+pub fn near_pane_limit(panes: usize, window_height: usize) -> bool {
+    if window_height == 0 {
+        return false;
+    }
+    let capacity = (window_height + 1) / 2;
+    panes * 10 >= capacity * 9
+}
+
+/// Pure: does a tmux `split-window` error mean the session is out of room?
+pub fn is_pane_limit_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("no space for new pane") || s.contains("too small")
+}
+
+fn session_near_pane_limit() -> bool {
+    let out = Command::new("tmux")
+        .args(["display-message", "-p", "-t", SESSION, "#{window_height}"])
+        .output();
+    let h = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0),
+        _ => 0,
+    };
+    near_pane_limit(session_pane_ids().len(), h)
+}
+
 /// Best-effort PATH walk for the `session-task` CLI. Used by
 /// `transition_queue_item_for_workload` to mark the queue item
 /// done/abandoned after a workload-bound (`--queue-id`) workload
@@ -2010,6 +2217,7 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
     // longer matches the interpreter pattern doesn't surface a stale
     // capture from the previous invocation.
     let _ = fs::remove_file(&exit_path);
+    let _ = fs::remove_file(pruned_file(label));
     let _ = fs::remove_file(&out_path);
     let _ = fs::remove_file(&runtime_heartbeat_path);
     // Stale process-group sidecar from a previous run would point a
@@ -2151,19 +2359,37 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
     // `set_permissions` above is now belt-and-suspenders for any
     // operator who runs the script directly from a shell.)
     let script_path_str = script_path.to_string_lossy().to_string();
-    let out = Command::new("tmux")
-        .args([
-            "split-window",
-            "-t",
-            SESSION,
-            "-v",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "bash",
-            &script_path_str,
-        ])
-        .output();
+    if session_near_pane_limit() {
+        let n = prune_now(AUTO_PRUNE_AGE_SECS, false, true);
+        eprintln!(
+            "workload: '{SESSION}' session near its pane limit; auto-pruned {n} finished pane(s)"
+        );
+    }
+    let split = || {
+        Command::new("tmux")
+            .args([
+                "split-window",
+                "-t",
+                SESSION,
+                "-v",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "bash",
+                &script_path_str,
+            ])
+            .output()
+    };
+    let mut out = split();
+    if let Ok(o) = &out {
+        if !o.status.success() && is_pane_limit_error(&String::from_utf8_lossy(&o.stderr)) {
+            let n = prune_now(AUTO_PRUNE_AGE_SECS, false, true);
+            eprintln!(
+                "workload: pane limit hit creating pane; auto-pruned {n} finished pane(s), retrying once"
+            );
+            out = split();
+        }
+    }
     let pane_id = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Ok(o) => {
@@ -2337,19 +2563,29 @@ impl Drop for SignalShield {
 }
 
 /// CLI: `workload list`
-pub fn cmd_list() -> i32 {
+pub fn cmd_list(show_all: bool) -> i32 {
     let state = load_state();
     if state.is_empty() {
         println!("No workloads");
         return 0;
     }
+    let mut hidden = 0usize;
     for (label, info) in &state {
+        let pruned = is_pruned(label);
+        if pruned && !show_all {
+            hidden += 1;
+            continue;
+        }
         let alive = pane_alive(&info.pane_id);
         let exit_code = read_exit_code(label);
         let status = if alive {
             "running".to_string()
         } else if let Some(ec) = exit_code {
-            format!("done (exit {ec})")
+            if pruned {
+                format!("done (exit {ec}, pruned)")
+            } else {
+                format!("done (exit {ec})")
+            }
         } else {
             "dead".to_string()
         };
@@ -2358,6 +2594,9 @@ pub fn cmd_list() -> i32 {
             label, info.pane_id, status, info.started_at
         );
         println!("    {}", info.command);
+    }
+    if hidden > 0 {
+        println!("({hidden} pruned workload(s) hidden; `workload list --all` shows them)");
     }
     0
 }
@@ -7356,6 +7595,87 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
 
     fn alive(panes: &[&str]) -> BTreeSet<String> {
         panes.iter().map(|p| p.to_string()).collect()
+    }
+
+    // ---- workload prune ------------------------------------------------
+
+    fn prune_state() -> WorkloadState {
+        let mut st = WorkloadState::new();
+        for (l, p) in [
+            ("old-done", "%1"),
+            ("new-done", "%2"),
+            ("running", "%3"),
+            ("gone", "%9"),
+        ] {
+            st.insert(l.to_string(), entry(p));
+        }
+        st
+    }
+
+    #[test]
+    fn select_prunable_takes_only_old_done_panes_in_session() {
+        let fin = |l: &str| match l {
+            "old-done" => Some(1_000),
+            "new-done" => Some(9_900),
+            "gone" => Some(1_000),
+            _ => None, // running: no exit marker
+        };
+        let got = select_prunable(
+            &prune_state(),
+            &alive(&["%1", "%2", "%3"]),
+            fin,
+            10_000,
+            3_600,
+        );
+        assert_eq!(got, vec![("old-done".to_string(), "%1".to_string())]);
+    }
+
+    #[test]
+    fn select_prunable_never_touches_running_even_when_age_zero() {
+        let got = select_prunable(&prune_state(), &alive(&["%3"]), |_| None, 10_000, 0);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn prune_panes_marks_only_successfully_killed() {
+        let targets = vec![
+            ("a".to_string(), "%1".to_string()),
+            ("b".to_string(), "%2".to_string()),
+        ];
+        let mut killed = Vec::new();
+        let mut marked = Vec::new();
+        let (ok, bad) = prune_panes(
+            &targets,
+            |p| {
+                killed.push(p.to_string());
+                p == "%1"
+            },
+            |l| marked.push(l.to_string()),
+        );
+        assert_eq!(ok, vec!["a"]);
+        assert_eq!(bad, vec!["b"]);
+        assert_eq!(marked, vec!["a"]);
+        assert_eq!(killed, vec!["%1", "%2"]);
+    }
+
+    #[test]
+    fn parse_age_accepts_m_h_d_and_rejects_junk() {
+        assert_eq!(parse_age_secs("30m"), Ok(1800));
+        assert_eq!(parse_age_secs("2h"), Ok(7200));
+        assert_eq!(parse_age_secs("1d"), Ok(86_400));
+        assert!(parse_age_secs("soon").is_err());
+        assert!(parse_age_secs("").is_err());
+    }
+
+    #[test]
+    fn pane_limit_detection() {
+        assert!(is_pane_limit_error("no space for new pane"));
+        assert!(is_pane_limit_error("create pane failed: pane too small"));
+        assert!(!is_pane_limit_error("can't find session: tasks"));
+        // height 100 -> capacity 50; 90% = 45
+        assert!(!near_pane_limit(44, 100));
+        assert!(near_pane_limit(45, 100));
+        assert!(!near_pane_limit(500, 0));
     }
 
     /// The recreate path must tear down exactly the workloads whose pane
