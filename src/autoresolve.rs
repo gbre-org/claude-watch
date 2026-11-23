@@ -523,6 +523,90 @@ const HARD_DENY: &[(&str, &str)] = &[
     ("/library", "system"),
 ];
 
+/// Words (split on anything but alphanumerics, `_`, `-`, `.`) that mean a
+/// command removes, overwrites or destroys something. Used only by the
+/// "can't be sure" notice path, which is deliberately conservative: a hit
+/// anywhere, even inside a quoted string, keeps the answer No.
+const DESTRUCTIVE_WORDS: &[&str] = &[
+    "rm",
+    "rmdir",
+    "unlink",
+    "shred",
+    "dd",
+    "truncate",
+    "mv",
+    "tee",
+    "sudo",
+    "doas",
+    "destroy",
+    "rmi",
+    "prune",
+    "clean",
+    "wipefs",
+    "fdisk",
+    "parted",
+    "mkswap",
+    "srm",
+    "trash",
+    "-delete",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "--delete",
+    "--remove",
+    "--rm",
+    "--force",
+    "-f",
+    "--hard",
+    "-i",
+    "--in-place",
+];
+
+/// True when the command contains no removal- or destruction-class token and
+/// no hard-deny class (reuses `HARD_DENY`: network, secrets, git history,
+/// system paths, `find`, `xargs`, `eval` ...).
+pub fn no_destructive_tokens(command: &str) -> bool {
+    if hard_deny_class(command).is_some() {
+        return false;
+    }
+    let lower = command.to_ascii_lowercase();
+    let words = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .filter(|w| !w.is_empty());
+    for w in words {
+        if DESTRUCTIVE_WORDS.contains(&w)
+            || w.starts_with("mkfs")
+            || w.starts_with("--remove")
+            || w.starts_with("--delete")
+        {
+            return false;
+        }
+    }
+    // Clobbering redirects: any `>` / `>>` / `>|` whose target is not /dev/*
+    // or an fd duplication (`2>&1`).
+    let chars: Vec<char> = lower.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '>' {
+            continue;
+        }
+        let mut j = i + 1;
+        while matches!(chars.get(j), Some('>') | Some('|')) {
+            j += 1;
+        }
+        if chars.get(j) == Some(&'&') {
+            continue;
+        }
+        while matches!(chars.get(j), Some(' ') | Some('\t')) {
+            j += 1;
+        }
+        let target: String = chars[j..].iter().take(5).collect();
+        if !target.starts_with("/dev/") {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn hard_deny_class(command: &str) -> Option<&'static str> {
     let lower = command.to_ascii_lowercase();
     HARD_DENY
@@ -997,6 +1081,13 @@ fn strip_chrome(line: &str) -> &str {
                     | '\u{2500}'
                     | '\u{2501}'
                     | '\u{2550}'
+                    // Dashed rules (the unboxed dialog layout's separator).
+                    | '\u{254c}'
+                    | '\u{254d}'
+                    | '\u{2504}'
+                    | '\u{2505}'
+                    | '\u{2508}'
+                    | '\u{2509}'
             )
     })
 }
@@ -1004,7 +1095,10 @@ fn strip_chrome(line: &str) -> &str {
 fn option_row(line: &str) -> Option<(u32, String, bool)> {
     let mut rest = strip_chrome(line);
     let mut cursor = false;
-    if let Some(r) = rest.strip_prefix('\u{276f}') {
+    if let Some(r) = rest
+        .strip_prefix('\u{276f}')
+        .or_else(|| rest.strip_prefix('>'))
+    {
         cursor = true;
         rest = r.trim_start();
     }
@@ -1021,6 +1115,31 @@ const ACCEPTED_WARNING_PREFIXES: &[&str] = &[
     "dangerous rm operation on critical path:",
     "dangerous rm operation on possibly-empty variable path",
 ];
+
+/// Informational line printed when the safety check could not parse the
+/// command (possibly wrapped over several rows). It never changes the
+/// decision: the allow rules still have to cover the whole command.
+const UNSURE_WARNING_PREFIX: &str = "claude code can't be sure it read this command";
+
+/// Description line the unboxed layout prints above the command.
+fn is_leading_description(line: &str) -> bool {
+    line.eq_ignore_ascii_case("run shell command")
+}
+
+/// Text after `Bash command` in a title: `from X`, `· from X` or empty.
+fn title_suffix(title: &str) -> &str {
+    title["bash command".len()..]
+        .trim()
+        .trim_start_matches(['\u{b7}', '-', '\u{2013}', '\u{2014}'])
+        .trim()
+}
+
+fn agent_from_title(title: &str) -> Option<String> {
+    let rest = title_suffix(title).strip_prefix("from ")?.trim();
+    let rest = rest.strip_prefix("the ").unwrap_or(rest);
+    let rest = rest.strip_suffix(" agent").unwrap_or(rest).trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
 
 fn looks_like_description(line: &str) -> bool {
     let first = line.chars().next();
@@ -1100,7 +1219,7 @@ pub fn parse_bash_prompt(frame: &str) -> Result<BashPrompt, String> {
         })
         .ok_or("no 'Bash command' title")?;
     let title = strip_chrome(tail[t]);
-    let rest = title["bash command".len()..].trim();
+    let rest = title_suffix(title);
     let agent = if rest.is_empty() {
         None
     } else if let Some(a) = rest.strip_prefix("from ") {
@@ -1135,6 +1254,20 @@ pub fn parse_bash_prompt(frame: &str) -> Result<BashPrompt, String> {
         block.push((s.to_string(), full));
     }
     let mut warning = None;
+    // Unboxed layout: leading description line, trailing (possibly wrapped)
+    // "can't be sure" notice.
+    if block.len() >= 2 && is_leading_description(&block[0].0) {
+        block.remove(0);
+    }
+    if let Some(i) = block
+        .iter()
+        .position(|(t, _)| t.to_ascii_lowercase().starts_with(UNSURE_WARNING_PREFIX))
+    {
+        if i > 0 {
+            let tail: Vec<String> = block.drain(i..).map(|b| b.0).collect();
+            warning = Some(tail.join(" "));
+        }
+    }
     if let Some((last, _)) = block.last() {
         if last.to_ascii_lowercase().starts_with("dangerous ") {
             if ACCEPTED_WARNING_PREFIXES
@@ -1316,14 +1449,25 @@ pub fn classify_screen(frame: &str) -> Screen {
     }
 
     let lo = q.saturating_sub(25);
-    let Some(top) = (lo..q)
+    // Boxed layout: a rounded top border. Unboxed layout (no border at all):
+    // the `Bash command ...` header line is itself the top.
+    let boxed = (lo..q)
         .rev()
-        .find(|&i| tail[i].trim_start().starts_with('\u{256d}'))
-    else {
-        return Screen::Undecided("no box top above the question".into());
-    };
-    let Some(t) = (top + 1..q).find(|&i| !strip_chrome(tail[i]).is_empty()) else {
-        return Screen::Undecided("no title line".into());
+        .find(|&i| tail[i].trim_start().starts_with('\u{256d}'));
+    let unboxed = (lo..q).rev().find(|&i| {
+        strip_chrome(tail[i])
+            .to_ascii_lowercase()
+            .starts_with("bash command")
+    });
+    let t = match (boxed, unboxed) {
+        (Some(top), _) => {
+            let Some(t) = (top + 1..q).find(|&i| !strip_chrome(tail[i]).is_empty()) else {
+                return Screen::Undecided("no title line".into());
+            };
+            t
+        }
+        (None, Some(t)) => t,
+        (None, None) => return Screen::Undecided("no box top above the question".into()),
     };
     let body = tail[t + 1..q]
         .iter()
@@ -1407,9 +1551,13 @@ pub fn decide_dialog(
     };
     let raw_cmd = dialog.body.clone();
     let agent_of = |t: &str| {
-        t.to_ascii_lowercase()
-            .find(" from ")
-            .map(|i| t[i + 6..].trim().to_string())
+        if t.to_ascii_lowercase().starts_with("bash command") {
+            agent_from_title(t)
+        } else {
+            t.to_ascii_lowercase()
+                .find(" from ")
+                .map(|i| t[i + 6..].trim().to_string())
+        }
     };
     if !dialog
         .title
@@ -1448,7 +1596,28 @@ pub fn decide_dialog(
             resolved,
             prompt: Box::new(prompt),
         },
-        Decision::Deny { reason } => no(reason, prompt.command.clone(), prompt.agent.clone()),
+        Decision::Deny { reason } => {
+            // The only blocker is the safety check's "can't be sure it read
+            // this command" notice (a parse-uncertainty message, not a
+            // finding): answer Yes for an agent's command that has no
+            // removal-class token at all.
+            let unsure = prompt
+                .warning
+                .as_deref()
+                .map(|w| w.to_ascii_lowercase().starts_with(UNSURE_WARNING_PREFIX))
+                .unwrap_or(false);
+            if unsure
+                && prompt.agent.is_some()
+                && prompt.variants.iter().all(|v| no_destructive_tokens(v))
+            {
+                return Verdict::Yes {
+                    rule_ids: vec!["unsure-notice-no-removal".to_string()],
+                    resolved: Vec::new(),
+                    prompt: Box::new(prompt),
+                };
+            }
+            no(reason, prompt.command.clone(), prompt.agent.clone())
+        }
     }
 }
 
@@ -1599,7 +1768,9 @@ pub fn dialog_reason_line(body: &str) -> Option<String> {
         .map(str::trim)
         .find(|l| {
             let lo = l.to_ascii_lowercase();
-            lo.starts_with("dangerous ") || lo.contains("could not be checked")
+            lo.starts_with("dangerous ")
+                || lo.contains("could not be checked")
+                || lo.starts_with(UNSURE_WARNING_PREFIX)
         })
         .map(str::to_string)
 }
@@ -2628,6 +2799,73 @@ mod tests {
         );
         let n = refusal_note("rm -f $Q/*.json", "unparseable:x");
         assert!(n.contains("rm -f $Q/*.json") && n.contains("unparseable"));
+    }
+
+    const UNBOXED: &str = include_str!("../tests/fixtures/autoresolve_unboxed_subagent_unsure.txt");
+
+    #[test]
+    fn unboxed_subagent_dialog_with_unsure_warning_decides_first_cycle() {
+        // Regression: no box border, dashed rule, `Bash command · from the X
+        // agent` header, "can't be sure" notice. Was Undecided("no box top").
+        let Screen::Dialog(d) = classify_screen(UNBOXED) else {
+            panic!("must classify as a dialog on the first capture")
+        };
+        assert_eq!(d.no_digit(), Some(2));
+        let p = parse_bash_prompt(UNBOXED).expect("parses");
+        assert_eq!(p.agent.as_deref(), Some("general-purpose"));
+        assert!(p.command.starts_with("cd /tmp/claude-1000/"));
+        assert!(p.command.ends_with("cut -c1-400; done"), "{}", p.command);
+        assert!(!p.command.contains("Run shell command"));
+        assert!(!p.command.contains("can't be sure"));
+        assert!(p.warning.as_deref().unwrap().contains("dangerous removal"));
+        let reason = dialog_reason_line(&d.body).expect("reason line");
+        assert!(reason.starts_with("Claude Code can't be sure"));
+        match verdict(UNBOXED) {
+            Verdict::Yes {
+                prompt, rule_ids, ..
+            } => {
+                assert_eq!(prompt.agent.as_deref(), Some("general-purpose"));
+                assert_eq!(rule_ids, vec!["unsure-notice-no-removal".to_string()]);
+            }
+            v => panic!("must be Yes: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn unsure_notice_yes_requires_no_removal_tokens() {
+        let with = |from: &str, to: &str| UNBOXED.replace(from, to);
+        let rm = with("echo \"== $a\";", "rm -f x; echo \"== $a\";");
+        assert!(matches!(verdict(&rm), Verdict::No { .. }), "rm");
+        // rm inside a quoted string is still a hit (conservative).
+        let q = with("echo \"== $a\";", "echo 'rm me'; echo \"== $a\";");
+        assert!(matches!(verdict(&q), Verdict::No { .. }), "quoted rm");
+        let f = with("echo \"== $a\";", "find . -name x -delete; echo \"== $a\";");
+        assert!(matches!(verdict(&f), Verdict::No { .. }), "find -delete");
+        // Clobber redirect onto a real path; /dev/null and 2>&1 stay fine.
+        let c = with("done", "done > out.txt");
+        assert!(matches!(verdict(&c), Verdict::No { .. }), "clobber");
+        let d = with("done", "done > /dev/null");
+        assert!(matches!(verdict(&d), Verdict::Yes { .. }), "/dev/null");
+        // Not agent-origin (plain `Bash command`): never the unsure path.
+        let na = with(
+            "Bash command \u{b7} from the general-purpose agent",
+            "Bash command",
+        );
+        assert!(matches!(verdict(&na), Verdict::No { .. }), "no agent");
+        for cmd in [
+            "git clean -fd",
+            "docker rmi x",
+            "zfs destroy p/d",
+            "truncate -s 0 f",
+            "dd if=a of=b",
+            "mkfs.ext4 x",
+            "torrent-ctl --remove x",
+            "mv a b",
+            "git reset --hard",
+        ] {
+            assert!(!no_destructive_tokens(cmd), "{cmd}");
+        }
+        assert!(no_destructive_tokens("ls -la 2>&1 | grep foo"));
     }
 
     #[test]
