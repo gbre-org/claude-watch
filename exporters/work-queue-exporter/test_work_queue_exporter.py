@@ -934,6 +934,54 @@ def run_scenarios():
     pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s17d")
     check("S17d hostjob progress_age absent", pa is None, f"got {pa!r}")
 
+    # ---- Scenario 17e: REMOTE hostjob (no local heartbeat file) with a
+    # fresh queue-row last_heartbeat_at -> progress_age emitted and small, so
+    # WorkQueueStuckSoft's `unless progress_age < 900` suppresses it.
+    print("\nScenario 17e: remote hostjob w/ row heartbeat -> progress_age small")
+    item = make_running_item("q-s17e", "remote hostjob")
+    item["scope"] = ["hostjob:remote-hj"]
+    item["registered_at"] = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+    item["last_heartbeat_at"] = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(hj_env)
+    mod.collect()
+    pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s17e")
+    check("S17e remote hostjob progress_age from row heartbeat",
+          pa is not None and 100 <= pa < 200, f"got {pa!r}")
+
+    # ---- Scenario 17f: stale row heartbeat but FRESH pushed log -> fresher
+    # signal wins.
+    print("\nScenario 17f: stale heartbeat + fresh pushed log -> small")
+    pl_dir = tempfile.mkdtemp(prefix="wqe-hjpl-")
+    os.makedirs(os.path.join(pl_dir, "remote-hj2"))
+    with open(os.path.join(pl_dir, "remote-hj2", "log"), "w") as f:
+        f.write("x\n")
+    pl_env = dict(hj_env)
+    pl_env["HOSTJOB_PUSHED_LOG_DIR"] = pl_dir
+    item = make_running_item("q-s17f", "remote hostjob 2")
+    item["scope"] = ["hostjob:remote-hj2"]
+    item["last_heartbeat_at"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(pl_env)
+    mod.collect()
+    pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s17f")
+    check("S17f fresher pushed log wins", pa is not None and pa < 30, f"got {pa!r}")
+
+    # ---- Scenario 17g: remote hostjob whose row heartbeat is stale and no
+    # log -> progress_age LARGE (a genuinely silent job still alerts).
+    print("\nScenario 17g: remote hostjob silent for hours -> progress_age large")
+    item = make_running_item("q-s17g", "silent remote hostjob")
+    item["scope"] = ["hostjob:silent-hj"]
+    item["last_heartbeat_at"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(pl_env)
+    mod.collect()
+    pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s17g")
+    check("S17g silent remote hostjob still large", pa is not None and pa > 9000, f"got {pa!r}")
+
     # ---- Scenario 18: helper edge cases.
     print("\nScenario 18: _workload_label_from_scope + _hostjob_label_from_scope edge cases")
     mod = load_exporter(env)

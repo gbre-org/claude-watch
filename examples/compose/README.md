@@ -897,6 +897,9 @@ reaches the queue host only through ssh. If that ssh key is bound to a
 forced-command allow-list, the list must include **`queue heartbeat`** and
 **`queue hostjob-log-sink`** in addition to `add|register|done|abandon`;
 otherwise the worker runs fine but the queue sees no log and no heartbeat.
+(Observed once: a healthy long-running job showed "launch failed / no log"
+and a stuck-queue alert until those two subcommands were added to the
+allow-list; its heartbeat then arrived and the alert resolved.)
 
 The queue host never abandons a silent remote row on its own evidence. It
 asks the runner host through `HOSTJOB_HOST_PROBE_CMD` (exit 0 = worker alive,

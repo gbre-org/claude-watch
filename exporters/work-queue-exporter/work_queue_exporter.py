@@ -328,6 +328,11 @@ WORKLOAD_SCOPE_PREFIX = "workload:"
 HOSTJOB_HEARTBEAT_DIR = os.environ.get(
     "HOSTJOB_HEARTBEAT_DIR", "/hostjob-heartbeats"
 )
+# Logs a REMOTE hostjob pushes to the queue host (`queue hostjob-log-sink`),
+# `<dir>/<label>/log`. Its mtime is a progress signal for remote rows.
+HOSTJOB_PUSHED_LOG_DIR = os.environ.get(
+    "HOSTJOB_PUSHED_LOG_DIR", "/hostjob-pushed-logs"
+)
 HOSTJOB_SCOPE_PREFIX = "hostjob:"
 # Staleness threshold (seconds) for flagging a `running` queue item with
 # no agent record as a never-spawned / abandoned-without-binding orphan.
@@ -1402,21 +1407,35 @@ def collect():
                 # dimension (informational — the join key is `id`).
                 hostjob_label = _hostjob_label_from_scope(it.get("scope"))
                 if hostjob_label:
-                    hj_hb_path = os.path.join(
-                        HOSTJOB_HEARTBEAT_DIR, hostjob_label, "heartbeat"
-                    )
+                    # Progress = the FRESHEST of three signals. A REMOTE
+                    # hostjob's runner state lives on another machine, so the
+                    # local heartbeat file never exists for it; its liveness
+                    # reaches the queue as the row's `last_heartbeat_at`
+                    # (`queue heartbeat`) and the pushed log's mtime. Without
+                    # these a healthy remote job always looked stuck.
+                    mtimes = []
                     try:
-                        hj_mtime = os.stat(hj_hb_path).st_mtime
-                        hj_progress_age = max(0.0, time.time() - hj_mtime)
+                        mtimes.append(os.stat(os.path.join(
+                            HOSTJOB_HEARTBEAT_DIR, hostjob_label, "heartbeat"
+                        )).st_mtime)
+                    except OSError:
+                        pass
+                    try:
+                        mtimes.append(os.stat(os.path.join(
+                            HOSTJOB_PUSHED_LOG_DIR, hostjob_label, "log"
+                        )).st_mtime)
+                    except OSError:
+                        pass
+                    row_hb = _parse_ts(it.get("last_heartbeat_at"))
+                    if row_hb is not None:
+                        mtimes.append(row_hb.timestamp())
+                    if mtimes:
                         g_progress_age.labels(
                             id=iid, summary=summary,
                             workload_label=hostjob_label,
-                        ).set(hj_progress_age)
-                    except OSError:
-                        # Heartbeat missing -- hostjob in startup, exited
-                        # but not yet flipped, or no progress heartbeat
-                        # emitted. Fail-soft (same posture as workload).
-                        pass
+                        ).set(max(0.0, time.time() - max(mtimes)))
+                    # else: no signal at all -- stay silent (fail-soft, same
+                    # posture as workload).
 
             # Attribute an owner: active-agents record keyed on this qid,
             # then the register-time `agent_id` stamp, then the arm-hook
