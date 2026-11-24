@@ -160,6 +160,20 @@ def test_enoent_with_snapshot_recovers_not_resets(monkeypatch=None):
 
 
 def test_enoent_recovers_by_retry_when_file_reappears():
+    # The suite default (1ms/retry) is too short for a writer that reappears
+    # after 150ms; give THIS test a retry window (7 x 0.1s) that spans it.
+    prev = os.environ.get("SESSION_TASK_READ_RETRY_SLEEP")
+    os.environ["SESSION_TASK_READ_RETRY_SLEEP"] = "0.1"
+    try:
+        _enoent_recovers_by_retry_body()
+    finally:
+        if prev is None:
+            os.environ.pop("SESSION_TASK_READ_RETRY_SLEEP", None)
+        else:
+            os.environ["SESSION_TASK_READ_RETRY_SLEEP"] = prev
+
+
+def _enoent_recovers_by_retry_body():
     mod = _load_module()
     with tempfile.TemporaryDirectory() as tmp:
         _point_module_at(mod, tmp)

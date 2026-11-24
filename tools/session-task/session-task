@@ -1100,6 +1100,25 @@ class QueueUnrecoverable(Exception):
 # os.replace. Treat those as transient: retry with backoff before concluding
 # anything. Total worst-case wait ~2s.
 _QUEUE_READ_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
+
+
+def _read_retry_delays():
+    """Retry delays, honoring SESSION_TASK_READ_RETRY_SLEEP.
+
+    When that env var is a non-negative number of seconds, every retry sleeps
+    that fixed amount instead (the retry COUNT is unchanged, so tests keep
+    exercising the full retry path but near-instantly). Unset/invalid keeps the
+    production backoff.
+    """
+    raw = os.environ.get("SESSION_TASK_READ_RETRY_SLEEP")
+    if raw not in (None, ""):
+        try:
+            v = float(raw)
+            if v >= 0:
+                return (v,) * len(_QUEUE_READ_RETRY_DELAYS)
+        except ValueError:
+            pass
+    return _QUEUE_READ_RETRY_DELAYS
 QUEUE_SNAPSHOT_KEEP = 20
 QUEUE_SNAPSHOT_MIN_INTERVAL_S = 30.0
 
@@ -1126,7 +1145,7 @@ def _read_text_retry(path):
     the full retry budget (a persistently absent file yields FileNotFoundError).
     """
     last = None
-    for delay in (0.0,) + _QUEUE_READ_RETRY_DELAYS:
+    for delay in (0.0,) + _read_retry_delays():
         if delay:
             time.sleep(delay)
         try:
@@ -1213,7 +1232,7 @@ def _read_queue_with_recovery():
     if raw is not None and not raw.strip():
         # Empty file: torn/truncated by a foreign writer if any snapshot
         # exists; otherwise a fresh store. Re-read once more before judging.
-        time.sleep(0.2)
+        time.sleep(_read_retry_delays()[3])
         raw, exc = _read_text_retry(QUEUE_FILE)
         if raw is not None and not raw.strip():
             if not _has_any_snapshot():
@@ -1557,7 +1576,54 @@ def cmd_queue_pg_export_json(args):
           f"to {QUEUE_FILE}")
 
 
+def _pg_probe():
+    """Read-only Postgres probe for `pg-status --postgres`. Never alerts, never
+    retries with sleeps, never writes. Returns (ok, lines)."""
+    lines = []
+    try:
+        pw = _pgwire()
+        conn = pw.PgConnection(_pg_dsn(), timeout=5.0)
+    except Exception as exc:  # noqa: BLE001 - report any probe failure
+        return False, [f"postgres: UNREACHABLE ({exc})"]
+    try:
+        lines.append("postgres: reachable")
+        try:
+            ver = conn.query("SELECT version()")
+            lines.append(f"server_version={ver}")
+            tbl = conn.query("SELECT to_regclass('queue_state') IS NOT NULL, "
+                             "to_regclass('queue_history') IS NOT NULL")
+            lines.append(f"schema(queue_state,queue_history)={tbl}")
+            try:
+                rows = conn.query("SELECT version, updated_at, "
+                                  "jsonb_array_length(doc->'items') "
+                                  "FROM queue_state WHERE id = 1")
+                lines.append(f"state(version,updated_at,items)={rows}")
+            except Exception:  # noqa: BLE001 - table absent before cutover
+                lines.append("state=absent (schema not migrated yet)")
+        except Exception as exc:  # noqa: BLE001
+            return False, lines + [f"postgres: query failed ({exc})"]
+    finally:
+        conn.close()
+    return True, lines
+
+
 def cmd_queue_pg_status(args):
+    backend = _queue_backend()
+    if getattr(args, "postgres", False):
+        ok, lines = _pg_probe()
+        print(f"backend={backend} (probing postgres; nothing changed)")
+        for ln in lines:
+            print(ln)
+        sys.exit(0 if ok else 1)
+    if backend != "postgres":
+        try:
+            snaps = len(list(_snapshot_dir().glob("queue.*.json")))
+        except OSError:
+            snaps = 0
+        bak = QUEUE_BAK_FILE.exists()
+        print(f"backend=json snapshots={snaps} bak={'yes' if bak else 'no'} "
+              f"(postgres not in use; probe with: queue pg-status --postgres)")
+        return
     conn = _pg_connect()
     try:
         rows = conn.query("SELECT version, updated_at, jsonb_array_length("
@@ -1565,7 +1631,7 @@ def cmd_queue_pg_status(args):
         hist = conn.query("SELECT count(*) FROM queue_history")
     finally:
         conn.close()
-    print(f"backend={_queue_backend()} state={rows} history_rows={hist}")
+    print(f"backend={backend} state={rows} history_rows={hist}")
 
 
 def _queue_open_locked(mode):
@@ -11658,7 +11724,12 @@ def build_parser():
                        help="Overwrite an existing Postgres row from queue.json")
     qsub.add_parser("pg-export-json",
                     help="Rollback: write the Postgres queue back to queue.json")
-    qsub.add_parser("pg-status", help="Show Postgres backend state")
+    q_pgs = qsub.add_parser("pg-status", help="Show queue backend state "
+                            "(JSON: backend=json, exit 0; Postgres only when "
+                            "it is the backend or with --postgres)")
+    q_pgs.add_argument("--postgres", action="store_true",
+                       help="Read-only probe of the Postgres DSN (reachability, "
+                            "schema, row count, version); no alert, no writes")
 
     # Manual scope locks (added 2026-05-08).
     q_lock = qsub.add_parser(
