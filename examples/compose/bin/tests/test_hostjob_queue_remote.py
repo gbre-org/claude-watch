@@ -252,6 +252,31 @@ class RemoteQueueTest(unittest.TestCase):
         self.assertIn("NO ROW", out)
         self._clean("down")
 
+    def test_add_timeout_adopts_committed_row(self):
+        import json as _json
+        import subprocess as _sp
+        from unittest import mock
+        os.environ["HOSTJOB_QUEUE_REMOTE"] = "ssh://op@queue.example"
+        listing = _json.dumps({"items": [
+            {"id": "q-slow-1", "status": "pending", "created_by": "hostjob",
+             "scope": ["hostjob:slow"]}]})
+        calls = []
+
+        def fake_run(argv, **kw):
+            joined = " ".join(argv)
+            calls.append(joined)
+            if "queue add" in joined:
+                raise _sp.TimeoutExpired(argv, kw.get("timeout"))
+            if "queue list" in joined:
+                return _sp.CompletedProcess(argv, 0, listing.encode(), b"")
+            return _sp.CompletedProcess(argv, 0, b"", b"")
+
+        with mock.patch.object(self.mod.subprocess, "run", fake_run):
+            qid, reg = self.mod._register_queue_item("slow", ["true"])
+        self.assertEqual(qid, "q-slow-1")
+        self.assertTrue(reg)
+        self.assertTrue(any("queue register q-slow-1" in c for c in calls), calls)
+
     def test_no_local_no_remote_records_missing(self):
         rc, out, err = self._run("none", ["true"])
         self.assertEqual(rc, 0)
