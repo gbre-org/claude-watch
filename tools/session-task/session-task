@@ -180,6 +180,7 @@ import os
 import re
 import secrets
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -4339,6 +4340,118 @@ HOSTJOB_REMOTE_STALE_SECONDS = int(
 )
 
 
+# A REMOTE hostjob that has shown NO sign of life this long after its row
+# started is a failed launch: the reaper never connected the log sink (so no
+# pushed log exists) and never heartbeat. Without this the row sat `running`
+# for HOSTJOB_REMOTE_STALE_SECONDS (24h) with nobody told. The runner beats
+# ~30s after launch and the sink creates its log at connect, so 120s of
+# silence on BOTH channels means the reaper/worker never came up.
+HOSTJOB_LAUNCH_GRACE_SECONDS = float(
+    os.environ.get("HOSTJOB_LAUNCH_GRACE_SECONDS", "120")
+)
+
+# Events decided inside `_reconcile_hostjob_rows` (which runs under the queue
+# lock) are queued here and emitted by `_flush_hostjob_events()` AFTER the
+# lock is released, so a slow emitter never holds the queue.
+_HOSTJOB_PENDING_EVENTS = []
+
+
+def _parse_iso(value):
+    try:
+        t = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t
+
+
+def _remote_hostjob_launch_failed(it, label, now):
+    """Terminal transition for a remote hostjob row that never came alive,
+    else None. "Alive" evidence is either (a) a pushed log for THIS run
+    (`<HOSTJOB_PUSHED_LOG_DIR>/<label>/log` modified at/after the row
+    started; the sink creates it on connect, before the worker prints) or
+    (b) a heartbeat later than the registration stamp."""
+    started = _parse_iso(
+        it.get("registered_at") or it.get("started_at") or it.get("created_at"))
+    if started is None:
+        return None
+    age = (now - started).total_seconds()
+    if age <= HOSTJOB_LAUNCH_GRACE_SECONDS:
+        return None
+    beat = _parse_iso(it.get("last_heartbeat_at"))
+    if beat is not None and (beat - started).total_seconds() > 2:
+        return None
+    try:
+        mtime = (HOSTJOB_PUSHED_LOG_DIR / label / "log").stat().st_mtime
+        if mtime >= started.timestamp() - 2:
+            return None
+    except OSError:
+        pass
+    return {
+        "status": "abandoned",
+        "tag": "hostjob-launch-failed",
+        "reason": "no log and no heartbeat from %s "
+        "after %ds" % (it.get("hostjob_host") or "remote host", int(age)),
+    }
+
+
+def _queue_hostjob_event(tag, it, label, reason):
+    """Queue an ACTIONABLE hostjob event for emission after unlock."""
+    _HOSTJOB_PENDING_EVENTS.append({
+        "tag": tag, "id": it.get("id"), "label": label, "reason": reason,
+        "host": it.get("hostjob_host") or "", "scope": it.get("scope", []),
+        "summary": _item_summary(it),
+    })
+
+
+def _flush_hostjob_events():
+    """Emit queued hostjob events (call after the queue lock is released)."""
+    events = list(_HOSTJOB_PENDING_EVENTS)
+    del _HOSTJOB_PENDING_EVENTS[:]
+    for ev in events:
+        _emit_hostjob_event(ev["tag"], ev)
+
+
+def _emit_hostjob_event(tag, ev):
+    qid, label = ev["id"], ev["label"]
+    verb = {
+        "hostjob-launch-failed": "LAUNCH FAILED",
+        "hostjob-telemetry-broken": "TELEMETRY BROKEN",
+        "hostjob-lost": "LOST (no heartbeat)",
+        "hostjob-failed": "FAILED",
+    }.get(tag, tag)
+    if tag == "hostjob-telemetry-broken":
+        action = (
+            f"hostjob {label} ({qid}): {ev['reason']}. Row NOT abandoned "
+            f"(never kill on queue-side silence). Fix the pipe: the queue "
+            f"host's ssh forced-command must allow `queue heartbeat` and "
+            f"`queue hostjob-log-sink`; for a long-lived job started by an "
+            f"older reaper, backfill the log with `tail -n +1 -F "
+            f"~/.cache/hostjob/{label}/log | ssh <queue-host> session-task "
+            f"queue hostjob-log-sink {label}` on the runner host. Do not "
+            f"restart the worker."
+        )
+    else:
+        action = (
+            f"hostjob {label} ({qid}) {verb}: {ev['reason']}. Row already "
+            f"abandoned and its scope freed. Check the log "
+            f"(`hostjob poll {label}` on the runner host / the q-site), fix "
+            f"the cause, and relaunch with `hostjob run {label} -- <cmd>`."
+        )
+    _claude_event_notify(
+        tag=tag,
+        message=f"hostjob {label} {verb} ({qid}): {ev['reason']}",
+        data={
+            "action": action, "tier": "actionable", "queue_id": qid,
+            "label": label, "host": ev["host"], "reason": ev["reason"],
+            "scope": ev["scope"], "summary": ev["summary"],
+            "ack_command": f"event-ack ack <key> --action 'hostjob {label}: <relaunched|dropped>'",
+        },
+        priority="high",
+    )
+
+
 def _remote_hostjob_stale_terminal(it, now):
     """For a remote-origin hostjob row return a terminal transition dict when
     it has had no heartbeat/registration for HOSTJOB_REMOTE_STALE_SECONDS,
@@ -4360,8 +4473,80 @@ def _remote_hostjob_stale_terminal(it, now):
         return None
     return {
         "status": "abandoned",
+        "tag": "hostjob-lost",
         "reason": "remote hostjob %s: no heartbeat for %dh (stale GC)"
         % (it.get("hostjob_host"), int(age // 3600)),
+    }
+
+
+# Silence at the queue host (no pushed log, no heartbeat) is NOT proof the
+# remote worker is dead: the telemetry pipe (ssh forced-command allow-list,
+# an older reaper, a broken sink) can be down while the worker is healthy.
+# So a silent remote row is only ABANDONED when the runner host itself says
+# the worker is gone. The host is asked through an operator-configured probe
+# command (HOSTJOB_HOST_PROBE_CMD, shlex-split; env HOSTJOB_PROBE_LABEL /
+# _QID / _HOST): exit 0 = worker alive, exit 1 = worker gone, anything else
+# (not configured, ssh failure, timeout) = unknown.
+HOSTJOB_PROBE_TIMEOUT_SECONDS = float(
+    os.environ.get("HOSTJOB_PROBE_TIMEOUT_SECONDS", "15")
+)
+
+
+def _probe_remote_hostjob(it, label):
+    """Return "alive", "gone" or "unknown" (fail-soft, never raises)."""
+    cmd = os.environ.get("HOSTJOB_HOST_PROBE_CMD", "").strip()
+    if not cmd:
+        return "unknown"
+    try:
+        env = dict(os.environ)
+        env["HOSTJOB_PROBE_LABEL"] = label
+        env["HOSTJOB_PROBE_QID"] = str(it.get("id") or "")
+        env["HOSTJOB_PROBE_HOST"] = str(it.get("hostjob_host") or "")
+        r = subprocess.run(
+            shlex.split(cmd), stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=HOSTJOB_PROBE_TIMEOUT_SECONDS,
+            env=env)
+    except Exception:  # noqa: BLE001 -- unreachable host == unknown
+        return "unknown"
+    return {0: "alive", 1: "gone"}.get(r.returncode, "unknown")
+
+
+def _remote_hostjob_decide(it, label, status, now):
+    """Decide what to do with a SILENT remote hostjob row.
+
+    Returns None (nothing to do / already handled) or a dict:
+      {"status": "abandoned", "tag", "reason"}    host confirmed worker gone
+      {"quarantine": True, "tag", "reason"}       host unreachable: hold scope
+      {"alive_silent": True, "tag", "reason"}     worker alive, telemetry down
+    """
+    verdict = None
+    if status == "running":
+        verdict = _remote_hostjob_launch_failed(it, label, now)
+    if verdict is None:
+        verdict = _remote_hostjob_stale_terminal(it, now)
+    if verdict is None:
+        return None
+    reason = verdict["reason"]
+    probe = _probe_remote_hostjob(it, label)
+    if probe == "gone":
+        verdict["reason"] = (
+            ("hostjob launch failed: " if verdict["tag"] == "hostjob-launch-failed" else "")
+            + reason + " (host confirms worker gone)")
+        return verdict
+    if status != "running":
+        return None  # quarantined: only a confirmed-gone verdict may act
+    if probe == "alive":
+        if it.get("telemetry_broken_at"):
+            return None  # already alerted once
+        return {
+            "alive_silent": True, "tag": "hostjob-telemetry-broken",
+            "reason": "worker is ALIVE on the host but its heartbeat/log "
+            "never reaches the queue (" + reason + ")",
+        }
+    return {
+        "quarantine": True, "tag": "hostjob-telemetry-broken",
+        "reason": reason + "; host could not be probed, so the row is "
+        "quarantined (scope held), not abandoned",
     }
 
 
@@ -4477,7 +4662,21 @@ def _reconcile_hostjob_rows(items):
             if it.get("hostjob_host"):
                 # Remote-origin row: local state dir says nothing. Only the
                 # long-staleness GC may close it.
-                eff = _remote_hostjob_stale_terminal(it, now)
+                eff = _remote_hostjob_decide(it, label, status, now)
+                if eff is not None and (eff.get("quarantine")
+                                        or eff.get("alive_silent")):
+                    now_iso = _fmt_ts()
+                    if eff.get("quarantine"):
+                        it["status"] = "quarantined"
+                        it["quarantined_at"] = now_iso
+                        it["quarantine_reason"] = eff["reason"]
+                        it["quarantined_from"] = status
+                        reconciled.append((it.get("id"), "quarantined"))
+                    else:
+                        reconciled.append((it.get("id"), "running"))
+                    it["telemetry_broken_at"] = now_iso
+                    _queue_hostjob_event(eff["tag"], it, label, eff["reason"])
+                    continue
             else:
                 eff = _hostjob_effective_terminal(label, age)
             if eff is None:
@@ -4516,6 +4715,9 @@ def _reconcile_hostjob_rows(items):
             else:
                 it["abandoned_at"] = _fmt_ts()
                 it["abandon_reason"] = eff.get("reason") or "hostjob finished (reconciled)"
+                if eff.get("tag"):
+                    it["death_evidence"] = "hostjob reconcile: " + eff["reason"]
+                    _queue_hostjob_event(eff["tag"], it, label, eff["reason"])
             reconciled.append((it.get("id"), eff["status"]))
         except Exception:
             continue
@@ -4552,6 +4754,14 @@ def cmd_queue_hostjob_log_sink(args):
     except OSError:
         pass
     with open(d / "log", "wb", buffering=0) as out:
+        # Create-and-announce immediately: the file existing means the
+        # runner's reaper really connected, so "no log" == launch failed
+        # (see _remote_hostjob_launch_failed), not "worker is just quiet".
+        import time as _t2
+        z = _t2.strftime("%z")
+        off = z[:3] + ":" + z[3:] if len(z) == 5 else "Z"
+        out.write((_t2.strftime("%Y-%m-%dT%H:%M:%S", _t2.localtime()) + off
+                   + " [hostjob] log sink connected for %s\n" % label).encode())
         while True:
             chunk = sys.stdin.buffer.readline()
             if not chunk:
@@ -4596,9 +4806,11 @@ def cmd_queue_reconcile_hostjobs(args):
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
     except Exception:
+        del _HOSTJOB_PENDING_EVENTS[:]
         fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
         raise
+    _flush_hostjob_events()
 
     if getattr(args, "json", False):
         print(json.dumps(
@@ -4716,7 +4928,9 @@ def cmd_queue_list(args):
             items = list(data["items"])
         else:
             _queue_unlock_readonly(fh)
+        _flush_hostjob_events()
     except Exception:
+        del _HOSTJOB_PENDING_EVENTS[:]
         try:
             _queue_unlock_readonly(fh)
         except Exception:
@@ -5189,6 +5403,18 @@ def cmd_queue_abandon(args):
             target, args, started_at=started_at, prior_status=prior_status,
         )
         return
+
+    _hj_label = _extract_hostjob_label(target.get("scope") or [])
+    _hj_exit = re.match(r"hostjob exit (-?\d+)", args.reason or "")
+    if confirmed_dead and _hj_label and _hj_exit and int(_hj_exit.group(1)) != 0:
+        # The runner's reaper abandons a failed worker as confirmed-dead, which
+        # is terminal and only rides the ambient queue-abandoned event. A
+        # hostjob that ERRORED needs a main-loop look (reap + relaunch).
+        _emit_hostjob_event("hostjob-failed", {
+            "id": target["id"], "label": _hj_label, "reason": args.reason,
+            "host": target.get("hostjob_host") or "",
+            "scope": target.get("scope", []), "summary": _item_summary(target),
+        })
 
     log_completed(
         f"[queue {target['id']} abandoned] {target['description']}"
