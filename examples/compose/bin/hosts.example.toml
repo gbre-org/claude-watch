@@ -1,0 +1,29 @@
+# hostjob-remote registry. Copy to ~/.config/hostjob/hosts.toml (or point
+# $HOSTJOB_HOSTS at it). Placeholder hosts only.
+#
+# Per host:
+#   roles            list of roles; `--role X` picks the first host with role X
+#   transport        "mcp-http" (JSON-RPC to an MCP host-bash server)
+#   endpoint         transport URL
+#   credential_file  bearer token file; MUST be mode 0600 and owned by you.
+#                    Either raw token text or JSON {"token": "..."}.
+#   hostjob          remote path to the hostjob script (default: `hostjob` on PATH)
+#   python           interpreter used with a path-style `hostjob` (default python3)
+#   cwd              default remote working dir for `run`
+#   interactive_only true = never chosen by --role; only via explicit --host
+
+[hosts.build-box]
+roles = ["build", "synth"]
+transport = "mcp-http"
+endpoint = "http://127.0.0.1:18000/mcp"
+credential_file = "~/.config/hostjob/creds/build-box"
+hostjob = "/path/on/remote/to/hostjob"
+cwd = "/path/on/remote/workdir"
+
+[hosts.laptop]
+roles = ["laptop"]
+transport = "mcp-http"
+endpoint = "http://127.0.0.1:18001/mcp"
+credential_file = "~/.config/hostjob/creds/laptop"
+hostjob = "/path/on/remote/to/hostjob"
+interactive_only = true
