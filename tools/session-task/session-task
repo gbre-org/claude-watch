@@ -183,6 +183,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -802,10 +803,8 @@ def _load_queue_items_silent():
     Returns dict id -> item, or empty dict on any failure.
     """
     try:
-        if not QUEUE_FILE.exists():
-            return {}
-        raw = QUEUE_FILE.read_text()
-        if not raw.strip():
+        raw, _exc = _read_text_retry(QUEUE_FILE)
+        if raw is None or not raw.strip():
             return {}
         try:
             data = json.loads(raw)
@@ -1080,46 +1079,178 @@ def _quarantine_corrupt(raw):
             return None
 
 
-def _read_bak():
-    """Return the last-good queue dict from the .bak snapshot, or None."""
+class QueueUnrecoverable(Exception):
+    """queue.json is unreadable/corrupt and no snapshot could restore it.
+
+    Raised instead of silently resetting to EMPTY: the caller must fail loudly
+    (non-zero exit) and NOT write, so every on-disk byte is preserved for
+    manual recovery. Carries the recovery-info dict for the alert."""
+
+    def __init__(self, info):
+        super().__init__(info.get("reason", "queue unrecoverable"))
+        self.info = info
+
+
+# Transient-read retry budget. A read can see ENOENT / an empty or torn file
+# for a moment when another writer in a different lock domain (macOS host vs.
+# the Linux container over a bind mount, where flock is NOT coherent) is mid
+# os.replace. Treat those as transient: retry with backoff before concluding
+# anything. Total worst-case wait ~2s.
+_QUEUE_READ_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
+QUEUE_SNAPSHOT_KEEP = 20
+QUEUE_SNAPSHOT_MIN_INTERVAL_S = 30.0
+
+
+def _snapshot_dir():
+    return QUEUE_FILE.parent / "queue-snapshots"
+
+
+def _parse_queue_doc(raw):
+    """Parse `raw` to a valid queue dict, or None."""
     try:
-        if not QUEUE_BAK_FILE.exists():
-            return None
-        obj = json.loads(QUEUE_BAK_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
         return None
     if isinstance(obj, dict) and isinstance(obj.get("items"), list):
         return obj
     return None
 
 
-def _read_queue_with_recovery():
-    """Read + parse queue.json with layered corruption recovery. Never raises.
+def _read_text_retry(path):
+    """Read `path`, retrying transient failures (ENOENT, other OSError).
 
-    Returns (data_dict, recovery_info). recovery_info is None on a clean parse;
-    otherwise a dict describing the fallback taken so the caller can alert
-    LOUDLY. Recovery order on unparseable JSON:
-      1. salvage the leading valid document from the corrupt bytes (recovers
-         items written before a trailing concurrent-write fragment),
-      2. fall back to the last-good .bak snapshot,
-      3. reset to empty (last resort -- in-flight state lost).
-    The corrupt bytes are always quarantined first.
+    Returns (text, None) on success, (None, exc) if it stayed unreadable after
+    the full retry budget (a persistently absent file yields FileNotFoundError).
     """
-    if not QUEUE_FILE.exists():
-        return _queue_empty(), None
+    last = None
+    for delay in (0.0,) + _QUEUE_READ_RETRY_DELAYS:
+        if delay:
+            time.sleep(delay)
+        try:
+            return Path(path).read_text(), None
+        except OSError as exc:
+            last = exc
+    return None, last
+
+
+def _snapshot_candidates():
+    """Paths of recovery snapshots, newest first: .bak then rolling snaps."""
+    out = [QUEUE_BAK_FILE]
     try:
-        raw = QUEUE_FILE.read_text()
+        snaps = sorted(_snapshot_dir().glob("queue.*.json"), reverse=True)
+    except OSError:
+        snaps = []
+    return out + snaps
+
+
+def _read_bak():
+    """Return the newest valid snapshot (.bak first, then rolling) or None."""
+    for p in _snapshot_candidates():
+        try:
+            raw = p.read_text()
+        except OSError:
+            continue
+        doc = _parse_queue_doc(raw)
+        if doc is not None:
+            return doc
+    return None
+
+
+def _has_any_snapshot():
+    for p in _snapshot_candidates():
+        try:
+            if p.exists():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _maybe_rolling_snapshot(text):
+    """Keep the last N timestamped snapshots, at most one per interval.
+    Best-effort; never fails the queue op."""
+    try:
+        d = _snapshot_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        existing = sorted(d.glob("queue.*.json"))
+        if existing:
+            age = time.time() - existing[-1].stat().st_mtime
+            if age < QUEUE_SNAPSHOT_MIN_INTERVAL_S:
+                return
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        _atomic_write_text(d / f"queue.{ts}.json", text)
+        existing = sorted(d.glob("queue.*.json"))
+        for old in existing[:-QUEUE_SNAPSHOT_KEEP]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
     except OSError as exc:
-        return _queue_empty(), {
-            "mode": "empty", "reason": f"unreadable: {exc}",
+        print(f"[session-task] queue rolling snapshot failed: {exc}",
+              file=sys.stderr)
+
+
+def _read_queue_with_recovery():
+    """Read + parse queue.json with layered recovery. NEVER resets to empty
+    over existing state.
+
+    Returns (data_dict, recovery_info); recovery_info is None on a clean parse.
+    Order:
+      0. transient read failures (ENOENT, EIO, empty/torn content) are retried
+         with backoff -- they are normal when a writer in another lock domain
+         is mid-replace, and are NOT corruption;
+      1. salvage the leading valid document from corrupt bytes,
+      2. newest valid snapshot (.bak, then rolling queue-snapshots/),
+      3. if the file was never created and no snapshot exists: a fresh empty
+         store (legitimate first run, no alert);
+      4. otherwise raise QueueUnrecoverable (fail loud, write nothing).
+    Garbage bytes are always quarantined first.
+    """
+    raw, exc = _read_text_retry(QUEUE_FILE)
+    if raw is not None and not raw.strip():
+        # Empty file: torn/truncated by a foreign writer if any snapshot
+        # exists; otherwise a fresh store. Re-read once more before judging.
+        time.sleep(0.2)
+        raw, exc = _read_text_retry(QUEUE_FILE)
+        if raw is not None and not raw.strip():
+            if not _has_any_snapshot():
+                return _queue_empty(), None
+            bak = _read_bak()
+            if bak is not None:
+                return bak, {
+                    "mode": "bak", "reason": "queue.json empty/truncated",
+                    "recovered_items": len(bak.get("items", [])),
+                    "quarantine": None, "corrupt_bytes": 0,
+                }
+            raise QueueUnrecoverable({
+                "mode": "unrecoverable",
+                "reason": "queue.json empty and no valid snapshot",
+                "recovered_items": 0, "quarantine": None, "corrupt_bytes": 0,
+            })
+    if raw is None:
+        if isinstance(exc, FileNotFoundError):
+            if not _has_any_snapshot():
+                return _queue_empty(), None  # genuine first run
+            bak = _read_bak()
+            if bak is not None:
+                return bak, {
+                    "mode": "bak",
+                    "reason": f"queue.json missing after retries: {exc}",
+                    "recovered_items": len(bak.get("items", [])),
+                    "quarantine": None, "corrupt_bytes": 0,
+                }
+        raise QueueUnrecoverable({
+            "mode": "unrecoverable", "reason": f"unreadable: {exc}",
             "recovered_items": 0, "quarantine": None, "corrupt_bytes": 0,
-        }
-    if not raw.strip():
-        return _queue_empty(), None
+        })
+    doc = _parse_queue_doc(raw)
+    if doc is not None:
+        return doc, None
     try:
-        return json.loads(raw), None
-    except json.JSONDecodeError as exc:
-        reason = str(exc)
+        json.loads(raw)
+        reason = "not a queue document (missing items list)"
+    except json.JSONDecodeError as jexc:
+        reason = str(jexc)
     quarantine = _quarantine_corrupt(raw)
     q = str(quarantine) if quarantine else None
     salvaged = _salvage_leading_json(raw)
@@ -1136,30 +1267,30 @@ def _read_queue_with_recovery():
             "recovered_items": len(bak.get("items", [])),
             "quarantine": q, "corrupt_bytes": len(raw),
         }
-    return _queue_empty(), {
-        "mode": "empty", "reason": reason, "recovered_items": 0,
+    raise QueueUnrecoverable({
+        "mode": "unrecoverable", "reason": reason, "recovered_items": 0,
         "quarantine": q, "corrupt_bytes": len(raw),
-    }
+    })
 
 
 def _alert_queue_recovery(info):
     """Emit a LOUD alert (stderr + urgent/high claude-event) whenever queue.json
-    corruption triggered a recovery/reset. NEVER silent -- the 2026-08-16
-    incident silently reset the queue to empty, losing all in-flight items."""
+    trouble triggered a recovery or a refusal. NEVER silent."""
     mode = info.get("mode")
     n = info.get("recovered_items", 0)
-    q = info.get("quarantine") or "(not preserved)"
-    if mode == "empty":
-        tag = "queue-corrupt-reset-empty"
+    q = info.get("quarantine") or "(none)"
+    if mode == "unrecoverable":
+        tag = "queue-corrupt-unrecoverable"
         priority = "urgent"
-        msg = (f"queue.json CORRUPT and UNRECOVERABLE -- reset to EMPTY "
-               f"(0 items recovered). IN-FLIGHT QUEUE STATE LOST. "
-               f"Corrupt bytes quarantined at {q}.")
+        msg = (f"queue.json UNRECOVERABLE ({info.get('reason', '')}); no valid "
+               f"snapshot. REFUSING to write -- all on-disk state left intact "
+               f"(quarantine: {q}). Restore from {QUEUE_BAK_FILE} or "
+               f"{_snapshot_dir()}/ then re-run.")
     elif mode == "bak":
         tag = "queue-corrupt-recovered-bak"
         priority = "high"
-        msg = (f"queue.json CORRUPT -- recovered {n} item(s) from the last-good "
-               f".bak snapshot. Corrupt bytes quarantined at {q}.")
+        msg = (f"queue.json bad/missing ({info.get('reason', '')}) -- recovered "
+               f"{n} item(s) from the newest valid snapshot. Quarantine: {q}.")
     else:
         tag = "queue-corrupt-recovered-salvage"
         priority = "high"
@@ -1194,7 +1325,15 @@ def _queue_open_locked(mode):
     lock_fh = os.fdopen(lock_fd, "r+")
     fcntl.flock(lock_fh, fcntl.LOCK_EX)
     # Read under the lock so same-domain writers serialize.
-    data, recovery = _read_queue_with_recovery()
+    try:
+        data, recovery = _read_queue_with_recovery()
+    except QueueUnrecoverable as qexc:
+        # Fail loud, write NOTHING: release the lock and exit non-zero so no
+        # caller can persist an empty store over recoverable bytes.
+        _alert_queue_recovery(qexc.info)
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
+        sys.exit(75)
     if recovery is not None:
         _alert_queue_recovery(recovery)
     # Normalize
@@ -1274,6 +1413,7 @@ def _queue_write_and_unlock(fh, data):
     except OSError as exc:
         print(f"[session-task] queue .bak snapshot failed: {exc}",
               file=sys.stderr)
+    _maybe_rolling_snapshot(text)
     fcntl.flock(fh, fcntl.LOCK_UN)
     fh.close()
 
