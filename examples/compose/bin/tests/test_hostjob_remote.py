@@ -167,3 +167,146 @@ def test_hosts_listing_hides_secrets(reg, capsys):
     out = capsys.readouterr().out
     assert "a\troles=build,synth" in out and "interactive_only" in out
     assert TOKEN not in out
+
+
+# ------------------------------------------------------------------- sync
+import subprocess  # noqa: E402
+
+
+def _g(cwd, *a):
+    return subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True, text=True,
+                          env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}).stdout.strip()
+
+
+def _commit(cwd, name, content="x"):
+    p = cwd / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    _g(cwd, "add", "-A")
+    _g(cwd, "commit", "-qm", name)
+    return _g(cwd, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def repos(tmp_path):
+    """origin (work repo) + a clone, both on main."""
+    origin, clone = tmp_path / "origin", tmp_path / "clone"
+    origin.mkdir()
+    _g(origin, "init", "-q", "-b", "main")
+    first = _commit(origin, "a")
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+    return origin, clone, first
+
+
+class Local(hr.Transport):
+    """Runs the command in a local bash: exercises the real sync_script."""
+
+    def exec(self, command, timeout=60):
+        p = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+        return p.returncode, p.stdout
+
+
+def _host(repo, **kw):
+    return hr.Host("h", {"endpoint": "http://x", "repo": str(repo), **kw})
+
+
+def _sync(host):
+    return hr.sync_hosts({"h": host}, None, lambda h: Local())[0]
+
+
+def test_derive_repo():
+    assert hr.derive_repo("/Users/a/repos/claude-watch/examples/compose/bin/hostjob") == "/Users/a/repos/claude-watch"
+    assert hr.derive_repo("hostjob") is None
+    assert hr.derive_repo("/r/hostjob") is None
+
+
+def test_decide_sync_table():
+    D = hr.decide_sync
+    assert D({"OLD": ["a"], "NEW": ["a"], "BRANCH": ["main"], "TARGET": ["a"]})[0] == "CURRENT"
+    s = D({"OLD": ["a"], "NEW": ["b"], "BRANCH": ["main"], "TARGET": ["b"], "CHANGED": ["2"]})
+    assert s[0] == "UPDATED" and s[4] is True
+    assert D({"OLD": ["a"], "NEW": ["b"], "BRANCH": ["main"], "TARGET": ["b"], "CHANGED": ["0"]})[4] is False
+    s = D({"OLD": ["a"], "BRANCH": ["main"], "DIRTY": [" M src/x.rs"]})
+    assert s[0] == "REFUSED" and "src/x.rs" in s[1]
+    assert D({"OLD": ["a"], "BRANCH": ["feat"]})[0] == "REFUSED"
+    assert D({"OLD": ["a"], "BRANCH": ["main"], "FETCHERR": ["boom"]})[0] == "FAILED"
+    assert D({"OLD": ["a"], "BRANCH": ["main"], "TARGET": ["b"], "MERGEERR": ["fatal"]})[0] == "FAILED"
+    assert D({"ERR": ["no checkout at /x"]})[0] == "FAILED"
+
+
+def test_sync_real_repo_updates_and_flags_mcp_crate(repos):
+    origin, clone, first = repos
+    new = _commit(origin, "crates/mcp-host-bash-server/src/main.rs")
+    r = _sync(_host(clone))
+    assert (r["status"], r["old"], r["new"], r["mcp"]) == ("UPDATED", first, new, True)
+    assert "mac-nix switch" in hr.format_sync_table([r])
+    assert _g(clone, "rev-parse", "HEAD") == new
+    assert _sync(_host(clone))["status"] == "CURRENT"
+    new2 = _commit(origin, "docs.md")
+    r = _sync(_host(clone))
+    assert r["status"] == "UPDATED" and r["new"] == new2 and r["mcp"] is False
+    out = hr.format_sync_table([r])
+    assert "%s -> %s" % (new[:7], new2[:7]) in out and "NOTE" not in out
+
+
+def test_sync_refuses_tracked_changes_but_allows_untracked(repos):
+    origin, clone, first = repos
+    new = _commit(origin, "b")
+    (clone / "a").write_text("edited")
+    r = _sync(_host(clone))
+    assert r["status"] == "REFUSED" and "a" in r["detail"] and _g(clone, "rev-parse", "HEAD") == first
+    assert hr.sync_exit_code([r]) == 1
+    _g(clone, "checkout", "--", "a")
+    (clone / ".env.bak-123").write_text("junk")
+    assert _sync(_host(clone))["status"] == "UPDATED"
+    assert _g(clone, "rev-parse", "HEAD") == new
+
+
+def test_sync_refuses_non_main_and_fails_on_diverged(repos):
+    origin, clone, first = repos
+    _g(clone, "checkout", "-q", "-b", "feat")
+    assert _sync(_host(clone))["status"] == "REFUSED"
+    _g(clone, "checkout", "-q", "main")
+    _commit(clone, "local-only")
+    _commit(origin, "remote-only")
+    r = _sync(_host(clone))
+    assert r["status"] == "FAILED" and "ff-only" in r["detail"]
+
+
+def test_sync_missing_checkout(tmp_path):
+    r = _sync(_host(tmp_path / "nope"))
+    assert r["status"] == "FAILED" and "no checkout" in r["detail"]
+
+
+class Dead(hr.Transport):
+    def exec(self, command, timeout=60):
+        raise hr.TransportError("URLError: down")
+
+
+def test_sync_skips_unreachable_and_interactive(reg):
+    hosts = hr.load_registry()
+    for h in hosts.values():
+        h.repo = "/r"
+    res = hr.sync_hosts(hosts, None, lambda h: Dead())
+    by = {r["host"]: r for r in res}
+    assert by["a"]["status"] == by["b"]["status"] == "SKIPPED" and "unreachable" in by["a"]["detail"]
+    assert by["lap"]["status"] == "SKIPPED" and "interactive_only" in by["lap"]["detail"]
+    assert hr.sync_exit_code(res) == 0  # skips never fail a deploy
+    # naming the laptop explicitly does attempt it
+    assert "unreachable" in hr.sync_hosts(hosts, "lap", lambda h: Dead())[0]["detail"]
+    with pytest.raises(hr.RegistryError):
+        hr.sync_hosts(hosts, "nope")
+
+
+def test_rev_warning_and_check_rev_never_fails(capsys):
+    h = hr.Host("g", {"endpoint": "http://x", "repo": "/r/cw"})
+    assert hr.rev_warning(h, "a" * 40, "a" * 40) is None
+    assert hr.rev_warning(h, "", "b" * 40) is None
+    assert "aaaaaaa" in hr.rev_warning(h, "a" * 40, "b" * 40)
+    f = Fake([(0, "%s\n%s\trefs/heads/main\n" % ("a" * 40, "b" * 40))])
+    hr.check_rev(h, f)
+    assert "warning" in capsys.readouterr().err
+    assert f.cmds[0].startswith("git -C /r/cw rev-parse HEAD")
+    hr.check_rev(h, Dead())  # transport failure is swallowed
+    assert capsys.readouterr().err == ""
