@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# e2e for the cw-clear Claude Code mod (mods/cw-clear), run inside the
+# claude-container image with a real, authenticated Claude Code in tmux.
+#
+# It asserts four facts the "clear + resume as a mod" design rests on:
+#   1. $.command.run({command:'clear'}) runs the REAL built-in /clear
+#      (a new transcript derived "via clear" that no longer holds the old
+#      conversation; the old codeword is forgotten).
+#   2. A $.prompt.submit queued right after it fires as the first turn of
+#      the fresh conversation.
+#   3. $.clock.every timers keep firing during a long (40s) foreground tool
+#      call, and while idle.
+#   4. A tool.check hook can ALLOW a Bash rm that the engine's own check
+#      answers `ask` for (path-resolution case), while a command the hook
+#      does not match still raises the permission dialog (control).
+#
+# Isolation: a throwaway container, its own CLAUDE_CONFIG_DIR (a tmpdir
+# bind-mounted at /cfg), its own tmux server inside the container. It never
+# reads or writes the host ~/.claude, ~/.claude.json, the host tmux or the
+# claude-watch daemon.
+#
+# Auth (the container's own way: credentials in the config dir, or an API key):
+#   CW_E2E_CREDENTIALS=<path to a .credentials.json>   copied into the tmpdir
+#       config dir with refreshToken REMOVED, so the test can never rotate the
+#       refresh token a live session depends on (the access token must be
+#       valid for the ~2 minute run); or
+#   ANTHROPIC_API_KEY=<key>                              passed into the container.
+# Neither set: the test SKIPS (exit 0), which is what CI does (no secrets).
+#
+# The image's own claude is too old for mods (needs >= 2.1.331), so a newer
+# Linux claude binary is bind-mounted read-only:
+#   CW_E2E_CLAUDE_BIN=<path>   default: $CLAUDE_CODE_EXECPATH
+# Image: CLAUDE_CONTAINER_IMAGE (default claude-container:dev).
+#
+# Run:  make test-cw-clear-mod-e2e     (about 2 minutes, spends a few cents)
+set -u
+
+IMAGE="${CLAUDE_CONTAINER_IMAGE:-claude-container:dev}"
+CLAUDE_BIN="${CW_E2E_CLAUDE_BIN:-${CLAUDE_CODE_EXECPATH:-}}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MOD="$(cd "$HERE/../../mods/cw-clear" && pwd)"
+
+skip() { echo "SKIP: $*"; exit 0; }
+
+command -v docker >/dev/null 2>&1 || skip "docker not available"
+docker image inspect "$IMAGE" >/dev/null 2>&1 || skip "image $IMAGE not built"
+[ -n "$CLAUDE_BIN" ] && [ -x "$CLAUDE_BIN" ] || skip "no CW_E2E_CLAUDE_BIN / CLAUDE_CODE_EXECPATH claude binary"
+[ -n "${CW_E2E_CREDENTIALS:-}" ] || [ -n "${ANTHROPIC_API_KEY:-}" ] || skip "no CW_E2E_CREDENTIALS or ANTHROPIC_API_KEY (CI has no credentials)"
+
+T="$(mktemp -d /tmp/cw-clear-e2e.XXXXXX)"
+NAME="cw-clear-e2e-$$"
+mkdir -p "$T/cfg" "$T/out" "$T/work"
+cleanup() { docker rm -f "$NAME" >/dev/null 2>&1; chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"; }
+trap cleanup EXIT
+
+fails=0
+ok()   { echo "PASS: $*"; }
+bad()  { echo "FAIL: $*"; fails=$((fails + 1)); }
+
+if [ -n "${CW_E2E_CREDENTIALS:-}" ]; then
+  jq 'del(..|.refreshToken?)' "$CW_E2E_CREDENTIALS" > "$T/cfg/.credentials.json" || skip "unreadable CW_E2E_CREDENTIALS"
+  chmod 600 "$T/cfg/.credentials.json"
+fi
+echo 'Resume: reply exactly RESUME-FIRED and also state the codeword I told you earlier, or NO-CODEWORD if you do not know one.' > "$T/out/resume.txt"
+cat > "$T/cfg/settings.json" <<'EOF'
+{
+  "permissions": {"allow": ["Bash(python3:*)", "Bash(touch:*)", "Bash(echo:*)"]},
+  "pluginConfigs": {"cw-clear": {"options": {"enabled": true, "probe": true,
+    "stateFile": "/out/state.json", "resumeFile": "/out/resume.txt"}}}
+}
+EOF
+echo '{"hasCompletedOnboarding": true, "theme": "dark", "projects": {"/work": {"hasTrustDialogAccepted": true}}}' > "$T/cfg/.claude.json"
+chmod -R a+rwX "$T"
+
+docker run -d --name "$NAME" --entrypoint sleep \
+  -e CLAUDE_CONFIG_DIR=/cfg -e TERM=xterm-256color ${ANTHROPIC_API_KEY:+-e ANTHROPIC_API_KEY} \
+  -v "$T/cfg:/cfg" -v "$T/out:/out" -v "$T/work:/work" \
+  -v "$MOD:/mod:ro" -v "$CLAUDE_BIN:/opt/claude:ro" -w /work "$IMAGE" 1200 >/dev/null || skip "could not start container"
+
+LOG="$T/out/state.json.log"
+tm() { docker exec "$NAME" tmux "$@"; }
+say() { tm send-keys -t t -l "$1"; sleep 0.5; tm send-keys -t t Enter; }
+screen() { tm capture-pane -p -t t -S -200 2>/dev/null; }
+# wait_for <timeout-s> <description> <command...>: poll until the command succeeds.
+wait_for() {
+  local t=$1 d=$2; shift 2
+  local i=0
+  while [ "$i" -lt "$t" ]; do "$@" && return 0; sleep 1; i=$((i + 1)); done
+  bad "timeout (${t}s) waiting for: $d"; return 1
+}
+logn() { grep -c "$1" "$LOG" 2>/dev/null; }
+has_log() { grep -q "$1" "$LOG" 2>/dev/null; }
+has_screen() { screen | grep -q "$1"; }
+
+docker exec "$NAME" /opt/claude plugin validate /mod 2>&1 | grep -q "Validation failed" && bad "plugin validate failed"
+
+tm new-session -d -s t -x 200 -y 50 -c /work \
+  "/opt/claude --permission-mode default --plugin-dir /mod --debug-file /out/debug.log; sleep 900"
+wait_for 40 "mod session.start" has_log "session.start" || { cat "$T/out/debug.log" | tail -20; exit 1; }
+
+# --- 3a. timers while idle -------------------------------------------------
+sleep 7
+[ "$(logn 'tick busy=false')" -ge 3 ] && ok "3a clock.every fires while idle ($(logn 'tick busy=false') ticks in ~7s)" || bad "3a no idle ticks"
+
+# --- 1/2. clear + resume ---------------------------------------------------
+say "Remember the codeword PINEAPPLE-7. Reply with only: ok"
+wait_for 60 "first turn complete" has_log "turn.complete"
+say "/cw-clear"
+wait_for 60 "resume turn complete" bash -c "[ \$(grep -c 'turn.complete' '$LOG') -ge 2 ]"
+wait_for 20 "resume answer on screen" has_screen "RESUME-FIRED"
+has_log "session.end reason=clear" && ok "1 session.end reason=clear raised by \$.command.run('clear')" || bad "1 no session.end reason=clear"
+cl="$(grep -n 'session.end reason=clear' "$LOG" | head -1 | cut -d: -f1)"
+rs="$(grep -n 'cw-clear: resume submitted' "$LOG" | head -1 | cut -d: -f1)"
+ts="$(awk '/turn.start/{n++; if(n==2){print NR}}' "$LOG")"
+if [ -n "$cl" ] && [ -n "$rs" ] && [ -n "$ts" ] && [ "$cl" -lt "$rs" ] && [ "$rs" -le "$ts" ]; then
+  ok "2 order: session.end(clear) < resume submitted < second turn.start"
+else
+  bad "2 ordering wrong (clear=$cl submitted=$rs turn2=$ts)"
+fi
+proj="$(ls -d "$T"/cfg/projects/*/ | head -1)"
+new="$(grep -l '"via":"clear"' "$proj"*.jsonl | head -1)"
+if [ -n "$new" ] && ! grep -q PINEAPPLE "$new" && grep -q "Resume: reply exactly RESUME-FIRED" "$new"; then
+  ok "1+2 new transcript is derived via clear, has no old codeword, and starts with the resume prompt"
+else
+  bad "1+2 transcript check (new=$new)"
+fi
+screen | grep -q "NO-CODEWORD" && ok "1 model in the new conversation does not know the codeword" || bad "1 codeword still known / no answer"
+
+# --- 3b. timers during a long foreground tool call ------------------------
+say "Use the Bash tool, in the FOREGROUND (no run_in_background), to run exactly: python3 -c \"import time; time.sleep(40); print('done-sleeping')\"   then reply with only: finished"
+wait_for 30 "long turn started" bash -c "[ \$(grep -c 'turn.start' '$LOG') -ge 3 ]"
+wait_for 90 "long turn complete" bash -c "[ \$(grep -c 'turn.complete' '$LOG') -ge 3 ]"
+read -r busyticks maxgap < <(awk '
+  /turn.start/ {n++; if (n==3) w=1}
+  /turn.complete/ && w {w=0}
+  w && /tick busy=true/ {c++; if (p && $1-p>m) m=$1-p; p=$1}
+  END {print c+0, m+0}' "$LOG")
+if [ "$busyticks" -ge 15 ] && [ "$maxgap" -le 3500 ]; then
+  ok "3b clock.every fired $busyticks times during a ~42s tool turn, max gap ${maxgap}ms"
+else
+  bad "3b timers stalled during the tool call (busy ticks=$busyticks max gap=${maxgap}ms)"
+fi
+
+# --- 4. tool.check allow over an engine 'ask' ------------------------------
+touch "$T/work/victim-b"
+say "Use the Bash tool to run exactly this one command and nothing else: rm -f /work/../work/victim-b   then reply with only: finished"
+wait_for 60 "tool.check logged" has_log "tool.check core=ask .*victim-b"
+wait_for 30 "override logged" has_log "tool.check: overriding to allow"
+wait_for 30 "turn complete" bash -c "[ \$(grep -c 'turn.complete' '$LOG') -ge 4 ]"
+if [ ! -e "$T/work/victim-b" ] && ! screen | tail -15 | grep -q "Do you want to proceed"; then
+  ok "4 hook allowed an engine-ask rm ($(grep -o 'core=ask reason="[^"]*"' "$LOG" | tail -1)); no dialog; file removed"
+else
+  bad "4 rm not allowed through (file still there or dialog shown)"
+fi
+# control: a command the hook does not match still raises the dialog
+say "Use the Bash tool to run exactly this one command and nothing else: rm -f \$(echo /work/ctl-1)   then reply with only: finished"
+wait_for 40 "control dialog" has_screen "Do you want to proceed"
+has_screen "Do you want to proceed" && ok "4c control: unmatched command still asks" || bad "4c control did not ask"
+tm send-keys -t t Escape
+
+echo "---"
+[ "$fails" -eq 0 ] && echo "ALL PASS" && exit 0
+echo "$fails FAILED (debug log: kept in $T until exit; see $T/out/debug.log)"
+exit 1

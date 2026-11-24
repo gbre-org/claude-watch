@@ -74,7 +74,7 @@
 .PHONY: test-trust-workspace test-claude-tmux-env test-cron-toggle
 .PHONY: test-eval-queue-ready-unspawned
 .PHONY: test-cw-theme-sync
-.PHONY: test-hooks-shim test-entrypoint
+.PHONY: test-hooks-shim test-entrypoint test-cw-clear-mod-e2e
 # Tests — compose stack + host shims
 .PHONY: test-cw test-hostjob test-ttyd-paste-handler test-ttyd-lock-toggle
 # Tests — macOS LaunchAgents + personal MCP host
@@ -502,6 +502,14 @@ test-hooks-shim: ## container hooks-shim / settings-rewrite suites
 #     exited instantly, and tmux destroyed the `tasks` session right after
 #     "Session 'tasks' created" printed — `workload run` / `workload kill`
 #     were unusable in the container.
+# e2e for the cw-clear mod prototype (mods/cw-clear): a real authenticated
+# Claude Code in a throwaway container. NOT part of `make test`/CI: skips
+# (exit 0) unless CW_E2E_CREDENTIALS (a .credentials.json) or ANTHROPIC_API_KEY
+# is set and a claude >= 2.1.331 binary is given (CW_E2E_CLAUDE_BIN). See the
+# header of the script. ~2 minutes.
+test-cw-clear-mod-e2e: ## cw-clear mod e2e (container + real Claude Code; skips without credentials)
+	container/tests/cw-clear-mod-e2e.test
+
 test-entrypoint: ## Container entrypoint + baked-image assertion suites
 	container/tests/entrypoint-claude-cmd.test
 	container/tests/entrypoint-tmux-truecolor.test

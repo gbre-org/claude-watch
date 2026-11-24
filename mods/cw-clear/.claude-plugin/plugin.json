@@ -1,0 +1,37 @@
+{
+  "name": "cw-clear",
+  "version": "0.1.0",
+  "description": "Prototype: /cw-clear clears the conversation and submits a resume prompt, plus a turn heartbeat file. Off unless enabled.",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Enable cw-clear",
+      "description": "Master flag. When false the mod registers nothing and writes nothing.",
+      "default": false
+    },
+    "resumeFile": {
+      "type": "string",
+      "title": "Resume prompt file",
+      "description": "Path of a file holding the resume prompt. Empty: run resumeCommand instead.",
+      "default": ""
+    },
+    "resumeCommand": {
+      "type": "string",
+      "title": "Resume prompt command",
+      "description": "Whitespace-separated argv whose stdout is the resume prompt (used when resumeFile is empty).",
+      "default": "session-task show"
+    },
+    "stateFile": {
+      "type": "string",
+      "title": "Heartbeat/state file",
+      "description": "JSON file rewritten on every turn event. Empty: heartbeat off.",
+      "default": ""
+    },
+    "probe": {
+      "type": "boolean",
+      "title": "Spike probes",
+      "description": "Also register /cw-probe-* commands, a 2s clock.every log and a Bash tool.check logger. Spike only.",
+      "default": false
+    }
+  }
+}
