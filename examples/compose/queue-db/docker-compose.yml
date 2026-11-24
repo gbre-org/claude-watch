@@ -1,0 +1,66 @@
+# Dedicated, queue-only Postgres for the session-task Postgres backend.
+#
+# Standalone compose project (own project name, own volume) so it never
+# touches the claude-container stack. Start only this service:
+#
+#   docker compose --env-file ~/.config/queue-db/queue-db.env \
+#     -f examples/compose/queue-db/docker-compose.yml up -d
+#
+# Secrets: QUEUE_DB_ADMIN_PASSWORD / QUEUE_DB_APP_PASSWORD come from the
+# out-of-tree env file above (mode 0600, never committed). Clients use the
+# unprivileged `queue_app` role; the superuser exists only for bootstrap.
+#
+# Reachability: published on host loopback ONLY (127.0.0.1:5434). The host
+# uses 127.0.0.1; the container uses host.docker.internal (the session-task
+# DSN host `auto` resolves each).
+name: queue-db
+
+services:
+  queue-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: queue_admin
+      POSTGRES_PASSWORD: ${QUEUE_DB_ADMIN_PASSWORD:?set in the out-of-tree env file}
+      POSTGRES_DB: queue
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      QUEUE_DB_APP_PASSWORD: ${QUEUE_DB_APP_PASSWORD:?set in the out-of-tree env file}
+    ports:
+      - "127.0.0.1:${QUEUE_DB_PORT:-5434}:5432"
+    volumes:
+      - queue-pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queue_admin -d queue"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Daily logical backup to a host directory (outside the DB volume).
+  # Restore: gunzip -c <file> | psql "<dsn>"   (into an empty database).
+  queue-db-backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      queue-db:
+        condition: service_healthy
+    environment:
+      PGHOST: queue-db
+      PGUSER: queue_app
+      PGPASSWORD: ${QUEUE_DB_APP_PASSWORD:?set in the out-of-tree env file}
+      PGDATABASE: queue
+      KEEP_DAYS: ${QUEUE_DB_BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - ${QUEUE_DB_BACKUP_DIR:?set in the out-of-tree env file}:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          f=/backups/queue-$$(date -u +%Y%m%dT%H%M%SZ).sql.gz
+          if pg_dump --no-owner | gzip > "$$f.tmp"; then mv "$$f.tmp" "$$f"; else rm -f "$$f.tmp"; echo "backup failed" >&2; fi
+          find /backups -name 'queue-*.sql.gz' -mtime +$$KEEP_DAYS -delete
+          sleep 86400
+        done
+
+volumes:
+  queue-pgdata:
