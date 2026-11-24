@@ -12,6 +12,13 @@ machine is ONE registry entry; no code changes.
     hostjob-remote [--host NAME | --role ROLE] poll L [--tail N]
     hostjob-remote [--host NAME | --role ROLE] stop L [--force]
     hostjob-remote [--host NAME | --role ROLE] list
+    hostjob-remote sync [--host NAME]
+
+`sync` fast-forwards each host's claude-watch checkout to origin/main so every
+host runs the same code. It REFUSES a checkout with tracked local changes (or
+one not on main), and reports unreachable or interactive_only hosts as SKIPPED
+(never a failure, so a sleeping laptop cannot block a deploy). `run` warns on
+stderr, without failing, when the target checkout is not at origin/main.
 
 Exit codes mirror local hostjob: 0 ok / job finished, 75 still running
 (`wait` hit its bound; re-invoke), 1 job failed or error from the remote
@@ -53,6 +60,16 @@ class TransportError(Exception):
 
 
 # ---------------------------------------------------------------- registry
+_HOSTJOB_TAIL = "/examples/compose/bin/hostjob"
+
+
+def derive_repo(hostjob):
+    """Checkout root implied by a path-style hostjob (<repo>/examples/compose/bin/hostjob)."""
+    if hostjob.endswith(_HOSTJOB_TAIL):
+        return hostjob[:-len(_HOSTJOB_TAIL)]
+    return None
+
+
 class Host:
     def __init__(self, name, d):
         self.name = name
@@ -64,6 +81,7 @@ class Host:
         self.cwd = d.get("cwd")
         self.interactive_only = bool(d.get("interactive_only", False))
         self.python = d.get("python", "python3")
+        self.repo = d.get("repo") or derive_repo(self.hostjob)
         if not isinstance(self.roles, list) or not all(isinstance(r, str) for r in self.roles):
             raise RegistryError("host %r: roles must be a list of strings" % name)
         if not self.endpoint:
@@ -204,6 +222,154 @@ def make_transport(host):
     return TRANSPORTS[host.transport](host)
 
 
+# --------------------------------------------------------------------- sync
+MCP_CRATE = "crates/mcp-host-bash-server"
+_MARK = "@@"
+
+
+def sync_script(repo):
+    """One remote shell line that prints @@KEY=value lines (parsed by parse_sync).
+
+    The dirty check ignores untracked files (`??`): a stray .env.bak-* must not
+    block a sync (a real collision makes the merge fail and is reported).
+    """
+    r = shlex.quote(repo)
+    parts = [
+        "cd %s || { echo '@@ERR=no checkout at %s'; exit 0; }" % (r, repo),
+        "echo \"@@BRANCH=$(git symbolic-ref --short -q HEAD)\"",
+        "OLD=$(git rev-parse HEAD); echo \"@@OLD=$OLD\"",
+        "D=$(git status --porcelain | grep -v '^??')",
+        "if [ -n \"$D\" ]; then echo \"$D\" | sed 's/^/@@DIRTY=/'; exit 0; fi",
+        "[ \"$(git symbolic-ref --short -q HEAD)\" = main ] || exit 0",
+        "git fetch -q origin main 2>&1 | sed 's/^/@@FETCHERR=/'",
+        "echo \"@@TARGET=$(git rev-parse origin/main)\"",
+        "git merge --ff-only -q origin/main 2>&1 | sed 's/^/@@MERGEERR=/'",
+        "echo \"@@NEW=$(git rev-parse HEAD)\"",
+        "echo \"@@CHANGED=$(git diff --name-only $OLD HEAD | grep -c '^%s/')\"" % MCP_CRATE,
+    ]
+    return "; ".join(parts)
+
+
+def parse_sync(out):
+    """Parse sync_script output into {KEY: [values]}."""
+    d = {}
+    for line in out.splitlines():
+        if line.startswith(_MARK) and "=" in line:
+            k, v = line[len(_MARK):].split("=", 1)
+            d.setdefault(k, []).append(v)
+    return d
+
+
+def decide_sync(d):
+    """Map parsed sync output to (status, detail, old, new, mcp_changed).
+
+    status: UPDATED | CURRENT | REFUSED | FAILED
+    """
+    def one(k):
+        return (d.get(k) or [""])[0]
+
+    old, new = one("OLD"), one("NEW")
+    if d.get("ERR"):
+        return "FAILED", one("ERR"), old, old, False
+    if d.get("DIRTY"):
+        return "REFUSED", "local changes: " + "; ".join(x.strip() for x in d["DIRTY"]), old, old, False
+    if one("BRANCH") != "main":
+        return "REFUSED", "checkout is on %s, not main" % (one("BRANCH") or "a detached HEAD"), old, old, False
+    if d.get("FETCHERR") or not one("TARGET"):
+        return "FAILED", "fetch failed: " + " ".join(d.get("FETCHERR", [])), old, old, False
+    if d.get("MERGEERR") or not new:
+        return "FAILED", "ff-only merge failed: " + " ".join(d.get("MERGEERR", [])), old, old, False
+    if old == new:
+        return "CURRENT", "", old, new, False
+    n = one("CHANGED")
+    return "UPDATED", "", old, new, n.isdigit() and int(n) > 0
+
+
+def sync_hosts(hosts, name=None, make_tr=None):
+    """Sync the chosen hosts (all non-interactive ones, or just `name`) -> list of result dicts."""
+    make_tr = make_tr or make_transport
+    if name:
+        if name not in hosts:
+            raise RegistryError("unknown host %r (known: %s)" % (name, ", ".join(sorted(hosts))))
+        chosen = [hosts[name]]
+    else:
+        chosen = list(hosts.values())
+    results = []
+    for h in chosen:
+        r = {"host": h.name, "status": "", "detail": "", "old": "", "new": "", "mcp": False}
+        results.append(r)
+        if h.interactive_only and not name:
+            r.update(status="SKIPPED", detail="interactive_only (name it with --host to sync)")
+            continue
+        if not h.repo:
+            r.update(status="FAILED", detail="no checkout path: set `repo` or a path-style `hostjob`")
+            continue
+        try:
+            _, out = make_tr(h).exec(sync_script(h.repo), timeout=60)
+        except TransportError as e:
+            r.update(status="SKIPPED", detail="unreachable: %s" % e)
+            continue
+        status, detail, old, new, mcp = decide_sync(parse_sync(out))
+        r.update(status=status, detail=detail, old=old, new=new, mcp=mcp)
+    return results
+
+
+def format_sync_table(results):
+    def short(x):
+        return x[:7] if x else "-"
+
+    lines = ["%-10s %-8s %s" % ("HOST", "STATUS", "REV / DETAIL")]
+    for r in results:
+        if r["status"] == "UPDATED":
+            rev = "%s -> %s" % (short(r["old"]), short(r["new"]))
+        elif r["status"] == "CURRENT":
+            rev = "%s (already current)" % short(r["new"])
+        else:
+            rev = r["detail"] + (" (at %s)" % short(r["old"]) if r["old"] else "")
+        lines.append("%-10s %-8s %s" % (r["host"], r["status"], rev))
+    for r in results:
+        if r["mcp"]:
+            lines.append("NOTE: %s: %s changed - a mac-nix switch is needed there to rebuild "
+                         "mcp-host-bash-server." % (r["host"], MCP_CRATE))
+    return "\n".join(lines) + "\n"
+
+
+def sync_exit_code(results):
+    return 1 if any(r["status"] in ("REFUSED", "FAILED") for r in results) else 0
+
+
+def cmd_sync(hosts, a):
+    results = sync_hosts(hosts, a.host)
+    sys.stdout.write(format_sync_table(results))
+    return sync_exit_code(results)
+
+
+def rev_warning(host, local, remote):
+    """Warning text when a host checkout is not at origin/main, else None."""
+    if not local or not remote or local == remote:
+        return None
+    return ("hostjob-remote: warning: %s claude-watch checkout is at %s but origin/main is %s; "
+            "run `hostjob-remote sync --host %s`" % (host.name, local[:7], remote[:7], host.name))
+
+
+def check_rev(host, tr):
+    """Best-effort: warn on stderr if the host checkout lags origin/main. Never fails."""
+    if not host.repo:
+        return
+    r = shlex.quote(host.repo)
+    try:
+        _, out = tr.exec("git -C %s rev-parse HEAD; git -C %s ls-remote origin refs/heads/main"
+                         % (r, r), timeout=20)
+    except TransportError:
+        return
+    rows = [x.split() for x in out.splitlines() if x.strip()]
+    local = rows[0][0] if rows and len(rows[0]) == 1 else ""
+    remote = rows[1][0] if len(rows) > 1 else ""
+    w = rev_warning(host, local, remote)
+    if w:
+        sys.stderr.write(w + "\n")
+
+
 # ----------------------------------------------------------------- commands
 def remote_cmd(host, *argv):
     prefix = ["hostjob"] if host.hostjob == "hostjob" else [host.python, host.hostjob]
@@ -221,6 +387,8 @@ def cmd_run(host, tr, a):
         cmd = cmd[1:]
     if not cmd:
         raise RegistryError("run: no command given (use: run --label L -- cmd ...)")
+    if not a.no_rev_check:
+        check_rev(host, tr)
     argv = ["run", "--label", a.label]
     cwd = a.cwd or host.cwd
     if cwd:
@@ -275,6 +443,7 @@ def build_parser():
     r.add_argument("--label", required=True)
     r.add_argument("--cwd")
     r.add_argument("--force", action="store_true")
+    r.add_argument("--no-rev-check", action="store_true", help="skip the checkout-vs-origin/main warning")
     r.add_argument("cmd", nargs=argparse.REMAINDER)
     w = sub.add_parser("wait", help="bounded wait; exit 75 if still running")
     w.add_argument("label")
@@ -287,6 +456,8 @@ def build_parser():
     s.add_argument("label")
     s.add_argument("--force", action="store_true")
     sub.add_parser("list", help="list jobs on the host")
+    sub.add_parser("sync", help="fast-forward host claude-watch checkouts to origin/main "
+                                "(all non-interactive hosts, or --host NAME)")
     return p
 
 
@@ -296,6 +467,10 @@ def main(argv=None):
         hosts = load_registry(os.path.expanduser(a.registry) if a.registry else None)
         if a.sub == "hosts":
             return cmd_hosts(hosts)
+        if a.sub == "sync":
+            if a.role:
+                raise RegistryError("sync takes --host NAME or nothing (all hosts), not --role")
+            return cmd_sync(hosts, a)
         host = select_host(hosts, a.host, a.role)
         tr = make_transport(host)
         fn = {"run": cmd_run, "wait": cmd_wait, "poll": cmd_poll, "stop": cmd_stop, "list": cmd_list}[a.sub]

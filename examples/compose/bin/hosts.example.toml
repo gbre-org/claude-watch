@@ -8,6 +8,8 @@
 #   credential_file  bearer token file; MUST be mode 0600 and owned by you.
 #                    Either raw token text or JSON {"token": "..."}.
 #   hostjob          remote path to the hostjob script (default: `hostjob` on PATH)
+#   repo             remote claude-watch checkout that `sync` fast-forwards (default:
+#                    derived from a path-style `hostjob` ending examples/compose/bin/hostjob)
 #   python           interpreter used with a path-style `hostjob` (default python3)
 #   cwd              default remote working dir for `run`
 #   interactive_only true = never chosen by --role; only via explicit --host
