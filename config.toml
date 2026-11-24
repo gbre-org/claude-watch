@@ -943,6 +943,26 @@ enabled = true
 # cold-start state and every save emitted a full set of events: seven
 # memory-reminders landed in 52 seconds against a 30-minute interval.
 
+[cw_clear_mod]
+# cw-clear Claude Code mod (mods/cw-clear). When enabled AND the mod's
+# heartbeat file is fresh and ready, `self-clear` (and so every daemon /
+# skill driven clear) types `/cw-clear`: the mod does the real /clear and
+# submits the resume prompt as the first turn. If the flag is off, or the
+# heartbeat is missing / stale / not ready, or the clear is not confirmed,
+# `self-clear` uses the tmux injection path unchanged. Every run logs a
+# `PATH-USED:` line in the self-clear log.
+# OPT-IN, DEFAULT OFF: merging or deploying changes nothing until set.
+# The mod itself must also be loaded (see mods/cw-clear/README.md).
+enabled = false
+# Must equal the mod's `stateFile` / `resumeFile` options. Omit for the
+# runtime-dir defaults ($XDG_RUNTIME_DIR/claude-cw-clear-heartbeat.json and
+# claude-cw-clear-resume.txt).
+#   heartbeat_file = "/run/user/1000/claude-cw-clear-heartbeat.json"
+#   resume_file = "/run/user/1000/claude-cw-clear-resume.txt"
+# A heartbeat older than this is stale (mod hung, unloaded or reloaded
+# without re-registering). The mod ticks every 15s by default. Default 60.
+heartbeat_max_age_secs = 60
+
 [idle_autocompact]
 # Idle auto-compaction: when the session is GENUINELY IDLE, reset the main
 # loop's context (a self-clear + resume prompt) so idle wakes stop paying

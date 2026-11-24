@@ -87,6 +87,48 @@ pub struct Config {
     /// permission prompts. Default OFF. See `crate::autoresolve`.
     #[serde(default)]
     pub autoresolve: crate::autoresolve::AutoResolveConfig,
+    /// cw-clear Claude Code mod (`mods/cw-clear`): when enabled AND the mod's
+    /// heartbeat is fresh, `self-clear` triggers `/cw-clear` instead of the
+    /// tmux `/clear` + resume injection. Default OFF. Read by the
+    /// `self-clear` tool; see `CwClearModConfig`.
+    #[serde(default)]
+    #[allow(dead_code)] // consumed by the self-clear tool via config.toml, not the daemon
+    pub cw_clear_mod: CwClearModConfig,
+}
+
+/// `[cw_clear_mod]`: opt-in use of the cw-clear mod by `self-clear`.
+///
+/// `heartbeat_file` / `resume_file` must equal the mod's `stateFile` /
+/// `resumeFile` options. Empty strings mean the tool's runtime-dir defaults
+/// (`claude-cw-clear-heartbeat.json` / `claude-cw-clear-resume.txt` under
+/// `$XDG_RUNTIME_DIR`). A heartbeat older than `heartbeat_max_age_secs`, a
+/// missing one, or one with `ready != true` makes `self-clear` use the tmux
+/// path instead.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct CwClearModConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub heartbeat_file: String,
+    #[serde(default)]
+    pub resume_file: String,
+    #[serde(default = "default_cw_clear_heartbeat_max_age_secs")]
+    pub heartbeat_max_age_secs: u64,
+}
+
+fn default_cw_clear_heartbeat_max_age_secs() -> u64 {
+    60
+}
+
+impl Default for CwClearModConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            heartbeat_file: String::new(),
+            resume_file: String::new(),
+            heartbeat_max_age_secs: default_cw_clear_heartbeat_max_age_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2426,6 +2468,18 @@ pub fn parse_config(toml_str: &str) -> Result<Config, toml::de::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cw_clear_mod_defaults_off_and_parses() {
+        let d = CwClearModConfig::default();
+        assert!(!d.enabled);
+        assert_eq!(d.heartbeat_max_age_secs, 60);
+        let c: CwClearModConfig = toml::from_str("enabled = true\nheartbeat_max_age_secs = 30").unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.heartbeat_max_age_secs, 30);
+        let empty: CwClearModConfig = toml::from_str("").unwrap();
+        assert_eq!(empty, d);
+    }
+
     use super::*;
 
     const SAMPLE_CONFIG: &str = r#"

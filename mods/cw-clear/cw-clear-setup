@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Print or apply the settings that enable the cw-clear mod.
+
+Nothing here runs unless you invoke it; installing or merging this repo never
+enables the mod. Two steps turn the feature on:
+
+  1. Mod side: Claude Code must load the mod (`--plugin-dir <this dir>`) with
+     `pluginConfigs["cw-clear"].options` carrying `enabled: true`, a
+     `stateFile` (heartbeat) and a `resumeFile`. `--apply` merges those
+     options into a settings.json you name.
+  2. Daemon side: set `[cw_clear_mod] enabled = true` in claude-watch's
+     config.toml (heartbeat_file / resume_file must equal stateFile /
+     resumeFile; the defaults below match the daemon's defaults).
+
+Usage:
+  cw-clear-setup                      print the plan (settings JSON + toml + flag)
+  cw-clear-setup --apply --settings FILE [--dry-run]
+                                      merge the mod options into FILE
+Options: --heartbeat PATH, --resume PATH (defaults under $XDG_RUNTIME_DIR).
+Disable: remove the `enabled` option / set it false, or set the toml flag false.
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+MOD_DIR = Path(__file__).resolve().parent
+
+
+def runtime_file(name):
+    rt = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    return str(Path(rt) / name) if rt else "/var/run/claude/" + name
+
+
+def mod_options(heartbeat, resume):
+    return {"enabled": True, "stateFile": heartbeat, "resumeFile": resume}
+
+
+def merge_settings(settings, heartbeat, resume):
+    """Return settings with pluginConfigs["cw-clear"].options set (pure)."""
+    out = dict(settings)
+    pc = dict(out.get("pluginConfigs") or {})
+    entry = dict(pc.get("cw-clear") or {})
+    opts = dict(entry.get("options") or {})
+    opts.update(mod_options(heartbeat, resume))
+    entry["options"] = opts
+    pc["cw-clear"] = entry
+    out["pluginConfigs"] = pc
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--settings")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--heartbeat", default=runtime_file("claude-cw-clear-heartbeat.json"))
+    ap.add_argument("--resume", default=runtime_file("claude-cw-clear-resume.txt"))
+    a = ap.parse_args(argv)
+
+    if not a.apply:
+        print("# 1. settings.json (pluginConfigs):")
+        print(json.dumps(merge_settings({}, a.heartbeat, a.resume), indent=2))
+        print(f"\n# 2. launch Claude Code with:  --plugin-dir {MOD_DIR}")
+        print("\n# 3. claude-watch config.toml:\n[cw_clear_mod]\nenabled = true")
+        if a.heartbeat != runtime_file("claude-cw-clear-heartbeat.json"):
+            print(f'heartbeat_file = "{a.heartbeat}"')
+        if a.resume != runtime_file("claude-cw-clear-resume.txt"):
+            print(f'resume_file = "{a.resume}"')
+        return 0
+
+    if not a.settings:
+        print("--apply needs --settings FILE", file=sys.stderr)
+        return 2
+    path = Path(a.settings)
+    try:
+        cur = json.loads(path.read_text()) if path.exists() else {}
+    except ValueError as e:
+        print(f"{path}: not valid JSON ({e}); refusing to touch it", file=sys.stderr)
+        return 1
+    if not isinstance(cur, dict):
+        print(f"{path}: top level is not an object; refusing", file=sys.stderr)
+        return 1
+    new = json.dumps(merge_settings(cur, a.heartbeat, a.resume), indent=2) + "\n"
+    if a.dry_run:
+        print(new, end="")
+        return 0
+    tmp = path.with_name(path.name + ".cw-tmp")
+    tmp.write_text(new)
+    os.replace(tmp, path)
+    print(f"updated {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
