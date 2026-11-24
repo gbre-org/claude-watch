@@ -92,6 +92,44 @@ claude-watch handles it on two levels, both governed by `[claude]` config keys:
 
 Set `handle_bypass_dialog = false` to leave the dialog entirely to a human.
 
+## Running bounded jobs on any registered machine (`hostjob-remote`)
+
+`examples/compose/bin/hostjob` runs *on* a host and detaches long commands.
+`examples/compose/bin/hostjob-remote` runs on the coordinator and drives that
+remote `hostjob` through a pluggable transport (today: the JSON-RPC of an MCP
+host-bash server over HTTP with a bearer token). Every machine is reached the
+same way; adding one is a single registry entry, no code change.
+
+```
+hostjob-remote hosts
+hostjob-remote --role build run --label L [--cwd D] -- cmd...
+hostjob-remote --host NAME wait L [--timeout S]   # exit 75 = still running
+hostjob-remote --host NAME poll L [--tail N]
+hostjob-remote --host NAME stop L [--force]
+hostjob-remote --host NAME list
+hostjob-remote [--host NAME] sync                 # fast-forward checkouts to origin/main
+```
+
+`sync` keeps every host's claude-watch checkout on `origin/main` so all hosts
+run the same code. It refuses a checkout with tracked local changes or not on
+`main` (exit 1), reports unreachable and `interactive_only` hosts as SKIPPED
+(not a failure; name an interactive host with `--host` to sync it), and prints
+a per-host `old -> new` rev table, noting when `crates/mcp-host-bash-server`
+changed (that host then needs a rebuild of the binary by your host provisioner).
+`make deploy` runs it automatically (`make sync-hosts`) without ever failing the
+deploy. `run` warns on stderr, without failing, when the target checkout is not
+at origin/main (`--no-rev-check` silences it). The checkout path is the host's
+`repo` key, or is derived from a path-style `hostjob`.
+
+Registry: `~/.config/hostjob/hosts.toml` (override with `$HOSTJOB_HOSTS`), see
+`examples/compose/bin/hosts.example.toml`. Per host: `roles`, `transport`,
+`endpoint`, `credential_file` (must be mode 0600 and owned by you, else the
+host is refused; the token is only sent as an Authorization header and never
+printed), `hostjob` (remote path), `cwd`, and `interactive_only` (never picked
+by `--role`; only by explicit `--host`). Exit codes mirror `hostjob`:
+0 done, 75 still running, 1 job failed, 2 usage/registry error, 69 transport
+unreachable. Tests: `python3 -m pytest examples/compose/bin/tests/test_hostjob_remote.py`.
+
 ## Alerting hierarchy
 
 claude-watch and its sibling tools form a three-tier alerting hierarchy. Each

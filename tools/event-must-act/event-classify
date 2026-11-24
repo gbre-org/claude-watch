@@ -593,6 +593,20 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("*", "hostjob-done", None, AMBIENT,
         "Host job finished; context only."),
 
+    # Failed / never-launched / lost hostjobs: producers stamp
+    # data.tier=actionable; these rows are the BACKSTOP so they never fall to
+    # UNCLASSIFIED.
+    ("*", "hostjob-failed", None, ACTIONABLE,
+        "Host job exited nonzero; row abandoned, needs review + relaunch."),
+    ("*", "hostjob-launch-failed", None, ACTIONABLE,
+        "Host job never produced a log or heartbeat; row abandoned, "
+        "needs the runner host checked + relaunch."),
+    ("*", "hostjob-telemetry-broken", None, ACTIONABLE,
+        "Remote host job silent at the queue (alive or unverifiable); "
+        "fix the heartbeat/log pipe, row NOT abandoned."),
+    ("*", "hostjob-lost", None, ACTIONABLE,
+        "Remote host job went silent for 24h; row abandoned."),
+
     # Watcher routine events.
     ("*", "watcher-cleanup", None, AMBIENT,
         "Watcher cleanup tick; context only."),
@@ -934,6 +948,10 @@ def _self_test() -> int:
         # Ambient: workload + watcher
         (("manual", "workload-done", ""), AMBIENT),
         (("hostjob", "hostjob-done", ""), AMBIENT),
+        (("queue", "hostjob-failed", ""), ACTIONABLE),
+        (("queue", "hostjob-launch-failed", ""), ACTIONABLE),
+        (("queue", "hostjob-lost", ""), ACTIONABLE),
+        (("queue", "hostjob-telemetry-broken", ""), ACTIONABLE),
         (("claude-watch", "memory-reminder", ""), AMBIENT),
         (("manual", "watcher-cleanup", ""), AMBIENT),
         # claude-watch/* catch-all stays ambient for non-keepalive tags.

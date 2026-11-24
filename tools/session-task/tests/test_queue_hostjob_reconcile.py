@@ -442,10 +442,17 @@ def _remote_row(qid, label, *, age_seconds, **extra):
     return row
 
 
+def _push_log(env, label, text="x\n"):
+    d = Path(env["HOME"], ".config", "session", "hostjob-logs", label)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "log").write_text(text)
+
+
 def test_remote_row_no_local_state_dir_stays_open_even_when_visible():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         _write_queue(env, [_remote_row("q-rm", "macjob", age_seconds=3600)])
+        _push_log(env, "macjob")
         # Local state dir is visible and non-empty (other local jobs) but has
         # no entry for this label -- the exact case that used to false-close.
         _write_status(env, "otherjob", {"status": "running", "rc": None})
@@ -459,6 +466,7 @@ def test_remote_row_ignores_local_terminal_status_json():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         _write_queue(env, [_remote_row("q-rt", "macjob2", age_seconds=3600)])
+        _push_log(env, "macjob2")
         _write_status(env, "macjob2", {"status": "done", "rc": 0})
         _run(env, "queue", "reconcile-hostjobs", "--json")
         assert _read_item(env, "q-rt")["status"] == "running"
@@ -477,7 +485,9 @@ def test_remote_row_recent_heartbeat_keeps_open_despite_old_registration():
 def test_remote_row_stale_over_24h_is_gcd_to_abandoned():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
+        _probe(env, tmp, 1)
         _write_queue(env, [_remote_row("q-rs", "macjob4", age_seconds=25 * 3600)])
+        _push_log(env, "macjob4")
         r = _run(env, "queue", "reconcile-hostjobs", "--json")
         assert r.returncode == 0, r.stderr
         it = _read_item(env, "q-rs")
@@ -513,3 +523,190 @@ def test_local_row_without_marker_unchanged_missing_dir_closes():
         _write_status(env, "otherjob", {"status": "running", "rc": None})
         _run(env, "queue", "reconcile-hostjobs", "--json")
         assert _read_item(env, "q-lc")["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Launch-failed class: a REMOTE hostjob whose reaper never connected the log
+# sink and never heartbeat ("launch failed / no log"). Must become a terminal
+# abandon (scope freed) AND an ACTIONABLE claude-event.
+# ---------------------------------------------------------------------------
+def _events(env):
+    d = Path(env["HOME"], "claude-events")
+    out = []
+    if d.is_dir():
+        for f in sorted(d.rglob("*.json")):
+            try:
+                out.append(json.loads(f.read_text()))
+            except ValueError:
+                pass
+    return out
+
+
+def _probe(env, tmp, rc):
+    """Install a host-probe command that exits `rc` (0 alive / 1 gone)."""
+    sh = Path(tmp, "probe.sh")
+    sh.write_text("#!/bin/sh\nexit %d\n" % rc)
+    sh.chmod(0o755)
+    env["HOSTJOB_HOST_PROBE_CMD"] = str(sh)
+
+
+def _launch_env(tmp):
+    env = _env_for_tmp(tmp)
+    env.pop("HOSTJOB_HOST_PROBE_CMD", None)
+    for k in ("CLAUDE_EVENT_QUEUE", "CRON_EVENT_QUEUE"):
+        env.pop(k, None)
+    env["CLAUDE_EVENT_SESSION_TASK"] = "1"
+    return env
+
+
+def test_remote_no_log_no_heartbeat_past_grace_is_abandoned_with_event():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _probe(env, tmp, 1)
+        _write_queue(env, [_remote_row("q-lf", "dubjobs", age_seconds=300)])
+        r = _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert r.returncode == 0, r.stderr
+        it = _read_item(env, "q-lf")
+        assert it["status"] == "abandoned", it
+        assert "launch failed" in it["abandon_reason"]
+        assert it.get("death_evidence")
+        evs = [e for e in _events(env) if "hostjob-launch-failed" in json.dumps(e)]
+        assert evs, _events(env)
+        blob = json.dumps(evs[0])
+        assert "actionable" in blob and "q-lf" in blob and "dubjobs" in blob
+
+
+def test_remote_launch_within_grace_untouched():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _write_queue(env, [_remote_row("q-lg", "fresh", age_seconds=30)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-lg")["status"] == "running"
+        assert not _events(env)
+
+
+def test_remote_pushed_log_for_this_run_keeps_running():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _write_queue(env, [_remote_row("q-ll", "quiet", age_seconds=600)])
+        _push_log(env, "quiet", "sink connected\n")
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-ll")["status"] == "running"
+
+
+def test_remote_stale_pushed_log_from_older_run_does_not_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _probe(env, tmp, 1)
+        _write_queue(env, [_remote_row("q-ls", "rerun", age_seconds=300)])
+        _push_log(env, "rerun", "old run\n")
+        old = datetime.now(timezone.utc).timestamp() - 86400
+        os.utime(Path(env["HOME"], ".config/session/hostjob-logs/rerun/log"), (old, old))
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-ls")["status"] == "abandoned"
+
+
+def test_remote_heartbeat_after_registration_keeps_running_without_log():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        beat = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        _write_queue(env, [_remote_row(
+            "q-lb", "beating", age_seconds=300, last_heartbeat_at=beat)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-lb")["status"] == "running"
+
+
+def test_queue_list_reaps_launch_failed_and_emits_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _probe(env, tmp, 1)
+        _write_queue(env, [_remote_row("q-l1", "dead1", age_seconds=300)])
+        _run(env, "queue", "list", "--all")
+        _run(env, "queue", "list", "--all")
+        assert _read_item(env, "q-l1")["status"] == "abandoned"
+        evs = [e for e in _events(env) if "hostjob-launch-failed" in json.dumps(e)]
+        assert len(evs) == 1, evs
+
+
+def test_log_sink_creates_log_immediately():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        r = subprocess.run(
+            [sys.executable, str(SESSION_TASK), "queue", "hostjob-log-sink", "sinky"],
+            input=b"", capture_output=True, env=env, timeout=15)
+        assert r.returncode == 0, r.stderr
+        log = Path(env["HOME"], ".config/session/hostjob-logs/sinky/log")
+        assert log.exists() and b"log sink connected" in log.read_bytes()
+
+
+def test_reaper_nonzero_exit_abandon_emits_actionable_hostjob_failed():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _write_queue(env, [_running_hostjob_row("q-hf", "crashy", age_seconds=60)])
+        r = _run(env, "queue", "abandon", "q-hf", "--confirmed-dead", "--force",
+                 "--reason", "hostjob exit 127 (log: /x)")
+        assert r.returncode == 0, r.stderr
+        evs = [e for e in _events(env) if "hostjob-failed" in json.dumps(e)]
+        assert evs and "actionable" in json.dumps(evs[0])
+        # exit 0 / other reasons stay quiet
+        _write_queue(env, [_running_hostjob_row("q-hg", "fine", age_seconds=60)])
+        n = len([e for e in _events(env) if "hostjob-failed" in json.dumps(e)])
+        _run(env, "queue", "abandon", "q-hg", "--confirmed-dead", "--force",
+             "--reason", "operator stop")
+        assert len([e for e in _events(env) if "hostjob-failed" in json.dumps(e)]) == n
+
+
+# ---------------------------------------------------------------------------
+# A LIVE remote worker whose telemetry never reaches the queue must NEVER be
+# abandoned on queue-side silence alone (incident: long-lived dub job alive on
+# the host while its heartbeat/log RPCs were denied by the ssh allow-list).
+# ---------------------------------------------------------------------------
+def _tag_events(env, tag):
+    return [e for e in _events(env) if tag in json.dumps(e)]
+
+
+def test_live_worker_without_pushed_log_is_not_abandoned_and_alerts_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _probe(env, tmp, 0)  # host says: alive
+        _write_queue(env, [_remote_row("q-al", "alive1", age_seconds=4 * 3600)])
+        for _ in range(2):
+            r = _run(env, "queue", "reconcile-hostjobs", "--json")
+            assert r.returncode == 0, r.stderr
+        it = _read_item(env, "q-al")
+        assert it["status"] == "running", it
+        evs = _tag_events(env, "hostjob-telemetry-broken")
+        assert len(evs) == 1 and "actionable" in json.dumps(evs[0])
+        assert not _tag_events(env, "hostjob-launch-failed")
+
+
+def test_unprobeable_host_quarantines_not_abandons():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)  # no probe configured -> unknown
+        _write_queue(env, [_remote_row("q-un", "unk1", age_seconds=300)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        it = _read_item(env, "q-un")
+        assert it["status"] == "quarantined", it  # scope still held
+        assert len(_tag_events(env, "hostjob-telemetry-broken")) == 1
+        # Re-sweeping neither abandons nor re-alerts.
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-un")["status"] == "quarantined"
+        assert len(_tag_events(env, "hostjob-telemetry-broken")) == 1
+
+
+def test_probe_failure_exit_code_is_unknown_not_gone():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _probe(env, tmp, 255)  # ssh failure
+        _write_queue(env, [_remote_row("q-pf", "pf1", age_seconds=300)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-pf")["status"] == "quarantined"
+
+
+def test_stale_24h_remote_row_without_probe_is_not_abandoned():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _launch_env(tmp)
+        _push_log(env, "stale1")
+        _write_queue(env, [_remote_row("q-st", "stale1", age_seconds=25 * 3600)])
+        _run(env, "queue", "reconcile-hostjobs", "--json")
+        assert _read_item(env, "q-st")["status"] == "quarantined"

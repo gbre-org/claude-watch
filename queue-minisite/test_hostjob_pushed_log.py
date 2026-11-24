@@ -20,7 +20,10 @@ class PushedLogTest(unittest.TestCase):
                                 "hostjob-log-sink", "job1"],
                                input=b"a\nb\n", env=env, capture_output=True)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual((Path(tmp) / "pushed/job1/log").read_bytes(), b"a\nb\n")
+            got = (Path(tmp) / "pushed/job1/log").read_bytes()
+            # The sink announces itself with a timestamped first line.
+            self.assertIn(b"[hostjob] log sink connected for job1", got.split(b"\n", 1)[0])
+            self.assertTrue(got.endswith(b"a\nb\n"))
             bad = subprocess.run([sys.executable, str(ST), "queue",
                                   "hostjob-log-sink", "../x"],
                                  input=b"", env=env, capture_output=True)

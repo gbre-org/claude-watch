@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""hostjob-remote - run BOUNDED hostjobs on any registered remote machine.
+
+`hostjob` (the sibling script) runs ON a host and detaches long commands.
+`hostjob-remote` runs on the COORDINATOR host and drives that remote hostjob
+through a transport, so every machine is reached the same way. Adding a
+machine is ONE registry entry; no code changes.
+
+    hostjob-remote hosts
+    hostjob-remote [--host NAME | --role ROLE] run  --label L [--cwd D] [--force] -- cmd...
+    hostjob-remote [--host NAME | --role ROLE] wait L [--timeout S] [--tail N]
+    hostjob-remote [--host NAME | --role ROLE] poll L [--tail N]
+    hostjob-remote [--host NAME | --role ROLE] stop L [--force]
+    hostjob-remote [--host NAME | --role ROLE] list
+    hostjob-remote [--host NAME] sync
+
+`sync` fast-forwards each host's claude-watch checkout to origin/main so every
+host runs the same code. It REFUSES a checkout with tracked local changes (or
+one not on main), and reports unreachable or interactive_only hosts as SKIPPED
+(never a failure, so a sleeping laptop cannot block a deploy). `run` warns on
+stderr, without failing, when the target checkout is not at origin/main.
+
+Exit codes mirror local hostjob: 0 ok / job finished, 75 still running
+(`wait` hit its bound; re-invoke), 1 job failed or error from the remote
+hostjob, 2 usage / registry error, 69 transport unreachable. Other nonzero
+remote codes are passed through.
+
+Registry (TOML), default ~/.config/hostjob/hosts.toml, override with
+$HOSTJOB_HOSTS (see hosts.example.toml). Credential files must be owner-only
+(mode 0600, owned by you) or the host is refused. Tokens are only ever sent in
+an Authorization header; they never appear in argv, logs or output.
+
+Transports are pluggable (class Transport); `mcp-http` speaks the JSON-RPC of
+an MCP host-bash server (`tools/call run_command`). Stdlib only, Python 3.11+.
+"""
+import argparse
+import json
+import math
+import os
+import re
+import shlex
+import stat
+import sys
+import time
+import tomllib
+import urllib.request
+
+DEFAULT_REGISTRY = "~/.config/hostjob/hosts.toml"
+EX_UNAVAILABLE = 69
+MAX_BLOCK = 25  # remote host-bash commands are capped (~30s); stay under it
+_RC_RE = re.compile(r"\n?\[exit code (\d+)\]\s*$")
+
+
+class RegistryError(Exception):
+    pass
+
+
+class TransportError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- registry
+_HOSTJOB_TAIL = "/examples/compose/bin/hostjob"
+
+
+def derive_repo(hostjob):
+    """Checkout root implied by a path-style hostjob (<repo>/examples/compose/bin/hostjob)."""
+    if hostjob.endswith(_HOSTJOB_TAIL):
+        return hostjob[:-len(_HOSTJOB_TAIL)]
+    return None
+
+
+class Host:
+    def __init__(self, name, d):
+        self.name = name
+        self.roles = d.get("roles", [])
+        self.transport = d.get("transport", "mcp-http")
+        self.endpoint = d.get("endpoint")
+        self.credential_file = d.get("credential_file")
+        self.hostjob = d.get("hostjob", "hostjob")
+        self.cwd = d.get("cwd")
+        self.interactive_only = bool(d.get("interactive_only", False))
+        self.python = d.get("python", "python3")
+        self.repo = d.get("repo") or derive_repo(self.hostjob)
+        if not isinstance(self.roles, list) or not all(isinstance(r, str) for r in self.roles):
+            raise RegistryError("host %r: roles must be a list of strings" % name)
+        if not self.endpoint:
+            raise RegistryError("host %r: endpoint is required" % name)
+
+
+def registry_path():
+    return os.path.expanduser(os.environ.get("HOSTJOB_HOSTS") or DEFAULT_REGISTRY)
+
+
+def load_registry(path=None):
+    path = path or registry_path()
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        raise RegistryError("registry not found: %s (see hosts.example.toml)" % path) from None
+    except tomllib.TOMLDecodeError as e:
+        raise RegistryError("registry %s is not valid TOML: %s" % (path, e)) from None
+    hosts = data.get("hosts")
+    if not isinstance(hosts, dict) or not hosts:
+        raise RegistryError("registry %s defines no [hosts.<name>] tables" % path)
+    return {n: Host(n, d) for n, d in hosts.items()}
+
+
+def select_host(hosts, name=None, role=None):
+    if name and role:
+        raise RegistryError("use --host or --role, not both")
+    if name:
+        if name not in hosts:
+            raise RegistryError("unknown host %r (known: %s)" % (name, ", ".join(sorted(hosts))))
+        return hosts[name]
+    if role:
+        cands = [h for h in hosts.values() if role in h.roles and not h.interactive_only]
+        if not cands:
+            skipped = [h.name for h in hosts.values() if role in h.roles]
+            extra = ""
+            if skipped:
+                extra = (" (interactive_only hosts are never picked by role; "
+                         "name them with --host: %s)" % ", ".join(skipped))
+            raise RegistryError("no host with role %r%s" % (role, extra))
+        return cands[0]
+    raise RegistryError("choose a host with --host NAME or --role ROLE")
+
+
+def read_token(path):
+    """Read a bearer token from an owner-only file (JSON {"token": ..} or raw text)."""
+    p = os.path.expanduser(path)
+    try:
+        st = os.stat(p)
+    except FileNotFoundError:
+        raise RegistryError("credential file missing: %s" % path) from None
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise RegistryError("credential file %s must be owned by you and mode 0600 (is %04o)"
+                            % (path, stat.S_IMODE(st.st_mode)))
+    with open(p) as f:
+        raw = f.read().strip()
+    if raw.startswith("{"):
+        try:
+            raw = json.loads(raw)["token"]
+        except (ValueError, KeyError, TypeError):
+            raise RegistryError("credential file %s is malformed (need a 'token' key)" % path) from None
+    if not raw:
+        raise RegistryError("credential file %s is empty" % path)
+    return raw
+
+
+# --------------------------------------------------------------- transports
+class Transport:
+    """Run one shell command string on a remote host -> (rc, output)."""
+
+    def exec(self, command, timeout=60):
+        raise NotImplementedError
+
+
+class McpHttpTransport(Transport):
+    def __init__(self, url, token):
+        self.url = url
+        self._auth = token if token.startswith("Bearer ") else "Bearer " + token
+
+    def _post(self, body, sid=None, timeout=60):
+        h = {"content-type": "application/json",
+             "accept": "application/json, text/event-stream",
+             "Authorization": self._auth}
+        if sid:
+            h["Mcp-Session-Id"] = sid
+        req = urllib.request.Request(self.url, json.dumps(body).encode(), h)
+        r = urllib.request.urlopen(req, timeout=timeout)
+        return r.headers.get("Mcp-Session-Id"), r.read().decode()
+
+    @staticmethod
+    def _json(txt):
+        txt = txt.strip()
+        if txt.startswith("event:") or txt.startswith("data:"):  # SSE framing
+            for line in txt.splitlines():
+                if line.startswith("data:"):
+                    return json.loads(line[5:].strip())
+        return json.loads(txt)
+
+    def exec(self, command, timeout=60):
+        try:
+            sid, _ = self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                 "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                                            "clientInfo": {"name": "hostjob-remote", "version": "1"}}},
+                                timeout=timeout)
+            self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid, timeout)
+            _, txt = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                 "params": {"name": "run_command", "arguments": {"command": command}}},
+                                sid, timeout)
+            res = self._json(txt)["result"]
+        except (OSError, ValueError, KeyError) as e:
+            # the exception text carries no request headers, hence no token
+            raise TransportError("%s: %s" % (type(e).__name__, e)) from None
+        out = "".join(c.get("text", "") for c in res.get("content", []))
+        rc = 1 if res.get("isError") else 0
+        m = _RC_RE.search(out)
+        if m:
+            rc = int(m.group(1))
+            out = out[:m.start()]
+            if out and not out.endswith("\n"):
+                out += "\n"
+        return rc, out
+
+
+def _mcp_http(host):
+    if not host.credential_file:
+        raise RegistryError("host %r: credential_file is required for transport mcp-http" % host.name)
+    return McpHttpTransport(host.endpoint, read_token(host.credential_file))
+
+
+TRANSPORTS = {"mcp-http": _mcp_http}  # add e.g. "ssh" here
+
+
+def make_transport(host):
+    if host.transport not in TRANSPORTS:
+        raise RegistryError("host %r: unknown transport %r (have: %s)"
+                            % (host.name, host.transport, ", ".join(TRANSPORTS)))
+    return TRANSPORTS[host.transport](host)
+
+
+# --------------------------------------------------------------------- sync
+MCP_CRATE = "crates/mcp-host-bash-server"
+_MARK = "@@"
+
+
+def sync_script(repo):
+    """One remote shell line that prints @@KEY=value lines (parsed by parse_sync).
+
+    The dirty check ignores untracked files (`??`): a stray .env.bak-* must not
+    block a sync (a real collision makes the merge fail and is reported).
+    """
+    r = shlex.quote(repo)
+    parts = [
+        "cd %s || { echo '@@ERR=no checkout at %s'; exit 0; }" % (r, repo),
+        "echo \"@@BRANCH=$(git symbolic-ref --short -q HEAD)\"",
+        "OLD=$(git rev-parse HEAD); echo \"@@OLD=$OLD\"",
+        "D=$(git status --porcelain | grep -v '^??')",
+        "if [ -n \"$D\" ]; then echo \"$D\" | sed 's/^/@@DIRTY=/'; exit 0; fi",
+        "[ \"$(git symbolic-ref --short -q HEAD)\" = main ] || exit 0",
+        "git fetch -q origin main 2>&1 | sed 's/^/@@FETCHERR=/'",
+        "echo \"@@TARGET=$(git rev-parse origin/main)\"",
+        "git merge --ff-only -q origin/main 2>&1 | sed 's/^/@@MERGEERR=/'",
+        "echo \"@@NEW=$(git rev-parse HEAD)\"",
+        "echo \"@@CHANGED=$(git diff --name-only $OLD HEAD | grep -c '^%s/')\"" % MCP_CRATE,
+    ]
+    return "; ".join(parts)
+
+
+def parse_sync(out):
+    """Parse sync_script output into {KEY: [values]}."""
+    d = {}
+    for line in out.splitlines():
+        if line.startswith(_MARK) and "=" in line:
+            k, v = line[len(_MARK):].split("=", 1)
+            d.setdefault(k, []).append(v)
+    return d
+
+
+def decide_sync(d):
+    """Map parsed sync output to (status, detail, old, new, mcp_changed).
+
+    status: UPDATED | CURRENT | REFUSED | FAILED
+    """
+    def one(k):
+        return (d.get(k) or [""])[0]
+
+    old, new = one("OLD"), one("NEW")
+    if d.get("ERR"):
+        return "FAILED", one("ERR"), old, old, False
+    if d.get("DIRTY"):
+        return "REFUSED", "local changes: " + "; ".join(x.strip() for x in d["DIRTY"]), old, old, False
+    if one("BRANCH") != "main":
+        return "REFUSED", "checkout is on %s, not main" % (one("BRANCH") or "a detached HEAD"), old, old, False
+    if d.get("FETCHERR") or not one("TARGET"):
+        return "FAILED", "fetch failed: " + " ".join(d.get("FETCHERR", [])), old, old, False
+    if d.get("MERGEERR") or not new:
+        return "FAILED", "ff-only merge failed: " + " ".join(d.get("MERGEERR", [])), old, old, False
+    if old == new:
+        return "CURRENT", "", old, new, False
+    n = one("CHANGED")
+    return "UPDATED", "", old, new, n.isdigit() and int(n) > 0
+
+
+def sync_hosts(hosts, name=None, make_tr=None):
+    """Sync the chosen hosts (all non-interactive ones, or just `name`) -> list of result dicts."""
+    make_tr = make_tr or make_transport
+    if name:
+        if name not in hosts:
+            raise RegistryError("unknown host %r (known: %s)" % (name, ", ".join(sorted(hosts))))
+        chosen = [hosts[name]]
+    else:
+        chosen = list(hosts.values())
+    results = []
+    for h in chosen:
+        r = {"host": h.name, "status": "", "detail": "", "old": "", "new": "", "mcp": False}
+        results.append(r)
+        if h.interactive_only and not name:
+            r.update(status="SKIPPED", detail="interactive_only (name it with --host to sync)")
+            continue
+        if not h.repo:
+            r.update(status="FAILED", detail="no checkout path: set `repo` or a path-style `hostjob`")
+            continue
+        try:
+            _, out = make_tr(h).exec(sync_script(h.repo), timeout=60)
+        except TransportError as e:
+            r.update(status="SKIPPED", detail="unreachable: %s" % e)
+            continue
+        status, detail, old, new, mcp = decide_sync(parse_sync(out))
+        r.update(status=status, detail=detail, old=old, new=new, mcp=mcp)
+    return results
+
+
+def format_sync_table(results):
+    def short(x):
+        return x[:7] if x else "-"
+
+    lines = ["%-10s %-8s %s" % ("HOST", "STATUS", "REV / DETAIL")]
+    for r in results:
+        if r["status"] == "UPDATED":
+            rev = "%s -> %s" % (short(r["old"]), short(r["new"]))
+        elif r["status"] == "CURRENT":
+            rev = "%s (already current)" % short(r["new"])
+        else:
+            rev = r["detail"] + (" (at %s)" % short(r["old"]) if r["old"] else "")
+        lines.append("%-10s %-8s %s" % (r["host"], r["status"], rev))
+    for r in results:
+        if r["mcp"]:
+            lines.append("NOTE: %s: %s changed - a mac-nix switch is needed there to rebuild "
+                         "mcp-host-bash-server." % (r["host"], MCP_CRATE))
+    return "\n".join(lines) + "\n"
+
+
+def sync_exit_code(results):
+    return 1 if any(r["status"] in ("REFUSED", "FAILED") for r in results) else 0
+
+
+def cmd_sync(hosts, a):
+    results = sync_hosts(hosts, a.host)
+    sys.stdout.write(format_sync_table(results))
+    return sync_exit_code(results)
+
+
+def rev_warning(host, local, remote):
+    """Warning text when a host checkout is not at origin/main, else None."""
+    if not local or not remote or local == remote:
+        return None
+    return ("hostjob-remote: warning: %s claude-watch checkout is at %s but origin/main is %s; "
+            "run `hostjob-remote sync --host %s`" % (host.name, local[:7], remote[:7], host.name))
+
+
+def check_rev(host, tr):
+    """Best-effort: warn on stderr if the host checkout lags origin/main. Never fails."""
+    if not host.repo:
+        return
+    r = shlex.quote(host.repo)
+    try:
+        _, out = tr.exec("git -C %s rev-parse HEAD; git -C %s ls-remote origin refs/heads/main"
+                         % (r, r), timeout=20)
+    except TransportError:
+        return
+    rows = [x.split() for x in out.splitlines() if x.strip()]
+    local = rows[0][0] if rows and len(rows[0]) == 1 else ""
+    remote = rows[1][0] if len(rows) > 1 else ""
+    w = rev_warning(host, local, remote)
+    if w:
+        sys.stderr.write(w + "\n")
+
+
+# ----------------------------------------------------------------- commands
+def remote_cmd(host, *argv):
+    prefix = ["hostjob"] if host.hostjob == "hostjob" else [host.python, host.hostjob]
+    return " ".join(shlex.quote(a) for a in prefix + list(argv))
+
+
+def _emit(rc, out):
+    sys.stdout.write(out)
+    return rc
+
+
+def cmd_run(host, tr, a):
+    cmd = list(a.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        raise RegistryError("run: no command given (use: run --label L -- cmd ...)")
+    if not a.no_rev_check:
+        check_rev(host, tr)
+    argv = ["run", "--label", a.label]
+    cwd = a.cwd or host.cwd
+    if cwd:
+        argv += ["--cwd", cwd]
+    if a.force:
+        argv.append("--force")
+    return _emit(*tr.exec(remote_cmd(host, *argv, "--", *cmd)))
+
+
+def cmd_poll(host, tr, a):
+    return _emit(*tr.exec(remote_cmd(host, "poll", a.label, "--tail", str(a.tail))))
+
+
+def cmd_wait(host, tr, a, sleep=time.sleep, clock=time.monotonic):
+    deadline = clock() + a.timeout
+    while True:
+        block = max(1, min(MAX_BLOCK, math.ceil(deadline - clock())))
+        rc, out = tr.exec(remote_cmd(host, "wait", a.label, "--max-block", str(block),
+                                     "--tail", str(a.tail)), timeout=block + 20)
+        if rc != 75:
+            return _emit(rc, out)
+        if clock() >= deadline:
+            return _emit(75, out)
+        sleep(0)  # the remote already blocked ~block seconds; go for the next slice
+
+
+def cmd_stop(host, tr, a):
+    argv = ["stop", a.label] + (["--force"] if a.force else [])
+    return _emit(*tr.exec(remote_cmd(host, *argv)))
+
+
+def cmd_list(host, tr, a):
+    return _emit(*tr.exec(remote_cmd(host, "list")))
+
+
+def cmd_hosts(hosts):
+    for h in hosts.values():
+        print("%s\troles=%s\ttransport=%s\tendpoint=%s%s" % (
+            h.name, ",".join(h.roles) or "-", h.transport, h.endpoint,
+            "\tinteractive_only" if h.interactive_only else ""))
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="hostjob-remote", description=__doc__.split("\n\n")[0])
+    p.add_argument("--host")
+    p.add_argument("--role")
+    p.add_argument("--registry", help="registry path (default $HOSTJOB_HOSTS or %s)" % DEFAULT_REGISTRY)
+    sub = p.add_subparsers(dest="sub", required=True)
+    sub.add_parser("hosts", help="list the registry")
+    r = sub.add_parser("run", help="launch a detached job on the host")
+    r.add_argument("--label", required=True)
+    r.add_argument("--cwd")
+    r.add_argument("--force", action="store_true")
+    r.add_argument("--no-rev-check", action="store_true", help="skip the checkout-vs-origin/main warning")
+    r.add_argument("cmd", nargs=argparse.REMAINDER)
+    w = sub.add_parser("wait", help="bounded wait; exit 75 if still running")
+    w.add_argument("label")
+    w.add_argument("--timeout", type=int, default=MAX_BLOCK, help="seconds to wait (default %d)" % MAX_BLOCK)
+    w.add_argument("--tail", type=int, default=40)
+    q = sub.add_parser("poll", help="one-shot status + log tail")
+    q.add_argument("label")
+    q.add_argument("--tail", type=int, default=40)
+    s = sub.add_parser("stop", help="stop a running job")
+    s.add_argument("label")
+    s.add_argument("--force", action="store_true")
+    sub.add_parser("list", help="list jobs on the host")
+    sub.add_parser("sync", help="fast-forward host claude-watch checkouts to origin/main "
+                                "(all non-interactive hosts, or `--host NAME sync`)")
+    return p
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    try:
+        hosts = load_registry(os.path.expanduser(a.registry) if a.registry else None)
+        if a.sub == "hosts":
+            return cmd_hosts(hosts)
+        if a.sub == "sync":
+            if a.role:
+                raise RegistryError("sync takes --host NAME or nothing (all hosts), not --role")
+            return cmd_sync(hosts, a)
+        host = select_host(hosts, a.host, a.role)
+        tr = make_transport(host)
+        fn = {"run": cmd_run, "wait": cmd_wait, "poll": cmd_poll, "stop": cmd_stop, "list": cmd_list}[a.sub]
+        return fn(host, tr, a)
+    except RegistryError as e:
+        sys.stderr.write("hostjob-remote: %s\n" % e)
+        return 2
+    except TransportError as e:
+        sys.stderr.write("hostjob-remote: transport error: %s\n" % e)
+        return EX_UNAVAILABLE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

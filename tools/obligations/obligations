@@ -1634,6 +1634,10 @@ def _stale_ready_items(queue_path, threshold_secs, now_unix):
             continue
         if not _queue_item_is_ready_now(items, it):
             continue
+        # Machine-owned rows (hostjob-created) are tracked by their runner;
+        # a "dispatch or abandon" reminder is wrong for them.
+        if it.get("created_by") == "hostjob":
+            continue
         created = _parse_iso_ts(it.get("created_at", ""))
         if created is None:
             continue

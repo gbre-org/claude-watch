@@ -74,7 +74,7 @@
 .PHONY: test-trust-workspace test-claude-tmux-env test-cron-toggle
 .PHONY: test-eval-queue-ready-unspawned
 .PHONY: test-cw-theme-sync
-.PHONY: test-hooks-shim test-entrypoint
+.PHONY: test-hooks-shim test-entrypoint test-cw-clear-mod-e2e
 # Tests — compose stack + host shims
 .PHONY: test-cw test-hostjob test-ttyd-paste-handler test-ttyd-lock-toggle
 # Tests — macOS LaunchAgents + personal MCP host
@@ -354,6 +354,7 @@ test-self-clear: ## self-clear config-only smoke tests
 	python3 tools/watchers/tests/test_self_clear_config.py
 	python3 tools/watchers/tests/test_self_clear_rewind_guard.py
 	python3 tools/watchers/tests/test_self_clear_double_clear.py
+	python3 tools/watchers/tests/test_self_clear_mod_path.py
 
 # self-login pure predicates + config paths. No terminal needed.
 test-self-login: ## self-login unit tests (pane predicates, code validation, config)
@@ -502,6 +503,14 @@ test-hooks-shim: ## container hooks-shim / settings-rewrite suites
 #     exited instantly, and tmux destroyed the `tasks` session right after
 #     "Session 'tasks' created" printed — `workload run` / `workload kill`
 #     were unusable in the container.
+# e2e for the cw-clear mod prototype (mods/cw-clear): a real authenticated
+# Claude Code in a throwaway container. NOT part of `make test`/CI: skips
+# (exit 0) unless CW_E2E_CREDENTIALS (a .credentials.json) or ANTHROPIC_API_KEY
+# is set and a claude >= 2.1.331 binary is given (CW_E2E_CLAUDE_BIN). See the
+# header of the script. ~2 minutes.
+test-cw-clear-mod-e2e: ## cw-clear mod e2e (container + real Claude Code; skips without credentials)
+	container/tests/cw-clear-mod-e2e.test
+
 test-entrypoint: ## Container entrypoint + baked-image assertion suites
 	container/tests/entrypoint-claude-cmd.test
 	container/tests/entrypoint-tmux-truecolor.test
@@ -560,6 +569,8 @@ test-hostjob: ## hostjob detached host-job runner tests
 		examples/compose/bin/tests/test_hostjob_broker_stop_endpoint.py \
 		examples/compose/bin/tests/test_hostjob_queue.py \
 		examples/compose/bin/tests/test_hostjob_queue_remote.py \
+		examples/compose/bin/tests/test_hostjob_remote.py \
+		examples/compose/bin/tests/test_hostjob_remote.py \
 		examples/compose/bin/tests/test_hostjob_stop.py
 
 # Tests for examples/compose/ttyd/inject-autodark.py PASTE_EVENT_HANDLER_JS
@@ -926,6 +937,16 @@ install-cron: ## Render + install cron.d/cw-host into /etc/cron.d (needs root)
 # $(BIN_DIR)/claude-watch into target/release/ — see the install policy above.
 deploy-systemd: install install-skills ## Host/systemd deploy: build + install + skills + restart
 	sudo systemctl restart claude-watch
+	-@$(MAKE) --no-print-directory sync-hosts
+
+# Fast-forward every registered remote host's claude-watch checkout to
+# origin/main (hostjob-remote sync) and print a per-host rev table. Never fails
+# the deploy: no registry, an unreachable host or an interactive_only (laptop)
+# host is a SKIP, and a dirty checkout is reported REFUSED but not fatal here.
+# If the table notes crates/mcp-host-bash-server changed, that host needs a
+# nix switch to rebuild the binary; this target does not run it.
+sync-hosts: ## Fast-forward remote host checkouts to origin/main, print rev table
+	-@examples/compose/bin/hostjob-remote sync
 
 # DEPRECATED alias — kept so any docs / muscle-memory invoking `make deploy`
 # keep working. Prefer `make deploy-systemd` (self-documenting). No recipe body;
