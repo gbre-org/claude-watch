@@ -78,6 +78,11 @@ import os
 
 os.environ.setdefault("PINGME_SESSION_TASK", "0")
 
+# Make the transient-read retry backoff near-instant under test (production
+# keeps its ~2s worst-case budget). The retry COUNT is unchanged, so the
+# ENOENT/recovery tests still exercise every retry.
+os.environ.setdefault("SESSION_TASK_READ_RETRY_SLEEP", "0.001")
+
 # Strip (not setdefault -- see docstring above): these are typically
 # ALREADY SET in the ambient shell, and the whole point is overriding an
 # already-set value so tests that copy os.environ don't leak onto the
