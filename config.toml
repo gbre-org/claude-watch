@@ -65,6 +65,11 @@ max_context_tokens = 1000000
 # the key parses fine; the daemon logs one warning and ignores it.
 # Relaunch script path (written on restart)
 relaunch_script = "/var/run/claude/claude-relaunch.sh"
+# Extra Claude Code plugin dirs loaded on EVERY claude-watch relaunch (host
+# restart + auto-update relaunch), as `--plugin-dir <path>`. Missing dirs are
+# skipped with a warning. Default empty = launch argv unchanged.
+# Example: plugin_dirs = ["/path/to/claude-watch/mods/cw-clear"]
+plugin_dirs = []
 # Handle Claude Code's Bypass-Permissions consent dialog on relaunch.
 #
 # Every relaunch this daemon performs passes `--dangerously-skip-permissions`,

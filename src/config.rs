@@ -288,6 +288,12 @@ pub struct ClaudeConfig {
     /// path this costs one capture, not the full budget.
     #[serde(default = "default_bypass_dialog_wait_secs")]
     pub bypass_dialog_wait_secs: u64,
+    /// Extra Claude Code plugin directories to load on EVERY claude-watch
+    /// built launch (host restart and auto-update relaunch). Each existing
+    /// entry becomes `--plugin-dir <path>` (shell-quoted); a nonexistent entry
+    /// is skipped with a warning. Default empty = launch argv unchanged.
+    #[serde(default)]
+    pub plugin_dirs: Vec<String>,
 }
 
 fn default_handle_bypass_dialog() -> bool {
@@ -2473,7 +2479,8 @@ mod tests {
         let d = CwClearModConfig::default();
         assert!(!d.enabled);
         assert_eq!(d.heartbeat_max_age_secs, 60);
-        let c: CwClearModConfig = toml::from_str("enabled = true\nheartbeat_max_age_secs = 30").unwrap();
+        let c: CwClearModConfig =
+            toml::from_str("enabled = true\nheartbeat_max_age_secs = 30").unwrap();
         assert!(c.enabled);
         assert_eq!(c.heartbeat_max_age_secs, 30);
         let empty: CwClearModConfig = toml::from_str("").unwrap();

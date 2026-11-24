@@ -43,7 +43,10 @@ Enable (nothing happens until you do both, and merging changes nothing):
 1. `mods/cw-clear/cw-clear-setup` prints the settings.json snippet, the
    `--plugin-dir` flag and the config.toml lines;
    `cw-clear-setup --apply --settings FILE [--dry-run]` merges the options.
-   Restart Claude Code with `--plugin-dir mods/cw-clear`.
+   To keep the mod loaded across every relaunch, set
+   `[claude] plugin_dirs = ["<path to mods/cw-clear>"]` in config.toml
+   (claude-watch then appends `--plugin-dir` on each restart/relaunch it
+   builds) instead of restarting by hand with `--plugin-dir mods/cw-clear`.
 2. Set `[cw_clear_mod] enabled = true` (see config.toml).
 3. `self-clear --print` shows the selected path without touching the pane.
 
