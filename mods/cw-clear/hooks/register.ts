@@ -10,28 +10,48 @@ export const register: Register = (on, options) => {
   const logFile = stateFile ? `${stateFile}.log` : ''
   const resumeFile = String(options.resumeFile ?? '')
   const resumeCommand = String(options.resumeCommand ?? '')
+  const heartbeatMs = Math.max(1000, Number(options.heartbeatSecs ?? 15) * 1000)
+  // In-memory state. A hot reload of the mod re-runs register() with fresh
+  // values (turns 0, busy false, ready false, new instance id), so none of it
+  // may be treated as durable: the clear flow is stateless (it re-reads the
+  // resume prompt on every /cw-clear), and consumers detect a reload through
+  // the heartbeat `instance` / `loadedAt` fields.
+  const instance = Math.random().toString(36).slice(2, 10)
+  let loadedAt = 0
+  let ready = false
+  let tickStarted = false
   let turns = 0
   let busy = false
   // Whole log is rewritten per event ($.fs has no append); small by design.
   const lines: string[] = []
 
-  const heartbeat = (ev: string, ts: number) => JSON.stringify({ ts, event: ev, busy, turns }) + '\n'
+  const heartbeat = (ev: string, ts: number) =>
+    JSON.stringify({ ts, event: ev, busy, turns, ready, instance, loadedAt }) + '\n'
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'cw-clear',
       description: 'Clear the conversation, then submit the resume prompt.',
     })
+    ready = true
     if (options.probe === true) {
       await $.command.register({ name: 'cw-probe-submit', description: 'Spike: submit a probe prompt.' })
-      $.clock.every(2000, async () => {
+    }
+    // One heartbeat/probe timer per mod instance (session.start fires again
+    // after every /clear; a second timer would double the writes).
+    if (!tickStarted && (options.probe === true || stateFile)) {
+      tickStarted = true
+      $.clock.every(options.probe === true ? 2000 : heartbeatMs, async () => {
         const ts = await $.clock.now()
-        lines.push(`${ts} tick busy=${busy}`)
-        if (logFile) await $.fs.write(logFile, lines.join('\n') + '\n')
+        if (options.probe === true) {
+          lines.push(`${ts} tick busy=${busy}`)
+          if (logFile) await $.fs.write(logFile, lines.join('\n') + '\n')
+        }
         if (stateFile) await $.fs.write(stateFile, heartbeat('tick', ts))
       })
     }
     const ts = await $.clock.now()
+    if (loadedAt === 0) loadedAt = ts
     lines.push(`${ts} session.start`)
     if (logFile) await $.fs.write(logFile, lines.join('\n') + '\n')
     if (stateFile) await $.fs.write(stateFile, heartbeat('session.start', ts))
@@ -40,6 +60,7 @@ export const register: Register = (on, options) => {
 
   on('session.end', async ($, e, next) => {
     const ts = await $.clock.now()
+    ready = false
     lines.push(`${ts} session.end reason=${(e as any).reason}`)
     if (logFile) await $.fs.write(logFile, lines.join('\n') + '\n')
     if (stateFile) await $.fs.write(stateFile, heartbeat('session.end', ts))

@@ -27,6 +27,12 @@
       "description": "JSON file rewritten on every turn event. Empty: heartbeat off.",
       "default": ""
     },
+    "heartbeatSecs": {
+      "type": "number",
+      "title": "Heartbeat interval (seconds)",
+      "description": "How often the heartbeat file is rewritten while stateFile is set. Keep well under claude-watch heartbeat_max_age_secs (default 60).",
+      "default": 15
+    },
     "probe": {
       "type": "boolean",
       "title": "Spike probes",

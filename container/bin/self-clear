@@ -321,6 +321,103 @@ def _read_focus_main_keys():
     return []
 
 
+# --- cw-clear mod path (slice 1) -------------------------------------------
+# When `[cw_clear_mod] enabled = true` in config.toml AND the mod's heartbeat
+# file is fresh and says it is ready, self-clear types `/cw-clear` instead of
+# `/clear` + resume: the mod does the real /clear and submits the resume prompt
+# as the first turn. Anything else (flag off, heartbeat missing/stale/not ready,
+# mod command unavailable, clear not confirmed) falls back to the tmux path
+# below, unchanged. Every run logs a `PATH-USED:` line.
+CW_CLEAR_MOD_DEFAULT_MAX_AGE_SECS = 60.0
+
+
+def _default_runtime_file(name):
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return str(Path(runtime) / name)
+    return "/var/run/claude/" + name
+
+
+def read_cw_clear_mod_config():
+    """Read [cw_clear_mod] from cw's config.toml. Default: disabled.
+
+    Keys: enabled (bool, default false), heartbeat_file, resume_file (must
+    match the mod's `stateFile` / `resumeFile` options), heartbeat_max_age_secs.
+    Any read/parse problem returns the disabled default (fail closed to the
+    tmux path).
+    """
+    cfg = {
+        "enabled": False,
+        "heartbeat_file": _default_runtime_file("claude-cw-clear-heartbeat.json"),
+        "resume_file": _default_runtime_file("claude-cw-clear-resume.txt"),
+        "heartbeat_max_age_secs": CW_CLEAR_MOD_DEFAULT_MAX_AGE_SECS,
+    }
+    path = _find_config_file()
+    if not path:
+        return cfg
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            sect = (tomllib.load(f).get("cw_clear_mod", {}) or {})
+        cfg["enabled"] = sect.get("enabled", False) is True
+        for key in ("heartbeat_file", "resume_file"):
+            if str(sect.get(key, "") or "").strip():
+                cfg[key] = str(sect[key]).strip()
+        age = sect.get("heartbeat_max_age_secs")
+        if isinstance(age, (int, float)) and not isinstance(age, bool) and age > 0:
+            cfg["heartbeat_max_age_secs"] = float(age)
+    except Exception:
+        cfg["enabled"] = False
+    return cfg
+
+
+def read_mod_heartbeat(path):
+    """Parse the mod heartbeat JSON; None when missing/unreadable/not a dict."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def decide_clear_path(cfg, heartbeat, now):
+    """Pure path selection. Returns (use_mod: bool, reason: str).
+
+    Mod only when: enabled, heartbeat present with a numeric `ts` (epoch ms
+    from the mod's clock, or seconds) no older than heartbeat_max_age_secs
+    (and not from the future), `ready` is true (this mod instance registered
+    /cw-clear), and the last event is not session.end.
+    """
+    if not cfg.get("enabled"):
+        return False, "flag-off"
+    if not heartbeat:
+        return False, "heartbeat-missing"
+    ts = heartbeat.get("ts")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return False, "heartbeat-no-ts"
+    ts_s = ts / 1000.0 if ts > 1e11 else float(ts)
+    age = now - ts_s
+    if age < -5:
+        return False, f"heartbeat-from-future ({age:.0f}s)"
+    if age > cfg.get("heartbeat_max_age_secs", CW_CLEAR_MOD_DEFAULT_MAX_AGE_SECS):
+        return False, f"heartbeat-stale ({age:.0f}s)"
+    if heartbeat.get("ready") is not True:
+        return False, "mod-not-ready"
+    if heartbeat.get("event") == "session.end":
+        return False, "mod-session-ended"
+    return True, f"heartbeat-fresh ({max(age, 0):.0f}s)"
+
+
+def _write_resume_file(path, text):
+    """Atomically write the resume prompt the mod will read."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def _resolve_configured_pane():
     """Resolve cw's configured main-loop pane to an immutable #{pane_id}.
 
@@ -1020,6 +1117,13 @@ def plan_argv(pane, args):
     lines.append(f"  argv: ['tmux', 'select-pane', '-t', {pane!r}]")
     lines.append("STEP 2: interrupt_and_wait (Escape blast until idle)")
     lines.append(f"  argv: ['tmux', 'send-keys', '-t', {pane!r}, 'Escape']  (repeated up to --timeout)")
+    mod_cfg = read_cw_clear_mod_config()
+    use_mod, reason = decide_clear_path(
+        mod_cfg, read_mod_heartbeat(mod_cfg["heartbeat_file"]), time.time())
+    if args.no_resume and mod_cfg["enabled"]:
+        use_mod, reason = False, "no-resume-mode"
+    lines.append(
+        f"STEP 2b: path = {'cw-clear mod (/cw-clear, tmux fallback)' if use_mod else 'tmux'} ({reason})")
     lines.append("STEP 3: inject /clear")
     lines.append(
         "  argv: ['claude-watch', 'inject', '--pane', "
@@ -1075,6 +1179,65 @@ def plan_argv(pane, args):
     return lines
 
 
+MOD_RESUME_WAIT_SECS = 20
+
+
+def try_mod_path(pane, args, cfg):
+    """Drive the clear through the cw-clear mod. Returns one of:
+
+      "done"              mod cleared AND its resume prompt started a turn.
+      "cleared-no-resume" mod cleared, but no resume turn was seen: caller
+                          skips the /clear attempts and injects the resume
+                          prompt over tmux.
+      "fallback"          clear not confirmed (command unavailable, mod
+                          refused, ...): caller runs the tmux path unchanged.
+    """
+    hb_before = read_mod_heartbeat(cfg["heartbeat_file"]) or {}
+    turns_before = hb_before.get("turns")
+    try:
+        _write_resume_file(cfg["resume_file"], RESUME_PROMPT)
+    except OSError as e:
+        log(f"  mod path: cannot write resume file {cfg['resume_file']}: {e}")
+        return "fallback"
+    tokens_before = get_token_count()
+    log(f"  mod path: injecting /cw-clear (tokens before={tokens_before})")
+    inject(pane, "/cw-clear", label="/cw-clear", slash_command=True, escape=True)
+
+    poll_end = time.time() + args.delay
+    confirmed = False
+    while time.time() < poll_end:
+        time.sleep(0.5)
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        pane_text = out if (rc == 0 and out) else None
+        if pane_text is None:
+            continue
+        picker_seen, _ = _rewind_picker_confirm_once(pane, pane_text=pane_text)
+        if picker_seen:
+            continue
+        tokens_now = get_token_count()
+        idle_now = _is_idle_text(pane_text)
+        log(f"  mod poll: tokens={tokens_now} idle={idle_now}")
+        if _clear_took_effect(tokens_before, tokens_now, idle_now):
+            log(f"  mod path: clear confirmed (tokens {tokens_before} -> {tokens_now})")
+            confirmed = True
+            break
+    if not confirmed:
+        log("  mod path: clear NOT confirmed within delay")
+        return "fallback"
+
+    # The mod submits the resume prompt itself; its turn.start bumps the
+    # heartbeat `turns` counter (the heartbeat tick republishes it).
+    resume_end = time.time() + MOD_RESUME_WAIT_SECS
+    while time.time() < resume_end:
+        hb = read_mod_heartbeat(cfg["heartbeat_file"]) or {}
+        t = hb.get("turns")
+        if isinstance(t, int) and (not isinstance(turns_before, int) or t > turns_before):
+            return "done"
+        time.sleep(1)
+    log(f"  mod path: no resume turn seen within {MOD_RESUME_WAIT_SECS}s")
+    return "cleared-no-resume"
+
+
 def cancel_stray_rewind_picker(pane, max_tries=5, settle=0.4):
     """Escape a Rewind picker that is ALREADY open before we start driving.
 
@@ -1124,6 +1287,29 @@ def child_main(pane, args):
 
     max_clear_attempts = 3
     clear_confirmed = False
+
+    # Path selection: cw-clear mod (flag on + fresh heartbeat) else tmux.
+    mod_cfg = read_cw_clear_mod_config()
+    if args.no_resume and mod_cfg["enabled"]:
+        use_mod, reason = False, "no-resume-mode"
+    else:
+        use_mod, reason = decide_clear_path(
+            mod_cfg, read_mod_heartbeat(mod_cfg["heartbeat_file"]), time.time())
+    if use_mod:
+        outcome = try_mod_path(pane, args, mod_cfg)
+        if outcome == "done":
+            log(f"PATH-USED: mod ({reason})")
+            _stamp_handoff_marker()
+            log("SUCCESS: /cw-clear (mod cleared + resumed)")
+            return
+        if outcome == "cleared-no-resume":
+            log(f"PATH-USED: mod-clear+tmux-resume ({reason}; mod cleared but no resume turn seen)")
+            clear_confirmed = True
+            max_clear_attempts = 0
+        else:
+            log(f"PATH-USED: tmux (mod-failed after {reason}: /cw-clear unavailable or clear not confirmed)")
+    else:
+        log(f"PATH-USED: tmux ({reason})")
 
     for attempt in range(1, max_clear_attempts + 1):
         tokens_before = get_token_count()

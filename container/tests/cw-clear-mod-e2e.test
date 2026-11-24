@@ -102,6 +102,13 @@ wait_for 40 "mod session.start" has_log "session.start" || { cat "$T/out/debug.l
 sleep 7
 [ "$(logn 'tick busy=false')" -ge 3 ] && ok "3a clock.every fires while idle ($(logn 'tick busy=false') ticks in ~7s)" || bad "3a no idle ticks"
 
+# --- 3c. heartbeat carries what self-clear's path selection needs ---------
+if jq -e '.ready == true and (.instance|length) > 0 and (.ts|type) == "number"' "$T/out/state.json" >/dev/null 2>&1; then
+  ok "3c heartbeat is ready with an instance id"
+else
+  bad "3c heartbeat missing ready/instance: $(cat "$T/out/state.json" 2>/dev/null)"
+fi
+
 # --- 1/2. clear + resume ---------------------------------------------------
 say "Remember the codeword PINEAPPLE-7. Reply with only: ok"
 wait_for 60 "first turn complete" has_log "turn.complete"

@@ -354,6 +354,7 @@ test-self-clear: ## self-clear config-only smoke tests
 	python3 tools/watchers/tests/test_self_clear_config.py
 	python3 tools/watchers/tests/test_self_clear_rewind_guard.py
 	python3 tools/watchers/tests/test_self_clear_double_clear.py
+	python3 tools/watchers/tests/test_self_clear_mod_path.py
 
 # self-login pure predicates + config paths. No terminal needed.
 test-self-login: ## self-login unit tests (pane predicates, code validation, config)
