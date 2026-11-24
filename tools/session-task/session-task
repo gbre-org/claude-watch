@@ -184,6 +184,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -802,11 +803,11 @@ def _load_queue_items_silent():
 
     Returns dict id -> item, or empty dict on any failure.
     """
+    if _queue_backend() == "postgres":
+        return _pg_load_items_silent()
     try:
-        if not QUEUE_FILE.exists():
-            return {}
-        raw = QUEUE_FILE.read_text()
-        if not raw.strip():
+        raw, _exc = _read_text_retry(QUEUE_FILE)
+        if raw is None or not raw.strip():
             return {}
         try:
             data = json.loads(raw)
@@ -1081,46 +1082,178 @@ def _quarantine_corrupt(raw):
             return None
 
 
-def _read_bak():
-    """Return the last-good queue dict from the .bak snapshot, or None."""
+class QueueUnrecoverable(Exception):
+    """queue.json is unreadable/corrupt and no snapshot could restore it.
+
+    Raised instead of silently resetting to EMPTY: the caller must fail loudly
+    (non-zero exit) and NOT write, so every on-disk byte is preserved for
+    manual recovery. Carries the recovery-info dict for the alert."""
+
+    def __init__(self, info):
+        super().__init__(info.get("reason", "queue unrecoverable"))
+        self.info = info
+
+
+# Transient-read retry budget. A read can see ENOENT / an empty or torn file
+# for a moment when another writer in a different lock domain (macOS host vs.
+# the Linux container over a bind mount, where flock is NOT coherent) is mid
+# os.replace. Treat those as transient: retry with backoff before concluding
+# anything. Total worst-case wait ~2s.
+_QUEUE_READ_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
+QUEUE_SNAPSHOT_KEEP = 20
+QUEUE_SNAPSHOT_MIN_INTERVAL_S = 30.0
+
+
+def _snapshot_dir():
+    return QUEUE_FILE.parent / "queue-snapshots"
+
+
+def _parse_queue_doc(raw):
+    """Parse `raw` to a valid queue dict, or None."""
     try:
-        if not QUEUE_BAK_FILE.exists():
-            return None
-        obj = json.loads(QUEUE_BAK_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
         return None
     if isinstance(obj, dict) and isinstance(obj.get("items"), list):
         return obj
     return None
 
 
-def _read_queue_with_recovery():
-    """Read + parse queue.json with layered corruption recovery. Never raises.
+def _read_text_retry(path):
+    """Read `path`, retrying transient failures (ENOENT, other OSError).
 
-    Returns (data_dict, recovery_info). recovery_info is None on a clean parse;
-    otherwise a dict describing the fallback taken so the caller can alert
-    LOUDLY. Recovery order on unparseable JSON:
-      1. salvage the leading valid document from the corrupt bytes (recovers
-         items written before a trailing concurrent-write fragment),
-      2. fall back to the last-good .bak snapshot,
-      3. reset to empty (last resort -- in-flight state lost).
-    The corrupt bytes are always quarantined first.
+    Returns (text, None) on success, (None, exc) if it stayed unreadable after
+    the full retry budget (a persistently absent file yields FileNotFoundError).
     """
-    if not QUEUE_FILE.exists():
-        return _queue_empty(), None
+    last = None
+    for delay in (0.0,) + _QUEUE_READ_RETRY_DELAYS:
+        if delay:
+            time.sleep(delay)
+        try:
+            return Path(path).read_text(), None
+        except OSError as exc:
+            last = exc
+    return None, last
+
+
+def _snapshot_candidates():
+    """Paths of recovery snapshots, newest first: .bak then rolling snaps."""
+    out = [QUEUE_BAK_FILE]
     try:
-        raw = QUEUE_FILE.read_text()
+        snaps = sorted(_snapshot_dir().glob("queue.*.json"), reverse=True)
+    except OSError:
+        snaps = []
+    return out + snaps
+
+
+def _read_bak():
+    """Return the newest valid snapshot (.bak first, then rolling) or None."""
+    for p in _snapshot_candidates():
+        try:
+            raw = p.read_text()
+        except OSError:
+            continue
+        doc = _parse_queue_doc(raw)
+        if doc is not None:
+            return doc
+    return None
+
+
+def _has_any_snapshot():
+    for p in _snapshot_candidates():
+        try:
+            if p.exists():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _maybe_rolling_snapshot(text):
+    """Keep the last N timestamped snapshots, at most one per interval.
+    Best-effort; never fails the queue op."""
+    try:
+        d = _snapshot_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        existing = sorted(d.glob("queue.*.json"))
+        if existing:
+            age = time.time() - existing[-1].stat().st_mtime
+            if age < QUEUE_SNAPSHOT_MIN_INTERVAL_S:
+                return
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        _atomic_write_text(d / f"queue.{ts}.json", text)
+        existing = sorted(d.glob("queue.*.json"))
+        for old in existing[:-QUEUE_SNAPSHOT_KEEP]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
     except OSError as exc:
-        return _queue_empty(), {
-            "mode": "empty", "reason": f"unreadable: {exc}",
+        print(f"[session-task] queue rolling snapshot failed: {exc}",
+              file=sys.stderr)
+
+
+def _read_queue_with_recovery():
+    """Read + parse queue.json with layered recovery. NEVER resets to empty
+    over existing state.
+
+    Returns (data_dict, recovery_info); recovery_info is None on a clean parse.
+    Order:
+      0. transient read failures (ENOENT, EIO, empty/torn content) are retried
+         with backoff -- they are normal when a writer in another lock domain
+         is mid-replace, and are NOT corruption;
+      1. salvage the leading valid document from corrupt bytes,
+      2. newest valid snapshot (.bak, then rolling queue-snapshots/),
+      3. if the file was never created and no snapshot exists: a fresh empty
+         store (legitimate first run, no alert);
+      4. otherwise raise QueueUnrecoverable (fail loud, write nothing).
+    Garbage bytes are always quarantined first.
+    """
+    raw, exc = _read_text_retry(QUEUE_FILE)
+    if raw is not None and not raw.strip():
+        # Empty file: torn/truncated by a foreign writer if any snapshot
+        # exists; otherwise a fresh store. Re-read once more before judging.
+        time.sleep(0.2)
+        raw, exc = _read_text_retry(QUEUE_FILE)
+        if raw is not None and not raw.strip():
+            if not _has_any_snapshot():
+                return _queue_empty(), None
+            bak = _read_bak()
+            if bak is not None:
+                return bak, {
+                    "mode": "bak", "reason": "queue.json empty/truncated",
+                    "recovered_items": len(bak.get("items", [])),
+                    "quarantine": None, "corrupt_bytes": 0,
+                }
+            raise QueueUnrecoverable({
+                "mode": "unrecoverable",
+                "reason": "queue.json empty and no valid snapshot",
+                "recovered_items": 0, "quarantine": None, "corrupt_bytes": 0,
+            })
+    if raw is None:
+        if isinstance(exc, FileNotFoundError):
+            if not _has_any_snapshot():
+                return _queue_empty(), None  # genuine first run
+            bak = _read_bak()
+            if bak is not None:
+                return bak, {
+                    "mode": "bak",
+                    "reason": f"queue.json missing after retries: {exc}",
+                    "recovered_items": len(bak.get("items", [])),
+                    "quarantine": None, "corrupt_bytes": 0,
+                }
+        raise QueueUnrecoverable({
+            "mode": "unrecoverable", "reason": f"unreadable: {exc}",
             "recovered_items": 0, "quarantine": None, "corrupt_bytes": 0,
-        }
-    if not raw.strip():
-        return _queue_empty(), None
+        })
+    doc = _parse_queue_doc(raw)
+    if doc is not None:
+        return doc, None
     try:
-        return json.loads(raw), None
-    except json.JSONDecodeError as exc:
-        reason = str(exc)
+        json.loads(raw)
+        reason = "not a queue document (missing items list)"
+    except json.JSONDecodeError as jexc:
+        reason = str(jexc)
     quarantine = _quarantine_corrupt(raw)
     q = str(quarantine) if quarantine else None
     salvaged = _salvage_leading_json(raw)
@@ -1137,30 +1270,30 @@ def _read_queue_with_recovery():
             "recovered_items": len(bak.get("items", [])),
             "quarantine": q, "corrupt_bytes": len(raw),
         }
-    return _queue_empty(), {
-        "mode": "empty", "reason": reason, "recovered_items": 0,
+    raise QueueUnrecoverable({
+        "mode": "unrecoverable", "reason": reason, "recovered_items": 0,
         "quarantine": q, "corrupt_bytes": len(raw),
-    }
+    })
 
 
 def _alert_queue_recovery(info):
     """Emit a LOUD alert (stderr + urgent/high claude-event) whenever queue.json
-    corruption triggered a recovery/reset. NEVER silent -- the 2026-08-16
-    incident silently reset the queue to empty, losing all in-flight items."""
+    trouble triggered a recovery or a refusal. NEVER silent."""
     mode = info.get("mode")
     n = info.get("recovered_items", 0)
-    q = info.get("quarantine") or "(not preserved)"
-    if mode == "empty":
-        tag = "queue-corrupt-reset-empty"
+    q = info.get("quarantine") or "(none)"
+    if mode == "unrecoverable":
+        tag = "queue-corrupt-unrecoverable"
         priority = "urgent"
-        msg = (f"queue.json CORRUPT and UNRECOVERABLE -- reset to EMPTY "
-               f"(0 items recovered). IN-FLIGHT QUEUE STATE LOST. "
-               f"Corrupt bytes quarantined at {q}.")
+        msg = (f"queue.json UNRECOVERABLE ({info.get('reason', '')}); no valid "
+               f"snapshot. REFUSING to write -- all on-disk state left intact "
+               f"(quarantine: {q}). Restore from {QUEUE_BAK_FILE} or "
+               f"{_snapshot_dir()}/ then re-run.")
     elif mode == "bak":
         tag = "queue-corrupt-recovered-bak"
         priority = "high"
-        msg = (f"queue.json CORRUPT -- recovered {n} item(s) from the last-good "
-               f".bak snapshot. Corrupt bytes quarantined at {q}.")
+        msg = (f"queue.json bad/missing ({info.get('reason', '')}) -- recovered "
+               f"{n} item(s) from the newest valid snapshot. Quarantine: {q}.")
     else:
         tag = "queue-corrupt-recovered-salvage"
         priority = "high"
@@ -1179,6 +1312,262 @@ def _alert_queue_recovery(info):
         pass
 
 
+# --- PostgreSQL backend (opt-in; default stays the JSON file) ---------------
+# Why: the JSON store is shared between a macOS host and a Linux container over
+# a bind mount where flock is not coherent and renames/reads race (2026-08-16
+# interleave, 2026-11-24 ENOENT). Postgres gives one lock domain (row lock
+# over TCP) for every writer. Selected by env SESSION_TASK_QUEUE_BACKEND or the
+# file <queue dir>/backend containing "postgres"; DSN from SESSION_TASK_PG_DSN
+# or <queue dir>/pg-dsn (0600, never in the repo). Host "auto" in the DSN
+# resolves to host.docker.internal inside a container, 127.0.0.1 on the host.
+# The whole queue doc is ONE jsonb row (queue_state) so every existing command
+# keeps its read-modify-write shape; queue_history keeps the last
+# PG_HISTORY_KEEP versions for point-in-time recovery. After every commit the
+# doc is mirrored to queue.json (read-only cache for the minisite/exporters/
+# hooks that still read the file, and the rollback source).
+# NEVER falls back to an empty queue: any PG problem exits 75 with an alert.
+PG_HISTORY_KEEP = 500
+_PG_SCHEMA_SQL = (
+    "CREATE TABLE IF NOT EXISTS queue_state ("
+    " id int PRIMARY KEY CHECK (id = 1), doc jsonb NOT NULL,"
+    " version bigint NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());"
+    "CREATE TABLE IF NOT EXISTS queue_history ("
+    " version bigint PRIMARY KEY, doc jsonb NOT NULL,"
+    " at timestamptz NOT NULL DEFAULT now());"
+)
+
+
+def _queue_backend():
+    b = os.environ.get("SESSION_TASK_QUEUE_BACKEND")
+    if not b:
+        try:
+            b = (QUEUE_FILE.parent / "backend").read_text().strip()
+        except OSError:
+            b = ""
+    return "postgres" if b.lower() in ("postgres", "pg", "postgresql") else "json"
+
+
+def _pg_dsn():
+    dsn = os.environ.get("SESSION_TASK_PG_DSN")
+    if not dsn:
+        try:
+            dsn = (QUEUE_FILE.parent / "pg-dsn").read_text().strip()
+        except OSError:
+            dsn = ""
+    if not dsn:
+        raise RuntimeError("no SESSION_TASK_PG_DSN / pg-dsn file")
+    if "@auto:" in dsn or "@auto/" in dsn:
+        host = ("host.docker.internal" if os.path.exists("/.dockerenv")
+                else "127.0.0.1")
+        dsn = dsn.replace("@auto", "@" + host, 1)
+    return dsn
+
+
+def _pgwire():
+    d = os.path.dirname(os.path.realpath(__file__))
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    import pgwire
+    return pgwire
+
+
+def _pg_fail(reason):
+    """Fail loud: alert + exit 75. NEVER an empty-queue fallback."""
+    _alert_queue_recovery({
+        "mode": "unrecoverable", "reason": f"postgres backend: {reason}",
+        "recovered_items": 0, "quarantine": None, "corrupt_bytes": 0,
+    })
+    print("[session-task] queue backend is postgres and unusable; refusing to "
+          "fall back to an empty/stale queue. Last mirror: "
+          f"{QUEUE_FILE} (read-only cache).", file=sys.stderr)
+    sys.exit(75)
+
+
+def _pg_connect():
+    pw = _pgwire()
+    last = None
+    for delay in (0.0, 0.3, 1.0):
+        if delay:
+            time.sleep(delay)
+        try:
+            return pw.PgConnection(_pg_dsn(), timeout=5.0)
+        except (pw.PgError, OSError, RuntimeError, ValueError) as exc:
+            last = exc
+    _pg_fail(f"connect failed: {last}")
+
+
+class _PgLock:
+    """Lock handle for the PG backend: an open transaction holding the
+    queue_state row lock. Has fileno()/close() so legacy
+    `fcntl.flock(fh, LOCK_UN)` call sites stay harmless."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self._null = os.open(os.devnull, os.O_RDONLY)
+
+    def fileno(self):
+        return self._null
+
+    def close(self):
+        if self.conn is not None:
+            try:
+                self.conn.query("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            self.conn.close()
+            self.conn = None
+        if self._null is not None:
+            os.close(self._null)
+            self._null = None
+
+
+def _pg_read_doc(conn, lock):
+    sql = ("SELECT doc::text, version FROM queue_state WHERE id = 1"
+           + (" FOR UPDATE" if lock else ""))
+    rows = conn.query(sql)
+    if not rows:
+        return None, 0
+    return json.loads(rows[0][0]), int(rows[0][1])
+
+
+def _pg_open_locked():
+    conn = _pg_connect()
+    pw = _pgwire()
+    try:
+        conn.query("BEGIN; SET LOCAL idle_in_transaction_session_timeout = "
+                   "'120s'; SET LOCAL lock_timeout = '60s'")
+        data, ver = _pg_read_doc(conn, lock=True)
+    except (pw.PgError, OSError, ValueError) as exc:
+        conn.close()
+        _pg_fail(f"read failed: {exc}")
+    if data is None:
+        conn.close()
+        _pg_fail("queue_state row missing (run `session-task queue "
+                 "pg-migrate` first); refusing to create an empty queue")
+    lh = _PgLock(conn)
+    lh.version = ver
+    return lh, data
+
+
+def _pg_write_and_unlock(lh, data):
+    pw = _pgwire()
+    data["schema_version"] = QUEUE_SCHEMA_VERSION
+    text = json.dumps(data, indent=2) + "\n"
+    lit = pw.dollar_quote(text)
+    try:
+        lh.conn.query(
+            f"UPDATE queue_state SET doc = {lit}::jsonb, version = version + 1,"
+            f" updated_at = now() WHERE id = 1;"
+            f"INSERT INTO queue_history (version, doc) SELECT version, doc"
+            f" FROM queue_state WHERE id = 1;"
+            f"DELETE FROM queue_history WHERE version <"
+            f" (SELECT version FROM queue_state WHERE id = 1) - {PG_HISTORY_KEEP};"
+            f"COMMIT")
+    except (pw.PgError, OSError) as exc:
+        lh.close()
+        _pg_fail(f"write failed (change NOT applied): {exc}")
+    try:  # advisory read-only cache for file readers
+        _atomic_write_text(QUEUE_FILE, text)
+    except OSError as exc:
+        print(f"[session-task] queue.json mirror failed: {exc}", file=sys.stderr)
+    lh.close()
+
+
+def _pg_load_items_silent():
+    pw = _pgwire()
+    try:
+        conn = pw.PgConnection(_pg_dsn(), timeout=2.0)
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        data, _v = _pg_read_doc(conn, lock=False)
+    except Exception:  # noqa: BLE001
+        return {}
+    finally:
+        conn.close()
+    out = {}
+    for it in (data or {}).get("items", []):
+        if isinstance(it, dict) and "id" in it:
+            out[it["id"]] = it
+    return out
+
+
+def cmd_queue_pg_migrate(args):
+    """Idempotent JSON -> Postgres migration. Backs up queue.json first and
+    never touches it. Refuses to overwrite an existing PG row without --force.
+    """
+    pw = _pgwire()
+    raw, exc = _read_text_retry(QUEUE_FILE)
+    if raw is None:
+        print(f"cannot read {QUEUE_FILE}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    doc = _parse_queue_doc(raw)
+    if doc is None:
+        print("queue.json is not a valid queue doc; refusing", file=sys.stderr)
+        sys.exit(1)
+    n = len(doc.get("items", []))
+    if args.dry_run:
+        print(f"would migrate {n} item(s) from {QUEUE_FILE}")
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = QUEUE_FILE.parent / f"queue.json.pre-pg-migrate.{ts}"
+    backup.write_text(raw)
+    conn = pw.PgConnection(_pg_dsn(), timeout=5.0)
+    try:
+        conn.query("BEGIN")
+        conn.query(_PG_SCHEMA_SQL)
+        conn.query("LOCK TABLE queue_state IN EXCLUSIVE MODE")
+        rows = conn.query("SELECT version FROM queue_state WHERE id = 1")
+        if rows and not args.force:
+            conn.query("ROLLBACK")
+            print(f"queue_state already populated (version {rows[0][0]}); "
+                  "idempotent no-op (use --force to overwrite from JSON)")
+            return
+        lit = pw.dollar_quote(json.dumps(doc))
+        conn.query(
+            f"INSERT INTO queue_state (id, doc, version) VALUES (1, {lit}::jsonb, 1)"
+            f" ON CONFLICT (id) DO UPDATE SET doc = EXCLUDED.doc,"
+            f" version = queue_state.version + 1, updated_at = now()")
+        conn.query("COMMIT")
+    except pw.PgError as exc:
+        try:
+            conn.query("ROLLBACK")
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"migration failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        conn.close()
+    print(f"migrated {n} item(s); backup at {backup}. Flip the switch with: "
+          f"echo postgres > {QUEUE_FILE.parent / 'backend'}")
+
+
+def cmd_queue_pg_export_json(args):
+    """Write the PG doc back to queue.json (rollback path)."""
+    conn = _pg_connect()
+    try:
+        data, ver = _pg_read_doc(conn, lock=False)
+    finally:
+        conn.close()
+    if data is None:
+        print("no queue_state row", file=sys.stderr)
+        sys.exit(1)
+    _atomic_write_text(QUEUE_FILE, json.dumps(data, indent=2) + "\n")
+    print(f"exported version {ver} ({len(data.get('items', []))} items) "
+          f"to {QUEUE_FILE}")
+
+
+def cmd_queue_pg_status(args):
+    conn = _pg_connect()
+    try:
+        rows = conn.query("SELECT version, updated_at, jsonb_array_length("
+                          "doc->'items') FROM queue_state WHERE id = 1")
+        hist = conn.query("SELECT count(*) FROM queue_history")
+    finally:
+        conn.close()
+    print(f"backend={_queue_backend()} state={rows} history_rows={hist}")
+
+
 def _queue_open_locked(mode):
     """Acquire the queue write lock and read queue.json with corruption recovery.
 
@@ -1191,11 +1580,23 @@ def _queue_open_locked(mode):
     (unlocks only). `mode` is informational -- we always take LOCK_EX.
     """
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = os.open(str(QUEUE_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
-    lock_fh = os.fdopen(lock_fd, "r+")
-    fcntl.flock(lock_fh, fcntl.LOCK_EX)
-    # Read under the lock so same-domain writers serialize.
-    data, recovery = _read_queue_with_recovery()
+    if _queue_backend() == "postgres":
+        lock_fh, data = _pg_open_locked()
+        recovery = None
+    else:
+        lock_fd = os.open(str(QUEUE_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+        lock_fh = os.fdopen(lock_fd, "r+")
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        # Read under the lock so same-domain writers serialize.
+        try:
+            data, recovery = _read_queue_with_recovery()
+        except QueueUnrecoverable as qexc:
+            # Fail loud, write NOTHING: release the lock and exit non-zero so
+            # no caller can persist an empty store over recoverable bytes.
+            _alert_queue_recovery(qexc.info)
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            lock_fh.close()
+            sys.exit(75)
     if recovery is not None:
         _alert_queue_recovery(recovery)
     # Normalize
@@ -1266,6 +1667,8 @@ def _queue_write_and_unlock(fh, data):
     recovery source by `_read_queue_with_recovery` if queue.json is later found
     corrupt. `fh` is the flock lock handle returned by `_queue_open_locked`.
     """
+    if isinstance(fh, _PgLock):
+        return _pg_write_and_unlock(fh, data)
     data["schema_version"] = QUEUE_SCHEMA_VERSION
     text = json.dumps(data, indent=2) + "\n"
     _atomic_write_text(QUEUE_FILE, text)
@@ -1275,11 +1678,14 @@ def _queue_write_and_unlock(fh, data):
     except OSError as exc:
         print(f"[session-task] queue .bak snapshot failed: {exc}",
               file=sys.stderr)
+    _maybe_rolling_snapshot(text)
     fcntl.flock(fh, fcntl.LOCK_UN)
     fh.close()
 
 
 def _queue_unlock_readonly(fh):
+    if isinstance(fh, _PgLock):
+        return fh.close()
     fcntl.flock(fh, fcntl.LOCK_UN)
     fh.close()
 
@@ -11243,6 +11649,17 @@ def build_parser():
 
     qsub.add_parser("banner", help="Top-5 ready items banner")
 
+    q_pgm = qsub.add_parser(
+        "pg-migrate",
+        help="One-time idempotent queue.json -> Postgres migration (backs up "
+             "queue.json; does not flip the backend).")
+    q_pgm.add_argument("--dry-run", action="store_true")
+    q_pgm.add_argument("--force", action="store_true",
+                       help="Overwrite an existing Postgres row from queue.json")
+    qsub.add_parser("pg-export-json",
+                    help="Rollback: write the Postgres queue back to queue.json")
+    qsub.add_parser("pg-status", help="Show Postgres backend state")
+
     # Manual scope locks (added 2026-05-08).
     q_lock = qsub.add_parser(
         "lock",
@@ -11353,6 +11770,9 @@ def main():
             "prune": cmd_queue_prune,
             "rotate": cmd_queue_rotate,
             "banner": cmd_queue_banner,
+            "pg-migrate": cmd_queue_pg_migrate,
+            "pg-export-json": cmd_queue_pg_export_json,
+            "pg-status": cmd_queue_pg_status,
             "lock": cmd_queue_lock,
             "unlock": cmd_queue_unlock,
             "locks": cmd_queue_locks,

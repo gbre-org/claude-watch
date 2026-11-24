@@ -102,7 +102,7 @@ def test_run_wait_poll_stop_list(reg, monkeypatch, capsys):
     f = Fake([(0, "launched\n"), (0, "done\n"), (0, "status\n"), (0, "stopped\n"), (0, "jobs\n")])
     rc, o = run(["--role", "build", "run", "--label", "j1", "--", "echo", "a b"], f, monkeypatch, capsys)
     assert rc == 0 and o.out == "launched\n"
-    assert f.cmds[0] == "python3 /r/hostjob run --label j1 --cwd /r/work -- echo 'a b'"
+    assert f.cmds[0] == "python3 /r/hostjob run --label j1 --cwd /r/work -- echo 'a b'"  # opaque-ref-ok: test fixture command string
     assert run(["--host", "a", "wait", "j1", "--timeout", "5"], f, monkeypatch, capsys)[0] == 0
     assert "wait j1 --max-block 5" in f.cmds[1]
     assert run(["--host", "b", "poll", "j1", "--tail", "7"], f, monkeypatch, capsys)[0] == 0

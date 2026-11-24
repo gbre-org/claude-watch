@@ -134,6 +134,10 @@ class ForceStartEndpointTest(unittest.TestCase):
         # the canonical schema; just unlink and re-seed.
         if self.queue_actual.exists():
             self.queue_actual.unlink()
+            # The hardened store restores a missing queue.json from its
+            # snapshots, so a reset must clear those too.
+            Path(str(self.queue_actual) + ".bak").unlink(missing_ok=True)
+            shutil.rmtree(self.queue_actual.parent / "queue-snapshots", ignore_errors=True)
         self.running_id, self.blocked_id = _seed_queue(
             self.queue_actual, self.env,
         )

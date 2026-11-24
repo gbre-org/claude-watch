@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 SESSION_TASK = Path(__file__).resolve().parent.parent / "session-task"
@@ -130,15 +131,94 @@ def test_recovery_falls_back_to_bak_when_unsalvageable():
         assert [it["id"] for it in data["items"]] == ["q-x", "q-y"]
 
 
-def test_recovery_resets_empty_as_last_resort():
+def test_unrecoverable_garbage_raises_never_resets_empty():
+    mod = _load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _point_module_at(mod, tmp)
+        mod.QUEUE_FILE.write_text("}}}garbage{{{")
+        try:
+            mod._read_queue_with_recovery()
+        except mod.QueueUnrecoverable as exc:
+            assert exc.info["mode"] == "unrecoverable"
+        else:
+            raise AssertionError("garbage with no snapshot must fail loud")
+        assert list(d.glob("queue.json.corrupt.*")), "bytes not preserved"
+        assert mod.QUEUE_FILE.read_text() == "}}}garbage{{{"
+
+
+def test_enoent_with_snapshot_recovers_not_resets(monkeypatch=None):
+    """The 2026-11-24 incident: queue.json momentarily ENOENT while a foreign
+    writer replaced it. Must NOT reset to empty."""
     mod = _load_module()
     with tempfile.TemporaryDirectory() as tmp:
         _point_module_at(mod, tmp)
+        mod._QUEUE_READ_RETRY_DELAYS = (0.0, 0.0)
+        mod.QUEUE_BAK_FILE.write_text(json.dumps(_queue_doc(["q-1", "q-2"])))
+        # queue.json absent for the whole retry budget, bak present
+        data, info = mod._read_queue_with_recovery()
+        assert info["mode"] == "bak" and len(data["items"]) == 2
+
+
+def test_enoent_recovers_by_retry_when_file_reappears():
+    mod = _load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        _point_module_at(mod, tmp)
+        doc = _queue_doc(["q-a"])
+        target = mod.QUEUE_FILE
+
+        def late_writer():
+            time.sleep(0.15)
+            target.write_text(json.dumps(doc))
+        t = threading.Thread(target=late_writer)
+        # snapshot exists so absent file would otherwise be recovered from bak
+        mod.QUEUE_BAK_FILE.write_text(json.dumps(_queue_doc(["stale"])))
+        t.start()
+        data, info = mod._read_queue_with_recovery()
+        t.join()
+        assert info is None, info
+        assert [i["id"] for i in data["items"]] == ["q-a"]
+
+
+def test_missing_file_no_snapshot_is_fresh_store():
+    mod = _load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        _point_module_at(mod, tmp)
+        data, info = mod._read_queue_with_recovery()
+        assert info is None and data["items"] == []
+
+
+def test_empty_file_with_snapshot_recovers():
+    mod = _load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        _point_module_at(mod, tmp)
+        mod.QUEUE_BAK_FILE.write_text(json.dumps(_queue_doc(["q-1"])))
+        mod.QUEUE_FILE.write_text("")
+        data, info = mod._read_queue_with_recovery()
+        assert info["mode"] == "bak" and len(data["items"]) == 1
+
+
+def test_rolling_snapshot_recovers_when_bak_also_bad():
+    mod = _load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _point_module_at(mod, tmp)
+        mod.QUEUE_SNAPSHOT_MIN_INTERVAL_S = 0.0
+        mod._maybe_rolling_snapshot(json.dumps(_queue_doc(["q-s1", "q-s2"])))
+        mod.QUEUE_BAK_FILE.write_text("{{garbage")
         mod.QUEUE_FILE.write_text("}}}garbage{{{")
         data, info = mod._read_queue_with_recovery()
-        assert info is not None and info["mode"] == "empty"
-        assert info["recovered_items"] == 0
-        assert data["items"] == []
+        assert info["mode"] == "bak"
+        assert [i["id"] for i in data["items"]] == ["q-s1", "q-s2"]
+
+
+def test_rolling_snapshot_prunes_to_keep():
+    mod = _load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        _point_module_at(mod, tmp)
+        mod.QUEUE_SNAPSHOT_MIN_INTERVAL_S = 0.0
+        mod.QUEUE_SNAPSHOT_KEEP = 3
+        for i in range(7):
+            mod._maybe_rolling_snapshot(json.dumps(_queue_doc([f"q-{i}"])))
+        assert len(list(mod._snapshot_dir().glob("queue.*.json"))) == 3
 
 
 def test_clean_parse_reports_no_recovery():
@@ -195,15 +275,42 @@ def test_e2e_corrupt_file_salvages_and_alerts_loudly():
         assert list(d.glob("queue.json.corrupt.*")), "no quarantine file"
 
 
-def test_e2e_unrecoverable_reset_alerts_loudly():
+def test_e2e_unrecoverable_fails_loud_and_preserves_bytes():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
-        _write_queue(tmp, "}}}total garbage no json{{{")
+        d = _write_queue(tmp, "}}}total garbage no json{{{")
+        r = _run(env, "queue", "list", "--json")
+        assert r.returncode == 75, (r.returncode, r.stderr)
+        assert "UNRECOVERABLE" in r.stderr and "REFUSING" in r.stderr, r.stderr
+        assert (d / "queue.json").read_text() == "}}}total garbage no json{{{"
+        # a write attempt must also refuse and leave bytes untouched
+        r = _run(env, "queue", "add", "x", "--scope", "repo:foo", "--json")
+        assert r.returncode == 75
+        assert (d / "queue.json").read_text() == "}}}total garbage no json{{{"
+
+
+def test_e2e_kill9_mid_write_never_loses_items():
+    """SIGKILL writers at random points: queue.json is replaced atomically so
+    it always parses and earlier items survive."""
+    import random
+    import signal
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _run(env, "queue", "add", "keeper", "--scope", "repo:keep", "--json")
+        assert r.returncode == 0, r.stderr
+        for i in range(10):
+            p = subprocess.Popen(
+                [sys.executable, str(SESSION_TASK), "queue", "add", f"k{i}",
+                 "--scope", f"repo:k{i}", "--json"],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(random.uniform(0.0, 0.15))
+            p.send_signal(signal.SIGKILL)
+            p.wait()
         r = _run(env, "queue", "list", "--json")
         assert r.returncode == 0, r.stderr
-        assert json.loads(r.stdout) == []
-        assert "CORRUPT" in r.stderr and "reset to EMPTY" in r.stderr, r.stderr
-        assert "IN-FLIGHT QUEUE STATE LOST" in r.stderr, r.stderr
+        ids = [it["description"] if "description" in it else it.get("task")
+               for it in json.loads(r.stdout)]
+        assert "keeper" in ids, ids
 
 
 def test_e2e_write_snapshots_bak_and_stays_parseable():
