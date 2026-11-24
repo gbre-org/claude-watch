@@ -504,6 +504,31 @@ def _queue_add_failed(msg, remote_desc=None):
     )
 
 
+_ADD_TIMEOUT_REMOTE = 60
+
+
+def _recover_added_row(backend, scope):
+    """After a timed-out remote `queue add`, find the row it created (scope
+    ``hostjob:<label>`` is unique per label). Returns the q-id or None. Never
+    raises."""
+    try:
+        r = subprocess.run(_st_argv(backend, "queue", "list", "--json"),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=30)
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout.decode("utf-8", "replace"))
+        items = data.get("items", []) if isinstance(data, dict) else data
+        for it in items:
+            if (isinstance(it, dict) and it.get("created_by") == "hostjob"
+                    and it.get("status") in ("pending", "running")
+                    and scope in (it.get("scope") or [])):
+                return it.get("id")
+    except Exception:
+        pass
+    return None
+
+
 def _register_queue_item(label, cmd=None, depends_on=None, register=True):
     """Add (and optionally register) a session-task queue item for this hostjob.
 
@@ -567,8 +592,20 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=20,
+            timeout=_ADD_TIMEOUT_REMOTE if isinstance(st_bin, dict) else 20,
         )
+    except subprocess.TimeoutExpired as e:
+        # The remote may well have COMMITTED the add after we gave up waiting
+        # (slow queue host under a burst of dispatches). Dropping the row on
+        # the floor here leaves an orphan `pending` row that nobody registers
+        # or closes. Look it up by its unique scope before giving up.
+        qid = _recover_added_row(st_bin, scope) if isinstance(st_bin, dict) else None
+        if qid:
+            sys.stderr.write("hostjob: queue add timed out but row %s exists; "
+                             "adopting it.\n" % qid)
+            return qid, (True if not register else _queue_register(st_bin, qid))
+        _queue_add_failed("queue add failed (%r)" % e, remote_desc)
+        return None, None
     except Exception as e:
         _queue_add_failed("queue add failed (%r)" % e, remote_desc)
         return None, None
