@@ -107,7 +107,7 @@ hostjob-remote --host NAME wait L [--timeout S]   # exit 75 = still running
 hostjob-remote --host NAME poll L [--tail N]
 hostjob-remote --host NAME stop L [--force]
 hostjob-remote --host NAME list
-hostjob-remote sync [--host NAME]                 # fast-forward checkouts to origin/main
+hostjob-remote [--host NAME] sync                 # fast-forward checkouts to origin/main
 ```
 
 `sync` keeps every host's claude-watch checkout on `origin/main` so all hosts

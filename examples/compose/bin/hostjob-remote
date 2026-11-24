@@ -12,7 +12,7 @@ machine is ONE registry entry; no code changes.
     hostjob-remote [--host NAME | --role ROLE] poll L [--tail N]
     hostjob-remote [--host NAME | --role ROLE] stop L [--force]
     hostjob-remote [--host NAME | --role ROLE] list
-    hostjob-remote sync [--host NAME]
+    hostjob-remote [--host NAME] sync
 
 `sync` fast-forwards each host's claude-watch checkout to origin/main so every
 host runs the same code. It REFUSES a checkout with tracked local changes (or
@@ -457,7 +457,7 @@ def build_parser():
     s.add_argument("--force", action="store_true")
     sub.add_parser("list", help="list jobs on the host")
     sub.add_parser("sync", help="fast-forward host claude-watch checkouts to origin/main "
-                                "(all non-interactive hosts, or --host NAME)")
+                                "(all non-interactive hosts, or `--host NAME sync`)")
     return p
 
 
