@@ -174,6 +174,10 @@ class LiveStreamEndpointTest(unittest.TestCase):
         # starts from a clean slate. Cache TTL = 5s; reset to force reread.
         if self.queue_actual.exists():
             self.queue_actual.unlink()
+            # The hardened store restores a missing queue.json from its
+            # snapshots, so a reset must clear those too.
+            Path(str(self.queue_actual) + ".bak").unlink(missing_ok=True)
+            shutil.rmtree(self.queue_actual.parent / "queue-snapshots", ignore_errors=True)
         if self.agent_state.exists():
             self.agent_state.unlink()
         if self.jsonl_root.exists():

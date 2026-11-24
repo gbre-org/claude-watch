@@ -121,6 +121,10 @@ class WorkloadArchiveEndpointTest(unittest.TestCase):
     def setUp(self):
         if self.queue_actual.exists():
             self.queue_actual.unlink()
+            # The hardened store restores a missing queue.json from its
+            # snapshots, so a reset must clear those too.
+            Path(str(self.queue_actual) + ".bak").unlink(missing_ok=True)
+            shutil.rmtree(self.queue_actual.parent / "queue-snapshots", ignore_errors=True)
         # Clean any prior archive files so each test starts fresh.
         if self.archive_dir.exists():
             for p in self.archive_dir.iterdir():
