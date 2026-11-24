@@ -1330,16 +1330,11 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
     // $PATH). See `resolve_relaunch_bin` / `resolve_claude_bin` for the
     // failure modes these guard against.
     let claude_bin = resolve_relaunch_bin();
-    let launch = if let Some(ref sid) = session_id {
-        info!(session_id = %sid, "restarting Claude Code with --resume");
-        format!(
-            "{} --dangerously-skip-permissions --resume {}",
-            claude_bin, sid
-        )
-    } else {
-        info!("restarting Claude Code with --continue (no session ID found)");
-        format!("{} --dangerously-skip-permissions --continue", claude_bin)
-    };
+    match session_id {
+        Some(ref sid) => info!(session_id = %sid, "restarting Claude Code with --resume"),
+        None => info!("restarting Claude Code with --continue (no session ID found)"),
+    }
+    let launch = build_host_restart_argv(&claude_bin, session_id.as_deref(), &config.plugin_dirs);
 
     // Write relaunch script. Ensure its parent dir exists first: the
     // default lives under `/var/run/claude/`, which is a tmpfs that does
@@ -5704,8 +5699,52 @@ fn resolve_relaunch_bin() -> String {
     resolve_claude_bin()
 }
 
+/// POSIX single-quote shell escape (bare when the string is plainly safe).
+fn sh_quote_path(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':' | '@' | ',')
+        });
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// Render `[claude] plugin_dirs` as ` --plugin-dir <p>` flags (each with a
+/// leading space; empty string when none apply). A directory that does not
+/// exist is skipped with a warning and never fails the launch.
+fn plugin_dir_flags(dirs: &[String]) -> String {
+    let mut out = String::new();
+    for d in dirs {
+        if !std::path::Path::new(d).is_dir() {
+            tracing::warn!(dir = %d, "[claude] plugin_dirs entry does not exist; skipping");
+            continue;
+        }
+        out.push_str(" --plugin-dir ");
+        out.push_str(&sh_quote_path(d));
+    }
+    out
+}
+
+/// Argv for the host crash-recovery restart (`restart_claude`).
+fn build_host_restart_argv(bin: &str, session_id: Option<&str>, plugin_dirs: &[String]) -> String {
+    let mut cmd = bin.to_string();
+    cmd.push_str(&plugin_dir_flags(plugin_dirs));
+    cmd.push_str(" --dangerously-skip-permissions");
+    match session_id {
+        Some(sid) => {
+            cmd.push_str(" --resume ");
+            cmd.push_str(sid);
+        }
+        None => cmd.push_str(" --continue"),
+    }
+    cmd
+}
+
 /// Pure modulo env + a filesystem existence check; no I/O side effects.
-fn build_relaunch_claude_argv(session_id: Option<&str>) -> String {
+fn build_relaunch_claude_argv(session_id: Option<&str>, plugin_dirs: &[String]) -> String {
     let mut cmd = resolve_relaunch_bin();
     if let Ok(shim) = std::env::var("CLAUDE_SHIM_SETTINGS_PATH") {
         if !shim.is_empty() {
@@ -5726,6 +5765,7 @@ fn build_relaunch_claude_argv(session_id: Option<&str>) -> String {
         cmd.push_str(" --plugin-dir ");
         cmd.push_str(&plugin_dir);
     }
+    cmd.push_str(&plugin_dir_flags(plugin_dirs));
     cmd.push_str(" --dangerously-skip-permissions");
     match session_id {
         Some(sid) => {
@@ -6393,7 +6433,7 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     // commands. `build_relaunch_claude_argv` reconstructs the correct
     // shape from the same env vars; on the host (no shim env) it degrades
     // to the previous bare-`claude` behavior.
-    let launch = build_relaunch_claude_argv(session_id.as_deref());
+    let launch = build_relaunch_claude_argv(session_id.as_deref(), &config.claude.plugin_dirs);
 
     // Ensure the relaunch-script parent dir exists (see crash-recovery
     // note above): `/var/run/claude/` is tmpfs and may be gone after a
@@ -16009,8 +16049,56 @@ pane_unchanged_secs = 600
     // -------------------------------------------------------------------
 
     #[test]
+    fn plugin_dirs_empty_leaves_host_argv_unchanged() {
+        assert_eq!(
+            build_host_restart_argv("claude", None, &[]),
+            "claude --dangerously-skip-permissions --continue"
+        );
+        assert_eq!(
+            build_host_restart_argv("claude", Some("abc"), &[]),
+            "claude --dangerously-skip-permissions --resume abc"
+        );
+    }
+
+    #[test]
+    fn plugin_dirs_one_dir_missing_skipped_and_spaces_quoted() {
+        let base = std::env::temp_dir().join(format!("cw-plugdirs-{}", std::process::id()));
+        let plain = base.join("plain");
+        let spaced = base.join("with space");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(&spaced).unwrap();
+        let p = plain.to_string_lossy().into_owned();
+        let sp = spaced.to_string_lossy().into_owned();
+        let missing = base.join("nope").to_string_lossy().into_owned();
+
+        let one = build_host_restart_argv("claude", None, &[p.clone()]);
+        assert_eq!(
+            one,
+            format!("claude --plugin-dir {p} --dangerously-skip-permissions --continue")
+        );
+        let skip = build_host_restart_argv("claude", None, &[missing.clone(), p.clone()]);
+        assert_eq!(skip, one);
+        assert!(!skip.contains("nope"));
+        let quoted = build_host_restart_argv("claude", Some("sid"), &[sp.clone()]);
+        assert!(quoted.contains(&format!("--plugin-dir '{sp}'")), "{quoted}");
+        // The auto-update relaunch argv honors it too.
+        let relaunch = build_relaunch_claude_argv(None, &[sp.clone(), p.clone()]);
+        assert!(
+            relaunch.contains(&format!("--plugin-dir '{sp}' --plugin-dir {p}")),
+            "{relaunch}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sh_quote_path_escapes_apostrophe() {
+        assert_eq!(sh_quote_path("/a/b"), "/a/b");
+        assert_eq!(sh_quote_path("/a b/it's"), "'/a b/it'\\''s'");
+    }
+
+    #[test]
     fn relaunch_argv_always_skips_permissions_and_continues() {
-        let cmd = build_relaunch_claude_argv(None);
+        let cmd = build_relaunch_claude_argv(None, &[]);
         // The leading token is now `resolve_claude_bin()` — either a bare
         // `claude` (host / unknown layout) or an absolute path ending in
         // `/claude` (container). Assert it references a claude binary rather
@@ -16102,7 +16190,7 @@ pane_unchanged_secs = 600
     #[test]
     fn relaunch_argv_uses_resolved_absolute_bin_when_env_set() {
         std::env::set_var("CLAUDE_BIN", "/opt/custom/claude");
-        let cmd = build_relaunch_claude_argv(None);
+        let cmd = build_relaunch_claude_argv(None, &[]);
         assert!(
             cmd.starts_with("/opt/custom/claude "),
             "argv must lead with the resolved absolute bin: {cmd}"
@@ -16118,7 +16206,7 @@ pane_unchanged_secs = 600
     #[test]
     fn relaunch_argv_resumes_with_session_id() {
         let sid = "12345678-1234-1234-1234-123456789abc";
-        let cmd = build_relaunch_claude_argv(Some(sid));
+        let cmd = build_relaunch_claude_argv(Some(sid), &[]);
         assert!(
             cmd.contains(&format!("--resume {sid}")),
             "session id => --resume <sid>: {cmd}"
