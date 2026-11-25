@@ -179,6 +179,12 @@
 //                              prose looking for something that looks like a
 //                              clock.
 //
+// ONE COLUMN, ONE STAMP: a line's own leading RFC3339 stamp (workload runner
+// `...-05:00`, CI `...Z`) is split off the text (server-side, and again here
+// for cached / pre-split lines), so the body never repeats the time the column
+// shows; stacked stamps collapse to the outermost. A continuation line with no
+// stamp shows no time. The CI header status carries no clock of its own.
+//
 // For those two sources the pane shows NOTHING in the timestamp column and
 // says why: its header gains a `no ts` marker while timestamps are on. It does
 // NOT fall back to the client's arrival time. Arrival time answers a different
@@ -1187,6 +1193,27 @@
     return '';
   }
 
+  // Client-side twin of app.py `_split_line_ts`, for lines that did not come
+  // through the server splitter (cached CI runs hydrated from localStorage,
+  // older servers). Same narrow pattern: RFC3339 with `T` and an explicit
+  // offset / Z. Leading stamps stack-strip (first wins) so the body never
+  // carries a second timestamp beside the column. Returns {ts, text}.
+  const LINE_TS_RE =
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))[ \t]+/;
+  function splitLineTs(text) {
+    const t = String(text == null ? '' : text);
+    const m = LINE_TS_RE.exec(t);
+    if (!m) return { ts: '', text: t };
+    let body = t.slice(m[0].length);
+    for (;;) {
+      const m2 = LINE_TS_RE.exec(body);
+      if (!m2 || body.length === m2[0].length) break;
+      body = body.slice(m2[0].length);
+    }
+    if (!body) return { ts: '', text: t };
+    return { ts: m[1], text: body };
+  }
+
   // Returns { sigil, text, cls, ts } for one stream payload, or null to skip
   // it. `ts` is the SOURCE timestamp (ISO8601) or '' when the source has none.
   function formatPayload(payload) {
@@ -1199,12 +1226,14 @@
       // Plain-text tail (workload / hostjob / archived output): verbatim. A
       // stamped producer's time arrives as `source_ts` (split off the text
       // server-side); an unstamped line gets '' and shows no time.
-      return {
-        sigil: '',
-        text: payload.text || '',
-        cls: 'mt-plain',
-        ts: sourceTs(payload),
-      };
+      let wtext = payload.text || '';
+      let wts = sourceTs(payload);
+      if (!wts) {
+        const sp = splitLineTs(wtext);
+        wtext = sp.text;
+        wts = sp.ts;
+      }
+      return { sigil: '', text: wtext, cls: 'mt-plain', ts: wts };
     }
 
     const rec = payload.rec || {};
@@ -1797,7 +1826,9 @@
     box.hidden = false;
     box.classList.toggle('mt-ci-final', !!payload.final);
     if (!pane.ended) {
-      setPaneStatus(pane, (payload.final ? 'complete' : 'live') + ' \u00b7 ' + stamp,
+      // No clock here: the footer above already says "last updated", and a
+      // second HH:MM:SS in the header is one timestamp column too many.
+      setPaneStatus(pane, payload.final ? 'complete' : 'live',
         payload.final ? 'mt-done' : 'mt-ok');
     }
   }
@@ -2002,7 +2033,8 @@
     if (appendPaneLine(pane, formatPayload(payload))) {
       if (pane.mode === 'ci' && payload.kind === 'workload_line' &&
           pane.ciRaw.length <= CI_RAW_MAX_LINES) {
-        pane.ciRaw.push(String(payload.text == null ? '' : payload.text));
+        pane.ciRaw.push((payload.source_ts ? payload.source_ts + ' ' : '') +
+          String(payload.text == null ? '' : payload.text));
       }
       // Real content arrived: the log exists, so the backoff has served its
       // purpose and resets (a later transient failure starts from 3s again).

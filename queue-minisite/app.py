@@ -4909,19 +4909,29 @@ def _split_line_ts(text: str) -> tuple[str, str]:
     """``(source_ts, remaining_text)`` for one plain-text log line.
 
     ``("", text)`` — text untouched — when the line carries no recognisable
-    per-line stamp.
+    per-line stamp. When stamps are STACKED (a workload runner stamp in front
+    of a producer's own stamp, e.g. a CI line relayed through a stamped
+    workload) the OUTERMOST one is the line's time and every further leading
+    stamp is stripped from the text too, so a pane never shows a second
+    timestamp inside the body next to the timestamp column.
     """
     if not text:
         return "", text
     m = _LINE_TS_RE.match(text)
     if not m:
         return "", text
+    ts = m.group(1)
     body = text[m.end():]
+    while True:
+        m2 = _LINE_TS_RE.match(body)
+        if not m2 or not body[m2.end():]:
+            break
+        body = body[m2.end():]
     if not body:
         # A line whose whole content is a timestamp has no body to attach it
         # to; keep it as text so it is still visible.
         return "", text
-    return m.group(1), body
+    return ts, body
 
 
 def _plain_line_event(text: str, transient: bool) -> dict[str, Any]:
