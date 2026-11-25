@@ -192,6 +192,47 @@ class CiRowsTest(unittest.TestCase):
         ev = self._sse(q)
         self.assertTrue(any(e.get("kind") == "open-failed" for e in ev), ev)
 
+    def _script(self, name, body):
+        f = Path(self.tmp) / name
+        f.write_text("#!/bin/sh\n" + body)
+        f.chmod(f.stat().st_mode | stat.S_IXUSR)
+        return f
+
+    def test_pending_rc_streams_data_not_open_failed(self):
+        """Exit 5 = pending: stdout is streamed as data, no open-failed
+        (which would drive the pane to 'launch failed / no log')."""
+        pend = self._script("pending-cmd", "echo '  - step Build [in_progress]'\nexit 5\n")
+        self.appmod.CI_LOG_CMD = f"{pend} {{run}}"
+        q = self._upsert()
+        _st(self.env, "queue", "ci", "close", "--id", q, "--outcome", "success")
+        ev = self._sse(q)
+        self.assertFalse(any(e.get("type") == "error" for e in ev), ev)
+        texts = [e["text"] for e in ev if e.get("type") == "event"]
+        self.assertIn("  - step Build [in_progress]", texts)
+
+    def test_pending_rc_with_no_output_gets_status_line(self):
+        pend = self._script("pending-empty", "exit 5\n")
+        self.appmod.CI_LOG_CMD = f"{pend} {{run}}"
+        q = self._upsert()
+        _st(self.env, "queue", "ci", "close", "--id", q, "--outcome", "success")
+        ev = self._sse(q)
+        self.assertFalse(any(e.get("type") == "error" for e in ev), ev)
+        texts = [e["text"] for e in ev if e.get("type") == "event"]
+        self.assertTrue(any("log not available yet" in t for t in texts), texts)
+
+    def test_failure_error_is_one_clean_line_not_traceback(self):
+        bad = self._script(
+            "tb-cmd",
+            "echo 'Traceback (most recent call last):' >&2\n"
+            "echo '  File \"x.py\", line 1' >&2\n"
+            "echo 'urllib.error.HTTPError: HTTP Error 404' >&2\nexit 1\n")
+        self.appmod.CI_LOG_CMD = f"{bad} {{run}}"
+        q = self._upsert()
+        ev = self._sse(q)
+        err = next(e for e in ev if e.get("kind") == "open-failed")
+        self.assertNotIn("Traceback", err["error"])
+        self.assertNotIn("File", err["error"])
+
     def test_stream_emits_lines_and_ends_when_closed(self):
         self.appmod.CI_LOG_CMD = f"{self.cmd} {{run}} {{job}}"
         q = self._upsert()

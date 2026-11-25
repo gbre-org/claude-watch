@@ -182,6 +182,12 @@ CI_LOG_POLL_SECONDS = float(os.environ.get("QUEUE_MINISITE_CI_LOG_POLL_SECONDS",
 CI_LOG_CMD_TIMEOUT = float(os.environ.get("QUEUE_MINISITE_CI_LOG_CMD_TIMEOUT", "30"))
 # Largest log kept per poll (bytes); the TAIL is kept when a log is longer.
 CI_LOG_MAX_BYTES = int(os.environ.get("QUEUE_MINISITE_CI_LOG_MAX_BYTES", str(4 * 1024 * 1024)))
+# Exit code the log command uses for "PENDING": the run is not finished and the
+# provider has not published a log yet (e.g. GitHub only serves a job's log once
+# that job completes). It is NOT a failure: stdout carries progress / a status
+# line, which is streamed as ordinary data, so the pane never settles on
+# "launch failed / no log" for a healthy in-progress run.
+CI_LOG_PENDING_RC = 5
 
 # Workload output directory (tail target for workload-bound queue items).
 # `workload run <label> -- <cmd>` writes:
@@ -5694,12 +5700,22 @@ def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
         while True:
             terminal = not _ci_item_open(qid)
             rc, out, err = _ci_run_log_cmd(argv)
+            if rc == CI_LOG_PENDING_RC:
+                # Pending, not failed: show whatever the tool printed (or a
+                # status line) so the pane has data and never reads as dead.
+                if not out.strip():
+                    out = ("log not available yet (the provider publishes "
+                           "logs when a job finishes)\n")
+                rc = 0
             if rc != 0:
                 if first:
+                    # One clean line: the LAST non-empty stderr line (never a
+                    # traceback body).
+                    lines_e = [ln for ln in err.strip().splitlines() if ln.strip()]
                     yield _format_sse({
                         "type": "error", "kind": "open-failed",
                         "error": f"CI log command failed (rc={rc}): "
-                                 f"{err.strip()[-300:]}",
+                                 f"{(lines_e[-1] if lines_e else '')[-200:]}",
                     })
                     return
                 # Later failures: keep what we have and try again.

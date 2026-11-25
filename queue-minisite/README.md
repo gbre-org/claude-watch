@@ -563,6 +563,11 @@ row carries an `http(s)` URL. It never counts toward the orphan tally.
   Output that does not extend the previous poll (the log was rewritten)
   emits a `log-reset` frame and the new tail. The stream ends with
   `workload-end` once the row closes (after one final poll).
+* **Pending (exit 5).** The log command may exit `5` meaning "not finished,
+  provider has no log yet" (GitHub serves a job's log only once it completes).
+  That is not a failure: its stdout (e.g. per-step progress) streams as data
+  (a status line is synthesised if empty), so the pane never shows
+  "launch failed / no log" for a healthy in-progress run.
 * **Retry-until-the-log-exists.** A failing / not-yet-available log command is
   reported as the retryable `open-failed` error, so the pane backs off and
   retries exactly like a workload whose `.output` does not exist yet. It holds a
