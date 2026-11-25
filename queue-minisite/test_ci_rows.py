@@ -179,6 +179,65 @@ class CiRowsTest(unittest.TestCase):
         css = (HERE / "static" / "style.css").read_text()
         self.assertIn(".mt-badge-ci", css)
 
+    # --- labelled body + syncer owner ------------------------------------
+
+    def _card_html(self, qid):
+        self.appmod._cache.fetched_at = 0.0
+        html = self.client.get("/").get_data(as_text=True)
+        start = html.index(f'id="queue-{qid}"')
+        return html[start:html.index("</article>", start)]
+
+    def _upsert_prov(self, provider, repo, **kw):
+        argv = ["queue", "ci", "upsert", "--provider", provider, "--repo",
+                repo, "--run", "45676171305", "--created-by", "pr-watch"]
+        for k, v in kw.items():
+            argv += ["--" + k.replace("_", "-"), v]
+        self.appmod._cache.fetched_at = 0.0
+        return _st(self.env, *argv).splitlines()[0]
+
+    def test_github_card_body_is_labelled(self):
+        q = self._upsert_prov(
+            "github", "gbre-org/claude-watch", status="in_progress",
+            branch="queue-minisite/ts-single-column",
+            url="https://github.example/run/1", pr_url="https://github.example/pr/9")
+        card = self._card_html(q)
+        self.assertIn("GitHub Actions run", card)
+        self.assertIn("gbre-org/claude-watch", card)
+        self.assertIn("branch <span class=\"ci-branch\">queue-minisite/ts-single-column", card)
+        self.assertIn(">open run</a>", card)
+        self.assertIn('href="https://github.example/pr/9"', card)
+        # no bare "#<run id>" header link any more
+        self.assertNotIn(">#45676171305</a>", card)
+        # owner + reaper are explicit
+        self.assertNotIn("owner unknown", card)
+        self.assertIn("pr-watch syncer (github)", card)
+        self.assertIn("reaped by pr-watch", card)
+        self.assertIn("stale alarm: queue ci check", card)
+
+    def test_gitea_card_body_is_labelled(self):
+        q = self._upsert_prov("gitea", "andrew/some-repo", branch="main",
+                              url="https://gitea.example/run/2")
+        card = self._card_html(q)
+        self.assertIn("Gitea Actions run", card)
+        self.assertIn("andrew/some-repo", card)
+        self.assertIn(">open run</a>", card)
+        self.assertNotIn("open PR", card)
+        self.assertIn("pr-watch syncer (gitea)", card)
+
+    def test_api_owner_is_ci_syncer(self):
+        q = self._upsert_prov("github", "o/r")
+        row = next(r for r in self._payload()["running"] if r["id"] == q)
+        self.assertEqual(row["owner"]["mode"], "ci")
+        self.assertEqual(row["owner"]["label"], "pr-watch syncer (github)")
+        self.assertEqual(row["ci"]["provider_label"], "GitHub Actions")
+        self.assertEqual(self._payload()["orphan_count"], 0)
+
+    def test_refresh_js_mirrors_body_and_owner(self):
+        js = (HERE / "static" / "refresh.js").read_text()
+        for needle in ("function ciBody", "ci-reaper", "owner.mode === 'ci'",
+                       "stale alarm: queue ci check", "open PR"):
+            self.assertIn(needle, js)
+
     # --- stream ----------------------------------------------------------
 
     def test_stream_without_command(self):

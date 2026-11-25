@@ -278,3 +278,24 @@ def test_ci_rows_not_in_banner_groups(env):
     _upsert(env)
     groups = json.loads(_run(env, "queue", "groups", "--json").stdout)
     assert groups == []
+
+
+def test_upsert_stamps_syncer_owner_and_pr_url(env):
+    q = _upsert(env, created_by="pr-watch", pr_url="https://example.test/pr/1")
+    row = _show(env, q)
+    assert row["owner"] == "pr-watch syncer (prov)"
+    assert row["ci"]["pr_url"] == "https://example.test/pr/1"
+    # Re-upsert keeps the stamp (and backfills rows created without one).
+    _upsert(env)
+    assert _show(env, q)["owner"] == "pr-watch syncer (prov)"
+
+
+def test_upsert_owner_defaults_to_ci_sync(env):
+    q = _upsert(env)
+    assert _show(env, q)["owner"] == "ci-sync syncer (prov)"
+
+
+def test_banner_never_flags_ci_row_as_no_owner(env):
+    _upsert(env)
+    out = _run(env, "queue", "banner").stdout
+    assert "NO OWNER" not in out

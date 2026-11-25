@@ -1423,6 +1423,19 @@ def _classify_owner(
         (a real anomaly worth showing).
     """
     iid = item.get("id", "")
+    if _is_ci_item(item):
+        # Passive CI row: owned + reaped by its syncer, not an agent.
+        return {
+            "mode": "ci",
+            "owner_source": "ci-syncer",
+            "alive": None,
+            "agent_id": "",
+            "label": _ci_view(item)["owner"],
+            "jsonl_age_seconds": None,
+            "jsonl_age": "?",
+            "jsonl_age_epoch": None,
+            "is_starting": False,
+        }
     agent = agent_by_qid.get(iid)
     if agent is not None:
         age = agent.get("jsonl_age_seconds")
@@ -1925,12 +1938,22 @@ def _ci_view(item: dict[str, Any]) -> dict[str, Any]:
     out = {
         k: str(ci.get(k) or "")
         for k in ("provider", "repo", "run", "job", "status", "outcome",
-                  "url", "branch", "sha", "parent", "last_synced")
+                  "url", "branch", "sha", "parent", "last_synced", "pr_url")
     }
+    prov = out["provider"].lower()
+    out["provider_label"] = {
+        "github": "GitHub Actions",
+        "gitea": "Gitea Actions",
+    }.get(prov, f"{out['provider']} CI" if out["provider"] else "CI")
+    out["owner"] = str(item.get("owner") or "")
+    out["reaper"] = str(item.get("created_by") or "ci-sync")
     # Only http(s) links are rendered as links (the row text is operator /
     # syncer supplied; never emit javascript: URLs into an href).
-    if out["url"] and not re.match(r"^https?://", out["url"], re.I):
-        out["url"] = ""
+    for _k in ("url", "pr_url"):
+        if out[_k] and not re.match(r"^https?://", out[_k], re.I):
+            out[_k] = ""
+    if not out["owner"]:
+        out["owner"] = f"{out['reaper']} syncer ({out['provider'] or '?'})"
     return out
 
 
@@ -2251,7 +2274,7 @@ def _shape(
         # Passive external row: no agent, owner, heartbeat or subagent tree.
         # An empty owner keeps it out of the orphan tally (`alive is False`)
         # and off the orphan badge.
-        shaped["owner"] = {}
+        shaped["owner"] = _classify_owner(item, now, agent_by_qid, owner_bindings)
         shaped["is_starting"] = False
         shaped["agent_stats"] = None
         shaped["subagents"] = []
