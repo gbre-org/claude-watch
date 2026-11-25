@@ -1540,21 +1540,29 @@
     const meta = el('div', 'mt-pane-meta');
     meta.hidden = true;
     head.appendChild(meta);
+    // CI panes only: the whole pipeline status as ONE compact line in the
+    // header (a collapsed <details>; the per-job / per-step detail opens from
+    // it). No separate panel below the stream.
+    let ciDetails = null, ciSummary = null, ciBadge = null, ciText = null, ciDetail = null;
+    if (info.mode === 'ci') {
+      ciDetails = el('details', 'mt-ci-details');
+      ciDetails.hidden = true;
+      ciSummary = el('summary', 'mt-ci-summary');
+      ciBadge = el('span', 'mt-ci-badge');
+      ciBadge.hidden = true;
+      ciText = el('span', 'mt-ci-text');
+      ciSummary.appendChild(ciBadge);
+      ciSummary.appendChild(ciText);
+      ciDetail = el('pre', 'mt-ci-detail');
+      ciDetails.appendChild(ciSummary);
+      ciDetails.appendChild(ciDetail);
+      head.insertBefore(ciDetails, meta);
+    }
     wrap.appendChild(head);
 
     const stream = el('pre', 'mt-pane-stream');
     stream.tabIndex = 0;
     wrap.appendChild(stream);
-    // CI panes only: the live "in progress" block + last-updated stamp, a
-    // sibling BELOW the scrolling stream so the stream tail stays the newest
-    // finished output and the running jobs are always visible at the bottom.
-    let ciStatus = null;
-    if (info.mode === 'ci') {
-      ciStatus = el('pre', 'mt-ci-status');
-      ciStatus.hidden = true;
-      wrap.appendChild(ciStatus);
-    }
-
     const pane = {
       // Identity: what this pane IS (kind + the id its stream is opened on),
       // and which queue item it belongs to. For a queue pane target === qid;
@@ -1572,7 +1580,10 @@
       mode: info.mode,
       el: wrap,
       streamEl: stream,
-      ciStatusEl: ciStatus,
+      ciDetailsEl: ciDetails,
+      ciTextEl: ciText,
+      ciBadgeEl: ciBadge,
+      ciDetailEl: ciDetail,
       statusEl: status,
       noTsEl: noTs,
       metaEl: meta,
@@ -1862,23 +1873,75 @@
     return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
   }
 
-  // CI pane footer: the volatile "in progress" lines plus a "last updated"
-  // stamp, so a quiet pane is visibly polling rather than silently stale.
-  // textContent only.
+  // CI pipeline status, ONE line in the pane header (a collapsed <details>;
+  // opening it lists every job and the open jobs' steps). Finished jobs are
+  // read off their `===== job 'X' (id N) <conclusion> =====` headers in the
+  // stream; unfinished ones off the volatile `ci-status` block. textContent
+  // only.
+  const CI_OK = { success: 1, skipped: 1, neutral: 1 };
+  const CI_RUNNING = { in_progress: 1, running: 1 };
+  function ciSummarize(pane, payload) {
+    const done = [];
+    const seen = {};
+    for (const t of pane.ciRaw) {
+      const m = /===== job '(.*)' \(id \S+\) (\S+) =====/.exec(String(t));
+      if (m && !seen[m[1]]) { seen[m[1]] = 1; done.push({ name: m[1], state: m[2] }); }
+    }
+    const open = [];
+    let cur = null;
+    for (const ln of (Array.isArray(payload.lines) ? payload.lines : [])) {
+      const m = /^job '(.*)' (\S+)(?: \((.*)\))?\s*$/.exec(ln);
+      if (m) { cur = { name: m[1], state: m[2], steps: [] }; open.push(cur); continue; }
+      const st = /^\s*\[\s*(\S+)\]\s+(\d+)\.\s/.exec(ln);
+      if (st && cur) cur.steps.push({ mark: st[1], n: +st[2] });
+    }
+    const jobs = done.slice();
+    for (const o of open) if (!seen[o.name]) jobs.push(o);
+    const ok = jobs.filter((j) => CI_OK[j.state]).length;
+    const failed = jobs.filter((j) => !CI_OK[j.state] && !CI_RUNNING[j.state] &&
+      ['failure', 'cancelled', 'timed_out', 'error'].indexOf(j.state) !== -1);
+    const running = open.filter((j) => CI_RUNNING[j.state]);
+    const pending = open.filter((j) => !CI_RUNNING[j.state] && !CI_OK[j.state] &&
+      failed.indexOf(j) === -1);
+    return { jobs, open, ok, failed, running, pending };
+  }
+
   function paintCiStatus(pane, payload) {
-    const box = pane.ciStatusEl;
+    const box = pane.ciTextEl;
     if (!box) return;
-    const lines = Array.isArray(payload.lines) ? payload.lines : [];
+    const sum = ciSummarize(pane, payload);
     const stamp = clockText(payload.ts);
-    const head = payload.final
-      ? 'run complete \u00b7 last updated ' + stamp
-      : 'in progress \u00b7 last updated ' + stamp;
-    box.textContent = [head].concat(lines).join('\n');
-    box.hidden = false;
-    box.classList.toggle('mt-ci-final', !!payload.final);
+    const parts = [];
+    if (sum.jobs.length) parts.push(sum.ok + '/' + sum.jobs.length + ' jobs ok');
+    if (payload.final) {
+      if (sum.failed.length) parts.push('failed: ' + sum.failed.map((j) => j.name).join(', '));
+    } else {
+      if (sum.failed.length) parts.push('failed: ' + sum.failed.map((j) => j.name).join(', '));
+      for (const r of sum.running) {
+        const total = r.steps.length;
+        const at = r.steps.filter((s) => s.mark === '>>')[0];
+        parts.push('running: ' + r.name +
+          (at && total ? ' (step ' + at.n + '/' + total + ')' : ''));
+      }
+      if (sum.pending.length) parts.push(sum.pending.length + ' pending');
+    }
+    parts.push('updated ' + stamp);
+    box.textContent = parts.join(' · ');
+    const badge = pane.ciBadgeEl;
+    if (payload.final) {
+      const bad = sum.failed.length > 0;
+      badge.hidden = false;
+      badge.textContent = bad ? 'failed' : 'passed';
+      badge.className = 'mt-ci-badge ' + (bad ? 'mt-ci-bad' : 'mt-ci-good');
+    } else {
+      badge.hidden = true;
+    }
+    const detail = sum.jobs.map((j) => '[' + (CI_OK[j.state] ? ' ok' : j.state) + '] ' + j.name)
+      .concat(sum.open.length ? [''].concat(payload.lines) : []);
+    pane.ciDetailEl.textContent = detail.join('\n');
+    pane.ciDetailsEl.hidden = false;
+    pane.ciDetailsEl.classList.toggle('mt-ci-final', !!payload.final);
     if (!pane.ended) {
-      // No clock here: the footer above already says "last updated", and a
-      // second HH:MM:SS in the header is one timestamp column too many.
       setPaneStatus(pane, payload.final ? 'complete' : 'live',
         payload.final ? 'mt-done' : 'mt-ok');
     }

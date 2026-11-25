@@ -111,8 +111,8 @@ assert('three stamped rows -> three cells', total === 3, String(total));
 const header = x.pane.querySelector('.mt-pane-status');
 assert('CI header status carries no clock', header && !/\d\d:\d\d:\d\d/.test(header.textContent),
   header && header.textContent);
-assert('footer still says last updated once',
-  (x.pane.querySelector('.mt-ci-status').textContent.match(HHMMSS) || []).length === 1);
+assert('header status line carries the one updated stamp',
+  (x.pane.querySelector('.mt-ci-text').textContent.match(HHMMSS) || []).length === 1);
 
 // Cached run re-hydrated from localStorage keeps ONE column and a clean body.
 const y = boot(store);

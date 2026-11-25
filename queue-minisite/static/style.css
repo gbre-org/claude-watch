@@ -3486,11 +3486,19 @@ body.multitail-open { overflow: hidden; }
 .ansi-strike    { text-decoration: line-through; }
 .ansi-underline.ansi-strike { text-decoration: underline line-through; }
 
-/* CI pane footer: running jobs + "last updated" stamp, below the stream. */
-.mt-ci-status {
-  margin: 0; padding: 4px 8px; max-height: 9em; overflow: auto;
-  font: inherit; font-size: 0.85em; white-space: pre-wrap;
-  border-top: 1px solid var(--border, currentColor);
-  opacity: 0.85;
+/* CI pane header: one-line pipeline status; per-job detail opens from it. */
+.mt-ci-details { position: relative; flex: 1 1 100%; font-size: 0.85em; }
+.mt-ci-details.mt-ci-final { opacity: 0.85; }
+.mt-ci-summary { cursor: pointer; }
+.mt-ci-badge {
+  display: inline-block; margin-right: 6px; padding: 0 6px;
+  border-radius: 3px; color: #fdf6e3; font-weight: 700;
 }
-.mt-ci-status.mt-ci-final { opacity: 0.6; }
+.mt-ci-badge.mt-ci-good { background: var(--ok, #859900); }
+.mt-ci-badge.mt-ci-bad { background: var(--orphan, #dc322f); }
+.mt-ci-detail {
+  position: absolute; z-index: 5; left: 0; right: 0; margin: 2px 0 0;
+  padding: 4px 8px; max-height: 14em; overflow: auto;
+  font: inherit; white-space: pre-wrap;
+  background: var(--bg, #fdf6e3); border: 1px solid var(--border, currentColor);
+}
