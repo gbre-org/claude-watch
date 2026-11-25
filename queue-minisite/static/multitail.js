@@ -179,6 +179,12 @@
 //                              prose looking for something that looks like a
 //                              clock.
 //
+// ONE COLUMN, ONE STAMP: a line's own leading RFC3339 stamp (workload runner
+// `...-05:00`, CI `...Z`) is split off the text (server-side, and again here
+// for cached / pre-split lines), so the body never repeats the time the column
+// shows; stacked stamps collapse to the outermost. A continuation line with no
+// stamp shows no time. The CI header status carries no clock of its own.
+//
 // For those two sources the pane shows NOTHING in the timestamp column and
 // says why: its header gains a `no ts` marker while timestamps are on. It does
 // NOT fall back to the client's arrival time. Arrival time answers a different
@@ -1187,6 +1193,27 @@
     return '';
   }
 
+  // Client-side twin of app.py `_split_line_ts`, for lines that did not come
+  // through the server splitter (cached CI runs hydrated from localStorage,
+  // older servers). Same narrow pattern: RFC3339 with `T` and an explicit
+  // offset / Z. Leading stamps stack-strip (first wins) so the body never
+  // carries a second timestamp beside the column. Returns {ts, text}.
+  const LINE_TS_RE =
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))[ \t]+/;
+  function splitLineTs(text) {
+    const t = String(text == null ? '' : text);
+    const m = LINE_TS_RE.exec(t);
+    if (!m) return { ts: '', text: t };
+    let body = t.slice(m[0].length);
+    for (;;) {
+      const m2 = LINE_TS_RE.exec(body);
+      if (!m2 || body.length === m2[0].length) break;
+      body = body.slice(m2[0].length);
+    }
+    if (!body) return { ts: '', text: t };
+    return { ts: m[1], text: body };
+  }
+
   // Returns { sigil, text, cls, ts } for one stream payload, or null to skip
   // it. `ts` is the SOURCE timestamp (ISO8601) or '' when the source has none.
   function formatPayload(payload) {
@@ -1199,12 +1226,14 @@
       // Plain-text tail (workload / hostjob / archived output): verbatim. A
       // stamped producer's time arrives as `source_ts` (split off the text
       // server-side); an unstamped line gets '' and shows no time.
-      return {
-        sigil: '',
-        text: payload.text || '',
-        cls: 'mt-plain',
-        ts: sourceTs(payload),
-      };
+      let wtext = payload.text || '';
+      let wts = sourceTs(payload);
+      if (!wts) {
+        const sp = splitLineTs(wtext);
+        wtext = sp.text;
+        wts = sp.ts;
+      }
+      return { sigil: '', text: wtext, cls: 'mt-plain', ts: wts };
     }
 
     const rec = payload.rec || {};
@@ -1647,6 +1676,31 @@
     return row;
   }
 
+  // --- TTY progress redraws (docker compose, buildkit, ...) -----------------
+  // Under a PTY these tools redraw in place: every frame is its own line that
+  // starts with erase-line (ESC[2K) and is followed by a line that is nothing
+  // but cursor movement / visibility escapes (ESC[3A ESC[0G ESC[?25l). The
+  // workload stamper puts a timestamp on EACH of those physical lines, so one
+  // spinner tick used to become two stamped rows (one of them visibly empty).
+  // Rules: (1) a line whose visible text is empty but which carries escapes is
+  // a pure control line and is never rendered (never a stamp-only row);
+  // (2) an erase-line frame REPLACES the earlier frame of the same logical
+  // line (same visible text once spinner glyphs and elapsed times are
+  // normalised) instead of stacking. Distinct lines of a multi-line block
+  // normalise to distinct keys, so they all survive.
+  const ERASE_LINE_RE = /\u001b\[2K/;
+  const FRAME_LOOKBACK = 24;
+  function visibleText(text) {
+    const A = window.AnsiText;
+    if (A && typeof A.strip === 'function') return A.strip(text);
+    return String(text).replace(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g, '');
+  }
+  function frameKey(vis) {
+    return vis.replace(/[\u2800-\u28ff|\\\/\-]/g, '')
+      .replace(/\d+(?:\.\d+)?m?s\b/g, '#')
+      .replace(/\s+/g, ' ').trim();
+  }
+
   // Append one formatted event. Returns true when a row was actually added,
   // which is what the caller uses to decide whether real data has arrived.
   function appendPaneLine(pane, fmt) {
@@ -1654,6 +1708,31 @@
     // A formatter that produced nothing at all would render an empty row that
     // eats a line of a very short pane for no information.
     if (!fmt.text && !fmt.sigil) return false;
+    const rawText = String(fmt.text || '');
+    let frameFp = null;
+    if (rawText.indexOf('\u001b') !== -1 && !fmt.sigil) {
+      const vis = visibleText(rawText);
+      if (!vis.trim()) return false;           // pure control line
+      if (ERASE_LINE_RE.test(rawText)) frameFp = frameKey(vis);
+    }
+    if (frameFp) {
+      const lo = Math.max(0, pane.records.length - FRAME_LOOKBACK);
+      for (let i = pane.records.length - 1; i >= lo; i--) {
+        if (pane.records[i].frame === frameFp) {
+          const old = pane.records[i];
+          const nrec = {
+            sigil: '', text: clipStore(rawText, verboseCapChars()),
+            cls: fmt.cls || '', ts: fmt.ts || '', frame: frameFp,
+          };
+          pane.chars += nrec.text.length - old.text.length;
+          pane.records[i] = nrec;
+          const row = pane.streamEl.children[i];
+          if (row) pane.streamEl.replaceChild(renderRecord(nrec), row);
+          if (pane.autoscroll) pane.streamEl.scrollTop = pane.streamEl.scrollHeight;
+          return true;
+        }
+      }
+    }
     const rec = {
       sigil: fmt.sigil || '',
       // Stored bounded, not clipped to the current width: the wrap and verbose
@@ -1671,6 +1750,7 @@
       text: clipStore(fmt.text, verboseCapChars()),
       cls: fmt.cls || '',
       ts: fmt.ts || '',
+      frame: frameFp,
     };
     pane.records.push(rec);
     // First stamped line in a plain-text pane: the source DOES carry times
@@ -1797,7 +1877,9 @@
     box.hidden = false;
     box.classList.toggle('mt-ci-final', !!payload.final);
     if (!pane.ended) {
-      setPaneStatus(pane, (payload.final ? 'complete' : 'live') + ' \u00b7 ' + stamp,
+      // No clock here: the footer above already says "last updated", and a
+      // second HH:MM:SS in the header is one timestamp column too many.
+      setPaneStatus(pane, payload.final ? 'complete' : 'live',
         payload.final ? 'mt-done' : 'mt-ok');
     }
   }
@@ -2002,7 +2084,8 @@
     if (appendPaneLine(pane, formatPayload(payload))) {
       if (pane.mode === 'ci' && payload.kind === 'workload_line' &&
           pane.ciRaw.length <= CI_RAW_MAX_LINES) {
-        pane.ciRaw.push(String(payload.text == null ? '' : payload.text));
+        pane.ciRaw.push((payload.source_ts ? payload.source_ts + ' ' : '') +
+          String(payload.text == null ? '' : payload.text));
       }
       // Real content arrived: the log exists, so the backoff has served its
       // purpose and resets (a later transient failure starts from 3s again).

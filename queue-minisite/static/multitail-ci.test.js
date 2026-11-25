@@ -85,8 +85,8 @@ const l = lines();
 assert('new job log appended at the bottom', l[l.length - 1].indexOf('job B log') !== -1, l.join('|'));
 const second = footer().textContent.match(/last updated (\S+)/)[1];
 assert('stamp advances on each poll', first !== second, first + ' vs ' + second);
-assert('header status shows the stamp', /live .*\d\d:\d\d:\d\d/.test(
-  pane.querySelector('.mt-pane-status').textContent),
+assert('header status has no clock (the footer carries the one stamp)',
+  /^live$/.test(pane.querySelector('.mt-pane-status').textContent),
 pane.querySelector('.mt-pane-status').textContent);
 
 es.emit({ type: 'meta', kind: 'log-reset' });
