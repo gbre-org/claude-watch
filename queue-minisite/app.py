@@ -46,12 +46,14 @@ auto-refresh doesn't re-stat the queue file every tick.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -5659,6 +5661,41 @@ def _ci_item_open(qid: str) -> bool:
     return False
 
 
+# In-memory copy of each COMPLETED CI run's final output, per queue id. Once a
+# run is final its log can never change, so a later pane open (or reconnect)
+# is served from here without running the log command at all. Bounded by
+# entry count; keyed so a re-run of the same row (new run id) misses.
+CI_FINAL_CACHE_MAX = 32
+_CI_FINAL_CACHE: "collections.OrderedDict[str, tuple[tuple, str, str]]" = collections.OrderedDict()
+_CI_FINAL_LOCK = threading.Lock()
+
+
+def _ci_final_key(item: dict[str, Any]) -> tuple:
+    ci = _ci_view(item)
+    return (ci["provider"], ci["repo"], ci["run"], ci["job"])
+
+
+def _ci_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _ci_final_get(qid: str, key: tuple) -> tuple[str, str] | None:
+    with _CI_FINAL_LOCK:
+        ent = _CI_FINAL_CACHE.get(qid)
+        if ent is None or ent[0] != key:
+            return None
+        _CI_FINAL_CACHE.move_to_end(qid)
+        return ent[1], ent[2]
+
+
+def _ci_final_put(qid: str, key: tuple, text: str, digest: str) -> None:
+    with _CI_FINAL_LOCK:
+        _CI_FINAL_CACHE[qid] = (key, text, digest)
+        _CI_FINAL_CACHE.move_to_end(qid)
+        while len(_CI_FINAL_CACHE) > CI_FINAL_CACHE_MAX:
+            _CI_FINAL_CACHE.popitem(last=False)
+
+
 def _split_ci_status(out: str) -> tuple[str, list[str]]:
     """Split ci-log output into (stable text, volatile status lines)."""
     lines = out.splitlines(keepends=True)
@@ -5668,7 +5705,7 @@ def _split_ci_status(out: str) -> tuple[str, list[str]]:
     return out, []
 
 
-def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
+def _tail_ci_output(item: dict[str, Any], have: str = "") -> Iterator[bytes]:
     """SSE generator for a passive CI row: poll the operator's log command and
     emit only what is new since the previous poll.
 
@@ -5680,7 +5717,13 @@ def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
     `log-reset` meta frame and the new tail. A trailing partial line is held
     back until it completes or the row closes. A failing command is reported
     as a retryable `open-failed` error (the pane backs off and retries until
-    the log exists, like a missing workload log)."""
+    the log exists, like a missing workload log).
+
+    A FINISHED run (every job done and logged) is final: its output is sent
+    once, the stream ends, and the output is kept in memory so a re-open does
+    not re-run the log command. ``have`` is the digest of final output the
+    browser already holds (localStorage): on a match the lines are not
+    re-sent; on a mismatch the client is told to drop what it hydrated."""
     qid = str(item.get("id") or "")
     started = time.monotonic()
     last_data_at = started
@@ -5704,18 +5747,23 @@ def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
 
     yield _format_sse({
         "type": "meta", "kind": "stream-start", "mode": "ci",
-        "label": qid, "ts": time.time(),
+        "label": qid, "ts": time.time(), "run": _ci_view(item)["run"],
     })
+    fkey = _ci_final_key(item)
 
     prev = ""        # full text of the previous poll (complete lines only)
     first = True
     try:
         while True:
             terminal = not _ci_item_open(qid)
-            rc, out, err = _ci_run_log_cmd(argv)
+            memo = _ci_final_get(qid, fkey)
             status_lines: list[str] = []
-            if rc in (0, CI_LOG_PENDING_RC) and out:
-                out, status_lines = _split_ci_status(out)
+            if memo is not None:
+                rc, out, err = 0, memo[0], ""
+            else:
+                rc, out, err = _ci_run_log_cmd(argv)
+                if rc in (0, CI_LOG_PENDING_RC) and out:
+                    out, status_lines = _split_ci_status(out)
             # rc 0 = every job finished and logged: the run is over even if
             # the syncer has not closed the row yet (shown as `final`).
             run_done = rc == 0
@@ -5737,9 +5785,19 @@ def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
                 # Later failures: keep what we have and try again.
                 out = None
             if out is not None:
-                complete = out if terminal else out[: out.rfind("\n") + 1]
-                if terminal and complete and not complete.endswith("\n"):
+                final_now = terminal or run_done
+                complete = out if final_now else out[: out.rfind("\n") + 1]
+                if final_now and complete and not complete.endswith("\n"):
                     complete += "\n"
+                digest = _ci_digest(complete) if final_now else ""
+                if first and have:
+                    if final_now and digest == have:
+                        prev = complete
+                        yield _format_sse({"type": "meta", "kind": "ci-cached",
+                                           "digest": digest})
+                    else:
+                        # What the browser hydrated is not this output.
+                        yield _format_sse({"type": "meta", "kind": "log-reset"})
                 if complete != prev:
                     if complete.startswith(prev):
                         delta = complete[len(prev):]
@@ -5768,9 +5826,19 @@ def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
                 yield _format_sse({
                     "type": "meta", "kind": "ci-status", "ts": time.time(),
                     "lines": [] if (terminal or run_done) else status_lines[-40:],
-                    "final": terminal or run_done,
+                    "final": final_now, "digest": digest,
+                    "run": _ci_view(item)["run"],
                 })
                 last_data_at = time.monotonic()
+                if run_done and not terminal and memo is None:
+                    _ci_final_put(qid, fkey, complete, digest)
+                if run_done:
+                    # Final: nothing further can change. Stop polling.
+                    yield _format_sse({
+                        "type": "meta", "kind": "workload-end", "label": qid,
+                        "reason": "terminal", "exit_code": None,
+                    })
+                    return
             if terminal:
                 yield _format_sse({
                     "type": "meta", "kind": "workload-end", "label": qid,
@@ -5919,7 +5987,8 @@ def api_queue_stream(qid: str) -> Any:
                 break
     if item is not None and _is_ci_item(item):
         return Response(
-            stream_with_context(_tail_ci_output(item)),
+            stream_with_context(_tail_ci_output(
+                item, have=request.args.get("have", "")[:64])),
             headers=headers,
             direct_passthrough=True,
         )

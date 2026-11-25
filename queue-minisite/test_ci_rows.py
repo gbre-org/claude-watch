@@ -261,6 +261,49 @@ class CiRowsTest(unittest.TestCase):
         gen.close()
         self.assertTrue(st["final"])
 
+    def _counting_final_cmd(self):
+        cnt = Path(self.tmp) / "calls"
+        cnt.write_text("")
+        c = self._script("final-cmd", f"echo x >> {cnt}\necho 'job a log'\necho 'job b log'\nexit 0\n")
+        self.appmod.CI_LOG_CMD = f"{c} {{run}}"
+        self.appmod._CI_FINAL_CACHE.clear()
+        return cnt
+
+    def test_final_run_stream_ends_and_second_open_does_not_rerun(self):
+        cnt = self._counting_final_cmd()
+        q = self._upsert()  # row stays OPEN: the run itself is complete
+        ev = self._sse(q)
+        self.assertEqual([e["text"] for e in ev if e.get("type") == "event"],
+                         ["job a log", "job b log"])
+        self.assertTrue(next(e for e in ev if e.get("kind") == "ci-status")["final"])
+        self.assertEqual(ev[-1]["kind"], "workload-end")  # polling stopped
+        self.assertEqual(len(cnt.read_text().splitlines()), 1)
+        ev2 = self._sse(q)
+        self.assertEqual([e["text"] for e in ev2 if e.get("type") == "event"],
+                         ["job a log", "job b log"])
+        self.assertEqual(len(cnt.read_text().splitlines()), 1)  # served from memory
+
+    def test_have_digest_match_resends_no_lines(self):
+        self._counting_final_cmd()
+        q = self._upsert()
+        fin = next(e for e in self._sse(q) if e.get("kind") == "ci-status")
+        self.assertTrue(fin["digest"])
+        self.appmod._cache.fetched_at = 0.0
+        r = self.client.get(f"/api/queue/{q}/stream?have={fin['digest']}")
+        ev = [json.loads(x[6:]) for x in r.get_data().decode().splitlines() if x.startswith("data: ")]
+        self.assertFalse([e for e in ev if e.get("type") == "event"])
+        self.assertTrue(any(e.get("kind") == "ci-cached" for e in ev))
+        self.assertTrue(any(e.get("kind") == "ci-status" and e["final"] for e in ev))
+
+    def test_have_digest_mismatch_resets_then_resends(self):
+        self._counting_final_cmd()
+        q = self._upsert()
+        r = self.client.get(f"/api/queue/{q}/stream?have=deadbeef")
+        ev = [json.loads(x[6:]) for x in r.get_data().decode().splitlines() if x.startswith("data: ")]
+        kinds = [e.get("kind") for e in ev]
+        self.assertLess(kinds.index("log-reset"), kinds.index("workload_line"))
+        self.assertNotIn("ci-cached", kinds)
+
     def test_split_ci_status(self):
         self.assertEqual(self.appmod._split_ci_status("a\nb\n"), ("a\nb\n", []))
         self.assertEqual(
@@ -295,7 +338,9 @@ class CiRowsTest(unittest.TestCase):
         self.assertEqual(ev[-1]["kind"], "workload-end")
 
     def test_stream_is_incremental(self):
-        self.appmod.CI_LOG_CMD = f"{self.cmd} {{run}}"
+        # exit 5 = run still pending (a rc-0 poll would be FINAL and end the stream)
+        c = self._script("grow-cmd", f"cat {self.logfile}\nexit 5\n")
+        self.appmod.CI_LOG_CMD = f"{c} {{run}}"
         q = self._upsert()
         self.logfile.write_text("one\n")
         gen = self.appmod._tail_ci_output(
