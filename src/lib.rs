@@ -5,6 +5,7 @@
 pub mod active_agents;
 pub mod agent;
 pub mod autoresolve;
+pub mod autoresolve_mod;
 pub mod cadence;
 pub mod cmd;
 pub mod config;

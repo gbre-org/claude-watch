@@ -339,15 +339,15 @@ def _default_runtime_file(name):
 
 
 def read_cw_clear_mod_config():
-    """Read [cw_clear_mod] from cw's config.toml. Default: disabled.
+    """Read [cw_clear_mod] from cw's config.toml. Default: ENABLED (mod mode).
 
-    Keys: enabled (bool, default false), heartbeat_file, resume_file (must
+    Keys: enabled (bool, default true), heartbeat_file, resume_file (must
     match the mod's `stateFile` / `resumeFile` options), heartbeat_max_age_secs.
-    Any read/parse problem returns the disabled default (fail closed to the
+    A parse problem or a non-bool value disables it (fail closed to the
     tmux path).
     """
     cfg = {
-        "enabled": False,
+        "enabled": True,
         "heartbeat_file": _default_runtime_file("claude-cw-clear-heartbeat.json"),
         "resume_file": _default_runtime_file("claude-cw-clear-resume.txt"),
         "heartbeat_max_age_secs": CW_CLEAR_MOD_DEFAULT_MAX_AGE_SECS,
@@ -359,7 +359,7 @@ def read_cw_clear_mod_config():
         import tomllib
         with open(path, "rb") as f:
             sect = (tomllib.load(f).get("cw_clear_mod", {}) or {})
-        cfg["enabled"] = sect.get("enabled", False) is True
+        cfg["enabled"] = sect.get("enabled", True) is True
         for key in ("heartbeat_file", "resume_file"):
             if str(sect.get(key, "") or "").strip():
                 cfg[key] = str(sect[key]).strip()

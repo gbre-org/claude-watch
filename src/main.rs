@@ -23,6 +23,7 @@ mod active_agents;
 mod agent;
 mod alert;
 mod autoresolve;
+mod autoresolve_mod;
 mod bypass_consent;
 mod cadence;
 mod cmd;
@@ -434,6 +435,37 @@ enum Commands {
         /// Emit machine-readable JSON outcome on stdout.
         #[arg(long)]
         json: bool,
+    },
+    /// Backend of the `cw-autoresolve` Claude Code mod (`mods/cw-autoresolve`).
+    ///
+    /// `decide` reads a JSON request `{command, agent_id?, warning?}` on stdin
+    /// and prints `{"answer":"allow"|"deny"|"abstain",...}`: the same rules
+    /// file, audit log, kill switch and rate limit as the tmux autoresolve
+    /// path. `heartbeat` stamps the mod's liveness file. Both exit 0 when they
+    /// ran; a decide failure answers `abstain` so the engine's own verdict
+    /// (and the tmux fallback) stands.
+    #[command(name = "autoresolve-mod")]
+    AutoresolveMod {
+        #[command(subcommand)]
+        action: AutoresolveModAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutoresolveModAction {
+    /// Decide one Bash command (JSON on stdin, JSON on stdout).
+    Decide,
+    /// Write the mod heartbeat file.
+    Heartbeat {
+        /// Mod instance id (changes when the mod reloads).
+        #[arg(long, default_value = "")]
+        instance: String,
+        /// Event that triggered the heartbeat (`tick`, `session.start`, `session.end`).
+        #[arg(long, default_value = "tick")]
+        event: String,
+        /// The mod's hooks are registered and answering.
+        #[arg(long)]
+        ready: bool,
     },
 }
 
@@ -2552,6 +2584,24 @@ async fn main() {
                 std::process::exit(code);
             }
         }
+        Some(Commands::AutoresolveMod { action }) => match action {
+            AutoresolveModAction::Decide => {
+                use std::io::Read;
+                let mut input = String::new();
+                let _ = std::io::stdin().read_to_string(&mut input);
+                println!("{}", autoresolve_mod::run_decide(&input));
+            }
+            AutoresolveModAction::Heartbeat {
+                instance,
+                event,
+                ready,
+            } => {
+                if let Err(e) = autoresolve_mod::run_heartbeat(&instance, &event, ready) {
+                    eprintln!("autoresolve-mod heartbeat: {e}");
+                    std::process::exit(1);
+                }
+            }
+        },
         Some(Commands::LoginExpiry {
             pane,
             credentials_file,

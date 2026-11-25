@@ -1,13 +1,13 @@
 {
   "name": "cw-clear",
   "version": "0.1.0",
-  "description": "Prototype: /cw-clear clears the conversation and submits a resume prompt, plus a turn heartbeat file. Off unless enabled.",
+  "description": "/cw-clear clears the conversation and submits a resume prompt, plus a turn heartbeat file. On by default.",
   "userConfig": {
     "enabled": {
       "type": "boolean",
       "title": "Enable cw-clear",
-      "description": "Master flag. When false the mod registers nothing and writes nothing.",
-      "default": false
+      "description": "Master flag, on by default. When false the mod registers nothing and writes nothing.",
+      "default": true
     },
     "resumeFile": {
       "type": "string",

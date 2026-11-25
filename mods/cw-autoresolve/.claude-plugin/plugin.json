@@ -1,0 +1,31 @@
+{
+  "name": "cw-autoresolve",
+  "version": "0.1.0",
+  "description": "Answers Claude Code's Bash safety dialogs (Yes for allow-listed commands, No otherwise) at the permission check via claude-watch's autoresolve rules. On by default.",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Enable cw-autoresolve",
+      "description": "On by default. When false the mod registers nothing and writes nothing.",
+      "default": true
+    },
+    "claudeWatchBin": {
+      "type": "string",
+      "title": "claude-watch binary",
+      "description": "Command used to reach the decider and heartbeat (argv[0]; looked up on PATH).",
+      "default": "claude-watch"
+    },
+    "heartbeatSecs": {
+      "type": "number",
+      "title": "Heartbeat interval (seconds)",
+      "description": "How often the liveness heartbeat is written. Keep well under claude-watch autoresolve.mod_heartbeat_max_age_secs (default 60).",
+      "default": 15
+    },
+    "deciderTimeoutSecs": {
+      "type": "number",
+      "title": "Decider timeout (seconds)",
+      "description": "How long to wait for claude-watch to decide before letting the engine's own dialog open.",
+      "default": 8
+    }
+  }
+}
