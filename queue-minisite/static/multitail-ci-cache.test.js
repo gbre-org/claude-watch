@@ -108,7 +108,10 @@ const store = memStore();
   const b = boot(store);
   assert('pane painted before any stream frame', lines(b.pane).join('|') === 'job A|job B',
     lines(b.pane).join('|'));
-  assert('footer says run complete', /run complete/.test(b.pane.querySelector('.mt-ci-status').textContent));
+  assert('hydrated final run renders its final header badge',
+    b.pane.querySelector('.mt-ci-badge').textContent === 'passed' &&
+    /updated \d\d:\d\d:\d\d/.test(b.pane.querySelector('.mt-ci-text').textContent));
+  assert('no footer element', !b.pane.querySelector('.mt-ci-status'));
   const es = b.es();
   assert('stream asks with ?have=digest', /\?have=abc123$/.test(es.url), es.url);
   es.emit({ type: 'meta', kind: 'stream-start', mode: 'ci', label: 'q-ci', run: '77' });
