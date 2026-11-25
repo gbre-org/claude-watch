@@ -408,6 +408,7 @@
           {% if it.live_log_mode %}data-live-log-mode="{{ it.live_log_mode }}"{% endif %}
           {% if it.kind == 'ci' %}data-ci-row="1"{% endif %}
           {% if it.ci_parent %}data-ci-parent="{{ it.ci_parent }}"{% endif %}
+          {% if it.kind == 'ci' and it.ci %}data-ci-run="{{ it.ci.run }}"{% endif %}
           tabindex="0"
           role="button"
           aria-label="View {% if is_hostjob %}hostjob{% elif is_workload %}workload{% elif is_starting %}live (polling — waiting for first event){% else %}live{% endif %} log for {{ it.id }}"

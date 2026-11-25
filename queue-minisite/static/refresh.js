@@ -487,7 +487,8 @@
       ? ` data-live-log-mode="${attr(liveLogMode)}"`
       : '') +
       (isCi ? ' data-ci-row="1"' : '') +
-      (it.ci_parent ? ` data-ci-parent="${attr(it.ci_parent)}"` : '');
+      (it.ci_parent ? ` data-ci-parent="${attr(it.ci_parent)}"` : '') +
+      (isCi && it.ci ? ` data-ci-run="${attr(it.ci.run)}"` : '');
 
     let head = '';
     if (isStarting && !isWorkload && !isHostjob) {

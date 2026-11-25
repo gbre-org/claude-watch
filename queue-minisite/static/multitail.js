@@ -746,8 +746,10 @@
   function writeStored(key, value) {
     try {
       window.localStorage.setItem(key, value);
+      return true;
     } catch (_) {
       /* storage unavailable — the choice still applies to this page */
+      return false;
     }
   }
 
@@ -858,6 +860,7 @@
       // pane nests under that item's pane when it has one (see placePane);
       // empty for every other row.
       parentQid: row.getAttribute('data-ci-parent') || '',
+      ciRun: row.getAttribute('data-ci-run') || '',
       summary: row.getAttribute('data-queue-summary') || '',
       meta: rowMetaInfo(row),
       // How many subagents this card is currently showing. Drives the header
@@ -1532,6 +1535,10 @@
       target: info.target,
       qid: info.qid,
       parentQid: info.parentQid || '',
+      ciRun: info.ciRun || '',
+      ciRaw: [],          // raw CI lines, for the completed-run cache
+      ciHave: '',         // digest of the hydrated cached run
+      ciHydrated: false,
       depth: info.depth || 0,
       mode: info.mode,
       el: wrap,
@@ -1795,6 +1802,111 @@
     }
   }
 
+
+  // --- completed-CI-run cache (localStorage) --------------------------------
+  //
+  // A FINISHED run's output never changes, so the client keeps it and paints
+  // it the instant the pane opens; the stream then only has to confirm it
+  // (`?have=<digest>`) and deliver the live part. NEVER cached: anything from
+  // a run that is not final (the in-progress block is a ci-status frame, not
+  // lines, and a non-final stream's lines are never stored).
+  //
+  // Key: `qsite_ci_log:v1:<queue id>:<run id>`. Versioned so a format change
+  // just orphans old entries. An index key holds the LRU order; total stored
+  // characters and entry count are capped, evicting least-recently-used. All
+  // access is guarded (see readStored / writeStored): storage may be absent,
+  // full or hand-edited, and the pane works identically without it.
+  const CI_CACHE_PREFIX = 'qsite_ci_log:v1:';
+  const CI_CACHE_INDEX = 'qsite_ci_log:v1:index';
+  const CI_CACHE_MAX_ENTRIES = 12;
+  const CI_CACHE_MAX_CHARS = 1500000;       // all entries together
+  const CI_CACHE_MAX_ENTRY_CHARS = 600000;  // one run; larger is not cached
+  const CI_RAW_MAX_LINES = 20000;
+
+  function ciCacheKey(qid, run) {
+    return CI_CACHE_PREFIX + qid + ':' + run;
+  }
+
+  function readCiIndex() {
+    const raw = readStored(CI_CACHE_INDEX);
+    if (!raw) return [];
+    try {
+      const v = JSON.parse(raw);
+      if (!Array.isArray(v)) return [];
+      return v.filter((e) => e && typeof e.k === 'string' &&
+        e.k.indexOf(CI_CACHE_PREFIX) === 0 && typeof e.n === 'number');
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function removeStored(key) {
+    try { window.localStorage.removeItem(key); } catch (_) { /* ignore */ }
+  }
+
+  function ciCacheLoad(qid, run) {
+    if (!qid || !run) return null;
+    const key = ciCacheKey(qid, run);
+    const raw = readStored(key);
+    if (!raw) return null;
+    let v = null;
+    try { v = JSON.parse(raw); } catch (_) { v = null; }
+    if (!v || v.v !== 1 || String(v.run) !== String(run) ||
+        !Array.isArray(v.lines) || typeof v.digest !== 'string' || !v.digest) {
+      removeStored(key);
+      return null;
+    }
+    // LRU touch.
+    const idx = readCiIndex().filter((e) => e.k !== key);
+    idx.push({ k: key, n: raw.length });
+    writeStored(CI_CACHE_INDEX, JSON.stringify(idx));
+    return v;
+  }
+
+  function ciCacheStore(qid, run, digest, lines, ts) {
+    if (!qid || !run || !digest || !Array.isArray(lines)) return false;
+    if (lines.length > CI_RAW_MAX_LINES) return false;
+    const key = ciCacheKey(qid, run);
+    const raw = JSON.stringify({ v: 1, run: String(run), digest: digest,
+      ts: ts || 0, lines: lines });
+    if (raw.length > CI_CACHE_MAX_ENTRY_CHARS) return false;
+    let idx = readCiIndex().filter((e) => e.k !== key);
+    idx.push({ k: key, n: raw.length });
+    // Evict least-recently-used (front of the list) until under both caps.
+    let total = idx.reduce((a, e) => a + e.n, 0);
+    while (idx.length > 1 &&
+           (idx.length > CI_CACHE_MAX_ENTRIES || total > CI_CACHE_MAX_CHARS)) {
+      const gone = idx.shift();
+      total -= gone.n;
+      removeStored(gone.k);
+    }
+    if (!writeStored(key, raw)) {
+      // Quota: drop everything older and try once more, else give up quietly.
+      for (const e of idx) if (e.k !== key) removeStored(e.k);
+      idx = [{ k: key, n: raw.length }];
+      if (!writeStored(key, raw)) return false;
+    }
+    writeStored(CI_CACHE_INDEX, JSON.stringify(idx));
+    return true;
+  }
+
+  // Paint a stored final run into a fresh CI pane. Returns true when it did.
+  function hydrateCiPane(pane) {
+    if (pane.mode !== 'ci' || pane.ciHydrated || !pane.ciRun) return false;
+    const hit = ciCacheLoad(pane.qid, pane.ciRun);
+    if (!hit) return false;
+    pane.ciHydrated = true;
+    pane.ciHave = hit.digest;
+    pane.ciRaw = hit.lines.map(String);
+    for (const t of pane.ciRaw) {
+      appendPaneLine(pane, formatPayload({ type: 'event', kind: 'workload_line',
+        text: t, source: 'workload' }));
+    }
+    pane.sawData = pane.records.length > 0;
+    paintCiStatus(pane, { lines: [], final: true, ts: hit.ts || 0 });
+    return true;
+  }
+
   function handlePayload(pane, payload) {
     if (payload.type === 'meta') {
       switch (payload.kind) {
@@ -1803,7 +1915,12 @@
           // shown data. A stream-start on a pane that has shown NOTHING is a
           // first look at the log (including the first look after a retry),
           // and its backfill is content the reader has not seen.
-          if (pane.sawData) pane.suppressBackfill = true;
+          if (pane.ciHydrated) {
+            // Hydrated from the cache: the server either confirms it
+            // (`ci-cached`) or sends log-reset + the real lines. Either way
+            // the first backfill must NOT be suppressed.
+            pane.ciHydrated = false;
+          } else if (pane.sawData) pane.suppressBackfill = true;
           setPaneStatus(pane, pane.sawData ? 'live' : 'live · no output yet', 'mt-ok');
           return;
         case 'backfill-begin':
@@ -1828,10 +1945,24 @@
           // (provider rewrote it): drop the old lines, the new text follows.
           pane.records = [];
           pane.chars = 0;
+          pane.ciRaw = [];
+          pane.ciHave = '';
           pane.streamEl.textContent = '';
+          return;
+        case 'ci-cached':
+          // Server confirmed the hydrated copy is current: nothing re-sent.
           return;
         case 'ci-status':
           paintCiStatus(pane, payload);
+          // Only a FINAL frame carries a digest; only then is the pane's raw
+          // text the whole, immutable run and safe to keep.
+          if (payload.final && payload.digest && pane.ciRun &&
+              payload.digest !== pane.ciHave && !pane.ciStored) {
+            if (ciCacheStore(pane.qid, pane.ciRun, payload.digest, pane.ciRaw,
+                payload.ts)) {
+              pane.ciHave = payload.digest;
+            }
+          }
           return;
         case 'archive-end':
           markEnded(pane, 'ended', 'mt-done');
@@ -1869,6 +2000,10 @@
     }
     if (pane.suppressBackfill) return;
     if (appendPaneLine(pane, formatPayload(payload))) {
+      if (pane.mode === 'ci' && payload.kind === 'workload_line' &&
+          pane.ciRaw.length <= CI_RAW_MAX_LINES) {
+        pane.ciRaw.push(String(payload.text == null ? '' : payload.text));
+      }
       // Real content arrived: the log exists, so the backoff has served its
       // purpose and resets (a later transient failure starts from 3s again).
       if (!pane.sawData) {
@@ -1889,13 +2024,16 @@
     if (pane.kind === 'subagent') {
       return '/api/subagent/' + encodeURIComponent(pane.target) + '/stream';
     }
-    return '/api/queue/' + encodeURIComponent(pane.target) + '/stream';
+    const base = '/api/queue/' + encodeURIComponent(pane.target) + '/stream';
+    return (pane.mode === 'ci' && pane.ciHave)
+      ? base + '?have=' + encodeURIComponent(pane.ciHave) : base;
   }
 
   function connectPane(pane) {
     if (pane.es || pane.terminal) return;
     pane.streaming = true;
     pane.retryAt = 0;
+    hydrateCiPane(pane);
     setPaneStatus(pane, 'connecting…', '');
     let es;
     try {
