@@ -301,6 +301,42 @@ class CiRowsTest(unittest.TestCase):
         self.assertEqual(st["lines"], ["job two running", "  [>>] 3. Test"])
         self.assertFalse(st["final"])
 
+    def test_real_in_progress_output_yields_jobs_and_whole_status_block(self):
+        """Captured real ci-log output (5 finished jobs + a running job with
+        47 status lines). The first backfill is tail-limited and the status
+        block used to be cut to its last 40 lines; both lost the job headers,
+        leaving the pane header with no counts."""
+        fx = HERE / "fixtures" / "ci-log-in-progress.txt"
+        c = self._script("real-cmd", f"cat {fx}\nexit 5\n")
+        self.appmod.CI_LOG_CMD = f"{c} {{run}}"
+        old = self.appmod.SSE_TAIL_BACKFILL_LINES
+        self.appmod.SSE_TAIL_BACKFILL_LINES = 10
+        try:
+            q = self._upsert()
+            gen = self.appmod._tail_ci_output(
+                next(i for i in json.loads(self.queue_actual.read_text())["items"]
+                     if i["id"] == q))
+            st = None
+            for raw in gen:
+                for line in raw.decode().splitlines():
+                    if line.startswith("data: "):
+                        f = json.loads(line[6:])
+                        if f.get("kind") == "ci-status":
+                            st = f
+                if st:
+                    break
+            gen.close()
+        finally:
+            self.appmod.SSE_TAIL_BACKFILL_LINES = old
+        self.assertEqual([j["name"] for j in st["jobs"]], [
+            "Prometheus Rules", "Queue-minisite jsdom tests", "Unit + Fixture Tests",
+            "Warning-Free Build", "E2E Tests", "Queue-minisite Python tests"])
+        self.assertEqual({j["state"] for j in st["jobs"]}, {"success"})
+        self.assertEqual(st["lines"][0], "job 'Container shell + shim tests' in_progress")
+        self.assertEqual(len(st["lines"]), 47)
+        self.assertFalse(st["final"])
+        self.assertTrue(st["provider_label"])
+
     def test_rc0_marks_status_final_before_row_closes(self):
         c = self._script("done-cmd", "echo 'all done'\nexit 0\n")
         self.appmod.CI_LOG_CMD = f"{c} {{run}}"
