@@ -22,6 +22,8 @@ count() { grep -c . "$LOG" 2>/dev/null || true; }
 setup; echo '{"messages":[{"id":7,"ts":9000,"read_at":null}]}' > "$SBX/body.json"
 run >/dev/null 2>&1
 [ "$(count)" = 1 ] && grep -q "7 unread" "$LOG" && pass "old unread -> inject naming id" || fail "old unread"
+grep -q -- "--escape" "$LOG" && pass "inject uses cancelling --escape" || fail "no --escape"
+grep -q "NOT a user rejection" "$LOG" && pass "alert says interrupt is not a rejection" || fail "alert text"
 run >/dev/null 2>&1
 [ "$(count)" = 1 ] && pass "cooldown suppresses repeat" || fail "cooldown"
 rm -rf "$SBX"
