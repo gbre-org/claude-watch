@@ -1714,6 +1714,16 @@
 
   // Append one formatted event. Returns true when a row was actually added,
   // which is what the caller uses to decide whether real data has arrived.
+  // Add a finished row to the stream. A CI pane keeps its volatile in-progress
+  // block (ciLiveEl) as the LAST child, so new rows go in front of it.
+  function appendRow(pane, row) {
+    if (pane.ciLiveEl && pane.ciLiveEl.parentNode === pane.streamEl) {
+      pane.streamEl.insertBefore(row, pane.ciLiveEl);
+    } else {
+      pane.streamEl.appendChild(row);
+    }
+  }
+
   function appendPaneLine(pane, fmt) {
     if (!fmt) return false;
     // A formatter that produced nothing at all would render an empty row that
@@ -1770,7 +1780,7 @@
       pane.sawTs = true;
       syncPaneTsMarker(pane);
     }
-    pane.streamEl.appendChild(renderRecord(rec));
+    appendRow(pane, renderRecord(rec));
     pane.chars = (pane.chars || 0) + rec.text.length;
     // TWO bounds, both evicting from the head: the line COUNT (a tail is a
     // window on the recent past) and the pane's total TEXT (a verbose line can
@@ -1803,6 +1813,7 @@
     for (const rec of pane.records) {
       pane.streamEl.appendChild(renderRecord(rec));
     }
+    if (pane.ciLiveEl) pane.streamEl.appendChild(pane.ciLiveEl);
     // Wrapping changes every scroll offset in the pane, so a preserved
     // scrollTop would land somewhere arbitrary. Anyone who was following the
     // tail keeps following it; anyone who had scrolled back keeps whatever the
@@ -1913,6 +1924,21 @@
     return { jobs, open, ok, failed, running, pending };
   }
 
+  // The volatile in-progress block is rewritten wholesale on every frame (it
+  // is not append-only), so it lives in ONE element kept at the end of the
+  // stream rather than as records.
+  function paintCiLive(pane, payload) {
+    const lines = (!payload.final && Array.isArray(payload.lines)) ? payload.lines : [];
+    if (!lines.length) {
+      if (pane.ciLiveEl && pane.ciLiveEl.parentNode) pane.ciLiveEl.parentNode.removeChild(pane.ciLiveEl);
+      return;
+    }
+    if (!pane.ciLiveEl) pane.ciLiveEl = el('div', 'mt-ci-live');
+    pane.ciLiveEl.textContent = lines.join('\n');
+    pane.streamEl.appendChild(pane.ciLiveEl);   // (re)appending moves it last
+    if (pane.autoscroll) pane.streamEl.scrollTop = pane.streamEl.scrollHeight;
+  }
+
   function paintCiStatus(pane, payload) {
     const box = pane.ciTextEl;
     if (!box) return;
@@ -1947,8 +1973,11 @@
     } else {
       badge.hidden = true;
     }
-    const detail = sum.jobs.map((j) => '[' + (CI_OK[j.state] ? ' ok' : j.state) + '] ' + j.name)
-      .concat(sum.open.length ? [''].concat(payload.lines) : []);
+    // The header dropdown stays compact: one line per job plus the run link.
+    // The in-progress step/log block is the BUILD LOG and belongs in the main
+    // log view (the stream), painted here.
+    paintCiLive(pane, payload);
+    const detail = sum.jobs.map((j) => '[' + (CI_OK[j.state] ? ' ok' : j.state) + '] ' + j.name);
     if (!detail.length) {
       detail.push(payload.final ? 'Run complete (no job details available).'
         : 'Waiting for job details from ' + (payload.provider_label || 'CI') + '.');
@@ -2111,6 +2140,7 @@
           pane.ciRaw = [];
           pane.ciHave = '';
           pane.streamEl.textContent = '';
+          if (pane.ciLiveEl) pane.streamEl.appendChild(pane.ciLiveEl);
           return;
         case 'ci-cached':
           // Server confirmed the hydrated copy is current: nothing re-sent.

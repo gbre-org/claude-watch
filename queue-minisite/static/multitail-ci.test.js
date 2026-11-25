@@ -63,7 +63,7 @@ const es = streams.find((s) => !s.closed);
 assert('stream opened', !!es);
 const stream = () => pane.querySelector('.mt-pane-stream');
 const footer = () => pane.querySelector('.mt-ci-status');
-const lines = () => Array.from(stream().children).map((c) => c.textContent);
+const lines = () => Array.from(stream().children).filter((c) => !c.classList.contains('mt-ci-live')).map((c) => c.textContent);
 
 const sum = () => pane.querySelector('.mt-ci-text');
 const dets = () => pane.querySelector('.mt-ci-details');
@@ -89,7 +89,11 @@ assert('detail collapsed by default', !dets().open);
 dets().open = true;
 const dt = pane.querySelector('.mt-ci-detail').textContent;
 assert('expanded detail lists jobs and steps',
-  dt.indexOf('unit') !== -1 && dt.indexOf('2. Run suites') !== -1 && dt.indexOf("job 'deploy'") !== -1, dt);
+  dt.indexOf('unit') !== -1, dt);
+assert('detail does not carry the build log', dt.indexOf('2. Run suites') === -1 && dt.indexOf("job 'deploy'") === -1, dt);
+const live = stream().querySelector('.mt-ci-live');
+assert('in-progress block is in the main log view', live && live.textContent.indexOf('2. Run suites') !== -1);
+assert('in-progress block stays last', stream().lastElementChild === live);
 dets().open = false;
 assert('collapse works', !dets().open);
 assert('header status has no clock', /^live$/.test(pane.querySelector('.mt-pane-status').textContent));
@@ -97,6 +101,7 @@ assert('header status has no clock', /^live$/.test(pane.querySelector('.mt-pane-
 es.emit({ type: 'event', kind: 'workload_line', text: 'job B log', source: 'workload' });
 es.emit({ type: 'meta', kind: 'ci-status', ts: T0 + 10, final: false, lines: ["job 'E2E' in_progress"] });
 const l = lines();
+assert('new row goes before the in-progress block', stream().lastElementChild.classList.contains('mt-ci-live'));
 assert('new job log appended at the bottom', l[l.length - 1].indexOf('job B log') !== -1, l.join('|'));
 assert('stamp advances on each poll', sum().textContent.match(/updated (\S+)/)[1] !== run1.match(/updated (\S+)/)[1]);
 assert('exactly one clock in the header line', (sum().textContent.match(/\d\d:\d\d:\d\d/g) || []).length === 1);
@@ -116,6 +121,7 @@ es.emit({ type: 'meta', kind: 'log-reset' });
 es.emit({ type: 'event', kind: 'workload_line', text: "===== job 'a' (id 1) success =====", source: 'workload' });
 es.emit({ type: 'event', kind: 'workload_line', text: "===== job 'b' (id 2) success =====", source: 'workload' });
 es.emit({ type: 'meta', kind: 'ci-status', ts: T0 + 60, lines: [], final: true });
+assert('final frame removes the in-progress block', !stream().querySelector('.mt-ci-live'));
 const badge = pane.querySelector('.mt-ci-badge');
 assert('final success: green passed badge', !badge.hidden && badge.textContent === 'passed' &&
   badge.classList.contains('mt-ci-good'), badge.className);
