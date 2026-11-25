@@ -1,9 +1,11 @@
-# cw-clear (prototype)
+# cw-clear
 
 A Claude Code mod that does what claude-watch's tmux-driven "self-clear then
-resume prompt" does, from inside the session. Spike only: it is not installed,
-enabled or deployed anywhere, and with `enabled` false (the default) it
-registers nothing.
+resume prompt" does, from inside the session. On by default (mod mode): it
+loads on every launch claude-watch builds (`[claude] bundled_mods`), the
+`enabled` option set to false makes it register nothing, and `self-clear`
+falls back to tmux whenever its heartbeat is stale. With no `stateFile` /
+`resumeFile` options it uses the same runtime-dir files `self-clear` does.
 
 What it provides when `enabled` is true:
 
@@ -23,7 +25,7 @@ with `claude --plugin-dir mods/cw-clear`. End-to-end test:
 `make test-cw-clear-mod-e2e` (needs Docker, credentials and a Claude Code
 binary of version 2.1.331 or later; it skips otherwise, so CI skips it).
 
-## Slice 1: use from claude-watch (default OFF)
+## Use from claude-watch (default ON)
 
 `self-clear` (the single choke point for daemon-, skill- and operator-driven
 context clears) prefers this mod only when ALL hold: `[cw_clear_mod] enabled =
@@ -38,7 +40,7 @@ runs unchanged. If the mod cleared but no resume turn appears, only the resume
 prompt is injected over tmux. Every run logs `PATH-USED: mod|tmux|...` with the
 reason in the self-clear log.
 
-Enable (nothing happens until you do both, and merging changes nothing):
+Setup (only needed to override the defaults):
 
 1. `mods/cw-clear/cw-clear-setup` prints the settings.json snippet, the
    `--plugin-dir` flag and the config.toml lines;

@@ -37,12 +37,58 @@ Cheaper and safer than pane automation:
 Instruct agents accordingly (their prompts / project instructions). Use
 `[autoresolve]` only as the fallback for what slips through.
 
+## Mod mode (default) and the tmux fallback
+
+By default the answer is given from INSIDE Claude Code by the `cw-autoresolve`
+mod (`mods/cw-autoresolve`), not by tmux keystrokes. The mod hooks the Bash
+`tool.check` event, which fires when the engine decides whether a call may run,
+before any dialog is drawn. `next(e)` resolves to the engine's own verdict;
+only when that is `ask` (the engine would open the "Dangerous rm operation..."
+dialog) does the mod pipe the command to `claude-watch autoresolve-mod decide`,
+which applies this document's rules file and semantics unchanged:
+
+- allow-listed command: the hook answers `allow` (the "Yes"; no dialog);
+- everything else (unknown command, heredoc, hard-deny class, unreadable or
+  missing rules, command over 64 KiB): `deny`, with the same agent note as
+  the tmux No as the tool error the model reads and rewrites from;
+- `abstain` (feature off, kill switch, dry-run, `prefer_mod = false`, rate
+  limit tripped, audit log unwritable, decider failed or timed out): the
+  engine's verdict stands, so the dialog opens and the tmux path below owns it.
+
+Audit (`path: "mod"`, kinds `mod-allow`, `mod-deny`, `mod-would-*`), the kill
+switch, `max_per_minute` / `trip_cooldown_secs` (derived from the audit file,
+shared with the daemon), and the claude-events (`autoresolve-answered`,
+`autoresolve-no`, `autoresolve-tripped`) all behave as in the tmux path. A hook
+`allow` is honoured for this dialog class: Claude Code documents `tool.check`
+as the verdict chain where "the last word up the chain is the decision", and
+the container e2e (`container/tests/cw-clear-mod-e2e.test`, case 4) runs a real
+Claude Code and shows a `tool.check` allow clearing an engine `ask` for an
+`rm` whose relative path the engine could not resolve (no dialog, file removed;
+an unmatched command still raises the dialog).
+
+Liveness: the mod runs `claude-watch autoresolve-mod heartbeat` on
+`session.start`, every 15 s and on `session.end`, writing
+`<state_dir>/autoresolve-mod-heartbeat.json` (override `mod_heartbeat_file`).
+While that heartbeat is fresh (`mod_heartbeat_max_age_secs`, default 60) and
+ready, the daemon's tmux step still runs but waits an extra `mod_grace_secs`
+(default 5) before acting, as a backstop for what the mod cannot answer
+(non-Bash dialogs, or a mod that failed). When the heartbeat is stale or
+missing the tmux path is the only path and runs exactly as before.
+
+`[autoresolve] prefer_mod = false` makes the mod abstain and removes the grace:
+tmux only. The mod is loaded on every launch claude-watch builds (see
+`[claude] bundled_mods`), or by hand with `--plugin-dir mods/cw-autoresolve`;
+set the mod option `enabled = false` to unload it.
+
 ## Modes and enablement
 
 ```toml
 [autoresolve]
 mode = "off"          # "off" (default) | "dry-run" | "enforce"; unknown = off
 rules_file = "/abs/path/autoresolve-rules.toml"
+prefer_mod = true             # default: answer from the cw-autoresolve mod, tmux = fallback
+mod_heartbeat_max_age_secs = 60
+mod_grace_secs = 5            # extra tmux wait while the mod is fresh
 max_per_minute = 6
 trip_cooldown_secs = 900
 settle_secs = 3
@@ -158,3 +204,16 @@ answered Yes unless an explicit allow rule matches the whole command.
 An unrecognised permission-shaped dialog (question plus numbered options) that
 stays unreadable past the grace period (`undecided_alert_after` cycles) is
 declined with Escape and reported with the same event tag.
+
+## Dialogs whose title scrolled off
+
+A command taller than the screen (a long heredoc) scrolls the `Bash command`
+title off the top and Claude Code draws `↑ N more lines` instead. That dialog
+used to read as "no box top above the question" (undecided: no keystroke until
+`undecided_alert_after` cycles, then Escape), so a blocked agent could sit for
+over a minute. It is now classified as a dialog with the placeholder title
+`(title scrolled off)` and always gets the default No after `no_after_secs`
+(audit reason `title-scrolled-off`); it can never be answered Yes because the
+head of the command is not visible. The title/box-top search also covers the
+whole captured tail instead of 25 rows. All autoresolve decisions are written
+to the audit file (`autoresolve-audit.jsonl`), NOT to the daemon log.

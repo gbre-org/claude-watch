@@ -106,7 +106,9 @@ pub struct Config {
 /// path instead.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct CwClearModConfig {
-    #[serde(default)]
+    /// Default ON (mod mode): `self-clear` still only uses the mod while its
+    /// heartbeat is fresh and ready, and falls back to tmux otherwise.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub heartbeat_file: String,
@@ -116,6 +118,10 @@ pub struct CwClearModConfig {
     pub heartbeat_max_age_secs: u64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_cw_clear_heartbeat_max_age_secs() -> u64 {
     60
 }
@@ -123,7 +129,7 @@ fn default_cw_clear_heartbeat_max_age_secs() -> u64 {
 impl Default for CwClearModConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             heartbeat_file: String::new(),
             resume_file: String::new(),
             heartbeat_max_age_secs: default_cw_clear_heartbeat_max_age_secs(),
@@ -294,6 +300,68 @@ pub struct ClaudeConfig {
     /// is skipped with a warning. Default empty = launch argv unchanged.
     #[serde(default)]
     pub plugin_dirs: Vec<String>,
+    /// Also load the claude-watch mods that ship with this build
+    /// (`mods/cw-clear`, `mods/cw-autoresolve`) on every launch it builds.
+    /// Default ON (mod mode): the daemon prefers a mod while its heartbeat is
+    /// fresh and falls back to tmux otherwise. The mods directory is
+    /// `$CLAUDE_WATCH_MODS_DIR`, else next to the binary (`../../mods` for a
+    /// cargo `target/<profile>` layout, `../mods`, `../share/claude-watch/mods`),
+    /// else the source tree this binary was built from. Entries already in
+    /// `plugin_dirs` are not duplicated. `false` loads only `plugin_dirs`.
+    #[serde(default = "default_true")]
+    pub bundled_mods: bool,
+}
+
+/// Names of the mod directories under the bundled `mods/` directory.
+pub const BUNDLED_MODS: &[&str] = &["cw-clear", "cw-autoresolve"];
+
+impl ClaudeConfig {
+    /// `plugin_dirs` plus the bundled mods that exist on disk (see
+    /// `bundled_mods`), without duplicates.
+    pub fn effective_plugin_dirs(&self) -> Vec<String> {
+        let mut out = self.plugin_dirs.clone();
+        if !self.bundled_mods {
+            return out;
+        }
+        let Some(root) = bundled_mods_root() else {
+            return out;
+        };
+        for name in BUNDLED_MODS {
+            let d = root.join(name);
+            if !d.join(".claude-plugin").is_dir() {
+                continue;
+            }
+            let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or(p.to_path_buf());
+            let want = canon(&d);
+            if out.iter().any(|e| canon(std::path::Path::new(e)) == want) {
+                continue;
+            }
+            out.push(d.display().to_string());
+        }
+        out
+    }
+}
+
+fn bundled_mods_root() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("CLAUDE_WATCH_MODS_DIR") {
+        if !p.trim().is_empty() {
+            cands.push(PathBuf::from(p.trim()));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            cands.push(dir.join("../../mods"));
+            cands.push(dir.join("../mods"));
+            cands.push(dir.join("../share/claude-watch/mods"));
+        }
+    }
+    cands.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mods"));
+    cands
+        .into_iter()
+        .find(|c| c.join("cw-autoresolve").join(".claude-plugin").is_dir())
+        .and_then(|c| std::fs::canonicalize(&c).ok())
 }
 
 fn default_handle_bypass_dialog() -> bool {
@@ -2493,10 +2561,41 @@ pub fn parse_config(toml_str: &str) -> Result<Config, toml::de::Error> {
 
 #[cfg(test)]
 mod tests {
+    fn claude_cfg(extra: &str) -> ClaudeConfig {
+        toml::from_str(&format!(
+            "max_context_tokens = 1000\nrelaunch_script = \"/x\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
     #[test]
-    fn cw_clear_mod_defaults_off_and_parses() {
+    fn bundled_mods_are_loaded_by_default_and_not_duplicated() {
+        let c = claude_cfg("");
+        assert!(c.bundled_mods);
+        let dirs = c.effective_plugin_dirs();
+        for name in BUNDLED_MODS {
+            assert!(
+                dirs.iter().any(|d| d.ends_with(&format!("/mods/{name}"))),
+                "{name} missing from {dirs:?}"
+            );
+        }
+        // An explicit entry for the same directory is not repeated.
+        let explicit = dirs[0].clone();
+        let c = claude_cfg(&format!("plugin_dirs = [\"{explicit}\"]"));
+        let again = c.effective_plugin_dirs();
+        assert_eq!(again.iter().filter(|d| **d == explicit).count(), 1);
+        assert_eq!(again.len(), dirs.len());
+        // Opt out: only what the operator listed.
+        let c = claude_cfg("bundled_mods = false\nplugin_dirs = [\"/a\"]");
+        assert_eq!(c.effective_plugin_dirs(), vec!["/a".to_string()]);
+    }
+
+    #[test]
+    fn cw_clear_mod_defaults_on_and_parses() {
         let d = CwClearModConfig::default();
-        assert!(!d.enabled);
+        assert!(d.enabled);
+        let off: CwClearModConfig = toml::from_str("enabled = false").unwrap();
+        assert!(!off.enabled);
         assert_eq!(d.heartbeat_max_age_secs, 60);
         let c: CwClearModConfig =
             toml::from_str("enabled = true\nheartbeat_max_age_secs = 30").unwrap();

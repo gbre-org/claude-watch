@@ -70,6 +70,11 @@ relaunch_script = "/var/run/claude/claude-relaunch.sh"
 # skipped with a warning. Default empty = launch argv unchanged.
 # Example: plugin_dirs = ["/path/to/claude-watch/mods/cw-clear"]
 plugin_dirs = []
+# Also load the mods that ship with this build (mods/cw-clear and
+# mods/cw-autoresolve) on every launch. Default true (mod mode); the daemon
+# falls back to tmux whenever a mod's heartbeat is stale. false = only
+# plugin_dirs. Entries already in plugin_dirs are not duplicated.
+bundled_mods = true
 # Handle Claude Code's Bypass-Permissions consent dialog on relaunch.
 #
 # Every relaunch this daemon performs passes `--dangerously-skip-permissions`,
@@ -967,9 +972,10 @@ enabled = true
 # heartbeat is missing / stale / not ready, or the clear is not confirmed,
 # `self-clear` uses the tmux injection path unchanged. Every run logs a
 # `PATH-USED:` line in the self-clear log.
-# OPT-IN, DEFAULT OFF: merging or deploying changes nothing until set.
-# The mod itself must also be loaded (see mods/cw-clear/README.md).
-enabled = false
+# DEFAULT ON (mod mode): the heartbeat gate still decides, so with the mod not
+# loaded self-clear uses tmux exactly as before. Set false to force tmux.
+# The mod is loaded on every launch claude-watch builds ([claude] bundled_mods).
+enabled = true
 # Must equal the mod's `stateFile` / `resumeFile` options. Omit for the
 # runtime-dir defaults ($XDG_RUNTIME_DIR/claude-cw-clear-heartbeat.json and
 # claude-cw-clear-resume.txt).
@@ -1166,6 +1172,12 @@ context_lines = 16
 # examples/autoresolve-rules.toml. Kill switches: `touch
 # <state_dir>/autoresolve.disable` or CLAUDE_WATCH_AUTORESOLVE_DISABLE=1.
 mode = "off"
+# Answer from the cw-autoresolve mod (decided at the permission check, before a
+# dialog is drawn) while its heartbeat is fresh; tmux keystrokes are the
+# fallback and a delayed backstop. false = tmux only. See docs/autoresolve.md.
+prefer_mod = true
+mod_heartbeat_max_age_secs = 60
+mod_grace_secs = 5
 # Only "no" is accepted (a default Yes is rejected at load).
 default_answer = "no"
 # Consecutive cycles an unreadable dialog-looking screen may persist before a

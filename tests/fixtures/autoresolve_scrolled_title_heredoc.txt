@@ -1,0 +1,26 @@
+* Waiting for 1 background agent to finish
+------------------------------------------------
+↑ 44 more lines
+  for f in $(ls "$OUT"/*.json); do
+    python3 - "$f" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d['checked'] = True
+json.dump(d, open(p, 'w'))
+PY
+  done
+  cat > "$OUT/report.md" <<'EOF2'
+# report
+rows: 12
+EOF2
+  rm -f "$OUT/stale.tmp"
+  echo done
+
+  Dangerous rm operation not ruled out — the shell may read this command differently than it was parsed
+
+Do you want to proceed?
+> 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend · ctrl+x ctrl+k

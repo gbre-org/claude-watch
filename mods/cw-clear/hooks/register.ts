@@ -1,14 +1,17 @@
 import type { Register } from 'claude-code'
 
-// Prototype only. Not deployed anywhere. Everything is off unless the
-// `enabled` option is true. `$` may not be bound or passed, so every `$` use
-// is spelled out at its call site and shared state is plain data.
+// On by default (set the `enabled` option to false to register nothing).
+// With no `stateFile` / `resumeFile` option the paths default to the same
+// runtime-dir files `self-clear` uses ($XDG_RUNTIME_DIR, else /var/run/claude),
+// so the mod and the tool agree with no settings entry. `$` may not be bound
+// or passed, so every `$` use is spelled out at its call site and shared state
+// is plain data.
 export const register: Register = (on, options) => {
-  if (options.enabled !== true) return
+  if (options.enabled === false) return
 
-  const stateFile = String(options.stateFile ?? '')
-  const logFile = stateFile ? `${stateFile}.log` : ''
-  const resumeFile = String(options.resumeFile ?? '')
+  let stateFile = String(options.stateFile ?? '')
+  let logFile = stateFile ? `${stateFile}.log` : ''
+  let resumeFile = String(options.resumeFile ?? '')
   const resumeCommand = String(options.resumeCommand ?? '')
   const heartbeatMs = Math.max(1000, Number(options.heartbeatSecs ?? 15) * 1000)
   // In-memory state. A hot reload of the mod re-runs register() with fresh
@@ -29,6 +32,17 @@ export const register: Register = (on, options) => {
     JSON.stringify({ ts, event: ev, busy, turns, ready, instance, loadedAt }) + '\n'
 
   on('session.start', async ($, e, next) => {
+    if (!stateFile || !resumeFile) {
+      // Same default as self-clear: $XDG_RUNTIME_DIR, else /var/run/claude.
+      let dir = '/var/run/claude'
+      const xdg = await $.env.get('XDG_RUNTIME_DIR')
+      if (xdg && xdg.trim()) dir = xdg.trim()
+      if (!stateFile) {
+        stateFile = `${dir}/claude-cw-clear-heartbeat.json`
+        logFile = `${stateFile}.log`
+      }
+      if (!resumeFile) resumeFile = `${dir}/claude-cw-clear-resume.txt`
+    }
     await $.command.register({
       name: 'cw-clear',
       description: 'Clear the conversation, then submit the resume prompt.',
@@ -93,8 +107,13 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'cw-clear' }, async ($, e, next) => {
     let text = ''
     if (resumeFile) {
-      text = String(await $.fs.read(resumeFile)).trim()
-    } else {
+      try {
+        text = String(await $.fs.read(resumeFile)).trim()
+      } catch {
+        text = '' // no staged resume prompt: fall back to the command
+      }
+    }
+    if (!text) {
       const argv = resumeCommand.split(/\s+/).filter(Boolean)
       if (argv.length > 0) {
         const r = await $.process.run(argv, { timeoutMs: 10000 })
