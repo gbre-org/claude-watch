@@ -855,6 +855,17 @@ orphan_escalate_cooldown_secs = 1800
 # is not hard-gated indefinitely. 0 disables (default): the operator resolves
 # via the pushover alert. When set, use a value well above hard_gate_grace_secs.
 orphan_auto_abandon_secs = 0
+# --- Passive CI rows (`session-task queue ci ...`) ---
+# CI rows are written by an external syncer and carry no agent heartbeat, so
+# they are exempt from the stuck/orphaned checks above and get their own
+# liveness check (`session-task queue ci check`, run by queue-check): a
+# `queue-ci-stale` event fires ONCE per row per reason when an open row
+#   * has not been synced for `ci_stale_sync_min` minutes (syncer stopped
+#     reaping), or
+#   * has been open longer than `ci_max_run_min` minutes (never closed/hung).
+# `--ci-stale-sync-min` / `--ci-max-run-min` override per run.
+ci_stale_sync_min = 15
+ci_max_run_min = 240
 
 [hybrid]
 # Hybrid hooks + daemon-fallback tuning.

@@ -185,6 +185,15 @@ requires a real dir under the repos root and therefore also trusts a bare
 distinctive name; the gate trusts only prefixed forms and never touches the
 filesystem), and in consequence (advise vs deny).
 
+## Passive CI rows
+
+`session-task queue ci upsert|close|list|check` maintains read-only mirror rows
+for external CI runs (`kind: ci`): no scope, hidden from the default
+`queue list` (`--ci` / `--ci-only` show them), outcome-aware `--depends-on`
+(ready only on `success`; otherwise the dependent is blocked and a
+`queue-dep-failed` event fires), and a staleness check that emits
+`queue-ci-stale`. Full reference: `docs/queue.md` section "Passive external CI rows".
+
 ## Free text: use a quoted heredoc, never a double-quoted argument
 
 Bash expands a backtick or `$(...)` inside a double-quoted argument BEFORE the

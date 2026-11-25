@@ -1932,6 +1932,15 @@ pub struct QueueCheckConfig {
     /// pushover alert. When set, must be well above `hard_gate_grace_secs`.
     #[serde(default = "default_queue_check_orphan_auto_abandon_secs")]
     pub orphan_auto_abandon_secs: u64,
+    /// Passive CI rows: minutes since the row's `last_synced` stamp after
+    /// which an OPEN row is reported (`queue-ci-stale`, reason `stale-sync`)
+    /// -- the external syncer stopped updating it. Default 15.
+    #[serde(default = "default_queue_check_ci_stale_sync_min")]
+    pub ci_stale_sync_min: u64,
+    /// Passive CI rows: minutes an OPEN row may stay open before it is
+    /// reported (`queue-ci-stale`, reason `max-run`). Default 240.
+    #[serde(default = "default_queue_check_ci_max_run_min")]
+    pub ci_max_run_min: u64,
 }
 
 impl Default for QueueCheckConfig {
@@ -1944,6 +1953,8 @@ impl Default for QueueCheckConfig {
             orphan_escalate_cooldown_secs: default_queue_check_orphan_escalate_cooldown_secs(),
             hard_gate_enabled: default_queue_check_hard_gate_enabled(),
             orphan_auto_abandon_secs: default_queue_check_orphan_auto_abandon_secs(),
+            ci_stale_sync_min: default_queue_check_ci_stale_sync_min(),
+            ci_max_run_min: default_queue_check_ci_max_run_min(),
         }
     }
 }
@@ -1974,6 +1985,14 @@ fn default_queue_check_hard_gate_enabled() -> bool {
 
 fn default_queue_check_orphan_auto_abandon_secs() -> u64 {
     0
+}
+
+fn default_queue_check_ci_stale_sync_min() -> u64 {
+    15
+}
+
+fn default_queue_check_ci_max_run_min() -> u64 {
+    240
 }
 
 /// Config for the daemon's cadence events. The daemon emits two

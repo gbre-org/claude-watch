@@ -1551,7 +1551,7 @@ def _queue_item_is_ready_now(items, item):
         the predicate flagged dep-chained items as actionable when they
         were correctly blocked by their predecessors)
     """
-    if item.get("status") != "pending":
+    if item.get("status") != "pending" or item.get("kind") == "ci":
         return False
     # Explicit deps: any unmet dep keeps the item not-ready. Mirrors
     # session-task._item_is_ready. Missing or non-done targets are

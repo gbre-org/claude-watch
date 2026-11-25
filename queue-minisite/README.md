@@ -539,6 +539,39 @@ the banner is not a `data-no-morph` element — multitail treats any visible one
 a dialog that owns the keyboard, so marking it would silently kill `w` / `t` /
 `c` whenever it was up.
 
+### CI panes (`ci` live-log mode)
+
+A passive external CI row (`kind: ci`, see `docs/queue.md`) is an ordinary row
+for the minisite: it appears in RUNNING while open and in DONE / ABANDONED once
+closed, with a chip showing the run's status (or its final outcome:
+`success` / `failure` / `cancelled` / `skipped`) and a link to the run when the
+row carries an `http(s)` URL. It never counts toward the orphan tally.
+
+* **Eligibility.** An **open** CI row gets a multitail pane (`live_log_mode:
+  "ci"`) only when a log command is configured (`QUEUE_MINISITE_CI_LOG_CMD`).
+  Without one there is nothing to read, so, like a `starting` agent, it gets
+  no pane. The single-item modal reuses the plain-text hostjob viewer.
+* **Log source.** The operator-supplied command template is split with `shlex`,
+  each token is formatted with `{provider} {repo} {run} {job} {log_ref} {sha}
+  {branch} {qid}` and the command is run **without a shell**; it must print the
+  job's log to stdout. Example:
+  `QUEUE_MINISITE_CI_LOG_CMD="my-ci-log --provider {provider} --repo {repo} --run {run} --job {job}"`.
+  A substituted value containing control characters or starting with `-` is
+  refused (`no-log-source`), so row data can never become an option.
+* **Incremental polling.** While the row is open the command is re-run every
+  `QUEUE_MINISITE_CI_LOG_POLL_SECONDS` (5); only new complete lines are emitted.
+  Output that does not extend the previous poll (the log was rewritten)
+  emits a `log-reset` frame and the new tail. The stream ends with
+  `workload-end` once the row closes (after one final poll).
+* **Retry-until-the-log-exists.** A failing / not-yet-available log command is
+  reported as the retryable `open-failed` error, so the pane backs off and
+  retries exactly like a workload whose `.output` does not exist yet. It holds a
+  stream slot only while connected, like every other pane.
+* **Nesting.** A CI row with a `parent` (the queue item that pushed the branch)
+  is nested one level under that item's pane: placed right after it and its
+  subagent panes, indented, and given a stream slot in the *nested* tier (after
+  every top-level pane). With no pane for the parent it stays top-level.
+
 ## Verbose mode (`v`) — stop eliding
 
 A pane's whole value is density, so the default renderer shows **one line per
@@ -722,6 +755,10 @@ folder on purpose: it is the app's own default logo, not a brand slot.
 | `SSE_TAIL_BACKFILL_LINES` | `200` | Historical-context backfill cap when a client first connects. |
 | `QUEUE_MINISITE_AGENT_STATS_FILE` | sibling of `AGENT_STATE_JSON` (`/agents-state/agent-stats.json`) | Per-agent activity snapshot (tool calls + tokens) written by `tools/cw-agent-stats/cw-agent-stats`, joined onto running rows + summed in the header — see "Agent activity counters" below. Empty = feature off. |
 | `QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS` | `60` | Snapshot older than this (by `generated_at` or file mtime) renders as stale: blank cells + `n/a` numerals on the header pill, never a frozen number. |
+| `QUEUE_MINISITE_CI_LOG_CMD` | _(empty)_ | Command template that prints a passive CI row's job log (`{provider} {repo} {run} {job} {log_ref} {sha} {branch} {qid}`), run without a shell. Empty = CI rows get no multitail pane. See "CI panes". |
+| `QUEUE_MINISITE_CI_LOG_POLL_SECONDS` | `5` | Seconds between polls of the CI log command while the row is open. |
+| `QUEUE_MINISITE_CI_LOG_CMD_TIMEOUT` | `30` | Hard timeout for one invocation of the CI log command. |
+| `QUEUE_MINISITE_CI_LOG_MAX_BYTES` | `4194304` | Largest log kept per poll (the tail is kept). |
 | `PINGME_SESSION_TASK` | `0` | Set to `1` to suppress pingme chatter from `session-task` lifecycle. |
 | `CLAUDE_EVENT_SESSION_TASK` | `0` | Set to `1` to suppress claude-event chatter from `session-task` lifecycle. |
 

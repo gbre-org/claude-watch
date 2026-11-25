@@ -74,6 +74,7 @@ def _unacked() -> list:
     return [
         it for it in items
         if isinstance(it, dict) and it.get("status") == "waiting"
+        and it.get("kind") != "ci"
         and isinstance(it.get("pending_completion"), dict)
     ]
 

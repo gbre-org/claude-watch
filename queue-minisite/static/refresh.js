@@ -100,6 +100,23 @@
   // answer — and we then render NOTHING. Absent is absent: no "unknown"
   // placeholder. MUST mirror the model_tag() macro in templates/index.html.
   // ---------------------------------------------------------------------
+  // CI chip for passive external rows (`it.kind === 'ci'`): the run's status,
+  // or its final outcome once closed, plus an http(s) link to the run. Renders
+  // nothing for any other row. MUST mirror the ci_tag() macro in
+  // templates/index.html.
+  function ciTag(it) {
+    if (!it || it.kind !== 'ci' || !it.ci) return '';
+    const ci = it.ci;
+    const state = ci.outcome || ci.status || 'running';
+    const cls = String(state).replace(/ /g, '-');
+    const jobTxt = ci.job ? ` (${ci.job})` : '';
+    let out = `<span class="badge ci-badge ci-${attr(cls)}" title="external CI run: ${attr(ci.provider)} ${attr(ci.repo)}#${attr(ci.run)}${attr(jobTxt)}">ci ${esc(state)}</span>`;
+    if (ci.url) {
+      out += `<a class="ci-link" href="${attr(ci.url)}" target="_blank" rel="noopener noreferrer" title="open the CI run">#${esc(ci.run)}</a>`;
+    }
+    return out;
+  }
+
   function modelTag(it) {
     const label = it.model_label || '';
     if (!label) return '';
@@ -437,7 +454,8 @@
       orphan ? 'orphan' : '',
     ].filter(Boolean).join(' ');
     const startingFlag = (isStarting && !isWorkload && !isHostjob) ? '1' : '0';
-    const logMode = isHostjob ? 'hostjob' : (isWorkload ? 'workload' : 'live');
+    const isCi = it.kind === 'ci';
+    const logMode = (isHostjob || isCi) ? 'hostjob' : (isWorkload ? 'workload' : 'live');
     // aria-label / title vary by state so screen readers + tooltips
     // describe the polling behaviour for starting rows. Mirrors the
     // template's logic.
@@ -465,9 +483,11 @@
     // stream. MUST mirror templates/index.html — this markup replaces the
     // server paint on the first tick.
     const liveLogMode = it.live_log_mode || '';
-    const liveLogAttr = liveLogMode
+    const liveLogAttr = (liveLogMode
       ? ` data-live-log-mode="${attr(liveLogMode)}"`
-      : '';
+      : '') +
+      (isCi ? ' data-ci-row="1"' : '') +
+      (it.ci_parent ? ` data-ci-parent="${attr(it.ci_parent)}"` : '');
 
     let head = '';
     if (isStarting && !isWorkload && !isHostjob) {
@@ -485,7 +505,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
-    head += modelTag(it);
+    head += modelTag(it) + ciTag(it);
     // Agent activity cell (botchat #2967) — MUST mirror the RUNNING block in
     // templates/index.html: tool-call + context-token counters for the live
     // agent bound to this queue id, in the HEAD so compact density keeps it.
@@ -599,7 +619,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
-    head += modelTag(it);
+    head += modelTag(it) + ciTag(it);
 
     const blockedIso = it.blocked_at_iso || '';
     let ageBlock = `<span ${blockedIso ? `data-local-time-iso="${attr(blockedIso)}" data-local-time-title-only` : ''} title="${attr(blockedIso)}">blocked ${relAge(it.age, it.age_epoch)}</span>`;
@@ -700,7 +720,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
-    head += modelTag(it);
+    head += modelTag(it) + ciTag(it);
 
     const iso = it.wedged_at_iso || '';
     let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">wedged ${relAge(it.age, it.age_epoch)}</span>`;
@@ -746,7 +766,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
-    head += modelTag(it);
+    head += modelTag(it) + ciTag(it);
 
     const iso = it.quarantined_at_iso || '';
     let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">quarantined ${relAge(it.age, it.age_epoch)}</span>`;
@@ -793,7 +813,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
-    head += modelTag(it);
+    head += modelTag(it) + ciTag(it);
 
     const iso = it.created_at_iso || '';
     let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">created ${relAge(it.age, it.age_epoch)}</span>`;
@@ -844,7 +864,7 @@
     if (it.locked) head += '<span class="badge state-locked" title="parked by an operator scope lock — NOT ready to spawn; the dispatcher refuses it until the scope is unlocked">locked</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
-    head += modelTag(it);
+    head += modelTag(it) + ciTag(it);
     if (it.depends_on && it.depends_on.length) {
       for (const dep of it.depends_on) {
         // Each dep is a clickable anchor (jumps to the target row)
@@ -960,7 +980,7 @@
       : '';
     let head = `<span class="badge ${badgeCls}"${badgeTitle}>${esc(badgeTxt)}</span>` +
       `<span class="id">${esc(it.id)}</span>` +
-      modelTag(it);
+      modelTag(it) + ciTag(it);
     if (isErroredHostjob) {
       head += `<span class="badge hostjob-badge" title="hostjob-bound: ${attr(it.hostjob_label || '')}">hostjob</span>`;
     }

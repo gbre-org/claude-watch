@@ -854,6 +854,10 @@
       qid: qid,
       depth: 0,
       mode: (row.getAttribute('data-live-log-mode') || '').toLowerCase(),
+      // A passive CI row names the queue item that pushed its branch. The
+      // pane nests under that item's pane when it has one (see placePane);
+      // empty for every other row.
+      parentQid: row.getAttribute('data-ci-parent') || '',
       summary: row.getAttribute('data-queue-summary') || '',
       meta: rowMetaInfo(row),
       // How many subagents this card is currently showing. Drives the header
@@ -1276,6 +1280,7 @@
   // --- pane construction ---------------------------------------------------
 
   function modeBadgeText(mode) {
+    if (mode === 'ci') return 'ci';
     if (mode === 'workload') return 'workload';
     if (mode === 'hostjob') return 'hostjob';
     if (mode === 'subagent') return 'subagent';
@@ -1423,7 +1428,10 @@
 
   function buildPane(info) {
     const isSub = info.kind === 'subagent';
-    const wrap = el('section', 'mt-pane' + (isSub ? ' mt-pane-sub' : ''));
+    const isCiChild = !isSub && info.mode === 'ci' && !!info.parentQid;
+    const wrap = el('section', 'mt-pane' + (isSub ? ' mt-pane-sub' : '') +
+      (isCiChild ? ' mt-pane-ci-child' : ''));
+    if (isCiChild) wrap.setAttribute('data-ci-parent-queue-id', info.parentQid);
     wrap.setAttribute('data-pane-kind', info.kind);
     wrap.setAttribute('data-pane-key', info.key);
     if (isSub) {
@@ -1514,6 +1522,7 @@
       kind: info.kind,
       target: info.target,
       qid: info.qid,
+      parentQid: info.parentQid || '',
       depth: info.depth || 0,
       mode: info.mode,
       el: wrap,
@@ -2015,8 +2024,9 @@
   function slotOrder() {
     const ordered = panesInDisplayOrder();
     const out = [];
-    for (const pane of ordered) if (pane.kind !== 'subagent') out.push(pane);
-    for (const pane of ordered) if (pane.kind === 'subagent') out.push(pane);
+    const nested = (p) => p.kind === 'subagent' || !!p.parentQid;
+    for (const pane of ordered) if (!nested(pane)) out.push(pane);
+    for (const pane of ordered) if (nested(pane)) out.push(pane);
     return out;
   }
 
@@ -2101,10 +2111,33 @@
   // see slotOrder().
   function eligibleInfos() {
     const out = [];
-    for (const row of eligibleRows()) {
+    // Passive CI rows nest under the item that pushed their branch, when that
+    // item is itself eligible for a pane. Everything else (including a CI row
+    // whose parent has no pane) stays top-level, in DOM order.
+    const rowList = eligibleRows();
+    const hasPane = new Set();
+    for (const r of rowList) hasPane.add(r.getAttribute('data-queue-id') || '');
+    const childrenOf = {};
+    const topRows = [];
+    for (const row of rowList) {
+      const p = row.getAttribute('data-ci-parent') || '';
+      if (p && p !== (row.getAttribute('data-queue-id') || '') && hasPane.has(p)) {
+        (childrenOf[p] = childrenOf[p] || []).push(row);
+      } else {
+        topRows.push(row);
+      }
+    }
+    for (const row of topRows) {
       const info = rowInfo(row);
       if (!info.qid || !info.mode) continue;
+      // Top-level by construction: a parent id with no pane of its own to
+      // hang under is not a nesting.
+      info.parentQid = '';
       out.push(info);
+      for (const child of (childrenOf[info.qid] || [])) {
+        const cinfo = rowInfo(child);
+        if (cinfo.qid && cinfo.mode) out.push(cinfo);
+      }
       if (!subsShownFor(info.qid)) continue;
       // A card's nested tails are eligible only while the card's OWN pane is:
       // a nested tail under a pane the reader dismissed (or retention cleared)
@@ -2123,6 +2156,23 @@
   // nested one immediately after its parent and after any nested panes that
   // parent already has, so a card and its subtree stay one contiguous group.
   function placePane(pane) {
+    if (pane.kind !== 'subagent' && pane.parentQid) {
+      // A nested CI pane goes right after its parent pane and that parent's
+      // existing nested panes (subagent or CI).
+      const cparent = panes.get(paneKey('queue', pane.parentQid));
+      if (cparent && cparent.el.parentNode === panesEl) {
+        let canchor = cparent.el;
+        let cnext = canchor.nextSibling;
+        while (cnext && cnext.getAttribute &&
+               (cnext.getAttribute('data-parent-queue-id') === pane.parentQid ||
+                cnext.getAttribute('data-ci-parent-queue-id') === pane.parentQid)) {
+          canchor = cnext;
+          cnext = canchor.nextSibling;
+        }
+        panesEl.insertBefore(pane.el, canchor.nextSibling);
+        return;
+      }
+    }
     if (pane.kind !== 'subagent') {
       panesEl.appendChild(pane.el);
       return;
