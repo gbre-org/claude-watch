@@ -76,7 +76,7 @@
 .PHONY: test-cw-theme-sync
 .PHONY: test-hooks-shim test-entrypoint test-cw-clear-mod-e2e
 # Tests — compose stack + host shims
-.PHONY: test-cw test-hostjob test-ttyd-paste-handler test-ttyd-lock-toggle
+.PHONY: test-cw test-cw-session-task test-hostjob test-ttyd-paste-handler test-ttyd-lock-toggle
 # Tests — macOS LaunchAgents + personal MCP host
 .PHONY: test-launchd-plist test-personal-mcp-host test-personal-mcp-host-plist
 .PHONY: test-personal-mcp-install
@@ -554,6 +554,11 @@ test-entrypoint: ## Container entrypoint + baked-image assertion suites
 # verify argv construction without requiring docker.
 test-cw: ## cw host-shim argv-construction tests
 	examples/compose/bin/tests/cw.test
+
+# cw-session-task: host-side forwarder that runs session-task inside the
+# container (one flock domain for every queue writer). Mock-docker based.
+test-cw-session-task: ## cw-session-task host->container forwarder tests
+	examples/compose/bin/tests/cw-session-task.test
 
 # Run the hostjob tests (examples/compose/bin/hostjob — the detached
 # host-job runner that lets an in-container agent launch host commands

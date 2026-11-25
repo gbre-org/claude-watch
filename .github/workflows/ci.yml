@@ -352,6 +352,9 @@ jobs:
       - name: Run cw host-shim tests
         run: make test-cw
 
+      - name: Run cw-session-task forwarder tests
+        run: make test-cw-session-task
+
       - name: Install uv (for hostjob + session-task tests)
         # test-hostjob shells out to `uv run --python 3.11 ...`; without
         # uv on PATH that step dies with exit 127. Install once here and

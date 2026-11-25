@@ -496,6 +496,28 @@ commands run a little longer without `hostjob`, but `hostjob` is still the
 right tool for genuinely long-running, fire-and-poll work. See the follow-up
 note in the security section.)
 
+### `cw-session-task` — host-side jobs that write the queue
+
+On a macOS host the queue (`~/.config/session/queue.json`) is shared with the
+container over a bind mount, and advisory `flock` is **not coherent** across
+that boundary, so a host process running `session-task` races the container's
+own writers (see the PostgreSQL-backend note in `tools/session-task/session-task`).
+A host launchd/cron job that must write the queue (for example a CI-status
+syncer) should call `examples/compose/bin/cw-session-task` instead: it
+forwards the call with `docker exec` into the running `claude-container`, so
+every writer stays in one lock domain and emitted `claude-event`s land in the
+container's event queue.
+
+```sh
+cw-session-task queue ci list --json     # same argv as session-task
+```
+
+It finds the container by its compose-service label (`CW_SERVICE`, default
+`claude-container`; or pin one with `CW_CONTAINER`), execs the CLI at
+`CW_SESSION_TASK_PATH` (default: the bind-mounted checkout path), and exits
+`75` when no matching container is running (Docker Desktop down or signed out),
+so callers can treat it as retryable. Tests: `make test-cw-session-task`.
+
 ### Auto-resume the prior conversation (`CLAUDE_AUTO_CONTINUE`)
 
 Set `CLAUDE_AUTO_CONTINUE=resume` in `.env` (commented example near the bottom of `.env.example`) to have the in-container claude launch with `--continue "resume"` instead of bare `claude`. This matches the standard host alias most operators already use:

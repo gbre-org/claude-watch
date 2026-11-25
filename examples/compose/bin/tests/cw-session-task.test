@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Tests for examples/compose/bin/cw-session-task, the host-side forwarder that
+runs `session-task` inside claude-container via `docker exec`.
+
+Uses CW_DOCKER to inject a mock docker so no daemon is needed.
+
+Coverage:
+  - --print-cmd hook builds the documented exec argv.
+  - Env overrides (CW_CONTAINER, CW_SESSION_TASK_PATH, CW_EXEC_USER).
+  - Container is discovered through the compose service label and the
+    forwarded argv + exit code pass through unchanged.
+  - No running container -> exit 75 (retryable), nothing exec'd.
+  - Missing docker binary -> exit 127.
+
+Run:  ./cw-session-task.test
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "cw-session-task"
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def run(args, env=None):
+    base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/tmp/fake-home"}
+    base.update(env or {})
+    return subprocess.run([str(SCRIPT), *args], env=base, capture_output=True,
+                          text=True, timeout=10)
+
+
+def make_mock(tmp: Path, ps_output: str, exec_rc: int) -> tuple[Path, Path]:
+    """Mock docker: `ps` prints ps_output; `exec` logs argv and exits exec_rc."""
+    log = tmp / "calls.log"
+    mock = tmp / "docker-mock"
+    mock.write_text(
+        "#!/bin/sh\n"
+        f'echo "$*" >> {log}\n'
+        'case "$1" in\n'
+        f'  ps) printf "%s" "{ps_output}"; exit 0 ;;\n'
+        f'  exec) exit {exec_rc} ;;\n'
+        "esac\n"
+    )
+    mock.chmod(mock.stat().st_mode | stat.S_IXUSR)
+    return mock, log
+
+
+def test_print_cmd_default() -> None:
+    r = run(["queue", "ci", "list", "--json"], {"CW_SESSION_TASK_PRINT_CMD": "1"})
+    lines = r.stdout.splitlines()
+    expect(r.returncode == 0, f"print-cmd rc={r.returncode}")
+    expect(lines[:5] == ["docker", "exec", "-i", "-u", "1000"], f"argv head: {lines}")
+    expect(lines[-4:] == ["queue", "ci", "list", "--json"], f"argv tail: {lines}")
+    expect(lines[6].endswith("tools/session-task/session-task"), f"cli path: {lines[6]!r}")
+
+
+def test_print_cmd_overrides() -> None:
+    r = run(["queue", "ci", "check"], {
+        "CW_SESSION_TASK_PRINT_CMD": "1", "CW_CONTAINER": "abc123",
+        "CW_SESSION_TASK_PATH": "/x/session-task", "CW_EXEC_USER": "501",
+    })
+    expect(r.stdout.splitlines() == ["docker", "exec", "-i", "-u", "501", "abc123",
+                                     "/x/session-task", "queue", "ci", "check"],
+           f"overrides: {r.stdout!r}")
+
+
+def test_forwards_and_propagates_rc() -> None:
+    with tempfile.TemporaryDirectory() as t:
+        mock, log = make_mock(Path(t), "deadbeef", 3)
+        r = run(["queue", "ci", "close", "--outcome", "success"], {"CW_DOCKER": str(mock)})
+        calls = log.read_text().splitlines()
+        expect(r.returncode == 3, f"rc should pass through, got {r.returncode}")
+        expect(any("label=com.docker.compose.service=claude-container" in c for c in calls),
+               f"label lookup missing: {calls}")
+        expect(any(c.startswith("exec -i -u 1000 deadbeef ") and
+                   c.endswith("queue ci close --outcome success") for c in calls),
+               f"exec argv wrong: {calls}")
+
+
+def test_no_container_is_tempfail() -> None:
+    with tempfile.TemporaryDirectory() as t:
+        mock, log = make_mock(Path(t), "", 0)
+        r = run(["queue", "ci", "list"], {"CW_DOCKER": str(mock)})
+        expect(r.returncode == 75, f"no container should exit 75, got {r.returncode}")
+        expect(not any(c.startswith("exec") for c in log.read_text().splitlines()),
+               "must not exec when no container")
+
+
+def test_missing_docker() -> None:
+    r = run(["queue", "list"], {"CW_DOCKER": "/nonexistent/docker"})
+    expect(r.returncode == 127, f"missing docker should exit 127, got {r.returncode}")
+
+
+for fn in (test_print_cmd_default, test_print_cmd_overrides,
+           test_forwards_and_propagates_rc, test_no_container_is_tempfail,
+           test_missing_docker):
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"{fn.__name__}: {exc!r}")
+
+if failures:
+    for f in failures:
+        print("FAIL:", f, file=sys.stderr)
+    sys.exit(1)
+print("cw-session-task: all tests passed")
