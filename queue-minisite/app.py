@@ -188,6 +188,10 @@ CI_LOG_MAX_BYTES = int(os.environ.get("QUEUE_MINISITE_CI_LOG_MAX_BYTES", str(4 *
 # line, which is streamed as ordinary data, so the pane never settles on
 # "launch failed / no log" for a healthy in-progress run.
 CI_LOG_PENDING_RC = 5
+# ci-log prints finished jobs' logs (append-only), then this line, then a
+# volatile block (running jobs' steps). Only the volatile block may change
+# non-monotonically, so it is streamed as a `ci-status` frame, not as lines.
+CI_LOG_STATUS_MARKER = "===== in progress ====="
 
 # Workload output directory (tail target for workload-bound queue items).
 # `workload run <label> -- <cmd>` writes:
@@ -5655,6 +5659,15 @@ def _ci_item_open(qid: str) -> bool:
     return False
 
 
+def _split_ci_status(out: str) -> tuple[str, list[str]]:
+    """Split ci-log output into (stable text, volatile status lines)."""
+    lines = out.splitlines(keepends=True)
+    for i, ln in enumerate(lines):
+        if ln.rstrip("\r\n") == CI_LOG_STATUS_MARKER:
+            return "".join(lines[:i]), [x.rstrip("\r\n") for x in lines[i + 1:]]
+    return out, []
+
+
 def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
     """SSE generator for a passive CI row: poll the operator's log command and
     emit only what is new since the previous poll.
@@ -5700,12 +5713,15 @@ def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
         while True:
             terminal = not _ci_item_open(qid)
             rc, out, err = _ci_run_log_cmd(argv)
+            status_lines: list[str] = []
+            if rc in (0, CI_LOG_PENDING_RC) and out:
+                out, status_lines = _split_ci_status(out)
+            # rc 0 = every job finished and logged: the run is over even if
+            # the syncer has not closed the row yet (shown as `final`).
+            run_done = rc == 0
             if rc == CI_LOG_PENDING_RC:
-                # Pending, not failed: show whatever the tool printed (or a
-                # status line) so the pane has data and never reads as dead.
-                if not out.strip():
-                    out = ("log not available yet (the provider publishes "
-                           "logs when a job finishes)\n")
+                # Pending, not failed: an empty stable section is fine, the
+                # ci-status frame below tells the reader what is going on.
                 rc = 0
             if rc != 0:
                 if first:
@@ -5749,6 +5765,12 @@ def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
                         last_data_at = time.monotonic()
                     prev = complete
                 first = False
+                yield _format_sse({
+                    "type": "meta", "kind": "ci-status", "ts": time.time(),
+                    "lines": [] if (terminal or run_done) else status_lines[-40:],
+                    "final": terminal or run_done,
+                })
+                last_data_at = time.monotonic()
             if terminal:
                 yield _format_sse({
                     "type": "meta", "kind": "workload-end", "label": qid,
