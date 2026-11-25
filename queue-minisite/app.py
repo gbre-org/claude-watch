@@ -1423,6 +1423,19 @@ def _classify_owner(
         (a real anomaly worth showing).
     """
     iid = item.get("id", "")
+    if _is_ci_item(item):
+        # Passive CI row: owned + reaped by its syncer, not an agent.
+        return {
+            "mode": "ci",
+            "owner_source": "ci-syncer",
+            "alive": None,
+            "agent_id": "",
+            "label": _ci_view(item)["owner"],
+            "jsonl_age_seconds": None,
+            "jsonl_age": "?",
+            "jsonl_age_epoch": None,
+            "is_starting": False,
+        }
     agent = agent_by_qid.get(iid)
     if agent is not None:
         age = agent.get("jsonl_age_seconds")
@@ -1925,12 +1938,22 @@ def _ci_view(item: dict[str, Any]) -> dict[str, Any]:
     out = {
         k: str(ci.get(k) or "")
         for k in ("provider", "repo", "run", "job", "status", "outcome",
-                  "url", "branch", "sha", "parent", "last_synced")
+                  "url", "branch", "sha", "parent", "last_synced", "pr_url")
     }
+    prov = out["provider"].lower()
+    out["provider_label"] = {
+        "github": "GitHub Actions",
+        "gitea": "Gitea Actions",
+    }.get(prov, f"{out['provider']} CI" if out["provider"] else "CI")
+    out["owner"] = str(item.get("owner") or "")
+    out["reaper"] = str(item.get("created_by") or "ci-sync")
     # Only http(s) links are rendered as links (the row text is operator /
     # syncer supplied; never emit javascript: URLs into an href).
-    if out["url"] and not re.match(r"^https?://", out["url"], re.I):
-        out["url"] = ""
+    for _k in ("url", "pr_url"):
+        if out[_k] and not re.match(r"^https?://", out[_k], re.I):
+            out[_k] = ""
+    if not out["owner"]:
+        out["owner"] = f"{out['reaper']} syncer ({out['provider'] or '?'})"
     return out
 
 
@@ -2251,7 +2274,7 @@ def _shape(
         # Passive external row: no agent, owner, heartbeat or subagent tree.
         # An empty owner keeps it out of the orphan tally (`alive is False`)
         # and off the orphan badge.
-        shaped["owner"] = {}
+        shaped["owner"] = _classify_owner(item, now, agent_by_qid, owner_bindings)
         shaped["is_starting"] = False
         shaped["agent_stats"] = None
         shaped["subagents"] = []
@@ -5715,6 +5738,31 @@ def _split_ci_status(out: str) -> tuple[str, list[str]]:
     return out, []
 
 
+CI_JOB_HEADER_RE = re.compile(r"^===== job '(.*)' \(id \S+\) (\S+) =====\s*$")
+# The volatile block is whole-job (a `job '...'` header then its steps); never
+# cut it from the FRONT per frame, that drops the job header and the pane then
+# cannot say which job the steps belong to.
+CI_STATUS_MAX_LINES = 400
+
+
+def _ci_job_headers(text: str) -> list[dict[str, str]]:
+    """Finished-job headers in ci-log's stable text, in order, de-duplicated.
+
+    Sent as structured data on every ci-status frame: the stream's first
+    backfill is tail-limited, so the browser cannot rely on having SEEN the
+    headers of a long run's earlier jobs."""
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for ln in text.splitlines():
+        if not ln.startswith("====="):
+            continue
+        m = CI_JOB_HEADER_RE.match(ln)
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1))
+            out.append({"name": m.group(1), "state": m.group(2)})
+    return out
+
+
 def _tail_ci_output(item: dict[str, Any], have: str = "") -> Iterator[bytes]:
     """SSE generator for a passive CI row: poll the operator's log command and
     emit only what is new since the previous poll.
@@ -5835,9 +5883,13 @@ def _tail_ci_output(item: dict[str, Any], have: str = "") -> Iterator[bytes]:
                 first = False
                 yield _format_sse({
                     "type": "meta", "kind": "ci-status", "ts": time.time(),
-                    "lines": [] if (terminal or run_done) else status_lines[-40:],
+                    "lines": ([] if (terminal or run_done)
+                              else status_lines[:CI_STATUS_MAX_LINES]),
+                    "jobs": _ci_job_headers(out or ""),
                     "final": final_now, "digest": digest,
                     "run": _ci_view(item)["run"],
+                    "url": _ci_view(item)["url"],
+                    "provider_label": _ci_view(item)["provider_label"],
                 })
                 last_data_at = time.monotonic()
                 if run_done and not terminal and memo is None:

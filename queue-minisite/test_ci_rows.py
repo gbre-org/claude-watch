@@ -179,6 +179,65 @@ class CiRowsTest(unittest.TestCase):
         css = (HERE / "static" / "style.css").read_text()
         self.assertIn(".mt-badge-ci", css)
 
+    # --- labelled body + syncer owner ------------------------------------
+
+    def _card_html(self, qid):
+        self.appmod._cache.fetched_at = 0.0
+        html = self.client.get("/").get_data(as_text=True)
+        start = html.index(f'id="queue-{qid}"')
+        return html[start:html.index("</article>", start)]
+
+    def _upsert_prov(self, provider, repo, **kw):
+        argv = ["queue", "ci", "upsert", "--provider", provider, "--repo",
+                repo, "--run", "45676171305", "--created-by", "pr-watch"]
+        for k, v in kw.items():
+            argv += ["--" + k.replace("_", "-"), v]
+        self.appmod._cache.fetched_at = 0.0
+        return _st(self.env, *argv).splitlines()[0]
+
+    def test_github_card_body_is_labelled(self):
+        q = self._upsert_prov(
+            "github", "gbre-org/claude-watch", status="in_progress",
+            branch="queue-minisite/ts-single-column",
+            url="https://github.example/run/1", pr_url="https://github.example/pr/9")
+        card = self._card_html(q)
+        self.assertIn("GitHub Actions run", card)
+        self.assertIn("gbre-org/claude-watch", card)
+        self.assertIn("branch <span class=\"ci-branch\">queue-minisite/ts-single-column", card)
+        self.assertIn(">open run</a>", card)
+        self.assertIn('href="https://github.example/pr/9"', card)
+        # no bare "#<run id>" header link any more
+        self.assertNotIn(">#45676171305</a>", card)
+        # owner + reaper are explicit
+        self.assertNotIn("owner unknown", card)
+        self.assertIn("pr-watch syncer (github)", card)
+        self.assertIn("reaped by pr-watch", card)
+        self.assertIn("stale alarm: queue ci check", card)
+
+    def test_gitea_card_body_is_labelled(self):
+        q = self._upsert_prov("gitea", "andrew/some-repo", branch="main",
+                              url="https://gitea.example/run/2")
+        card = self._card_html(q)
+        self.assertIn("Gitea Actions run", card)
+        self.assertIn("andrew/some-repo", card)
+        self.assertIn(">open run</a>", card)
+        self.assertNotIn("open PR", card)
+        self.assertIn("pr-watch syncer (gitea)", card)
+
+    def test_api_owner_is_ci_syncer(self):
+        q = self._upsert_prov("github", "o/r")
+        row = next(r for r in self._payload()["running"] if r["id"] == q)
+        self.assertEqual(row["owner"]["mode"], "ci")
+        self.assertEqual(row["owner"]["label"], "pr-watch syncer (github)")
+        self.assertEqual(row["ci"]["provider_label"], "GitHub Actions")
+        self.assertEqual(self._payload()["orphan_count"], 0)
+
+    def test_refresh_js_mirrors_body_and_owner(self):
+        js = (HERE / "static" / "refresh.js").read_text()
+        for needle in ("function ciBody", "ci-reaper", "owner.mode === 'ci'",
+                       "stale alarm: queue ci check", "open PR"):
+            self.assertIn(needle, js)
+
     # --- stream ----------------------------------------------------------
 
     def test_stream_without_command(self):
@@ -241,6 +300,42 @@ class CiRowsTest(unittest.TestCase):
         st = next(f for f in frames if f.get("kind") == "ci-status")
         self.assertEqual(st["lines"], ["job two running", "  [>>] 3. Test"])
         self.assertFalse(st["final"])
+
+    def test_real_in_progress_output_yields_jobs_and_whole_status_block(self):
+        """Captured real ci-log output (5 finished jobs + a running job with
+        47 status lines). The first backfill is tail-limited and the status
+        block used to be cut to its last 40 lines; both lost the job headers,
+        leaving the pane header with no counts."""
+        fx = HERE / "fixtures" / "ci-log-in-progress.txt"
+        c = self._script("real-cmd", f"cat {fx}\nexit 5\n")
+        self.appmod.CI_LOG_CMD = f"{c} {{run}}"
+        old = self.appmod.SSE_TAIL_BACKFILL_LINES
+        self.appmod.SSE_TAIL_BACKFILL_LINES = 10
+        try:
+            q = self._upsert()
+            gen = self.appmod._tail_ci_output(
+                next(i for i in json.loads(self.queue_actual.read_text())["items"]
+                     if i["id"] == q))
+            st = None
+            for raw in gen:
+                for line in raw.decode().splitlines():
+                    if line.startswith("data: "):
+                        f = json.loads(line[6:])
+                        if f.get("kind") == "ci-status":
+                            st = f
+                if st:
+                    break
+            gen.close()
+        finally:
+            self.appmod.SSE_TAIL_BACKFILL_LINES = old
+        self.assertEqual([j["name"] for j in st["jobs"]], [
+            "Prometheus Rules", "Queue-minisite jsdom tests", "Unit + Fixture Tests",
+            "Warning-Free Build", "E2E Tests", "Queue-minisite Python tests"])
+        self.assertEqual({j["state"] for j in st["jobs"]}, {"success"})
+        self.assertEqual(st["lines"][0], "job 'Container shell + shim tests' in_progress")
+        self.assertEqual(len(st["lines"]), 47)
+        self.assertFalse(st["final"])
+        self.assertTrue(st["provider_label"])
 
     def test_rc0_marks_status_final_before_row_closes(self):
         c = self._script("done-cmd", "echo 'all done'\nexit 0\n")

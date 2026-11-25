@@ -63,41 +63,78 @@ const es = streams.find((s) => !s.closed);
 assert('stream opened', !!es);
 const stream = () => pane.querySelector('.mt-pane-stream');
 const footer = () => pane.querySelector('.mt-ci-status');
-const lines = () => Array.from(stream().children).map((c) => c.textContent);
+const lines = () => Array.from(stream().children).filter((c) => !c.classList.contains('mt-ci-live')).map((c) => c.textContent);
 
-assert('footer starts hidden', footer() && footer().hidden);
+const sum = () => pane.querySelector('.mt-ci-text');
+const dets = () => pane.querySelector('.mt-ci-details');
+const T0 = Date.UTC(2026, 0, 1, 12, 0, 0) / 1000;
+
+assert('no footer element at all', !pane.querySelector('.mt-ci-status'));
+assert('header status line starts hidden', dets() && dets().hidden);
+assert('status line lives in the header', dets().parentNode === pane.querySelector('.mt-pane-head'));
 es.emit({ type: 'meta', kind: 'stream-start', mode: 'ci', label: 'q-ci' });
+
+// running / partial: 1 finished job in the stream, E2E running at step 2/3, 1 queued
+es.emit({ type: 'event', kind: 'workload_line', text: "===== job 'unit' (id 1) success =====", source: 'workload' });
 es.emit({ type: 'event', kind: 'workload_line', text: 'job A log', source: 'workload' });
-es.emit({ type: 'meta', kind: 'ci-status', ts: Date.UTC(2026, 0, 1, 12, 0, 0) / 1000 + 5,
-  lines: ["job 'b' in_progress", '  [  >>] 2. Test'], final: false });
+es.emit({ type: 'meta', kind: 'ci-status', ts: T0 + 5, final: false, lines: [
+  "job 'E2E' in_progress", '  started 2026-01-01', '  [  ok] 1. Checkout (success)',
+  '  [  >>] 2. Run suites (in_progress) since x', '  [pending] 3. Post (pending)',
+  "job 'deploy' queued"] });
+const run1 = sum().textContent;
+assert('running header', /^1\/3 jobs ok · running: E2E \(step 2\/3\) · 1 pending · updated \d\d:\d\d:\d\d$/.test(run1), run1);
+assert('no badge while running', pane.querySelector('.mt-ci-badge').hidden);
 assert('finished-job line in stream', lines().some((t) => t.indexOf('job A log') !== -1), lines().join('|'));
-assert('footer visible with in-progress lines',
-  !footer().hidden && footer().textContent.indexOf('2. Test') !== -1, footer().textContent);
-assert('footer has last-updated stamp',
-  /last updated \d\d:\d\d:\d\d/.test(footer().textContent), footer().textContent);
-assert('footer is outside the scrolling stream', footer().parentNode === pane && !stream().contains(footer()));
-const first = footer().textContent.match(/last updated (\S+)/)[1];
+assert('detail collapsed by default', !dets().open);
+dets().open = true;
+const dt = pane.querySelector('.mt-ci-detail').textContent;
+assert('expanded detail lists jobs and steps',
+  dt.indexOf('unit') !== -1, dt);
+assert('detail does not carry the build log', dt.indexOf('2. Run suites') === -1 && dt.indexOf("job 'deploy'") === -1, dt);
+const live = stream().querySelector('.mt-ci-live');
+assert('in-progress block is in the main log view', live && live.textContent.indexOf('2. Run suites') !== -1);
+assert('in-progress block stays last', stream().lastElementChild === live);
+dets().open = false;
+assert('collapse works', !dets().open);
+assert('header status has no clock', /^live$/.test(pane.querySelector('.mt-pane-status').textContent));
 
 es.emit({ type: 'event', kind: 'workload_line', text: 'job B log', source: 'workload' });
-es.emit({ type: 'meta', kind: 'ci-status', ts: Date.UTC(2026, 0, 1, 12, 0, 0) / 1000 + 10,
-  lines: [], final: false });
+es.emit({ type: 'meta', kind: 'ci-status', ts: T0 + 10, final: false, lines: ["job 'E2E' in_progress"] });
 const l = lines();
+assert('new row goes before the in-progress block', stream().lastElementChild.classList.contains('mt-ci-live'));
 assert('new job log appended at the bottom', l[l.length - 1].indexOf('job B log') !== -1, l.join('|'));
-const second = footer().textContent.match(/last updated (\S+)/)[1];
-assert('stamp advances on each poll', first !== second, first + ' vs ' + second);
-assert('header status has no clock (the footer carries the one stamp)',
-  /^live$/.test(pane.querySelector('.mt-pane-status').textContent),
-pane.querySelector('.mt-pane-status').textContent);
+assert('stamp advances on each poll', sum().textContent.match(/updated (\S+)/)[1] !== run1.match(/updated (\S+)/)[1]);
+assert('exactly one clock in the header line', (sum().textContent.match(/\d\d:\d\d:\d\d/g) || []).length === 1);
 
 es.emit({ type: 'meta', kind: 'log-reset' });
 assert('log-reset clears the stream', lines().length === 0, lines().join('|'));
 es.emit({ type: 'event', kind: 'workload_line', text: 'fresh', source: 'workload' });
 assert('lines after reset render', lines().length === 1 && lines()[0].indexOf('fresh') !== -1);
 
-es.emit({ type: 'meta', kind: 'ci-status', ts: Date.UTC(2026, 0, 1, 12, 1, 0) / 1000,
-  lines: [], final: true });
-assert('final frame says run complete', footer().textContent.indexOf('run complete') !== -1,
-  footer().textContent);
+// failing job while others still run: named in the header
+es.emit({ type: 'event', kind: 'workload_line', text: "===== job 'lint' (id 2) failure =====", source: 'workload' });
+es.emit({ type: 'meta', kind: 'ci-status', ts: T0 + 20, final: false, lines: ["job 'E2E' in_progress"] });
+assert('failed job named while running', /failed: lint/.test(sum().textContent), sum().textContent);
+
+// final success
+es.emit({ type: 'meta', kind: 'log-reset' });
+es.emit({ type: 'event', kind: 'workload_line', text: "===== job 'a' (id 1) success =====", source: 'workload' });
+es.emit({ type: 'event', kind: 'workload_line', text: "===== job 'b' (id 2) success =====", source: 'workload' });
+es.emit({ type: 'meta', kind: 'ci-status', ts: T0 + 60, lines: [], final: true });
+assert('final frame removes the in-progress block', !stream().querySelector('.mt-ci-live'));
+const badge = pane.querySelector('.mt-ci-badge');
+assert('final success: green passed badge', !badge.hidden && badge.textContent === 'passed' &&
+  badge.classList.contains('mt-ci-good'), badge.className);
+assert('final success text', /^2\/2 jobs ok · updated \d\d:\d\d:\d\d$/.test(sum().textContent), sum().textContent);
+assert('header status complete', pane.querySelector('.mt-pane-status').textContent === 'complete');
+
+// final failure
+es.emit({ type: 'meta', kind: 'log-reset' });
+es.emit({ type: 'event', kind: 'workload_line', text: "===== job 'a' (id 1) success =====", source: 'workload' });
+es.emit({ type: 'event', kind: 'workload_line', text: "===== job 'E2E' (id 2) failure =====", source: 'workload' });
+es.emit({ type: 'meta', kind: 'ci-status', ts: T0 + 70, lines: [], final: true });
+assert('final failure: red failed badge', badge.textContent === 'failed' && badge.classList.contains('mt-ci-bad'), badge.className);
+assert('final failure names job', /^1\/2 jobs ok · failed: E2E · updated /.test(sum().textContent), sum().textContent);
 
 if (failures) { console.error(failures + ' failure(s)'); process.exit(1); }
 console.log('all multitail-ci checks passed');

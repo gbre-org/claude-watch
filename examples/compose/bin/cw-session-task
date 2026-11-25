@@ -1,0 +1,63 @@
+#!/bin/sh
+# cw-session-task -- HOST-side forwarder: run `session-task` INSIDE the
+# claude-container, from a macOS/Linux host process (launchd job, cron, shell).
+#
+# WHY: the session-task queue is a JSON file shared between the host and the
+# container over a bind mount, and advisory flock is NOT coherent across that
+# boundary (see the "PostgreSQL backend" note in tools/session-task/session-task:
+# the 2026-08-16 interleave corruption). A host-side writer therefore races the
+# container's own writers. Routing every host-originated queue call through
+# `docker exec` keeps ALL writers in ONE lock domain (the container's Linux
+# kernel) without changing where the host job's credentials live. The in-
+# container process also inherits the container env (CLAUDE_EVENT_QUEUE, ...),
+# so events the CLI emits land in the same queue dir the main loop watches.
+#
+# USAGE (drop-in for `session-task`):
+#   cw-session-task queue ci list --json
+#   cw-session-task queue ci check
+#
+# Intended as the value of a caller's "which session-task" knob, e.g.
+# PR_WATCH_SESSION_TASK=/path/to/cw-session-task.
+#
+# ENV (all optional):
+#   CW_SERVICE            compose service to target     (default: claude-container)
+#   CW_CONTAINER          explicit container name/id; skips the label lookup
+#   CW_SESSION_TASK_PATH  in-container path of the CLI
+#                         (default: /home/hndrewaall/repos/claude-watch/tools/session-task/session-task,
+#                          which the example compose bind-mounts)
+#   CW_EXEC_USER          user to exec as                (default: 1000)
+#   CW_DOCKER             docker binary                  (default: docker)
+#   CW_SESSION_TASK_PRINT_CMD=1  print the exec argv one-per-line and exit 0
+#                         (test hook; also skips the container lookup)
+#
+# EXIT CODES: the forwarded command's own code; 75 (EX_TEMPFAIL) when docker is
+# unreachable or no running container matches (retryable, e.g. Docker Desktop
+# signed out); 127 when the docker binary is missing.
+
+DOCKER="${CW_DOCKER:-docker}"
+SERVICE="${CW_SERVICE:-claude-container}"
+CLI="${CW_SESSION_TASK_PATH:-/home/hndrewaall/repos/claude-watch/tools/session-task/session-task}"
+USER_ARG="${CW_EXEC_USER:-1000}"
+
+if [ "${CW_SESSION_TASK_PRINT_CMD:-}" = "1" ]; then
+    printf '%s\n' "$DOCKER" exec -i -u "$USER_ARG" "${CW_CONTAINER:-<container>}" "$CLI" "$@"
+    exit 0
+fi
+
+if ! command -v "$DOCKER" >/dev/null 2>&1; then
+    echo "cw-session-task: '$DOCKER' not found on PATH" >&2
+    exit 127
+fi
+
+CONTAINER="${CW_CONTAINER:-}"
+if [ -z "$CONTAINER" ]; then
+    CONTAINER=$("$DOCKER" ps -q \
+        --filter "label=com.docker.compose.service=$SERVICE" \
+        --filter status=running 2>/dev/null | head -n 1)
+fi
+if [ -z "$CONTAINER" ]; then
+    echo "cw-session-task: no running '$SERVICE' container (docker down or signed out?)" >&2
+    exit 75
+fi
+
+exec "$DOCKER" exec -i -u "$USER_ARG" "$CONTAINER" "$CLI" "$@"

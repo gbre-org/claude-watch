@@ -99,10 +99,11 @@ class ConfigRead(unittest.TestCase):
         self.m._find_config_file = lambda: str(p)
         return self.m.read_cw_clear_mod_config()
 
-    def test_default_is_disabled(self):
+    def test_default_is_enabled(self):
+        # Mod mode is the default; the fresh-heartbeat gate still decides.
         self.m._find_config_file = lambda: None
-        self.assertFalse(self.m.read_cw_clear_mod_config()["enabled"])
-        self.assertFalse(self.cfg_with("[tmux]\nx = 1\n")["enabled"])
+        self.assertTrue(self.m.read_cw_clear_mod_config()["enabled"])
+        self.assertTrue(self.cfg_with("[tmux]\nx = 1\n")["enabled"])
         self.assertFalse(self.cfg_with("[cw_clear_mod]\nenabled = false\n")["enabled"])
 
     def test_enabled_and_overrides(self):

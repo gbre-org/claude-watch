@@ -104,17 +104,33 @@
   // or its final outcome once closed, plus an http(s) link to the run. Renders
   // nothing for any other row. MUST mirror the ci_tag() macro in
   // templates/index.html.
-  function ciTag(it) {
+  function ciTag(it, withLink) {
+    if (withLink === undefined) withLink = true;
     if (!it || it.kind !== 'ci' || !it.ci) return '';
     const ci = it.ci;
     const state = ci.outcome || ci.status || 'running';
     const cls = String(state).replace(/ /g, '-');
     const jobTxt = ci.job ? ` (${ci.job})` : '';
     let out = `<span class="badge ci-badge ci-${attr(cls)}" title="external CI run: ${attr(ci.provider)} ${attr(ci.repo)}#${attr(ci.run)}${attr(jobTxt)}">ci ${esc(state)}</span>`;
-    if (ci.url) {
-      out += `<a class="ci-link" href="${attr(ci.url)}" target="_blank" rel="noopener noreferrer" title="open the CI run">#${esc(ci.run)}</a>`;
+    if (withLink && ci.url) {
+      out += `<a class="ci-link" href="${attr(ci.url)}" target="_blank" rel="noopener noreferrer" title="open the ${attr(ci.provider_label || 'CI')} run #${attr(ci.run)}">open run</a>`;
     }
     return out;
+  }
+
+  // Running-card body for a CI row: labelled run link (+ PR link) and the
+  // owner/reaper meta line. MUST mirror the ci_body() macro in
+  // templates/index.html.
+  function ciBody(it) {
+    if (!it || it.kind !== 'ci' || !it.ci) return '';
+    const ci = it.ci;
+    let line = `<span class="ci-prov">${esc(ci.provider_label || 'CI')} run</span> · <span class="ci-repo">${esc(ci.repo)}</span>`;
+    if (ci.job) line += ` · <span class="ci-job">${esc(ci.job)}</span>`;
+    if (ci.branch) line += ` · branch <span class="ci-branch">${esc(ci.branch)}</span>`;
+    if (ci.url) line += ` → <a class="ci-link" href="${attr(ci.url)}" target="_blank" rel="noopener noreferrer">open run</a>`;
+    if (ci.pr_url) line += ` · <a class="ci-link ci-pr-link" href="${attr(ci.pr_url)}" target="_blank" rel="noopener noreferrer">open PR</a>`;
+    return `<p class="ci-body">${line}</p>` +
+      `<div class="age ci-reaper"><span>reaped by ${esc(ci.reaper || 'ci-sync')}</span><span class="sep">·</span><span>stale alarm: queue ci check</span></div>`;
   }
 
   function modelTag(it) {
@@ -506,7 +522,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
-    head += modelTag(it) + ciTag(it);
+    head += modelTag(it) + ciTag(it, false);
     // Agent activity cell (botchat #2967) — MUST mirror the RUNNING block in
     // templates/index.html: tool-call + context-token counters for the live
     // agent bound to this queue id, in the HEAD so compact density keeps it.
@@ -541,10 +557,12 @@
       const aid = owner.agent_id || '';
       const aliveTxt = owner.alive ? 'alive' : 'STALE';
       ageBlock += `<span title="claude-watch agent transcript mtime (${attr(aid)})">agent ${esc(aid.slice(0, 12))} ${esc(aliveTxt)} (${relAge(owner.jsonl_age || '?', owner.jsonl_age_epoch)})</span>`;
+    } else if (owner.mode === 'ci') {
+      ageBlock += `<span title="passive CI row: created, updated and reaped by its syncer">${esc(owner.label || (it.ci && it.ci.owner) || 'ci syncer')}</span>`;
     } else {
       ageBlock += '<span title="no matching agent record in claude-watch state">owner unknown</span>';
     }
-    if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
+    if (it.created_by && owner.mode !== 'ci') ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
 
     let scope = '';
     if (it.scope && it.scope.length) {
@@ -590,6 +608,7 @@
       `<article id="queue-${attr(it.id)}" class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr}${hostjobAttr}${liveLogAttr} ${logModeAttr}>` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
+      ciBody(it) +
       `<div class="age">${ageBlock}</div>` +
       scope +
       prompt +

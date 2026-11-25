@@ -105,6 +105,32 @@ pub struct AutoResolveConfig {
     /// pressed (longer than `settle_secs`: gives a human a window).
     #[serde(default = "default_no_after")]
     pub no_after_secs: u64,
+    /// Prefer the Claude Code mod (`mods/cw-autoresolve`) over tmux
+    /// keystrokes. Default ON. The mod answers at the tool-permission check,
+    /// before any dialog is drawn, and `claude-watch autoresolve-mod decide`
+    /// applies the SAME rules file and semantics. The tmux path below stays
+    /// as the fallback: it is the only path while the mod's heartbeat is
+    /// stale or missing, and a backstop (delayed by `mod_grace_secs`) while it
+    /// is fresh. `false` disables the mod path entirely (the mod abstains).
+    #[serde(default = "yes")]
+    pub prefer_mod: bool,
+    /// Mod heartbeat file (JSON). Empty = `<state dir>/autoresolve-mod-heartbeat.json`.
+    #[serde(default)]
+    pub mod_heartbeat_file: String,
+    /// A heartbeat older than this is stale and the tmux path owns dialogs.
+    #[serde(default = "default_mod_heartbeat_max_age")]
+    pub mod_heartbeat_max_age_secs: u64,
+    /// Extra seconds the tmux path waits (on top of `settle_secs`) while the
+    /// mod is fresh, so the mod gets first dibs on anything it can answer.
+    #[serde(default = "default_mod_grace")]
+    pub mod_grace_secs: u64,
+}
+
+fn default_mod_heartbeat_max_age() -> u64 {
+    60
+}
+fn default_mod_grace() -> u64 {
+    5
 }
 
 fn default_default_answer() -> String {
@@ -156,6 +182,10 @@ impl Default for AutoResolveConfig {
             undecided_alert_after: default_undecided_alert_after(),
             notify_agent_on_no: true,
             no_after_secs: default_no_after(),
+            prefer_mod: true,
+            mod_heartbeat_file: String::new(),
+            mod_heartbeat_max_age_secs: default_mod_heartbeat_max_age(),
+            mod_grace_secs: default_mod_grace(),
         }
     }
 }
@@ -1392,6 +1422,16 @@ impl Dialog {
     }
 }
 
+/// Placeholder title for a dialog whose real title scrolled off the top.
+pub const SCROLLED_TITLE: &str = "(title scrolled off)";
+
+/// The `↑ 44 more lines` row Claude Code draws at the top of a dialog that is
+/// taller than the screen.
+fn is_more_lines_marker(line: &str) -> bool {
+    let s = strip_chrome(line).to_ascii_lowercase();
+    s.starts_with('\u{2191}') && s.contains("more line")
+}
+
 pub fn classify_screen(frame: &str) -> Screen {
     let lines: Vec<&str> = frame.lines().collect();
     let start = lines.len().saturating_sub(40);
@@ -1448,7 +1488,9 @@ pub fn classify_screen(frame: &str) -> Screen {
         return Screen::Undecided("cursor not on exactly one option".into());
     }
 
-    let lo = q.saturating_sub(25);
+    // Search the whole captured tail: a long command (a heredoc) pushes the
+    // box top / title far above the question.
+    let lo = 0;
     // Boxed layout: a rounded top border. Unboxed layout (no border at all):
     // the `Bash command ...` header line is itself the top.
     let boxed = (lo..q)
@@ -1459,28 +1501,36 @@ pub fn classify_screen(frame: &str) -> Screen {
             .to_ascii_lowercase()
             .starts_with("bash command")
     });
-    let t = match (boxed, unboxed) {
+    let (title, body_from, sig_from) = match (boxed, unboxed) {
         (Some(top), _) => {
             let Some(t) = (top + 1..q).find(|&i| !strip_chrome(tail[i]).is_empty()) else {
                 return Screen::Undecided("no title line".into());
             };
-            t
+            (strip_chrome(tail[t]).to_string(), t + 1, t)
         }
-        (None, Some(t)) => t,
-        (None, None) => return Screen::Undecided("no box top above the question".into()),
+        (None, Some(t)) => (strip_chrome(tail[t]).to_string(), t + 1, t),
+        // A dialog taller than the screen scrolls its title off the top and
+        // shows `↑ N more lines` instead. It is still a live, permission
+        // shaped dialog (nothing below the options, a Yes and a bare No):
+        // classify it with a placeholder title so it gets the default No.
+        // It can never be answered Yes: `parse_bash_prompt` needs the title.
+        (None, None) => match (lo..q).rev().find(|&i| is_more_lines_marker(tail[i])) {
+            Some(m) => (SCROLLED_TITLE.to_string(), m + 1, m),
+            None => return Screen::Undecided("no box top above the question".into()),
+        },
     };
-    let body = tail[t + 1..q]
+    let body = tail[body_from..q]
         .iter()
         .map(|l| strip_chrome(l))
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
     Screen::Dialog(Box::new(Dialog {
-        title: strip_chrome(tail[t]).to_string(),
+        title,
         question: strip_chrome(tail[q]).to_string(),
         options: opts,
         body,
-        signature: prompt_signature(&tail[t..].join("\n")),
+        signature: prompt_signature(&tail[sig_from..].join("\n")),
     }))
 }
 
@@ -1559,6 +1609,11 @@ pub fn decide_dialog(
                 .map(|i| t[i + 6..].trim().to_string())
         }
     };
+    if dialog.title == SCROLLED_TITLE {
+        // Only the tail of a long command is visible; it can never be
+        // verified, so it is always No.
+        return no("title-scrolled-off".to_string(), raw_cmd, None);
+    }
     if !dialog
         .title
         .to_ascii_lowercase()
@@ -1579,6 +1634,22 @@ pub fn decide_dialog(
                 agent_of(&dialog.title),
             )
         }
+    };
+    decide_parsed(policy, prompt, start_cwd)
+}
+
+/// Verdict for an already-parsed Bash prompt. Shared by the tmux path (the
+/// prompt was read off the screen) and the mod path (the command came
+/// straight from the tool call), so both apply identical rules.
+pub fn decide_parsed(
+    policy: Result<&Policy, &str>,
+    prompt: BashPrompt,
+    start_cwd: Option<&Path>,
+) -> Verdict {
+    let no = |reason: String, command: String, agent: Option<String>| Verdict::No {
+        reason,
+        command,
+        agent,
     };
     let policy = match policy {
         Ok(p) => p,
@@ -1619,6 +1690,27 @@ pub fn decide_dialog(
             no(reason, prompt.command.clone(), prompt.agent.clone())
         }
     }
+}
+
+/// Verdict for a command that did not come off a screen (the mod path): the
+/// full command text, the agent id when the call was a sub-agent's, and the
+/// reason line of the engine's own ask (the `Dangerous rm ...` or
+/// `can't be sure` text) when there is one.
+pub fn decide_command_text(
+    policy: Result<&Policy, &str>,
+    command: &str,
+    agent: Option<&str>,
+    warning: Option<&str>,
+    start_cwd: Option<&Path>,
+) -> Verdict {
+    let prompt = BashPrompt {
+        agent: agent.map(|a| a.to_string()),
+        command: command.to_string(),
+        variants: vec![command.to_string()],
+        warning: warning.map(|w| w.to_string()),
+        signature: prompt_signature(command),
+    };
+    decide_parsed(policy, prompt, start_cwd)
 }
 
 /// Counts consecutive cycles on which the screen looked like a dialog but was
@@ -1737,7 +1829,7 @@ pub fn resolve_state_dir(cfg: &AutoResolveConfig, state_file: &str) -> PathBuf {
 
 /// Append one audit line. Append-only; errors are swallowed (the audit is
 /// best-effort but the keystroke path checks it was attempted first).
-fn audit(state_dir: &Path, entry: serde_json::Value) -> bool {
+pub(crate) fn audit(state_dir: &Path, entry: serde_json::Value) -> bool {
     use std::io::Write;
     let _ = std::fs::create_dir_all(state_dir);
     match std::fs::OpenOptions::new()
@@ -1750,7 +1842,7 @@ fn audit(state_dir: &Path, entry: serde_json::Value) -> bool {
     }
 }
 
-fn emit_audit_event(kind: &'static str, msg: &str) {
+pub(crate) fn emit_audit_event(kind: &'static str, msg: &str) {
     crate::event_bus::emit(&crate::event_bus::ClaudeWatchAlert {
         alert_type: kind,
         stuck_reason: "auto-resolved permission prompt (audit)",
@@ -1799,7 +1891,7 @@ pub fn denial_message(
 
 /// An auto-No is information the main loop must see (it may need to ask the
 /// operator for permission), so it is raised at HIGH priority.
-fn emit_denial_event(
+pub(crate) fn emit_denial_event(
     agent: Option<&str>,
     agent_id: Option<&str>,
     notified: bool,
@@ -1822,7 +1914,7 @@ async fn pane_query(pane: &str, fmt: &str) -> Option<String> {
     crate::cmd::run_cmd(&["tmux", "display-message", "-p", "-t", pane, fmt], 5).await
 }
 
-fn mode_str(mode: Mode) -> &'static str {
+pub(crate) fn mode_str(mode: Mode) -> &'static str {
     if mode == Mode::Enforce {
         "enforce"
     } else {
@@ -1913,6 +2005,17 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
         Screen::Dialog(d) => *d,
     };
     let now = Instant::now();
+    // The mod answers at the tool-permission check, before a dialog is ever
+    // drawn, so a dialog that stays up while the mod is healthy is one the
+    // mod could not answer (or the mod failed): wait a little longer so the
+    // mod keeps first dibs, then fall through to the tmux decision. A trip
+    // recorded by the mod's decider (shared audit file) pauses this path too.
+    let mod_fresh = crate::autoresolve_mod::mod_is_fresh(cfg, state_file);
+    let settle =
+        Duration::from_secs(cfg.settle_secs + if mod_fresh { cfg.mod_grace_secs } else { 0 });
+    if crate::autoresolve_mod::tripped_recently(cfg, state_file) {
+        return StepOutcome::Considering;
+    }
 
     {
         let mut g = RUNTIME.lock().unwrap();
@@ -1933,7 +2036,7 @@ pub async fn step(cfg: &AutoResolveConfig, state_file: &str, pane: &str) -> Step
                 // Yes candidates settle quickly; the conservative No waits
                 // longer so a human has a window. The verdict is computed
                 // below; here use the shorter wait and re-check for No.
-                if now.duration_since(first) < Duration::from_secs(cfg.settle_secs) {
+                if now.duration_since(first) < settle {
                     return StepOutcome::Considering;
                 }
             }
@@ -2883,5 +2986,77 @@ mod tests {
             .unwrap()
             .signature;
         assert_ne!(a, b);
+    }
+
+    const SCROLLED: &str = include_str!("../tests/fixtures/autoresolve_scrolled_title_heredoc.txt");
+
+    #[test]
+    fn scrolled_title_heredoc_dialog_is_a_dialog_and_gets_default_no() {
+        // Regression (2026-11-25): a tall heredoc dialog scrolled its
+        // `Bash command` title off the top ("↑ 44 more lines"). It used to be
+        // Undecided("no box top above the question"): no keystroke for ~6
+        // cycles, and the agent sat blocked for over a minute.
+        let Screen::Dialog(d) = classify_screen(SCROLLED) else {
+            panic!("must classify as a dialog on the first capture")
+        };
+        assert_eq!(d.title, SCROLLED_TITLE);
+        assert_eq!(d.no_digit(), Some(2));
+        assert!(d.body.contains("python3 - \"$f\" <<'PY'"), "{}", d.body);
+        assert!(!d.body.contains("more lines"));
+        match decide_dialog(Ok(&policy()), SCROLLED, &d, None) {
+            Verdict::No { reason, .. } => assert_eq!(reason, "title-scrolled-off"),
+            v => panic!("must be No, never Yes: {v:?}"),
+        }
+        // The signature is stable across cycles (settle logic needs that).
+        let Screen::Dialog(d2) = classify_screen(SCROLLED) else {
+            panic!()
+        };
+        assert_eq!(d.signature, d2.signature);
+    }
+
+    #[test]
+    fn scrolled_title_never_answers_yes_even_for_an_allowed_command() {
+        // A visible tail that looks like an allow-listed rm must still be No:
+        // the head of the command is unknown.
+        let fx = format!(
+            "\u{2191} 3 more lines\n  rm -f {WT}/x.tmp\n\nDo you want to proceed?\n> 1. Yes\n  2. No\n"
+        );
+        let Screen::Dialog(d) = classify_screen(&fx) else {
+            panic!("dialog")
+        };
+        assert!(matches!(
+            decide_dialog(Ok(&policy()), &fx, &d, None),
+            Verdict::No { .. }
+        ));
+    }
+
+    #[test]
+    fn title_far_above_the_question_is_still_found() {
+        // A 30-line command: the title is more than 25 rows above the
+        // question but still on screen.
+        let mut fx = String::from(
+            "Bash command \u{b7} from the general-purpose agent\nRun shell command\n\n",
+        );
+        for i in 0..30 {
+            fx.push_str(&format!("  echo line{i}\n"));
+        }
+        fx.push_str("\nDo you want to proceed?\n> 1. Yes\n  2. No\n");
+        let Screen::Dialog(d) = classify_screen(&fx) else {
+            panic!("dialog")
+        };
+        assert!(d.title.starts_with("Bash command"), "{}", d.title);
+    }
+
+    #[test]
+    fn no_marker_and_no_title_stays_undecided() {
+        let fx = "  echo hi\n\nDo you want to proceed?\n> 1. Yes\n  2. No\n";
+        assert!(matches!(classify_screen(fx), Screen::Undecided(_)));
+    }
+
+    #[test]
+    fn scrolled_marker_in_stale_scrollback_is_nothing() {
+        // Live content below the options: the dialog is scrollback.
+        let fx = format!("{SCROLLED}\nsome later output\n");
+        assert_eq!(classify_screen(&fx), Screen::Nothing);
     }
 }

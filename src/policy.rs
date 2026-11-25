@@ -1334,7 +1334,11 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
         Some(ref sid) => info!(session_id = %sid, "restarting Claude Code with --resume"),
         None => info!("restarting Claude Code with --continue (no session ID found)"),
     }
-    let launch = build_host_restart_argv(&claude_bin, session_id.as_deref(), &config.plugin_dirs);
+    let launch = build_host_restart_argv(
+        &claude_bin,
+        session_id.as_deref(),
+        &config.effective_plugin_dirs(),
+    );
 
     // Write relaunch script. Ensure its parent dir exists first: the
     // default lives under `/var/run/claude/`, which is a tmpfs that does
@@ -6433,7 +6437,10 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     // commands. `build_relaunch_claude_argv` reconstructs the correct
     // shape from the same env vars; on the host (no shim env) it degrades
     // to the previous bare-`claude` behavior.
-    let launch = build_relaunch_claude_argv(session_id.as_deref(), &config.claude.plugin_dirs);
+    let launch = build_relaunch_claude_argv(
+        session_id.as_deref(),
+        &config.claude.effective_plugin_dirs(),
+    );
 
     // Ensure the relaunch-script parent dir exists (see crash-recovery
     // note above): `/var/run/claude/` is tmpfs and may be gone after a
