@@ -10395,6 +10395,21 @@ def cmd_queue_prune(args):
     print(f"pruned {len(to_remove)} items")
 
 
+def _running_item_has_no_owner(it, agent_qids):
+    """True when a `running` item has nothing that could name its owner.
+
+    Owner inputs: a register/assign-time `agent_id`, an explicit `pid`, a
+    `workload:`/`hostjob:` scope token (system jobs owned by a process), or
+    an active-agents record keyed on the item id (`agent_qids`).
+    """
+    if it.get("agent_id") or it.get("pid") is not None:
+        return False
+    for tok in it.get("scope") or []:
+        if isinstance(tok, str) and tok.startswith(("workload:", "hostjob:")):
+            return False
+    return it.get("id") not in agent_qids
+
+
 def cmd_queue_banner(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
@@ -10455,6 +10470,31 @@ def cmd_queue_banner(args):
         lines.append(f"  Waiting behind a group peer: {len(waiting)} item(s)")
     if running:
         lines.append(f"  In progress (running): {len(running)} item(s)")
+        agent_qids = set()
+        try:
+            st = _load_active_agents_state() or {}
+            for rec in st.get("agents") or []:
+                if isinstance(rec, dict) and rec.get("queue_id"):
+                    agent_qids.add(rec["queue_id"])
+        except Exception:
+            pass
+        ownerless = [it for it in running
+                     if _running_item_has_no_owner(it, agent_qids)]
+        if ownerless:
+            # Post-clear / post-wedge: a `running` row nobody owns usually
+            # means the Agent was never fired. Name them, do not just count.
+            lines.append(
+                f"  !! NO OWNER: {len(ownerless)} running item(s) with no agent "
+                "attributed -- fire the Agent, `queue assign <id> --agent <aid>`, "
+                "or `queue abandon <id>`")
+            for it in ownerless[:8]:
+                age = _elapsed_seconds(it.get("registered_at")
+                                       or it.get("started_at")
+                                       or it.get("created_at"))
+                age_s = f"{age // 60}m" if age is not None else "?"
+                lines.append(
+                    f"     - [{it['id']}] {it.get('description','')[:60]}  (running {age_s})"
+                )
     if locked_scopes:
         lines.append(f"  Locked scopes: {len(locked_scopes)} (see `session-task queue locks`)")
 
