@@ -10404,6 +10404,10 @@ def _running_item_has_no_owner(it, agent_qids):
     """
     if it.get("agent_id") or it.get("pid") is not None:
         return False
+    if _is_ci_row(it):
+        # Passive CI rows are owned by their syncer (`owner` stamp), never by
+        # an agent; mirrors cron-queue-check's kind == "ci" exemption.
+        return False
     for tok in it.get("scope") or []:
         if isinstance(tok, str) and tok.startswith(("workload:", "hostjob:")):
             return False
@@ -10934,6 +10938,13 @@ def _ci_new_row(key, *, created_by=CI_CREATED_BY):
     return row
 
 
+def _ci_owner_label(row):
+    """`<syncer> syncer (<provider>)` -- who creates, updates and reaps a CI row."""
+    ci = row.get("ci") or {}
+    who = row.get("created_by") or CI_CREATED_BY
+    return f"{who} syncer ({ci.get('provider') or '?'})"
+
+
 def _ci_refresh_text(row):
     label = _ci_label(row)
     ci = row.get("ci") or {}
@@ -11130,6 +11141,12 @@ def cmd_queue_ci_upsert(args):
                 if val is not None and val != "":
                     ci[field] = val
             ci.pop("placeholder", None)
+            if getattr(args, "pr_url", None):
+                ci["pr_url"] = args.pr_url
+            # The syncer owns and reaps this row: stamp it (every upsert, so
+            # older rows backfill) so `queue show`, the owner resolvers and the
+            # minisite never report a CI row as ownerless.
+            row["owner"] = _ci_owner_label(row)
             ci["last_synced"] = _fmt_ts()
             _ci_refresh_text(row)
         # A late-created row could already be a failed dependency target only
@@ -11603,6 +11620,8 @@ def build_parser():
     ci_up.add_argument("--branch")
     ci_up.add_argument("--sha")
     ci_up.add_argument("--parent", help="Queue id of the item that pushed the branch")
+    ci_up.add_argument("--pr-url", default=None, dest="pr_url",
+                       help="URL of the pull request the run belongs to (shown on the card)")
     ci_up.add_argument("--log-ref", default=None, dest="log_ref",
                        help="Opaque token passed to the operator's log command as {log_ref}")
     ci_up.add_argument("--created-by", default=CI_CREATED_BY)

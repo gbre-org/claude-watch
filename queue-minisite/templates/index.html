@@ -134,11 +134,21 @@
       closed (success / failure / cancelled / skipped), plus a link to the
       run when the row carries an http(s) URL. Renders NOTHING for any other
       row. MUST stay in step with ciTag() in static/refresh.js. -#}
-  {%- macro ci_tag(it) -%}
+  {%- macro ci_tag(it, link=true) -%}
     {%- if it.kind == 'ci' and it.ci -%}
       {%- set ci_state = it.ci.outcome or it.ci.status or 'running' -%}
       <span class="badge ci-badge ci-{{ ci_state|replace(' ', '-') }}" title="external CI run: {{ it.ci.provider }} {{ it.ci.repo }}#{{ it.ci.run }}{% if it.ci.job %} ({{ it.ci.job }}){% endif %}">ci {{ ci_state }}</span>
-      {%- if it.ci.url %}<a class="ci-link" href="{{ it.ci.url }}" target="_blank" rel="noopener noreferrer" title="open the CI run">#{{ it.ci.run }}</a>{% endif -%}
+      {%- if link and it.ci.url %}<a class="ci-link" href="{{ it.ci.url }}" target="_blank" rel="noopener noreferrer" title="open the {{ it.ci.provider_label }} run #{{ it.ci.run }}">open run</a>{% endif -%}
+    {%- endif -%}
+  {%- endmacro -%}
+  {#- CI BODY (running card): a LABELLED line naming the provider, repo and
+      branch with an explicit "open run" link (and the PR when the row carries
+      one), plus the owner/reaper meta line, so nothing needs a hover to be
+      identified. MUST stay in step with ciBody() in static/refresh.js. -#}
+  {%- macro ci_body(it) -%}
+    {%- if it.kind == 'ci' and it.ci -%}
+      <p class="ci-body"><span class="ci-prov">{{ it.ci.provider_label }} run</span> · <span class="ci-repo">{{ it.ci.repo }}</span>{% if it.ci.job %} · <span class="ci-job">{{ it.ci.job }}</span>{% endif %}{% if it.ci.branch %} · branch <span class="ci-branch">{{ it.ci.branch }}</span>{% endif %}{% if it.ci.url %} → <a class="ci-link" href="{{ it.ci.url }}" target="_blank" rel="noopener noreferrer">open run</a>{% endif %}{% if it.ci.pr_url %} · <a class="ci-link ci-pr-link" href="{{ it.ci.pr_url }}" target="_blank" rel="noopener noreferrer">open PR</a>{% endif %}</p>
+      <div class="age ci-reaper"><span>reaped by {{ it.ci.reaper }}</span><span class="sep">·</span><span>stale alarm: queue ci check</span></div>
     {%- endif -%}
   {%- endmacro -%}
   {%- macro model_tag(it) -%}
@@ -425,7 +435,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
-            {{ model_tag(it) }}{{ ci_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it, false) }}
             {#- AGENT ACTIVITY CELL (botchat #2967): live tool-call + context
                 token counters for the agent bound to this queue id, from the
                 agent-stats snapshot. Lives in the item HEAD (not .age / .scope)
@@ -457,6 +467,7 @@
               title="Stop this running item">stop</button>
           </header>
           <p class="summary">{{ it.summary }}</p>
+          {{ ci_body(it) }}
           <div class="age">
             <span
               {% if it.started_at_iso %}data-local-time-iso="{{ it.started_at_iso }}" data-local-time-title-only{% endif %}
@@ -470,10 +481,12 @@
               <span class="agent-spawning" title="queue item registered, waiting for agent's first JSONL event"><span class="spinner" aria-hidden="true"></span>agent spawning…</span>
             {% elif owner.mode == 'agent' %}
               <span title="claude-watch agent transcript mtime ({{ owner.agent_id }})">agent {{ owner.agent_id[:12] }} {{ 'alive' if owner.alive else 'STALE' }} (<span class="rel-age"{% if owner.jsonl_age_epoch %} data-rel-epoch="{{ '%.0f' % owner.jsonl_age_epoch }}"{% endif %}>{{ owner.jsonl_age }}</span>)</span>
+            {% elif owner.mode == 'ci' %}
+              <span title="passive CI row: created, updated and reaped by its syncer">{{ owner.label }}</span>
             {% else %}
               <span title="no matching agent record in claude-watch state">owner unknown</span>
             {% endif %}
-            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+            {% if it.created_by and owner.mode != 'ci' %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
           {% if it.scope %}
             <div class="scope">
