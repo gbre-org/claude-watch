@@ -9,7 +9,8 @@
 # liveness cannot see that. This check asks the one question that can: is any
 # inbound message still UNREAD after N minutes? If so the delivery path is
 # broken (or the loop is wedged) regardless of what watcher-ctl says, and we
-# inject a [CLAUDE-WATCH] alert straight into the pane.
+# inject a [CLAUDE-WATCH] alert straight into the pane, INTERRUPTING any
+# in-flight turn (inject --escape) so it is read now rather than queued.
 #
 # Environment:
 #   CW_INBOX_UNREAD_URL — URL returning JSON {"messages":[{"id","ts","read_at"}]}
@@ -49,12 +50,16 @@ if [ "$COOLDOWN" -gt 0 ] && [ -f "$STATE_FILE" ]; then
     [ $((NOW - LAST)) -lt "$COOLDOWN" ] && exit 0
 fi
 
-ALERT="[CLAUDE-WATCH] INBOX UNDELIVERED: inbound message(s) $ids unread >${STALE_MIN}min while the watcher may read healthy. Read them ($ids), then check the inbound-message watcher was armed with the Monitor tool (use its watcher-ctl run command and follow the printed Monitor command), NOT a Bash run_in_background task: a Bash task never streams output to you."
+ALERT="[CLAUDE-WATCH] INBOX UNDELIVERED (this alert interrupted your in-flight turn; that is NOT a user rejection, resume the preempted work after handling it): inbound message(s) $ids unread >${STALE_MIN}min while the watcher may read healthy. Read them ($ids), then check the inbound-message watcher was armed with the Monitor tool (use its watcher-ctl run command and follow the printed Monitor command), NOT a Bash run_in_background task: a Bash task never streams output to you."
+# --escape: CANCELLING inject. The default inject never sends Escape, so during
+# a long turn the alert only sat in the "Queued" list and was read minutes late
+# (the very delay this check exists to close). A message unread for >N minutes
+# is urgent enough to seize the turn; the alert text says it is not a rejection.
 rc=0
 if [ -n "$PANE" ]; then
-    claude-watch inject --pane "$PANE" --submit "$ALERT" || rc=$?
+    claude-watch inject --escape --pane "$PANE" --submit "$ALERT" || rc=$?
 else
-    claude-watch inject --submit "$ALERT" || rc=$?
+    claude-watch inject --escape --submit "$ALERT" || rc=$?
 fi
 [ "$rc" -eq 0 ] || exit "$rc"
 mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
