@@ -1676,6 +1676,31 @@
     return row;
   }
 
+  // --- TTY progress redraws (docker compose, buildkit, ...) -----------------
+  // Under a PTY these tools redraw in place: every frame is its own line that
+  // starts with erase-line (ESC[2K) and is followed by a line that is nothing
+  // but cursor movement / visibility escapes (ESC[3A ESC[0G ESC[?25l). The
+  // workload stamper puts a timestamp on EACH of those physical lines, so one
+  // spinner tick used to become two stamped rows (one of them visibly empty).
+  // Rules: (1) a line whose visible text is empty but which carries escapes is
+  // a pure control line and is never rendered (never a stamp-only row);
+  // (2) an erase-line frame REPLACES the earlier frame of the same logical
+  // line (same visible text once spinner glyphs and elapsed times are
+  // normalised) instead of stacking. Distinct lines of a multi-line block
+  // normalise to distinct keys, so they all survive.
+  const ERASE_LINE_RE = /\u001b\[2K/;
+  const FRAME_LOOKBACK = 24;
+  function visibleText(text) {
+    const A = window.AnsiText;
+    if (A && typeof A.strip === 'function') return A.strip(text);
+    return String(text).replace(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g, '');
+  }
+  function frameKey(vis) {
+    return vis.replace(/[\u2800-\u28ff|\\\/\-]/g, '')
+      .replace(/\d+(?:\.\d+)?m?s\b/g, '#')
+      .replace(/\s+/g, ' ').trim();
+  }
+
   // Append one formatted event. Returns true when a row was actually added,
   // which is what the caller uses to decide whether real data has arrived.
   function appendPaneLine(pane, fmt) {
@@ -1683,6 +1708,31 @@
     // A formatter that produced nothing at all would render an empty row that
     // eats a line of a very short pane for no information.
     if (!fmt.text && !fmt.sigil) return false;
+    const rawText = String(fmt.text || '');
+    let frameFp = null;
+    if (rawText.indexOf('\u001b') !== -1 && !fmt.sigil) {
+      const vis = visibleText(rawText);
+      if (!vis.trim()) return false;           // pure control line
+      if (ERASE_LINE_RE.test(rawText)) frameFp = frameKey(vis);
+    }
+    if (frameFp) {
+      const lo = Math.max(0, pane.records.length - FRAME_LOOKBACK);
+      for (let i = pane.records.length - 1; i >= lo; i--) {
+        if (pane.records[i].frame === frameFp) {
+          const old = pane.records[i];
+          const nrec = {
+            sigil: '', text: clipStore(rawText, verboseCapChars()),
+            cls: fmt.cls || '', ts: fmt.ts || '', frame: frameFp,
+          };
+          pane.chars += nrec.text.length - old.text.length;
+          pane.records[i] = nrec;
+          const row = pane.streamEl.children[i];
+          if (row) pane.streamEl.replaceChild(renderRecord(nrec), row);
+          if (pane.autoscroll) pane.streamEl.scrollTop = pane.streamEl.scrollHeight;
+          return true;
+        }
+      }
+    }
     const rec = {
       sigil: fmt.sigil || '',
       // Stored bounded, not clipped to the current width: the wrap and verbose
@@ -1700,6 +1750,7 @@
       text: clipStore(fmt.text, verboseCapChars()),
       cls: fmt.cls || '',
       ts: fmt.ts || '',
+      frame: frameFp,
     };
     pane.records.push(rec);
     // First stamped line in a plain-text pane: the source DOES carry times

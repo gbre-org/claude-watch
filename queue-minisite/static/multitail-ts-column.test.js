@@ -121,6 +121,40 @@ assert('hydrated from cache: same single column',
   rr.length === 5 && rr[0].ts[0] === '13:13:44' && rr[0].body === 'make deploy' &&
   rr[1].ts[0] === '17:41:36' && rr[3].ts.length === 0, JSON.stringify(rr));
 
+// TTY progress redraw: exact slice of a real `docker compose` deploy log (the
+// `=== containers ===` section, 2026-11-25T13:13:44-05:00). Every spinner
+// frame is a stamped line starting with ESC[2K, followed by a stamped line of
+// pure cursor movement (ESC[?25h ESC[?25l ESC[3A ESC[0G) and a blank line.
+{
+  const ESC = '\u001b';
+  const spin = (g, t, name) => '2026-11-25T13:13:44-05:00 ' + ESC + '[2K ' + ESC + '[33m' + g +
+    ESC + '[0m Container ' + name + '             Recreate                    ' + ESC + '[34m' + t + ESC + '[0m';
+  const ctl = '2026-11-25T13:13:44-05:00 ' + ESC + '[?25h' + ESC + '[?25l' + ESC + '[3A' + ESC + '[0G';
+  const w = boot(memStore({ qsite_mt_ts: '1' }));
+  const e = w.es();
+  e.emit({ type: 'meta', kind: 'stream-start', mode: 'ci', label: 'q-ci', run: '9' });
+  const glyphs = ['\u2826', '\u2827', '\u2807', '\u280f', '\u280b', '\u2819'];
+  glyphs.forEach((g, i) => {
+    // server-side shape: stamp already split into source_ts
+    for (const t of [spin(g, '6.' + (6 + i) + 's', 'queue-minisite'), ctl, '']) {
+      const m = /^(\S+) (.*)$/.exec(t);
+      e.emit({ type: 'event', kind: 'workload_line', source: 'workload',
+        source_ts: m ? m[1] : undefined, text: m ? m[2] : t });
+    }
+    // a second, different container line in the same block
+    const t2 = spin(g, '1.' + i + 's', 'other-svc');
+    e.emit({ type: 'event', kind: 'workload_line', source: 'workload',
+      source_ts: '2026-11-25T13:13:44-05:00', text: t2.replace(/^\S+ /, '') });
+  });
+  const pr = rows(w.pane);
+  assert('redraw frames collapse: one row per logical line (2), not per frame',
+    pr.length === 2, String(pr.length) + ' ' + JSON.stringify(pr.map((q) => q.body)));
+  assert('no stamp-only / empty rows', pr.every((q) => q.body.trim().length > 0));
+  assert('exactly one timestamp cell per row', pr.every((q) => q.ts.length === 1 && q.ts[0] === '13:13:44'));
+  assert('latest frame wins', /queue-minisite/.test(pr[0].body) && /other-svc/.test(pr[1].body));
+  assert('no escape garbage in bodies', pr.every((q) => q.body.indexOf('\u001b') === -1 && !/\[3A|\[0G/.test(q.body)));
+}
+
 if (failures) { console.error(failures + ' failure(s)'); process.exit(1); }
 console.log('all multitail-ts-column checks passed');
 process.exit(0);
