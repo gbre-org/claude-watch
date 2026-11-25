@@ -81,8 +81,11 @@ es.emit({ type: 'meta', kind: 'ci-status', ts: 1, final: false, lines: statusLin
   url: 'https://github.com/o/r/actions/runs/1', provider_label: 'GitHub Actions' });
 assert('header counts jobs', /^6\/7 jobs ok · running: Container shell \+ shim tests \(step 42\/45\) · updated \d\d:\d\d:\d\d$/.test(text()), text());
 dets().open = true;
-assert('expand view non-empty', detail().length > 0 && detail().indexOf('E2E Tests') !== -1 &&
-  detail().indexOf('42. Run session-task Python tests') !== -1, detail());
+assert('expand view lists jobs, not the build log', detail().length > 0 && detail().indexOf('E2E Tests') !== -1 &&
+  detail().indexOf('42. Run session-task Python tests') === -1, detail());
+const liveBlock = pane.querySelector('.mt-pane-stream .mt-ci-live');
+assert('step detail is in the main log view', !!liveBlock &&
+  liveBlock.textContent.indexOf('42. Run session-task Python tests') !== -1);
 
 // Degraded: no job data at all still says something and links the run.
 es.emit({ type: 'meta', kind: 'ci-status', ts: 2, final: false, lines: [], jobs: [],

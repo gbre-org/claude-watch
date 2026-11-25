@@ -3496,6 +3496,7 @@ body.multitail-open { overflow: hidden; }
 }
 .mt-ci-badge.mt-ci-good { background: var(--ok, #859900); }
 .mt-ci-badge.mt-ci-bad { background: var(--orphan, #dc322f); }
+.mt-ci-live { white-space: pre-wrap; opacity: 0.85; border-top: 1px dashed var(--border, currentColor); margin-top: 2px; }
 .mt-ci-detail {
   position: absolute; z-index: 5; left: 0; right: 0; margin: 2px 0 0;
   padding: 4px 8px; max-height: 14em; overflow: auto;
