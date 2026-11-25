@@ -1,0 +1,78 @@
+===== job 'Prometheus Rules' (id 139450604427) success =====
+﻿2026-11-25T19:17:28.4945885Z Current runner version: '2.338.2'
+2026-11-25T19:17:28.4974512Z ##[group]Runner Image Provisioner
+2026-11-25T19:17:28.4975535Z Hosted Compute Agent
+2026-11-25T19:17:28.4976279Z Version: 20261111.635
+===== job 'Queue-minisite jsdom tests' (id 139450604365) success =====
+﻿2026-11-25T19:17:29.5943612Z Current runner version: '2.338.2'
+2026-11-25T19:17:29.5963020Z ##[group]Runner Image Provisioner
+2026-11-25T19:17:29.5963670Z Hosted Compute Agent
+2026-11-25T19:17:29.5964155Z Version: 20261111.635
+===== job 'Unit + Fixture Tests' (id 139450604414) success =====
+﻿2026-11-25T19:17:29.5668735Z Current runner version: '2.338.2'
+2026-11-25T19:17:29.5685998Z ##[group]Runner Image Provisioner
+2026-11-25T19:17:29.5686789Z Hosted Compute Agent
+2026-11-25T19:17:29.5687191Z Version: 20261111.635
+===== job 'Warning-Free Build' (id 139450604399) success =====
+﻿2026-11-25T19:17:28.6621414Z Current runner version: '2.338.2'
+2026-11-25T19:17:28.6673516Z ##[group]Runner Image Provisioner
+2026-11-25T19:17:28.6676612Z Hosted Compute Agent
+2026-11-25T19:17:28.6677567Z Version: 20261111.635
+===== job 'E2E Tests' (id 139450604317) success =====
+﻿2026-11-25T19:17:29.3736175Z Current runner version: '2.338.2'
+2026-11-25T19:17:29.3762652Z ##[group]Runner Image Provisioner
+2026-11-25T19:17:29.3763625Z Hosted Compute Agent
+2026-11-25T19:17:29.3764313Z Version: 20261111.635
+===== job 'Queue-minisite Python tests' (id 139450604241) success =====
+﻿2026-11-25T19:17:29.4789753Z Current runner version: '2.338.2'
+2026-11-25T19:17:29.4814511Z ##[group]Runner Image Provisioner
+2026-11-25T19:17:29.4815410Z Hosted Compute Agent
+2026-11-25T19:17:29.4816074Z Version: 20261111.635
+===== in progress =====
+job 'Container shell + shim tests' in_progress
+  started 2026-11-25T19:17:27Z
+  [  ok] 1. Set up job (success) 2026-11-25T19:17:28Z -> 2026-11-25T19:17:29Z
+  [  ok] 2. Run actions/checkout@v4 (success) 2026-11-25T19:17:29Z -> 2026-11-25T19:17:30Z
+  [  ok] 3. Check baked-doc markdown links (no broken links) (success) 2026-11-25T19:17:30Z -> 2026-11-25T19:17:30Z
+  [  ok] 4. Check CLAUDE.md size budget (always-in-context guard) (success) 2026-11-25T19:17:30Z -> 2026-11-25T19:17:30Z
+  [  ok] 5. Run install-hooks (core.hooksPath + worktree) tests (success) 2026-11-25T19:17:30Z -> 2026-11-25T19:17:30Z
+  [  ok] 6. Run make-help index gate (success) 2026-11-25T19:17:30Z -> 2026-11-25T19:17:30Z
+  [  ok] 7. Run Build Info open-PR tile gate (success) 2026-11-25T19:17:30Z -> 2026-11-25T19:17:30Z
+  [  ok] 8. Run CI apt-installer (hang + retry) tests (success) 2026-11-25T19:17:30Z -> 2026-11-25T19:17:59Z
+  [  ok] 9. Run host-skills installer tests (success) 2026-11-25T19:17:59Z -> 2026-11-25T19:17:59Z
+  [  ok] 10. Run linked-skills installer tests (success) 2026-11-25T19:17:59Z -> 2026-11-25T19:18:00Z
+  [  ok] 11. Run host-cron installer tests (success) 2026-11-25T19:18:00Z -> 2026-11-25T19:18:00Z
+  [  ok] 12. Run install-links tests (success) 2026-11-25T19:18:00Z -> 2026-11-25T19:18:01Z
+  [  ok] 13. Run claude-tmux env passthrough + fail-loud warning tests (success) 2026-11-25T19:18:01Z -> 2026-11-25T19:18:01Z
+  [  ok] 14. Run cron-toggle (cw-cron-run + cw-cron-toggle) tests (success) 2026-11-25T19:18:01Z -> 2026-11-25T19:18:01Z
+  [  ok] 15. Run eval-queue-ready-unspawned obligation evaluator tests (success) 2026-11-25T19:18:01Z -> 2026-11-25T19:18:01Z
+  [  ok] 16. Run exec-hook shim tests (success) 2026-11-25T19:18:01Z -> 2026-11-25T19:18:15Z
+  [  ok] 17. Run agent-msg embedded test suite (success) 2026-11-25T19:18:15Z -> 2026-11-25T19:18:16Z
+  [  ok] 18. Run agent-tail embedded test suite (success) 2026-11-25T19:18:16Z -> 2026-11-25T19:18:16Z
+  [  ok] 19. Run claude-event + claude-event-tail unit tests (success) 2026-11-25T19:18:16Z -> 2026-11-25T19:18:17Z
+  [  ok] 20. Run dashboard-lib.sh parser tests (success) 2026-11-25T19:18:17Z -> 2026-11-25T19:18:17Z
+  [  ok] 21. Install inotify-tools (for every suite that drives claude-event-watch) (success) 2026-11-25T19:18:17Z -> 2026-11-25T19:18:27Z
+  [  ok] 22. Run event-must-act toolchain tests (success) 2026-11-25T19:18:27Z -> 2026-11-25T19:18:33Z
+  [  ok] 23. Run pr-branches tests (success) 2026-11-25T19:18:33Z -> 2026-11-25T19:18:33Z
+  [  ok] 24. Run entrypoint CLAUDE_CMD construction tests (success) 2026-11-25T19:18:33Z -> 2026-11-25T19:18:45Z
+  [  ok] 25. Run container ~/.claude state helper tests (success) 2026-11-25T19:18:45Z -> 2026-11-25T19:18:45Z
+  [  ok] 26. Run cw host-shim tests (success) 2026-11-25T19:18:45Z -> 2026-11-25T19:18:49Z
+  [  ok] 27. Run cw-session-task forwarder tests (success) 2026-11-25T19:18:49Z -> 2026-11-25T19:18:49Z
+  [  ok] 28. Install uv (for hostjob + session-task tests) (success) 2026-11-25T19:18:49Z -> 2026-11-25T19:18:49Z
+  [  ok] 29. Run hostjob detached-runner tests (success) 2026-11-25T19:18:49Z -> 2026-11-25T19:19:03Z
+  [  ok] 30. Run cw-theme-sync idle-gate tests (success) 2026-11-25T19:19:03Z -> 2026-11-25T19:19:04Z
+  [  ok] 31. Run launchd plist tests (success) 2026-11-25T19:19:04Z -> 2026-11-25T19:19:04Z
+  [  ok] 32. Run personal-mcp-host wrapper tests (success) 2026-11-25T19:19:04Z -> 2026-11-25T19:19:25Z
+  [  ok] 33. Run personal-mcp-host launchd plist tests (success) 2026-11-25T19:19:25Z -> 2026-11-25T19:19:25Z
+  [  ok] 34. Run personal-mcp-host install.sh tests (success) 2026-11-25T19:19:25Z -> 2026-11-25T19:19:25Z
+  [  ok] 35. Run ttyd paste-handler tests (success) 2026-11-25T19:19:25Z -> 2026-11-25T19:19:25Z
+  [  ok] 36. Run ttyd lock-toggle tests (success) 2026-11-25T19:19:25Z -> 2026-11-25T19:19:26Z
+  [  ok] 37. Run watcher tests (self-clear/self-login + claude-event-watch debounce) (success) 2026-11-25T19:19:26Z -> 2026-11-25T19:20:23Z
+  [  ok] 38. Run claude-events-exporter tests (success) 2026-11-25T19:20:23Z -> 2026-11-25T19:20:24Z
+  [  ok] 39. Run work-queue-exporter tests (success) 2026-11-25T19:20:24Z -> 2026-11-25T19:20:24Z
+  [  ok] 40. Run agent-psi-exporter tests (success) 2026-11-25T19:20:24Z -> 2026-11-25T19:20:25Z
+  [  ok] 41. Install session-task companion CLIs onto PATH (success) 2026-11-25T19:20:25Z -> 2026-11-25T19:20:25Z
+  [  >>] 42. Run session-task Python tests (in_progress) since 2026-11-25T19:20:25Z
+  [pending] 43. Run obligations-init pytest suite (user-manifest idempotency) (pending)
+  [pending] 44. Run obligations / hooks tests (pending)
+  [pending] 88. Post Run actions/checkout@v4 (pending)

@@ -1887,6 +1887,13 @@
       const m = /===== job '(.*)' \(id \S+\) (\S+) =====/.exec(String(t));
       if (m && !seen[m[1]]) { seen[m[1]] = 1; done.push({ name: m[1], state: m[2] }); }
     }
+    // Server-parsed headers cover jobs whose header line was never streamed
+    // to this pane (the first backfill is tail-limited).
+    for (const j of (Array.isArray(payload.jobs) ? payload.jobs : [])) {
+      if (j && typeof j.name === 'string' && !seen[j.name]) {
+        seen[j.name] = 1; done.push({ name: j.name, state: String(j.state || '') });
+      }
+    }
     const open = [];
     let cur = null;
     for (const ln of (Array.isArray(payload.lines) ? payload.lines : [])) {
@@ -1925,6 +1932,10 @@
       }
       if (sum.pending.length) parts.push(sum.pending.length + ' pending');
     }
+    if (!sum.jobs.length && !payload.final) {
+      // No job data at all: say what we do know rather than a bare stamp.
+      parts.push((payload.provider_label || 'CI') + ' run · in progress');
+    }
     parts.push('updated ' + stamp);
     box.textContent = parts.join(' · ');
     const badge = pane.ciBadgeEl;
@@ -1938,6 +1949,13 @@
     }
     const detail = sum.jobs.map((j) => '[' + (CI_OK[j.state] ? ' ok' : j.state) + '] ' + j.name)
       .concat(sum.open.length ? [''].concat(payload.lines) : []);
+    if (!detail.length) {
+      detail.push(payload.final ? 'Run complete (no job details available).'
+        : 'Waiting for job details from ' + (payload.provider_label || 'CI') + '.');
+    }
+    if (typeof payload.url === 'string' && /^https?:\/\//i.test(payload.url)) {
+      detail.push('', payload.url);
+    }
     pane.ciDetailEl.textContent = detail.join('\n');
     pane.ciDetailsEl.hidden = false;
     pane.ciDetailsEl.classList.toggle('mt-ci-final', !!payload.final);
