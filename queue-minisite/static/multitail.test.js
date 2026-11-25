@@ -2424,6 +2424,45 @@ console.log('\n-- make multitail the default view (persisted, URL wins)');
   assert('turning it off restores the queue default', m.isDefaultView() === false);
 }
 
+// ==========================================================================
+console.log('\n-- passive CI rows: ci panes nest under the item that pushed the branch');
+// ==========================================================================
+{
+  const ciCard = (qid, parent, summary) =>
+    `<article class="item state-running log-clickable" data-queue-id="${qid}" ` +
+    `data-queue-status="running" data-queue-summary="${summary}" ` +
+    `data-log-mode="hostjob" data-live-log-mode="ci" data-ci-row="1"` +
+    (parent ? ` data-ci-parent="${parent}"` : '') + '></article>';
+  // The CI row is listed BEFORE its parent in the DOM on purpose: it must
+  // still be placed right after the parent's pane.
+  resetQueue([
+    card('q-x', 'live', 'agent x'),
+    ciCard('q-ci1', 'q-p', 'ci run one'),
+    card('q-p', 'live', 'the pusher'),
+    card('q-y', 'live', 'agent y'),
+    ciCard('q-ci2', '', 'orphan ci'),
+    ciCard('q-ci3', 'q-nopane', 'ci with parent that has no pane'),
+  ]);
+  mt.openMode();
+  const order = mt.panesInDisplayOrder().map((p) => p.qid).join(',');
+  assert('a ci pane is placed directly after its parent pane',
+    order === 'q-x,q-p,q-ci1,q-y,q-ci2,q-ci3', order);
+  const ci1 = mt.panesInDisplayOrder().find((p) => p.qid === 'q-ci1');
+  assert('a ci pane is badged ci and tails the queue stream endpoint',
+    ci1.el.querySelector('.mt-pane-badge').textContent === 'ci' &&
+    ci1.el.getAttribute('data-live-log-mode') === 'ci');
+  assert('a nested ci pane carries its parent id and the nested class',
+    ci1.el.getAttribute('data-ci-parent-queue-id') === 'q-p' &&
+    ci1.el.classList.contains('mt-pane-ci-child'));
+  assert('a ci row whose parent has no pane stays top-level',
+    !mt.panesInDisplayOrder().find((p) => p.qid === 'q-ci3')
+      .el.classList.contains('mt-pane-ci-child'));
+  const slots = mt.slotOrder().map((p) => p.qid).join(',');
+  assert('nested ci panes get stream slots after every top-level pane',
+    slots.indexOf('q-ci1') > slots.indexOf('q-y'), slots);
+  mt.closeMode();
+}
+
 console.log(
   failures === 0
     ? '\nAll multitail tests passed.'

@@ -106,6 +106,16 @@ pub const DEFAULT_HARD_GATE_ENABLED: bool = true;
 /// (default): the operator resolves via the pushover alert instead.
 pub const DEFAULT_ORPHAN_AUTO_ABANDON_SECS: u64 = 0;
 
+/// Default minutes without a sync before an open passive CI row is reported
+/// (`queue-ci-stale`, reason `stale-sync`). Overridable via `[queue_check]
+/// ci_stale_sync_min` or `--ci-stale-sync-min`.
+pub const DEFAULT_CI_STALE_SYNC_MIN: u64 = 15;
+
+/// Default minutes an open passive CI row may stay open before it is reported
+/// (`queue-ci-stale`, reason `max-run`). Overridable via `[queue_check]
+/// ci_max_run_min` or `--ci-max-run-min`.
+pub const DEFAULT_CI_MAX_RUN_MIN: u64 = 240;
+
 /// Max number of ids to list inline in the human-readable `message`.
 pub const TOP_N: usize = 3;
 
@@ -1308,6 +1318,8 @@ pub fn corroborate_soft_orphans(
 pub fn cmd_queue_check(
     stale_heartbeat_min: u64,
     no_binding_grace_secs: u64,
+    ci_stale_sync_min: u64,
+    ci_max_run_min: u64,
     state_dir: Option<&str>,
     force_emit: bool,
     dry_run: bool,
@@ -1328,6 +1340,15 @@ pub fn cmd_queue_check(
         }
     };
     let current_ids: HashSet<String> = all_items.iter().map(|it| it.id.clone()).collect();
+
+    // Passive CI rows are NOT in `queue list --all` (they are hidden by default
+    // and exempt from every owner/heartbeat check above), so they get their
+    // own liveness check: the CLI emits `queue-ci-stale` once per (row,
+    // reason) when an open row has not been synced recently or has been open
+    // too long. Emission follows the same `emit_events` / `--force-emit` /
+    // `--dry-run` rules as the other conditions; the once-only ledger lives on
+    // the row itself.
+    run_ci_check(&cli, ci_stale_sync_min, ci_max_run_min, force_emit, dry_run);
 
     let state_dir = state_dir
         .map(PathBuf::from)
@@ -1514,6 +1535,43 @@ pub fn cmd_queue_check(
         return 1;
     }
     0
+}
+
+/// Run `session-task queue ci check` with the configured thresholds. Skipped
+/// when event emission is off (unless forced / dry-run). Best-effort: a
+/// failure is logged and never fails the rest of the tick.
+fn run_ci_check(
+    cli: &Path,
+    stale_sync_min: u64,
+    max_run_min: u64,
+    force_emit: bool,
+    dry_run: bool,
+) {
+    if !(force_emit || dry_run || config_emit_events()) {
+        return;
+    }
+    let stale = stale_sync_min.to_string();
+    let max_run = max_run_min.to_string();
+    let mut args: Vec<&str> = vec![
+        "queue",
+        "ci",
+        "check",
+        "--stale-sync-min",
+        &stale,
+        "--max-run-min",
+        &max_run,
+    ];
+    if dry_run {
+        args.push("--dry-run");
+    }
+    match run_session_task_raw(cli, &args, 20) {
+        Ok(out) => {
+            if !out.trim().is_empty() {
+                println!("{}", out.trim_end());
+            }
+        }
+        Err(e) => eprintln!("queue-check: ci check failed: {e}"),
+    }
 }
 
 fn hostname_string() -> String {
@@ -2568,5 +2626,20 @@ mod tests {
             "cleared qid resets"
         );
         assert!(out.next_sightings.contains_key("q-new"));
+    }
+
+    #[test]
+    fn ci_check_defaults_match_config_defaults() {
+        let c = crate::config::QueueCheckConfig::default();
+        assert_eq!(c.ci_stale_sync_min, DEFAULT_CI_STALE_SYNC_MIN);
+        assert_eq!(c.ci_max_run_min, DEFAULT_CI_MAX_RUN_MIN);
+    }
+
+    #[test]
+    fn ci_check_config_keys_parse_from_toml() {
+        let c: crate::config::QueueCheckConfig =
+            toml::from_str("ci_stale_sync_min = 7\nci_max_run_min = 90\n").unwrap();
+        assert_eq!(c.ci_stale_sync_min, 7);
+        assert_eq!(c.ci_max_run_min, 90);
     }
 }

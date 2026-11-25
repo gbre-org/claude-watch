@@ -166,6 +166,23 @@ AGENT_STATS_STALE_SECONDS = float(
 QUEUE_LOG_ARCHIVE_DIR = os.environ.get(
     "QUEUE_LOG_ARCHIVE_DIR", "/queue-home/.config/session/queue-logs"
 )
+# Passive CI rows (`session-task queue ci ...`, rows with `kind: "ci"`) have
+# no log file of their own. Their live log comes from an OPERATOR-SUPPLIED
+# command that prints the job's log to stdout, polled incrementally. The
+# template is split with shlex and each token is `str.format`-ed with the
+# row's fields -- {provider} {repo} {run} {job} {log_ref} {sha} {branch}
+# {qid} -- then executed WITHOUT a shell. Example:
+#   QUEUE_MINISITE_CI_LOG_CMD="ci-log --provider {provider} --repo {repo} --run {run} --job {job}"
+# Empty/unset = CI rows get no multitail pane (an empty pane is worse than
+# none) and the stream endpoint reports `no-log-source`.
+CI_LOG_CMD = os.environ.get("QUEUE_MINISITE_CI_LOG_CMD", "").strip()
+# Seconds between polls of the log command while the row is open.
+CI_LOG_POLL_SECONDS = float(os.environ.get("QUEUE_MINISITE_CI_LOG_POLL_SECONDS", "5"))
+# Hard timeout (seconds) for ONE invocation of the log command.
+CI_LOG_CMD_TIMEOUT = float(os.environ.get("QUEUE_MINISITE_CI_LOG_CMD_TIMEOUT", "30"))
+# Largest log kept per poll (bytes); the TAIL is kept when a log is longer.
+CI_LOG_MAX_BYTES = int(os.environ.get("QUEUE_MINISITE_CI_LOG_MAX_BYTES", str(4 * 1024 * 1024)))
+
 # Workload output directory (tail target for workload-bound queue items).
 # `workload run <label> -- <cmd>` writes:
 #   /tmp/claude-workloads/<label>.output  (line-oriented stdout/stderr)
@@ -1886,6 +1903,25 @@ def _badge_label(item: dict[str, Any], status: str) -> str:
     return f"waiting on {w.get('kind')}:{ref}"
 
 
+def _is_ci_item(item: dict[str, Any]) -> bool:
+    return isinstance(item, dict) and item.get("kind") == "ci"
+
+
+def _ci_view(item: dict[str, Any]) -> dict[str, Any]:
+    """The renderable subset of a passive CI row (`item["ci"]`)."""
+    ci = item.get("ci") if isinstance(item.get("ci"), dict) else {}
+    out = {
+        k: str(ci.get(k) or "")
+        for k in ("provider", "repo", "run", "job", "status", "outcome",
+                  "url", "branch", "sha", "parent", "last_synced")
+    }
+    # Only http(s) links are rendered as links (the row text is operator /
+    # syncer supplied; never emit javascript: URLs into an href).
+    if out["url"] and not re.match(r"^https?://", out["url"], re.I):
+        out["url"] = ""
+    return out
+
+
 def _shape(
     item: dict[str, Any],
     now: datetime,
@@ -2195,7 +2231,19 @@ def _shape(
         "from_archive": False,
     }
 
-    if status == "running":
+    is_ci = _is_ci_item(item)
+    shaped["kind"] = "ci" if is_ci else ""
+    shaped["ci"] = _ci_view(item) if is_ci else None
+    shaped["ci_parent"] = (shaped["ci"] or {}).get("parent", "") if is_ci else ""
+    if is_ci and status == "running":
+        # Passive external row: no agent, owner, heartbeat or subagent tree.
+        # An empty owner keeps it out of the orphan tally (`alive is False`)
+        # and off the orphan badge.
+        shaped["owner"] = {}
+        shaped["is_starting"] = False
+        shaped["agent_stats"] = None
+        shaped["subagents"] = []
+    elif status == "running":
         owner = _classify_owner(item, now, agent_by_qid, owner_bindings)
         shaped["owner"] = owner
         # Surface STARTING as a top-level boolean for the template +
@@ -2269,7 +2317,12 @@ def _shape(
     # (hostjob before workload before agent) so the flag can never claim a
     # mode the stream endpoint would not actually serve.
     live_log_mode = ""
-    if status == "running":
+    if is_ci:
+        # Open CI rows tail through the operator's log command; with none
+        # configured there is nothing to read, so no pane.
+        if status == "running" and CI_LOG_CMD:
+            live_log_mode = "ci"
+    elif status == "running":
         if shaped["hostjob_label"]:
             live_log_mode = "hostjob"
         elif shaped["workload_label"]:
@@ -5541,6 +5594,173 @@ def _tail_hostjob_output(label: str, qid: str | None = None) -> Iterator[bytes]:
             pass
 
 
+_CI_ARG_SAFE_RE = re.compile(r"^[^\x00-\x1f\x7f]*$")
+
+
+def _ci_log_argv(item: dict[str, Any]) -> list[str]:
+    """Build the log command argv for a CI row from the operator template.
+
+    No shell is involved. Every substituted value is rejected when it carries
+    control characters or starts with ``-`` (a value that is a whole argv
+    token must not be able to smuggle an option). Raises ValueError."""
+    ci = _ci_view(item)
+    values = {
+        "provider": ci["provider"], "repo": ci["repo"], "run": ci["run"],
+        "job": ci["job"], "sha": ci["sha"], "branch": ci["branch"],
+        "log_ref": str((item.get("ci") or {}).get("log_ref") or ""),
+        "qid": str(item.get("id") or ""),
+    }
+    for k, v in values.items():
+        if not _CI_ARG_SAFE_RE.match(v) or v.startswith("-"):
+            raise ValueError(f"unsafe value for {{{k}}}")
+    tokens = shlex.split(CI_LOG_CMD)
+    if not tokens:
+        raise ValueError("empty log command")
+    try:
+        return [t.format_map(values) for t in tokens]
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ValueError(f"bad log command template: {exc}") from exc
+
+
+def _ci_run_log_cmd(argv: list[str]) -> tuple[int, str, str]:
+    """Run the log command once. Returns (rc, stdout, stderr); stdout is the
+    TAIL of at most CI_LOG_MAX_BYTES. rc -1 = could not run / timed out."""
+    try:
+        r = subprocess.run(
+            argv, capture_output=True, timeout=CI_LOG_CMD_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return -1, "", str(exc)
+    out = r.stdout[-CI_LOG_MAX_BYTES:] if CI_LOG_MAX_BYTES > 0 else r.stdout
+    return (r.returncode, out.decode("utf-8", "replace"),
+            r.stderr[-2000:].decode("utf-8", "replace"))
+
+
+def _ci_item_open(qid: str) -> bool:
+    """True while the CI row is still `running` (uncached read; fail-soft
+    True so a transient read error never cuts a live tail)."""
+    data, err = _read_queue()
+    if err is not None or not isinstance(data, dict):
+        return True
+    for it in data.get("items", []) or []:
+        if isinstance(it, dict) and it.get("id") == qid:
+            return it.get("status") == "running"
+    return False
+
+
+def _tail_ci_output(item: dict[str, Any]) -> Iterator[bytes]:
+    """SSE generator for a passive CI row: poll the operator's log command and
+    emit only what is new since the previous poll.
+
+    Same wire format and knobs as the workload / hostjob tails (plain-text
+    `workload_line` frames, backfill, keepalive, idle / lifetime caps), so the
+    multitail pane needs no CI-specific rendering. Incremental rule: a poll's
+    output that EXTENDS the previous output emits just the new complete lines;
+    output that does not (the provider rewrote / rotated the log) emits a
+    `log-reset` meta frame and the new tail. A trailing partial line is held
+    back until it completes or the row closes. A failing command is reported
+    as a retryable `open-failed` error (the pane backs off and retries until
+    the log exists, like a missing workload log)."""
+    qid = str(item.get("id") or "")
+    started = time.monotonic()
+    last_data_at = started
+    last_keepalive_at = started
+
+    if not CI_LOG_CMD:
+        yield _format_sse({
+            "type": "error", "kind": "no-log-source", "queue_id": qid,
+            "error": "No CI log command is configured "
+                     "(QUEUE_MINISITE_CI_LOG_CMD).",
+        })
+        return
+    try:
+        argv = _ci_log_argv(item)
+    except ValueError as exc:
+        yield _format_sse({
+            "type": "error", "kind": "no-log-source", "queue_id": qid,
+            "error": f"CI log command not runnable: {exc}",
+        })
+        return
+
+    yield _format_sse({
+        "type": "meta", "kind": "stream-start", "mode": "ci",
+        "label": qid, "ts": time.time(),
+    })
+
+    prev = ""        # full text of the previous poll (complete lines only)
+    first = True
+    try:
+        while True:
+            terminal = not _ci_item_open(qid)
+            rc, out, err = _ci_run_log_cmd(argv)
+            if rc != 0:
+                if first:
+                    yield _format_sse({
+                        "type": "error", "kind": "open-failed",
+                        "error": f"CI log command failed (rc={rc}): "
+                                 f"{err.strip()[-300:]}",
+                    })
+                    return
+                # Later failures: keep what we have and try again.
+                out = None
+            if out is not None:
+                complete = out if terminal else out[: out.rfind("\n") + 1]
+                if terminal and complete and not complete.endswith("\n"):
+                    complete += "\n"
+                if complete != prev:
+                    if complete.startswith(prev):
+                        delta = complete[len(prev):]
+                        reset = False
+                    else:
+                        delta = complete
+                        reset = not first
+                    lines = delta.splitlines()
+                    if first and len(lines) > SSE_TAIL_BACKFILL_LINES:
+                        lines = lines[-SSE_TAIL_BACKFILL_LINES:]
+                    if reset:
+                        yield _format_sse({"type": "meta", "kind": "log-reset"})
+                    if first and lines:
+                        yield _format_sse({"type": "meta",
+                                           "kind": "backfill-begin",
+                                           "lines": len(lines)})
+                    for text in lines:
+                        yield _format_sse(_plain_line_event(text, False))
+                    if first and lines:
+                        yield _format_sse({"type": "meta",
+                                           "kind": "backfill-end"})
+                    if lines:
+                        last_data_at = time.monotonic()
+                    prev = complete
+                first = False
+            if terminal:
+                yield _format_sse({
+                    "type": "meta", "kind": "workload-end", "label": qid,
+                    "reason": "terminal", "exit_code": None,
+                })
+                return
+            # Wait for the next poll, still honouring keepalive / caps.
+            wait_until = time.monotonic() + CI_LOG_POLL_SECONDS
+            while time.monotonic() < wait_until:
+                now = time.monotonic()
+                if now - last_data_at > SSE_TAIL_MAX_IDLE_SECONDS:
+                    yield _format_sse({"type": "meta", "kind": "idle-timeout",
+                                       "idle_seconds": int(now - last_data_at)})
+                    return
+                if now - started > SSE_TAIL_MAX_LIFETIME_SECONDS:
+                    yield _format_sse({"type": "meta",
+                                       "kind": "lifetime-timeout",
+                                       "seconds": int(now - started)})
+                    return
+                if now - last_keepalive_at > SSE_KEEPALIVE_SECONDS:
+                    yield _format_sse_comment(f"keep-alive {int(now - started)}s")
+                    last_keepalive_at = now
+                time.sleep(min(SSE_TAIL_POLL_SECONDS,
+                               max(0.01, wait_until - now)))
+    except GeneratorExit:
+        return
+
+
 def _parse_jsonl_line(line: str) -> dict[str, Any]:
     """Parse a single transcript JSONL line into a stream event payload.
 
@@ -5659,6 +5879,12 @@ def api_queue_stream(qid: str) -> Any:
                 workload_label = _extract_workload_label(scope)
                 hostjob_label = _extract_hostjob_label(scope)
                 break
+    if item is not None and _is_ci_item(item):
+        return Response(
+            stream_with_context(_tail_ci_output(item)),
+            headers=headers,
+            direct_passthrough=True,
+        )
     if workload_label:
         return Response(
             stream_with_context(_tail_workload_output(workload_label)),

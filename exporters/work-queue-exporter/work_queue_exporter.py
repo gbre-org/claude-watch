@@ -1286,6 +1286,10 @@ def collect():
     have_owner_signal = _report_owner_inputs(agent_state_status, bindings_status)
 
     items = data.get("items", [])
+    # Passive external CI rows (`kind: ci`) have no owner or heartbeat by
+    # design; they must not count as running/orphaned work. Their liveness is
+    # checked by `session-task queue ci check` instead.
+    items = [it for it in items if not (isinstance(it, dict) and it.get("kind") == "ci")]
     # Top-level locked_scopes dict: {scope_token: {reason, locked_at, ...}}
     locked_scopes = set(data.get("locked_scopes", {}).keys())
 

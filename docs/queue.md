@@ -57,7 +57,8 @@ State: `~/.config/session/queue.json` (fcntl.flock-protected).
 ```
 session-task queue add "..." --scope <s> [--summary "..."] [--priority N]
                                           # 1 = highest priority; default 5
-session-task queue list [--ready] [--running] [--blocked]
+session-task queue list [--ready] [--running] [--blocked] [--ci | --ci-only]
+session-task queue ci upsert|close|list|check ...   # passive external CI rows
 session-task queue show <id>
 session-task queue scope <id>             # show effective scope
 session-task queue groups                 # show group membership
@@ -493,6 +494,60 @@ completion. Exporter series: `worktask_queue_item_waiting_age_seconds`,
 `queue heartbeat <id> --pid N` keeps working (back-compat) but is no longer
 the recommended way to keep an ownerless item quiet: use `queue wait`.
 `WorkQueueOrphaned` remains as a can't-happen backstop.
+
+## Passive external CI rows (`kind: ci`)
+
+A **CI row** mirrors one external CI run (or one job of a run) into the queue so
+progress shows up in the minisite / multitail next to agent work, and so an item
+can depend on a run. Rows are written by an external syncer through the CLI
+below; the queue never runs them. The provider is an opaque string the caller
+chooses.
+
+```
+session-task queue ci upsert --provider P --repo R --run N [--job J]
+        [--status S] [--url U] [--branch B] [--sha SHA] [--parent q-...]
+        [--log-ref TOKEN] [--reopen] [--json]      # prints the queue id
+session-task queue ci close  (--id q-... | --provider P --repo R --run N [--job J])
+        --outcome success|failure|cancelled|skipped [--url U] [--reason T] [--json]
+session-task queue ci list   [--all] [--parent q-...] [--provider P] [--json]
+session-task queue ci check  [--stale-sync-min N] [--max-run-min M] [--dry-run]
+session-task queue list --ci | --ci-only          # show them in the item list
+```
+
+* **Identity / idempotence.** A row is keyed by `(provider, repo, run, job)`;
+  `upsert` creates it or updates it in place and always stamps
+  `ci.last_synced` (the syncer's liveness signal). It prints the queue id, so
+  `--depends-on <id>` works; `--depends-on ci:<provider>:<repo>#<run>[:<job>]`
+  is accepted too (a placeholder row is created if the run is not known yet,
+  and the first `upsert` lands on it). `close` on a never-seen run creates the
+  row already closed. A closed row is final: `upsert` leaves it alone unless
+  `--reopen`, and `close` with a different outcome exits 3.
+* **Status mapping.** Open = `status: running`. `success` -> `done`; `failure`,
+  `cancelled`, `skipped` -> `abandoned`; the outcome is kept in `ci.outcome`.
+* **No effect on other items.** CI rows hold no scope, never join or serialize a
+  group, and never change another item's `ready_now`.
+* **Outcome-aware dependencies.** An item that depends on a CI row is ready
+  **only** on `success`. When the row closes any other way, each pending
+  dependent is moved to `blocked` (reason names the run, its outcome and URL)
+  and a `queue-dep-failed` claude-event is emitted per dependent; it is never
+  left waiting forever and never runs. A dependency added to an already-failed
+  row blocks immediately. Ordinary `done` / `abandon` semantics for normal items
+  are unchanged.
+* **Exempt from the owner/heartbeat machinery.** The default `queue list` and
+  `list --ready` hide CI rows (so `queue list --all --json`, which the stuck /
+  orphaned / stale-ready checks read, never contains them); the unacked
+  agent-completion gate, the work-queue exporter and the ready-item parity check
+  skip `kind: ci`. They have no owner, pid or heartbeat to go stale.
+* **Liveness check.** `queue ci check` (run by `claude-watch queue-check`) emits
+  one `queue-ci-stale` claude-event per open row per reason: `stale-sync` (no
+  `upsert` for `ci_stale_sync_min`, default 15) or `max-run` (open longer than
+  `ci_max_run_min`, default 240). Configure under `[queue_check]` in
+  `config.toml`, or per run with `--ci-stale-sync-min` / `--ci-max-run-min` on
+  `claude-watch queue-check`, or `SESSION_TASK_CI_STALE_SYNC_MIN` /
+  `SESSION_TASK_CI_MAX_RUN_MIN` for the bare CLI. The once-only record lives on
+  the row (`ci.alerts`), cleared by `--reopen`.
+* **Minisite / multitail.** See the queue-minisite README (`ci` live-log mode,
+  `QUEUE_MINISITE_CI_LOG_CMD`).
 
 ## Schema (v2)
 

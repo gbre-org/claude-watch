@@ -4469,6 +4469,8 @@ def cmd_queue_add(args):
             if tgt and tgt not in seen_dep:
                 seen_dep.add(tgt)
                 scope_task_targets.append(tgt)
+        # `ci:<provider>:<repo>#<run>[:<job>]` -> the CI row's queue id.
+        deps_split = _ci_resolve_refs(items, deps_split)
         all_dep_targets = deps_split + scope_task_targets
         if all_dep_targets:
             existing_ids_now = {it["id"] for it in items}
@@ -4555,6 +4557,8 @@ def cmd_queue_add(args):
         items.append(item)
 
         _recompute_group_heads(items)
+        # A dep that already closed unsuccessfully blocks the new item now.
+        _ci_block_failed_dependents(items)
 
         # Determine ready_now + serialized_after
         group_members_sorted = sorted(
@@ -5408,7 +5412,11 @@ def cmd_queue_list(args):
         except Exception:
             pass
 
-    # Filter
+    # Filter. Passive CI rows are hidden unless asked for (--ci / --ci-only).
+    if getattr(args, "ci_only", False):
+        items = [it for it in items if _is_ci_row(it)]
+    elif not getattr(args, "ci", False):
+        items = [it for it in items if not _is_ci_row(it)]
     if args.group:
         items = [it for it in items if it.get("group_id") == args.group]
     if args.ready:
@@ -5479,6 +5487,11 @@ def cmd_queue_list(args):
         )
         print(f"  summary: {summary}")
         print(f"  desc   : {desc}")
+        if _is_ci_row(it):
+            _ci = it.get("ci") or {}
+            print(f"  ci     : {_ci_label(it)} status={_ci.get('status') or '-'} "
+                  f"outcome={_ci.get('outcome') or '-'} "
+                  f"parent={_ci.get('parent') or '-'} {_ci.get('url') or ''}")
         # Surface the wedge / block reason inline so `queue list` is the
         # one-stop diagnosis surface -- no need to drill into `queue show`
         # for the most common operator question ("why is this stuck?").
@@ -5578,7 +5591,7 @@ def cmd_queue_groups(args):
 
     by_group = {}
     for it in items:
-        if it.get("status") not in ACTIVE_STATUSES:
+        if it.get("status") not in ACTIVE_STATUSES or _is_ci_row(it):
             continue
         by_group.setdefault(it["group_id"], []).append(it)
 
@@ -9719,6 +9732,7 @@ def cmd_queue_depend(args):
             )
             sys.exit(1)
 
+        to_add = _ci_resolve_refs(items, to_add)
         existing_ids = {it["id"] for it in items}
         unknown = [d for d in to_add if d not in existing_ids]
         if unknown:
@@ -9821,6 +9835,7 @@ def cmd_queue_depend(args):
             # group_head bookkeeping mirrors cmd_queue_block: a blocked item
             # is still the in-flight head of its group.
             _recompute_group_heads(items)
+        _ci_block_failed_dependents(items)
 
         _queue_write_and_unlock(fh, data)
     except Exception:
@@ -10388,7 +10403,8 @@ def cmd_queue_banner(args):
     ready = [it for it in items if _item_is_ready(items, it, locked_scopes=locked_scopes)]
     ready.sort(key=_sort_key)
     pending = [it for it in items if it.get("status") == "pending"]
-    running = [it for it in items if it.get("status") == "running"]
+    running = [it for it in items if it.get("status") == "running"
+               and not _is_ci_row(it)]
     wedged = [it for it in items if it.get("status") == "wedged"]
     blocked = [it for it in items if it.get("status") == "blocked"]
 
@@ -10748,6 +10764,589 @@ def cmd_queue_migrate(args):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Passive CI rows (`kind: "ci"`).
+#
+# A CI row mirrors one external CI run (or one job of a run) into the queue so
+# the minisite / multitail show CI progress next to agent work, and so an item
+# can `--depends-on` a run. The rows are PASSIVE: an external syncer
+# creates and updates them through `queue ci upsert` / `queue ci
+# close`; nothing in the queue ever "runs" them. Consequently:
+#
+#   * they hold NO scope (scope is always `[]`), so they never serialize
+#     against, nor appear in the group of, another item -- `ready_now` of
+#     every other item is unaffected by their existence;
+#   * they have no owner, agent, pid or heartbeat, so every owner/heartbeat
+#     based check (queue-stuck, queue-orphaned, stale-ready, the unacked
+#     agent-completion gate, block-abuse, the work-queue exporter) must skip
+#     them. The default `queue list` / `list --ready` hide them; the Rust
+#     `queue-check` / `stale-ready-check` read `queue list --all --json` and so
+#     never see them either. `queue list --ci` / `--ci-only` and `queue ci
+#     list` show them.
+#   * their liveness is the syncer's `last_synced` stamp instead: `queue ci
+#     check` emits `queue-ci-stale` (once per row per reason) when a row has
+#     not been synced for a while or has been open longer than a max run
+#     duration -- the "alert me if the reaper stops reaping" signal.
+#
+# Lifecycle / status mapping (so every existing consumer keeps working):
+#
+#   open        status=running                      (ci.outcome unset)
+#   success     status=done                         ci.outcome=success
+#   failure /   status=abandoned                    ci.outcome=failure|cancelled|skipped
+#   cancelled /
+#   skipped
+#
+# Dependencies: `status == done` already means "dep satisfied", and a CI row
+# is only ever `done` on success, so the ordinary readiness rule gives the
+# required outcome-aware semantics for free: an item depending on a CI row is
+# ready ONLY on success. The part that needs code is the failure side: a
+# dependent of a non-successful CI row is moved to `blocked` (reason naming
+# the run) and a `queue-dep-failed` event is emitted, so it neither runs nor
+# waits forever (`_ci_block_failed_dependents`).
+# ---------------------------------------------------------------------------
+
+CI_KIND = "ci"
+CI_OUTCOMES = ("success", "failure", "cancelled", "skipped")
+CI_DEFAULT_STALE_SYNC_MIN = 15
+CI_DEFAULT_MAX_RUN_MIN = 240
+CI_CREATED_BY = "ci-sync"
+
+# `ci:<provider>:<repo>#<run>[:<job>]` -- a dependency target by run reference.
+_CI_REF_RE = re.compile(
+    r"^ci:(?P<provider>[^:#\s]+):(?P<repo>[^#\s]+)#(?P<run>[^:\s]+)"
+    r"(?::(?P<job>.+))?$"
+)
+
+# Events produced while mutating under the queue lock; flushed by main() after
+# the lock is released (same pattern as _HOSTJOB_PENDING_EVENTS).
+_CI_PENDING_EVENTS = []
+
+
+def _is_ci_row(it):
+    return isinstance(it, dict) and it.get("kind") == CI_KIND
+
+
+def _ci_key(provider, repo, run, job=""):
+    return (
+        (provider or "").strip().lower(),
+        (repo or "").strip().lower(),
+        str(run if run is not None else "").strip(),
+        (job or "").strip(),
+    )
+
+
+def _ci_row_key(it):
+    ci = it.get("ci") or {}
+    return _ci_key(ci.get("provider"), ci.get("repo"), ci.get("run"),
+                   ci.get("job"))
+
+
+def _ci_find(items, key):
+    for it in items:
+        if _is_ci_row(it) and _ci_row_key(it) == key:
+            return it
+    return None
+
+
+def _ci_label(it):
+    """`provider repo#run[ job]` -- how a run is named in text."""
+    ci = it.get("ci") or {}
+    job = f" {ci['job']}" if ci.get("job") else ""
+    return f"{ci.get('provider', '?')} {ci.get('repo', '?')}#{ci.get('run', '?')}{job}"
+
+
+def _ci_is_open(it):
+    return _is_ci_row(it) and it.get("status") == "running"
+
+
+def _ci_new_row(key, *, created_by=CI_CREATED_BY):
+    provider, repo, run, job = key
+    now = _fmt_ts()
+    row = {
+        "id": _new_id(),
+        "kind": CI_KIND,
+        "description": "",
+        "summary": "",
+        "scope": [],
+        "group_id": _new_group_id(),
+        "group_head": False,
+        "status": "running",
+        "priority": 5,
+        "created_at": now,
+        "started_at": now,
+        "created_by": created_by or CI_CREATED_BY,
+        "ci": {
+            "provider": provider,
+            "repo": repo,
+            "run": run,
+            "job": job,
+            "status": "queued",
+            "outcome": "",
+            "url": "",
+            "branch": "",
+            "sha": "",
+            "parent": "",
+            "log_ref": "",
+            "last_synced": now,
+        },
+    }
+    _ci_refresh_text(row)
+    return row
+
+
+def _ci_refresh_text(row):
+    label = _ci_label(row)
+    ci = row.get("ci") or {}
+    row["description"] = f"CI {label}"
+    bits = [f"CI {label}"]
+    if ci.get("branch"):
+        bits.append(f"({ci['branch']})")
+    if row.get("status") != "running" and ci.get("outcome"):
+        bits.append(f"-> {ci['outcome']}")
+    elif ci.get("status"):
+        bits.append(f"[{ci['status']}]")
+    row["summary"] = " ".join(bits)[:200]
+
+
+def _ci_resolve_refs(items, tokens):
+    """Replace `ci:<provider>:<repo>#<run>[:<job>]` dependency targets with the
+    queue id of the matching CI row, creating an open placeholder row when the
+    syncer has not reported that run yet (so a dependency can be declared
+    before the first upsert). Non-ci tokens pass through untouched. Returns
+    the new token list; mutates `items` only when a placeholder is created."""
+    out = []
+    for tok in tokens:
+        m = _CI_REF_RE.match(tok) if isinstance(tok, str) else None
+        if not m:
+            out.append(tok)
+            continue
+        key = _ci_key(m.group("provider"), m.group("repo"), m.group("run"),
+                      m.group("job") or "")
+        row = _ci_find(items, key)
+        if row is None:
+            row = _ci_new_row(key)
+            row["ci"]["placeholder"] = True
+            items.append(row)
+        out.append(row["id"])
+    return out
+
+
+def _ci_block_failed_dependents(items):
+    """Move every PENDING item that depends on a CI row which closed without
+    `success` to `blocked`, with a reason naming the failed run. Returns the
+    list of blocked items; queues one `queue-dep-failed` event per item on
+    `_CI_PENDING_EVENTS` (flushed after the lock drops).
+
+    Idempotent: a blocked item is no longer pending so it is never re-blocked,
+    and only the operator's `queue unblock` returns it to pending (after which
+    it must be re-pointed, `queue depend --remove <ci-id>`, or the run
+    re-opened and succeed)."""
+    by_id = {it.get("id"): it for it in items if it.get("id")}
+    blocked = []
+    for it in items:
+        if it.get("status") != "pending" or _is_ci_row(it):
+            continue
+        failed = None
+        for dep_id in _iter_dep_ids(it):
+            dep = by_id.get(dep_id)
+            if (_is_ci_row(dep) and dep.get("status") == "abandoned"
+                    and (dep.get("ci") or {}).get("outcome") != "success"):
+                failed = dep
+                break
+        if failed is None:
+            continue
+        ci = failed.get("ci") or {}
+        outcome = ci.get("outcome") or "failure"
+        url = f" {ci['url']}" if ci.get("url") else ""
+        reason = (
+            f"CI dependency {failed['id']} ({_ci_label(failed)}) finished "
+            f"{outcome}{url}; refusing to run. Re-run CI then "
+            f"`session-task queue ci upsert --reopen ...`, or drop the edge "
+            f"with `session-task queue depend {it['id']} --remove "
+            f"{failed['id']}`, then `queue unblock {it['id']}`."
+        )
+        it["status"] = "blocked"
+        it["blocked_at"] = _fmt_ts()
+        it["block_reason"] = reason
+        it["blocked_by_ci"] = failed["id"]
+        blocked.append(it)
+        _CI_PENDING_EVENTS.append({
+            "tag": "queue-dep-failed",
+            "message": (
+                f"queue dependency FAILED: {it['id']} ({_item_summary(it)}) "
+                f"blocked -- CI {_ci_label(failed)} finished {outcome}"
+            ),
+            "data": {
+                "queue_id": it["id"],
+                "ci_queue_id": failed["id"],
+                "ci_provider": ci.get("provider", ""),
+                "ci_repo": ci.get("repo", ""),
+                "ci_run": ci.get("run", ""),
+                "ci_job": ci.get("job", ""),
+                "outcome": outcome,
+                "url": ci.get("url", ""),
+                "summary": _item_summary(it),
+                "block_reason": reason,
+            },
+            "priority": "normal",
+        })
+    if blocked:
+        _recompute_group_heads(items)
+    return blocked
+
+
+def _flush_ci_events():
+    events = list(_CI_PENDING_EVENTS)
+    del _CI_PENDING_EVENTS[:]
+    for ev in events:
+        _claude_event_notify(
+            ev["tag"], ev["message"], ev["data"],
+            priority=ev.get("priority", "low"),
+        )
+
+
+def _ci_row_view(it):
+    """Flat JSON view of a CI row for `queue ci list/upsert --json`."""
+    ci = it.get("ci") or {}
+    out = {
+        "id": it.get("id"),
+        "status": it.get("status"),
+        "outcome": ci.get("outcome", ""),
+        "provider": ci.get("provider", ""),
+        "repo": ci.get("repo", ""),
+        "run": ci.get("run", ""),
+        "job": ci.get("job", ""),
+        "ci_status": ci.get("status", ""),
+        "url": ci.get("url", ""),
+        "branch": ci.get("branch", ""),
+        "sha": ci.get("sha", ""),
+        "parent": ci.get("parent", ""),
+        "last_synced": ci.get("last_synced", ""),
+        "created_at": it.get("created_at", ""),
+        "completed_at": it.get("completed_at") or it.get("abandoned_at") or "",
+    }
+    return out
+
+
+def _ci_select(items, args):
+    """Find the target row for close: --id, or provider+repo+run[+job]."""
+    if getattr(args, "id", None):
+        row = next((it for it in items if it.get("id") == args.id), None)
+        if row is not None and not _is_ci_row(row):
+            print(f"ERROR: {args.id} is not a CI row", file=sys.stderr)
+            sys.exit(2)
+        return row, None
+    if not (args.provider and args.repo and args.run):
+        print("ERROR: pass --id, or --provider, --repo and --run",
+              file=sys.stderr)
+        sys.exit(2)
+    key = _ci_key(args.provider, args.repo, args.run, args.job or "")
+    return _ci_find(items, key), key
+
+
+def cmd_queue_ci_upsert(args):
+    """Create or update the CI row for one run (or run+job). Idempotent.
+
+    Stamps `ci.last_synced` on EVERY call -- that stamp is the syncer's
+    liveness signal (see `queue ci check`) -- so a syncer should upsert each
+    open run on every poll, even when nothing changed. Prints the queue id
+    (one line) so it can be fed to `--depends-on`; `--json` prints the row.
+    A row that is already closed is left alone (its outcome is final) unless
+    `--reopen` is passed."""
+    for name in ("provider", "repo", "run"):
+        if not str(getattr(args, name, "") or "").strip():
+            print(f"ERROR: --{name} is required", file=sys.stderr)
+            sys.exit(2)
+    key = _ci_key(args.provider, args.repo, args.run, args.job or "")
+    fh, data = _queue_open_locked("rw")
+    created = False
+    note = ""
+    try:
+        items = data["items"]
+        row = _ci_find(items, key)
+        if row is None:
+            row = _ci_new_row(key, created_by=args.created_by)
+            items.append(row)
+            created = True
+        ci = row["ci"]
+        closed = row.get("status") in TERMINAL_STATUSES
+        if closed and not args.reopen:
+            note = (f"{row['id']} already closed "
+                    f"({ci.get('outcome') or row.get('status')}); not updated "
+                    f"(use --reopen to re-run it)")
+        else:
+            if closed and args.reopen:
+                row["status"] = "running"
+                for k in ("completed_at", "abandoned_at", "abandon_reason"):
+                    row.pop(k, None)
+                ci["outcome"] = ""
+                ci.pop("alerts", None)
+                row["reopened_at"] = _fmt_ts()
+            if args.status:
+                ci["status"] = args.status
+            for field, val in (("url", args.url), ("branch", args.branch),
+                               ("sha", args.sha), ("parent", args.parent),
+                               ("log_ref", args.log_ref)):
+                if val is not None and val != "":
+                    ci[field] = val
+            ci.pop("placeholder", None)
+            ci["last_synced"] = _fmt_ts()
+            _ci_refresh_text(row)
+        # A late-created row could already be a failed dependency target only
+        # via --reopen paths; sweep so dependents of a re-failed run block.
+        _ci_block_failed_dependents(items)
+        _queue_write_and_unlock(fh, data)
+    except BaseException:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+    if note:
+        print(note, file=sys.stderr)
+    if args.json:
+        view = _ci_row_view(row)
+        view["created"] = created
+        print(json.dumps(view, indent=2))
+    else:
+        print(row["id"])
+        print(f"{'created' if created else 'updated'}: {row['id']} "
+              f"{_ci_label(row)}", file=sys.stderr)
+
+
+def cmd_queue_ci_close(args):
+    """Close a CI row with a final outcome (success|failure|cancelled|skipped).
+
+    success -> status=done; any other outcome -> status=abandoned (with
+    ci.outcome recording which). Dependents of a non-success row are moved to
+    `blocked` and a `queue-dep-failed` event is emitted per dependent. A row
+    that was never upserted is created already-closed (the syncer may first
+    see a run after it finished). Closing an already-closed row with the SAME
+    outcome is a no-op; with a different outcome it is refused (exit 3) --
+    re-open with `queue ci upsert --reopen` first."""
+    outcome = args.outcome
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        row, key = _ci_select(items, args)
+        if row is None:
+            if key is None:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                print(f"not found: {args.id}", file=sys.stderr)
+                sys.exit(1)
+            row = _ci_new_row(key)
+            items.append(row)
+        ci = row["ci"]
+        if row.get("status") in TERMINAL_STATUSES:
+            same = (ci.get("outcome") or "") == outcome
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            if same:
+                print(row["id"])
+                print(f"already closed: {row['id']} ({outcome})",
+                      file=sys.stderr)
+                return
+            print(f"ERROR: {row['id']} already closed as "
+                  f"{ci.get('outcome') or row.get('status')!r}; "
+                  f"re-open it with `queue ci upsert --reopen` first",
+                  file=sys.stderr)
+            sys.exit(3)
+        now = _fmt_ts()
+        ci["outcome"] = outcome
+        ci["last_synced"] = now
+        ci.pop("placeholder", None)
+        if args.url:
+            ci["url"] = args.url
+        if args.status:
+            ci["status"] = args.status
+        else:
+            ci["status"] = outcome
+        if outcome == "success":
+            row["status"] = "done"
+            row["completed_at"] = now
+        else:
+            row["status"] = "abandoned"
+            row["abandoned_at"] = now
+            row["abandon_reason"] = (
+                f"ci {outcome}" + (f": {args.reason}" if args.reason else "")
+            )
+        row["group_head"] = False
+        _ci_refresh_text(row)
+        dependents = [
+            it for it in items
+            if it.get("id") != row["id"]
+            and row["id"] in list(_iter_dep_ids(it))
+        ]
+        blocked = _ci_block_failed_dependents(items)
+        if outcome == "success" and dependents:
+            _CI_PENDING_EVENTS.append({
+                "tag": "queue-done",
+                "message": f"queue done: {row['id']} ({_item_summary(row)})",
+                "data": {
+                    "queue_id": row["id"],
+                    "group_id": row.get("group_id"),
+                    "scope": [],
+                    "summary": _item_summary(row),
+                    "ci": "true",
+                    "dependents": [d["id"] for d in dependents],
+                },
+                "priority": "low",
+            })
+        _queue_write_and_unlock(fh, data)
+    except SystemExit:
+        raise
+    except BaseException:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+    if args.json:
+        view = _ci_row_view(row)
+        view["blocked_dependents"] = [b["id"] for b in blocked]
+        print(json.dumps(view, indent=2))
+    else:
+        print(row["id"])
+        extra = (f"; blocked dependents: {','.join(b['id'] for b in blocked)}"
+                 if blocked else "")
+        print(f"closed: {row['id']} {_ci_label(row)} -> {outcome}{extra}",
+              file=sys.stderr)
+
+
+def cmd_queue_ci_list(args):
+    fh, data = _queue_open_locked("r")
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+    rows = [it for it in items if _is_ci_row(it)]
+    if not args.all:
+        rows = [it for it in rows if it.get("status") == "running"]
+    if args.parent:
+        rows = [it for it in rows
+                if (it.get("ci") or {}).get("parent") == args.parent]
+    if args.provider:
+        rows = [it for it in rows
+                if (it.get("ci") or {}).get("provider", "").lower()
+                == args.provider.strip().lower()]
+    rows.sort(key=lambda it: it.get("created_at", ""))
+    if args.json:
+        print(json.dumps([_ci_row_view(it) for it in rows], indent=2))
+        return
+    if not rows:
+        print("(no ci rows)")
+        return
+    print(f"{'ID':22} {'ST':10} {'OUTCOME':10} {'PARENT':22} RUN")
+    for it in rows:
+        ci = it.get("ci") or {}
+        print(f"{it['id']:22} {it.get('status', ''):10} "
+              f"{ci.get('outcome') or '-':10} {ci.get('parent') or '-':22} "
+              f"{_ci_label(it)}  synced {ci.get('last_synced', '?')}")
+
+
+def _ci_check_thresholds(args):
+    stale_sync = args.stale_sync_min
+    if stale_sync is None:
+        stale_sync = _env_num("SESSION_TASK_CI_STALE_SYNC_MIN",
+                              CI_DEFAULT_STALE_SYNC_MIN, float)
+    max_run = args.max_run_min
+    if max_run is None:
+        max_run = _env_num("SESSION_TASK_CI_MAX_RUN_MIN",
+                           CI_DEFAULT_MAX_RUN_MIN, float)
+    return float(stale_sync), float(max_run)
+
+
+def cmd_queue_ci_check(args):
+    """Alert when the CI syncer stops reaping.
+
+    CI rows have no agent heartbeat, so this is their liveness check. For each
+    OPEN CI row emit a `queue-ci-stale` claude-event when
+      * `ci.last_synced` is older than --stale-sync-min  (reason `stale-sync`:
+        the syncer stopped updating it -- it died, or lost the run), or
+      * the row has been open longer than --max-run-min   (reason `max-run`:
+        it was never closed, or the run is hung).
+    Each (row, reason) fires ONCE: the emit is recorded in `ci.alerts` under
+    the lock so the next tick stays quiet. Re-opening a row clears its
+    record. Prints one line per alert. `--dry-run` prints and records
+    nothing. Defaults: env SESSION_TASK_CI_STALE_SYNC_MIN (15) and
+    SESSION_TASK_CI_MAX_RUN_MIN (240); `claude-watch queue-check` passes its
+    `[queue_check] ci_stale_sync_min` / `ci_max_run_min` config values."""
+    stale_sync_min, max_run_min = _ci_check_thresholds(args)
+    now = datetime.now(timezone.utc)
+    fh, data = _queue_open_locked("rw")
+    alerts = []
+    try:
+        items = data["items"]
+        for row in items:
+            if not _ci_is_open(row):
+                continue
+            ci = row.setdefault("ci", {})
+            done_alerts = ci.get("alerts") or {}
+            synced = _parse_iso(ci.get("last_synced")) or _parse_iso(
+                row.get("created_at"))
+            opened = _parse_iso(row.get("created_at"))
+            reasons = []
+            if (synced is not None and "stale-sync" not in done_alerts
+                    and (now - synced).total_seconds() > stale_sync_min * 60):
+                reasons.append(("stale-sync", (now - synced).total_seconds()))
+            if (opened is not None and "max-run" not in done_alerts
+                    and (now - opened).total_seconds() > max_run_min * 60):
+                reasons.append(("max-run", (now - opened).total_seconds()))
+            for reason, age in reasons:
+                alerts.append((row, reason, age))
+                if not args.dry_run:
+                    done_alerts[reason] = _fmt_ts()
+                    ci["alerts"] = done_alerts
+        if args.dry_run:
+            _queue_unlock_readonly(fh)
+        else:
+            _queue_write_and_unlock(fh, data)
+    except BaseException:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+    for row, reason, age in alerts:
+        ci = row.get("ci") or {}
+        mins = int(age // 60)
+        if reason == "stale-sync":
+            msg = (f"CI row {row['id']} ({_ci_label(row)}) has not been "
+                   f"synced for {mins}m (limit {int(stale_sync_min)}m): the "
+                   f"CI syncer may have stopped reaping")
+        else:
+            msg = (f"CI row {row['id']} ({_ci_label(row)}) has been open "
+                   f"{mins}m (max {int(max_run_min)}m): never closed, or the "
+                   f"run is hung")
+        print(f"{reason}: {msg}")
+        if args.dry_run:
+            continue
+        _claude_event_notify(
+            "queue-ci-stale", f"queue CI stale: {msg}",
+            {
+                "queue_id": row["id"],
+                "reason": reason,
+                "age_min": mins,
+                "ci_provider": ci.get("provider", ""),
+                "ci_repo": ci.get("repo", ""),
+                "ci_run": ci.get("run", ""),
+                "ci_job": ci.get("job", ""),
+                "url": ci.get("url", ""),
+                "last_synced": ci.get("last_synced", ""),
+                "parent": ci.get("parent", ""),
+                "action": (
+                    "The syncer should close this row (`session-task queue ci "
+                    "close ...`); if it is gone, close or abandon the row by "
+                    "hand: `session-task queue ci close --id <id> --outcome "
+                    "cancelled`."
+                ),
+            },
+            priority="normal",
+        )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -10928,7 +11527,72 @@ def build_parser():
     q_list.add_argument("--ready", action="store_true")
     q_list.add_argument("--all", action="store_true")
     q_list.add_argument("--group")
+    q_list.add_argument(
+        "--ci", action="store_true",
+        help="Also show passive CI rows (hidden by default).")
+    q_list.add_argument(
+        "--ci-only", action="store_true", help="Show ONLY passive CI rows.")
     q_list.add_argument("--json", action="store_true")
+
+    q_ci = qsub.add_parser(
+        "ci",
+        help="Passive external CI rows: upsert / close / list / check",
+        description=(
+            "Passive CI rows mirror an external CI run into the queue. They "
+            "hold no scope, never serialize other items, are hidden from the "
+            "default `queue list`, and are exempt from every owner/heartbeat "
+            "check. An item `--depends-on` a CI row (queue id, or "
+            "`ci:<provider>:<repo>#<run>[:<job>]`) becomes ready ONLY when "
+            "the row closes with outcome `success`; on failure/cancelled/"
+            "skipped the dependent is moved to blocked and a "
+            "`queue-dep-failed` event is emitted. `queue ci check` emits "
+            "`queue-ci-stale` when a row stops being synced."
+        ),
+    )
+    ci_sub = q_ci.add_subparsers(dest="cicmd")
+    ci_up = ci_sub.add_parser(
+        "upsert", help="Create/update the row for a run (idempotent); prints its id")
+    ci_up.add_argument("--provider", required=True,
+                       help="Opaque provider name (caller-defined).")
+    ci_up.add_argument("--repo", required=True)
+    ci_up.add_argument("--run", required=True, help="Run id/number")
+    ci_up.add_argument("--job", default="", help="Job name (omit for a run-level row)")
+    ci_up.add_argument("--status", default=None,
+                       help="Free-form provider status (queued, in_progress, ...)")
+    ci_up.add_argument("--url")
+    ci_up.add_argument("--branch")
+    ci_up.add_argument("--sha")
+    ci_up.add_argument("--parent", help="Queue id of the item that pushed the branch")
+    ci_up.add_argument("--log-ref", default=None, dest="log_ref",
+                       help="Opaque token passed to the operator's log command as {log_ref}")
+    ci_up.add_argument("--created-by", default=CI_CREATED_BY)
+    ci_up.add_argument("--reopen", action="store_true",
+                       help="Re-open a closed row (clears its outcome)")
+    ci_up.add_argument("--json", action="store_true")
+    ci_cl = ci_sub.add_parser(
+        "close", help="Close a row with a final outcome (idempotent)")
+    ci_cl.add_argument("--id", help="CI row queue id (alternative to provider/repo/run)")
+    ci_cl.add_argument("--provider")
+    ci_cl.add_argument("--repo")
+    ci_cl.add_argument("--run")
+    ci_cl.add_argument("--job", default="")
+    ci_cl.add_argument("--outcome", required=True, choices=list(CI_OUTCOMES))
+    ci_cl.add_argument("--url")
+    ci_cl.add_argument("--status", default=None)
+    ci_cl.add_argument("--reason", default="")
+    ci_cl.add_argument("--json", action="store_true")
+    ci_ls = ci_sub.add_parser("list", help="List CI rows (open by default)")
+    ci_ls.add_argument("--all", action="store_true", help="Include closed rows")
+    ci_ls.add_argument("--parent")
+    ci_ls.add_argument("--provider")
+    ci_ls.add_argument("--json", action="store_true")
+    ci_ck = ci_sub.add_parser(
+        "check", help="Emit queue-ci-stale for rows not synced / open too long")
+    ci_ck.add_argument("--stale-sync-min", type=float, default=None,
+                       help=f"default env SESSION_TASK_CI_STALE_SYNC_MIN or {CI_DEFAULT_STALE_SYNC_MIN}")
+    ci_ck.add_argument("--max-run-min", type=float, default=None,
+                       help=f"default env SESSION_TASK_CI_MAX_RUN_MIN or {CI_DEFAULT_MAX_RUN_MIN}")
+    ci_ck.add_argument("--dry-run", action="store_true")
 
     q_reconcile_hj = qsub.add_parser(
         "reconcile-hostjobs",
@@ -11849,11 +12513,25 @@ def main():
             "locks": cmd_queue_locks,
             "migrate": cmd_queue_migrate,
         }
+        if args.qcmd == "ci":
+            cimap = {"upsert": cmd_queue_ci_upsert, "close": cmd_queue_ci_close,
+                     "list": cmd_queue_ci_list, "check": cmd_queue_ci_check}
+            cfn = cimap.get(getattr(args, "cicmd", None))
+            if cfn is None:
+                parser.parse_args(["queue", "ci", "--help"])
+                sys.exit(1)
+            try:
+                return cfn(args)
+            finally:
+                _flush_ci_events()
         fn = qmap.get(args.qcmd)
         if fn is None:
             parser.parse_args(["queue", "--help"])
             sys.exit(1)
-        return fn(args)
+        try:
+            return fn(args)
+        finally:
+            _flush_ci_events()
 
     parser.print_help()
     sys.exit(1)

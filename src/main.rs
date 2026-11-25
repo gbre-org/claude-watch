@@ -205,6 +205,16 @@ enum Commands {
         /// case). Overrides `[queue_check] no_binding_grace_secs`.
         #[arg(long)]
         no_binding_grace_secs: Option<u64>,
+        /// Minutes without a sync after which an open passive CI row is
+        /// reported `queue-ci-stale`. Overrides `[queue_check]
+        /// ci_stale_sync_min`.
+        #[arg(long)]
+        ci_stale_sync_min: Option<u64>,
+        /// Minutes an open passive CI row may stay open before it is
+        /// reported `queue-ci-stale`. Overrides `[queue_check]
+        /// ci_max_run_min`.
+        #[arg(long)]
+        ci_max_run_min: Option<u64>,
         /// Directory holding the per-emitter state file
         /// (`queue-check-state.json`). Falls back to
         /// `CLAUDE_WATCH_STATE_DIR` env var, then `/var/lib/claude-watch`.
@@ -2475,6 +2485,8 @@ async fn main() {
         Some(Commands::QueueCheck {
             stale_heartbeat_min,
             no_binding_grace_secs,
+            ci_stale_sync_min,
+            ci_max_run_min,
             state_dir,
             force_emit,
             dry_run,
@@ -2494,9 +2506,21 @@ async fn main() {
                     .map(|c| c.queue_check.no_binding_grace_secs)
                     .unwrap_or(queue_check::DEFAULT_NO_BINDING_GRACE_SECS)
             });
+            let ci_sync_min = ci_stale_sync_min.unwrap_or_else(|| {
+                cfg.as_ref()
+                    .map(|c| c.queue_check.ci_stale_sync_min)
+                    .unwrap_or(queue_check::DEFAULT_CI_STALE_SYNC_MIN)
+            });
+            let ci_run_min = ci_max_run_min.unwrap_or_else(|| {
+                cfg.as_ref()
+                    .map(|c| c.queue_check.ci_max_run_min)
+                    .unwrap_or(queue_check::DEFAULT_CI_MAX_RUN_MIN)
+            });
             let code = queue_check::cmd_queue_check(
                 stale_min,
                 grace_secs,
+                ci_sync_min,
+                ci_run_min,
                 state_dir.as_deref(),
                 force_emit,
                 dry_run,

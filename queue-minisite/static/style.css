@@ -1991,6 +1991,22 @@ body.modal-open { overflow: hidden; }
   color: #fff;
 }
 
+/* Passive external CI rows (kind "ci"): a chip carrying the run's status, or
+ * its final outcome once closed, and a link to the run. Hue by outcome so a
+ * failed run reads at a glance. */
+.badge.ci-badge {
+  background: var(--running);
+  color: #fff;
+}
+.badge.ci-success { background: var(--ok); }
+.badge.ci-failure { background: var(--orphan); }
+.badge.ci-cancelled,
+.badge.ci-skipped { background: var(--blocked); }
+.ci-link {
+  font-size: 0.75rem;
+  margin-left: 4px;
+}
+
 /* ------- vim-style keyboard selection (j/k) -------
  *
  * Painted by static/keyboard.js when the user navigates with j/k. The
@@ -2880,6 +2896,13 @@ body.multitail-open { overflow: hidden; }
 .mt-badge-workload { background: var(--ready); }
 .mt-badge-hostjob { background: var(--other); }
 .mt-badge-subagent { background: var(--blocked); }
+.mt-badge-ci { background: var(--ready); }
+/* A CI pane nested under the item that pushed the branch indents like a
+   subagent pane (one level). */
+.mt-pane.mt-pane-ci-child {
+  margin-left: var(--mt-sub-indent);
+  border-left-color: var(--ready);
+}
 .mt-pane-id {
   flex: 0 0 auto;
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;

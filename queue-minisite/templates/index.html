@@ -128,6 +128,19 @@
 
       MUST stay in step with modelTag() in static/refresh.js — the 5s morphdom
       merge replaces this markup with the JS version. -#}
+  {#- ---------- CI CHIP ----------
+      Passive external CI rows (`it.kind == 'ci'`, created by `session-task
+      queue ci upsert`) show the run's status, or its final OUTCOME once
+      closed (success / failure / cancelled / skipped), plus a link to the
+      run when the row carries an http(s) URL. Renders NOTHING for any other
+      row. MUST stay in step with ciTag() in static/refresh.js. -#}
+  {%- macro ci_tag(it) -%}
+    {%- if it.kind == 'ci' and it.ci -%}
+      {%- set ci_state = it.ci.outcome or it.ci.status or 'running' -%}
+      <span class="badge ci-badge ci-{{ ci_state|replace(' ', '-') }}" title="external CI run: {{ it.ci.provider }} {{ it.ci.repo }}#{{ it.ci.run }}{% if it.ci.job %} ({{ it.ci.job }}){% endif %}">ci {{ ci_state }}</span>
+      {%- if it.ci.url %}<a class="ci-link" href="{{ it.ci.url }}" target="_blank" rel="noopener noreferrer" title="open the CI run">#{{ it.ci.run }}</a>{% endif -%}
+    {%- endif -%}
+  {%- endmacro -%}
   {%- macro model_tag(it) -%}
     {%- if it.model_label %}<span class="model-tag" title="model: {{ it.model or it.model_label }}">{{ it.model_label }}</span>{% endif -%}
   {%- endmacro -%}
@@ -362,7 +375,9 @@
            a "polling" state and retry the SSE connection until the agent's
            first event lands (live-log.js handles the transition). #}
         {% set is_clickable = True %}
-        {% if is_hostjob %}
+        {% if is_hostjob or it.kind == 'ci' %}
+          {# CI rows reuse the plain-text hostjob viewer: same /stream endpoint,
+             same workload_line frames. #}
           {% set log_mode = 'hostjob' %}
         {% elif is_workload %}
           {% set log_mode = 'workload' %}
@@ -391,6 +406,8 @@
               static/refresh.js: this subtree is rebuilt on every 5s tick, so an
               attribute that exists only here disappears after one tick. -#}
           {% if it.live_log_mode %}data-live-log-mode="{{ it.live_log_mode }}"{% endif %}
+          {% if it.kind == 'ci' %}data-ci-row="1"{% endif %}
+          {% if it.ci_parent %}data-ci-parent="{{ it.ci_parent }}"{% endif %}
           tabindex="0"
           role="button"
           aria-label="View {% if is_hostjob %}hostjob{% elif is_workload %}workload{% elif is_starting %}live (polling — waiting for first event){% else %}live{% endif %} log for {{ it.id }}"
@@ -407,7 +424,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
-            {{ model_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it) }}
             {#- AGENT ACTIVITY CELL (botchat #2967): live tool-call + context
                 token counters for the agent bound to this queue id, from the
                 agent-stats snapshot. Lives in the item HEAD (not .age / .scope)
@@ -532,7 +549,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
-            {{ model_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
           {% if it.wedged_reason %}<p class="description abandon-reason"><strong>wedge:</strong> {{ it.wedged_reason }}</p>{% endif %}
@@ -594,7 +611,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
-            {{ model_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
           {% if it.quarantine_reason %}<p class="description abandon-reason"><strong>quarantine:</strong> {{ it.quarantine_reason }}</p>{% endif %}
@@ -665,7 +682,7 @@
             {% if it.locked %}<span class="badge state-locked" title="parked by an operator scope lock — NOT ready to spawn; the dispatcher refuses it until the scope is unlocked">locked</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
-            {{ model_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it) }}
             {# depends-on badge — depends_on landed 2026-05-02.
                Each dep is a clickable anchor (jumps to the target row)
                with an "x" affordance to remove the edge via DELETE. #}
@@ -787,7 +804,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
-            {{ model_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
           {% if it.block_reason %}<p class="description"><strong>blocker:</strong> {{ it.block_reason }}</p>{% endif %}
@@ -846,7 +863,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
-            {{ model_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
           <div class="age">
@@ -897,7 +914,7 @@
           <header class="item-head">
             <span class="badge state-done">done</span>
             <span class="id">{{ it.id }}</span>
-            {{ model_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it) }}
             {% if it.has_archive %}
               <span class="badge log-badge" title="archived agent transcript available">log</span>
             {% endif %}
@@ -945,7 +962,7 @@
               <span class="badge state-abandoned">abandoned</span>
             {% endif %}
             <span class="id">{{ it.id }}</span>
-            {{ model_tag(it) }}
+            {{ model_tag(it) }}{{ ci_tag(it) }}
             {% if it.is_errored_hostjob %}
               <span class="badge hostjob-badge" title="hostjob-bound: {{ it.hostjob_label }}">hostjob</span>
             {% endif %}
