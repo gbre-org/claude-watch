@@ -14,6 +14,10 @@
 //                today, but we leave the binding in place so adding one
 //                later is zero-config.
 //
+// Only VISIBLE rows are navigable: rows inside a folded section (or
+// otherwise hidden) are skipped, and folding the selected row's section
+// moves the selection to the nearest visible row.
+//
 // Selection state lives in a single `selectedQueueId` variable. We re-find
 // the row by data-queue-id on every action so the 5s morphdom refresh
 // can replace nodes without dropping the selection. Wrap-around: j on
@@ -61,11 +65,54 @@
     return false;
   }
 
-  function rows() {
-    // Live NodeList → static Array so the order is stable across the
-    // arrow-iteration loop even if DOM mutates mid-tick (it shouldn't,
-    // but defensive — morphdom replaces nodes async on refresh).
+  // A row is navigable only if it is actually shown. Walk the ancestors:
+  // a closed <details> hides everything except its own <summary>, and
+  // `hidden` / display:none / visibility:hidden (e.g. the source filter's
+  // .filtered-out) hide the subtree. Computed style rather than
+  // offsetParent so it also holds where no layout exists (jsdom tests) and
+  // for position:fixed ancestors.
+  function isVisible(el) {
+    let child = null;
+    for (let n = el; n && n.nodeType === 1; child = n, n = n.parentElement) {
+      if (n.hasAttribute('hidden')) return false;
+      if (n.tagName === 'DETAILS' && !n.open && child &&
+          !(child.tagName === 'SUMMARY' && child.parentElement === n)) {
+        return false;
+      }
+      const cs = window.getComputedStyle ? window.getComputedStyle(n) : null;
+      if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) return false;
+    }
+    return true;
+  }
+
+  function allRows() {
     return Array.prototype.slice.call(document.querySelectorAll(ROW_SELECTOR));
+  }
+
+  function rows() {
+    // Static Array of VISIBLE rows only (skips folded sections and
+    // anything otherwise hidden) so j/k never land on an unseen row.
+    return allRows().filter(isVisible);
+  }
+
+  // If the selected row was hidden (its section got folded, or a filter
+  // applied), move the selection to the nearest visible row after it in
+  // document order, else the nearest before it, else drop it.
+  function revalidateSelection() {
+    if (!selectedQueueId) return;
+    const every = allRows();
+    let idx = -1;
+    for (let i = 0; i < every.length; i++) {
+      if (every[i].getAttribute('data-queue-id') === selectedQueueId) { idx = i; break; }
+    }
+    if (idx < 0 || isVisible(every[idx])) return;
+    for (let i = idx + 1; i < every.length; i++) {
+      if (isVisible(every[i])) { applySelection(every[i]); return; }
+    }
+    for (let i = idx - 1; i >= 0; i--) {
+      if (isVisible(every[i])) { applySelection(every[i]); return; }
+    }
+    clearSelection();
   }
 
   function findSelectedIndex(allRows) {
@@ -224,6 +271,12 @@
     }
   });
 
+  // Folding a section hides the selected row: move off it immediately.
+  document.addEventListener('toggle', (ev) => {
+    const t = ev.target;
+    if (t && t.classList && t.classList.contains('queue-section')) revalidateSelection();
+  }, true);
+
   // Re-apply the selection ring after a morphdom refresh — refresh.js
   // replaces nodes by data-queue-id, but the .kbd-selected class is
   // ours, not in the rendered template, so we have to repaint it.
@@ -231,6 +284,8 @@
   // checks whether the selected row still has the class is enough and
   // costs nothing when nothing has changed.
   setInterval(() => {
+    if (!selectedQueueId) return;
+    revalidateSelection();
     if (!selectedQueueId) return;
     const all = rows();
     const idx = findSelectedIndex(all);
@@ -255,6 +310,7 @@
     moveUp,
     openSelected,
     clearSelection,
+    revalidateSelection,
     focusSearch,
     get selectedQueueId() { return selectedQueueId; },
   };
