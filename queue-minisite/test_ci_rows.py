@@ -210,15 +210,62 @@ class CiRowsTest(unittest.TestCase):
         texts = [e["text"] for e in ev if e.get("type") == "event"]
         self.assertIn("  - step Build [in_progress]", texts)
 
-    def test_pending_rc_with_no_output_gets_status_line(self):
+    def test_pending_rc_with_no_output_gets_status_frame(self):
         pend = self._script("pending-empty", "exit 5\n")
         self.appmod.CI_LOG_CMD = f"{pend} {{run}}"
         q = self._upsert()
         _st(self.env, "queue", "ci", "close", "--id", q, "--outcome", "success")
         ev = self._sse(q)
         self.assertFalse(any(e.get("type") == "error" for e in ev), ev)
-        texts = [e["text"] for e in ev if e.get("type") == "event"]
-        self.assertTrue(any("log not available yet" in t for t in texts), texts)
+        self.assertTrue(any(e.get("kind") == "ci-status" and "ts" in e for e in ev), ev)
+
+    def test_volatile_block_is_a_status_frame_not_log_lines(self):
+        body = ("echo 'job one log'\necho '===== in progress ====='\n"
+                "echo 'job two running'\necho '  [>>] 3. Test'\nexit 5\n")
+        c = self._script("volatile-cmd", body)
+        self.appmod.CI_LOG_CMD = f"{c} {{run}}"
+        q = self._upsert()
+        gen = self.appmod._tail_ci_output(
+            next(i for i in json.loads(self.queue_actual.read_text())["items"]
+                 if i["id"] == q))
+        frames = []
+        for raw in gen:
+            for line in raw.decode().splitlines():
+                if line.startswith("data: "):
+                    frames.append(json.loads(line[6:]))
+            if any(f.get("kind") == "ci-status" for f in frames):
+                break
+        gen.close()
+        texts = [f["text"] for f in frames if f.get("type") == "event"]
+        self.assertEqual(texts, ["job one log"])
+        st = next(f for f in frames if f.get("kind") == "ci-status")
+        self.assertEqual(st["lines"], ["job two running", "  [>>] 3. Test"])
+        self.assertFalse(st["final"])
+
+    def test_rc0_marks_status_final_before_row_closes(self):
+        c = self._script("done-cmd", "echo 'all done'\nexit 0\n")
+        self.appmod.CI_LOG_CMD = f"{c} {{run}}"
+        q = self._upsert()
+        gen = self.appmod._tail_ci_output(
+            next(i for i in json.loads(self.queue_actual.read_text())["items"]
+                 if i["id"] == q))
+        st = None
+        for raw in gen:
+            for line in raw.decode().splitlines():
+                if line.startswith("data: "):
+                    f = json.loads(line[6:])
+                    if f.get("kind") == "ci-status":
+                        st = f
+            if st:
+                break
+        gen.close()
+        self.assertTrue(st["final"])
+
+    def test_split_ci_status(self):
+        self.assertEqual(self.appmod._split_ci_status("a\nb\n"), ("a\nb\n", []))
+        self.assertEqual(
+            self.appmod._split_ci_status("a\n===== in progress =====\nx\ny\n"),
+            ("a\n", ["x", "y"]))
 
     def test_failure_error_is_one_clean_line_not_traceback(self):
         bad = self._script(

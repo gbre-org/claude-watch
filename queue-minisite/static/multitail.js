@@ -1513,6 +1513,15 @@
     const stream = el('pre', 'mt-pane-stream');
     stream.tabIndex = 0;
     wrap.appendChild(stream);
+    // CI panes only: the live "in progress" block + last-updated stamp, a
+    // sibling BELOW the scrolling stream so the stream tail stays the newest
+    // finished output and the running jobs are always visible at the bottom.
+    let ciStatus = null;
+    if (info.mode === 'ci') {
+      ciStatus = el('pre', 'mt-ci-status');
+      ciStatus.hidden = true;
+      wrap.appendChild(ciStatus);
+    }
 
     const pane = {
       // Identity: what this pane IS (kind + the id its stream is opened on),
@@ -1527,6 +1536,7 @@
       mode: info.mode,
       el: wrap,
       streamEl: stream,
+      ciStatusEl: ciStatus,
       statusEl: status,
       noTsEl: noTs,
       metaEl: meta,
@@ -1759,6 +1769,32 @@
     releaseSlot(pane);
   }
 
+  function clockText(tsSec) {
+    const d = tsSec ? new Date(tsSec * 1000) : new Date();
+    const p = (n) => (n < 10 ? '0' : '') + n;
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  // CI pane footer: the volatile "in progress" lines plus a "last updated"
+  // stamp, so a quiet pane is visibly polling rather than silently stale.
+  // textContent only.
+  function paintCiStatus(pane, payload) {
+    const box = pane.ciStatusEl;
+    if (!box) return;
+    const lines = Array.isArray(payload.lines) ? payload.lines : [];
+    const stamp = clockText(payload.ts);
+    const head = payload.final
+      ? 'run complete \u00b7 last updated ' + stamp
+      : 'in progress \u00b7 last updated ' + stamp;
+    box.textContent = [head].concat(lines).join('\n');
+    box.hidden = false;
+    box.classList.toggle('mt-ci-final', !!payload.final);
+    if (!pane.ended) {
+      setPaneStatus(pane, (payload.final ? 'complete' : 'live') + ' \u00b7 ' + stamp,
+        payload.final ? 'mt-done' : 'mt-ok');
+    }
+  }
+
   function handlePayload(pane, payload) {
     if (payload.type === 'meta') {
       switch (payload.kind) {
@@ -1787,6 +1823,16 @@
           markEnded(pane, label, code ? 'mt-err' : 'mt-done');
           return;
         }
+        case 'log-reset':
+          // The server's log is no longer an extension of what we showed
+          // (provider rewrote it): drop the old lines, the new text follows.
+          pane.records = [];
+          pane.chars = 0;
+          pane.streamEl.textContent = '';
+          return;
+        case 'ci-status':
+          paintCiStatus(pane, payload);
+          return;
         case 'archive-end':
           markEnded(pane, 'ended', 'mt-done');
           return;

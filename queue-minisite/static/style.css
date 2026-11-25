@@ -3485,3 +3485,12 @@ body.multitail-open { overflow: hidden; }
 .ansi-underline { text-decoration: underline; }
 .ansi-strike    { text-decoration: line-through; }
 .ansi-underline.ansi-strike { text-decoration: underline line-through; }
+
+/* CI pane footer: running jobs + "last updated" stamp, below the stream. */
+.mt-ci-status {
+  margin: 0; padding: 4px 8px; max-height: 9em; overflow: auto;
+  font: inherit; font-size: 0.85em; white-space: pre-wrap;
+  border-top: 1px solid var(--border, currentColor);
+  opacity: 0.85;
+}
+.mt-ci-status.mt-ci-final { opacity: 0.6; }
