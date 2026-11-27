@@ -46,6 +46,37 @@ In `~/.claude/settings.json` (after `make install` puts the binaries in
 }
 ```
 
+## Enabling the dispatcher gate on a bare host
+
+`make install` links `pre-tool-dispatch-gate-hook` and the
+`claude-watch-dispatch` CLI into `$BIN_DIR` (default `~/bin`). The gate is
+not active until it is wired into settings. Steps:
+
+1. Run `make install` (or `make -n install` to preview the links).
+2. Add the hook to the PreToolUse `*` block in `~/.claude/settings.json`,
+   AFTER the obligations gate so the obligations gate evaluates first:
+
+   ```json
+   {"matcher": "*", "hooks": [
+     {"type": "command", "command": "~/bin/pre-tool-obligations-gate-hook", "timeout": 5},
+     {"type": "command", "command": "~/bin/pre-tool-dispatch-gate-hook", "timeout": 5}
+   ]}
+   ```
+
+3. Threshold: default 6 consecutive non-exempt non-Agent tool calls. Set
+   `CLAUDE_WATCH_DISPATCH_THRESHOLD=<n>` in the environment, or persist it
+   with `claude-watch-dispatch set-threshold <n>` (the persisted value wins
+   over the env var). Inspect with `claude-watch-dispatch status`.
+4. Exempt patterns: one regex per line in `/etc/claude-code/dispatch-exempt.txt`
+   (optional; `claude-watch-dispatch list-exempt` shows the effective set).
+5. Escape hatches: `CLAUDE_WATCH_DISPATCH_BYPASS=1` (allow + audit),
+   `CLAUDE_WATCH_DISPATCH_ENABLED=0` (disable entirely), and
+   `claude-watch-dispatch reset` to zero the counter. Spawning an Agent also
+   resets it.
+
+Hooks edited in `settings.json` are picked up by current Claude Code without
+a restart; the gate takes effect on the next tool call after the edit.
+
 ## Hook scripts
 
 | Script | Hook event | Matcher | Purpose |
