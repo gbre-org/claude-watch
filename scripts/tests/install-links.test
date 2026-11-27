@@ -76,6 +76,13 @@ PREVIOUSLY_MISSING = [
     "queue-notify",
 ]
 
+# Dispatcher-gate pieces that bare-host installs previously never linked
+# (only the container image wired them).
+DISPATCH_GATE_LINKS = [
+    "pre-tool-dispatch-gate-hook",
+    "claude-watch-dispatch",
+]
+
 # Substrings that must never appear in a file shipped from this PUBLIC repo.
 PRIVATE_SENTINELS = [
     "/mnt/Raiden",
@@ -121,6 +128,12 @@ with tempfile.TemporaryDirectory() as tmp:
                 re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", dry_out) is not None,
                 f"make -n install lists {name!r}",
             )
+
+for name in DISPATCH_GATE_LINKS:
+    check(
+        re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", dry_out) is not None,
+        f"make -n install lists dispatch-gate tool {name!r}",
+    )
 
 # -----------------------------------------------------------------------------
 print("2. Parse TOOL_LINKS / MULTICALL_NAMES straight from `make -p`")

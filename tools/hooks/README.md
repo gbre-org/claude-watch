@@ -67,6 +67,10 @@ In `~/.claude/settings.json` (after `make install` puts the binaries in
 }
 ```
 
+## Bare-host dispatch gate
+
+`make install` links `pre-tool-dispatch-gate-hook` and `claude-watch-dispatch`. To enable the gate, add the hook to the PreToolUse `*` block AFTER the obligations gate; see "Enabling the dispatcher gate on a bare host" in `docs/hooks.md` for threshold, exempt-file, and bypass settings. Settings edits take effect without a restart.
+
 ## Emergency bypass
 
   - `OBLIGATIONS_BYPASS=1` env var — pre-tool-obligations-gate-hook treats
